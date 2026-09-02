@@ -58,6 +58,10 @@ MONAI 的 PatchGAN 判别器（Pix2PixHD 式），输出 patch logit 图而非�
 **Real sample（真实样本）**:
 训练集影像经 VAE 预编码的 latent，作为判别器的「真」，固定不更新。
 
+**Real sample pool（真实样本库）**:
+训练集（本轮 = BraTS train split）全量影像经 VAE 预编码的 latent 集合，按序列 token 分层；判别器的「真」与评测参照都取自它。
+_Avoid_: 真样本集
+
 **Fake sample（伪样本）**:
 当前 policy rollout 的去噪输出 latent，作为判别器的「假」。
 _Avoid_: 生成样本、负样本
@@ -77,3 +81,21 @@ GRPO 中共享同一初始噪声的 G 条 rollout 为一组；advantage 是该�
 **Granularity（粒度）**:
 Granular-GRPO 里续跑采样所用的时间步间隔 λ；多粒度（multi-granularity）指多个 λ 的 reward 融合。
 _Avoid_: 分辨率、尺度（尺度另有所指，见单/多尺度判别器）
+
+### 实验设计与验收
+
+**Baseline（无 RL 基线）**:
+冻结基座 checkpoint（不做 RL）的采样结果，作 RL 收益的对照基准；每组各一条（组1 = base UNet @ CFG=10；组2 = base UNet + 冻结预训练 ControlNet）。
+_Avoid_: 对照组、基准线
+
+**Quantitative evaluation（定量评测）**:
+像素域 2.5D FID（XY/YZ/ZX 三正交面、RadImageNet-ResNet50）+ KID/bootstrap CI 的自动化质量评测；跨模态组另加 3D SSIM/MAE。
+_Avoid_: L1
+
+**Downstream distribution alignment（下游指标分布对齐）**:
+用 nnUNet 仪器产出肿瘤体积/质心/ET-WT，对合成影像与真实分布做 TOST/KS/EMD 对齐检验；合成影像无 GT，不比 Dice。
+_Avoid_: L2、Dice 主判据
+
+**Expert review（专家目检）**:
+盲审流水线（视觉图灵 balanced accuracy + 4 维 5 分 Likert + Fleiss' κ）的人工终审。
+_Avoid_: L3、专家打分
