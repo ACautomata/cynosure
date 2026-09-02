@@ -26,6 +26,27 @@ _Avoid_: 采样、生成
 NV-Generate-CTMR 的分阶段能力。本轮实验只用「模态标签条件生成」与「跨模态影像条件生成」两阶段；「掩码条件生成」不在本轮范围。
 _Avoid_: 任务、phase、step
 
+### 策略建模
+
+**Velocity（速度场）**:
+UNet 的输出语义：`v = x0 − noise`（v-prediction），决定去噪方向。
+_Avoid_: 噪声预测、epsilon
+
+**CFG 组合场**:
+条件与无条件 velocity 的线性组合 `v_uncond + w·(v_cond − v_uncond)`，w 为引导强度。policy 的有效采样场按组对齐基座推理的 w（组1=10，组2=0）。
+_Avoid_: guidance（单独使用时）
+
+**Anchor 轨迹**:
+从同一初始噪声确定性 ODE 采出、逐步存下 latent 的参考轨迹；组内全部方向共享它，使 reward 差异唯一归因于被优化那一步的扰动。
+_Avoid_: 参考轨迹、主轨迹
+
+**单步 SDE 扰动（Singular Stochastic Sampling）**:
+把随机性限制在单个被优化步——仅在该步把确定性 ODE 步替换为带噪高斯核，其余步保持确定性。
+_Avoid_: 全程加噪、SDE 采样
+
+**MGAI（Multi-Granularity Advantage Integration）**:
+多粒度 advantage 集成：每个粒度 λ 的 advantage 各自组内标准化后直接求和的融合方式。
+
 ### Reward model
 
 **Reward model（奖励模型）**:
