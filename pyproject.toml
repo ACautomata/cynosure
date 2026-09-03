@@ -17,7 +17,9 @@ dependencies = [
     "pydantic>=2.7",
     # MONAI 推荐依赖（MAISI UNet 的 attention block 需要）
     "einops>=0.8",
-    # 集群侧钉 numpy==1.26.4（pytorch-dcu wheel 回验），本地开发不钉，见 docs/spec/orchestration.md
+    # import 白名单的显式依赖；集群侧钉 numpy==1.26.4（pytorch-dcu wheel 回验），
+    # 见 docs/spec/orchestration.md
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]

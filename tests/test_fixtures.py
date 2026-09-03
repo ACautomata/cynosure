@@ -1,6 +1,7 @@
 """fixture 生成器 + netbuild 测试：MONAI 微型网络的可前向配置（CPU 可跑）、
 fixture 数值锚（3 步 ODE、G 保持 12、latent [4,16,16,8]、input_img_size_numel=2048）。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ import torch
 
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
-from cynosure.netbuild import NetworkAssembler
+from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 
 
 class TestFixtureConfig:
@@ -57,8 +58,11 @@ class TestNetbuildForward:
         return Fixture().write_artifacts(tmp_path)
 
     def test_unet_forward_shape(self, fixture_artifacts: object) -> None:
-        net_config = NetworkAssembler.load_json(fixture_artifacts.unet_config_json)
-        unet = NetworkAssembler.unet(net_config, fixture_artifacts.unet_ckpt)
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(fixture_artifacts.unet_config_json),
+            checkpoint=fixture_artifacts.unet_ckpt,
+        )
+        unet = NetworkAssembler.unet(artifact)
         x = torch.randn(1, 4, 16, 16, 8)
         out = unet(
             x,
@@ -69,10 +73,13 @@ class TestNetbuildForward:
         assert out.shape == x.shape
 
     def test_discriminator_forward_patch_logits(self, fixture_artifacts: object) -> None:
-        disc_config = NetworkAssembler.load_json(
-            fixture_artifacts.discriminator_config_json,
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(
+                fixture_artifacts.discriminator_config_json,
+            ),
+            checkpoint=fixture_artifacts.discriminator_ckpt,
         )
-        disc = NetworkAssembler.discriminator(disc_config, fixture_artifacts.discriminator_ckpt)
+        disc = NetworkAssembler.discriminator(artifact)
         out = disc(torch.randn(2, 4, 16, 16, 8))
         patch_logits = out[-1]  # list 末元素 = patch logit 图
         assert patch_logits.shape[0] == 2
@@ -89,9 +96,7 @@ class TestNetbuildForward:
         self, fixture_artifacts: object,
     ) -> None:
         """网络配置 JSON 里的非构造参数（如基座死参数 scale）被静默过滤。"""
-        import json
-
         net_config = NetworkAssembler.load_json(fixture_artifacts.unet_config_json)
         net_config["scale"] = 1.4  # config 字面死参数陷阱（ADR-0002）
-        unet = NetworkAssembler.unet(net_config, fixture_artifacts.unet_ckpt)
+        unet = NetworkAssembler.unet(NetworkArtifact(config=net_config))
         assert unet is not None

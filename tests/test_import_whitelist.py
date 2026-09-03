@@ -13,29 +13,39 @@ ALLOWED_THIRD_PARTY = frozenset({"monai", "torch", "numpy", "pydantic", "einops"
 WHITELIST = frozenset(sys.stdlib_module_names) | ALLOWED_THIRD_PARTY | {"cynosure"}
 
 
-def top_level_modules(path: Path) -> set[str]:
-    """ast 解析单个源文件的顶层 import 包名。"""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    modules: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules |= {alias.name.split(".")[0] for alias in node.names}
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            modules.add(node.module.split(".")[0])
-    return modules
+class SourceImports:
+    """一个源码根的静态 import 图（ast 解析，不执行源码）。"""
 
+    def __init__(self, root: Path) -> None:
+        self._root = root
 
-def all_source_modules() -> set[str]:
-    return {
-        module
-        for source in sorted(SRC_ROOT.rglob("*.py"))
-        for module in top_level_modules(source)
-    }
+    def top_level_modules(self) -> set[str]:
+        """全部源文件的顶层 import 包名。"""
+        modules: set[str] = set()
+        for source in sorted(self._root.rglob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    modules.add(node.module.split(".")[0])
+        return modules
+
+    def relative_import_sites(self) -> list[str]:
+        """违反绝对导入规则的相对导入位置（path:lineno）。"""
+        sites: list[str] = []
+        for source in sorted(self._root.rglob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level > 0:
+                    sites.append(f"{source.relative_to(self._root)}:{node.lineno}")
+        return sites
 
 
 class TestZeroDependency:
     def test_all_source_imports_within_whitelist(self) -> None:
-        violations = all_source_modules() - WHITELIST
+        imports = SourceImports(SRC_ROOT)
+        violations = imports.top_level_modules() - WHITELIST
         assert violations == set(), f"白名单外的 import: {sorted(violations)}"
 
     def test_nv_generate_ctmr_is_rejected_by_construction(self, tmp_path: Path) -> None:
@@ -47,18 +57,12 @@ class TestZeroDependency:
         ):
             probe = tmp_path / "probe.py"
             probe.write_text(statement, encoding="utf-8")
-            imported = top_level_modules(probe)
+            imported = SourceImports(tmp_path).top_level_modules()
             assert imported - WHITELIST, f"{statement} 应被白名单拒绝"
 
     def test_no_relative_imports(self) -> None:
         """包内一律绝对导入（cynosure.xxx），不留相对导入。"""
-        offenders = []
-        for source in sorted(SRC_ROOT.rglob("*.py")):
-            tree = ast.parse(source.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.level > 0:
-                    offenders.append(f"{source.relative_to(SRC_ROOT)}:{node.lineno}")
-        assert offenders == [], f"相对导入: {offenders}"
+        assert SourceImports(SRC_ROOT).relative_import_sites() == []
 
     def test_whitelist_does_not_silently_grow(self) -> None:
         """第三方白名单变更必须是显式决定：钉死清单本体。"""

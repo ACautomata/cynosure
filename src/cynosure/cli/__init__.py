@@ -30,12 +30,16 @@ class CynosureCli:
     def run(self) -> int:
         parser = self._build_parser()
         args = parser.parse_args(self._argv)
+        # 三子命令共享同一 config schema：dispatch 前统一校验
+        config = self._load_config(args.config)
+        if config is None:
+            return _EXIT_USAGE_ERROR
         handlers = {
             "train": self._train,
             "eval": self._eval,
             "prepare": self._prepare,
         }
-        return handlers[args.command](args)
+        return handlers[args.command](args, config)
 
     def _build_parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(
@@ -74,15 +78,19 @@ class CynosureCli:
             print(f"config 不是合法 JSON: {exc}", file=self._stderr)
             return None
 
-    def _train(self, args: argparse.Namespace) -> int:
-        config = self._load_config(args.config)
-        if config is None:
-            return _EXIT_USAGE_ERROR
+    def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
         run_root = (
             Path(args.run_dir) if args.run_dir
             else RunArtifacts.default_root(config)
         )
-        artifacts = RunArtifacts.init(config, run_root)
+        try:
+            artifacts = RunArtifacts.init(config, run_root)
+        except FileExistsError:
+            print(
+                f"run 目录已存在（不静默覆盖；续训请走续训入口）: {run_root}",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
         print(
             "工件契约最小版已落盘：config.json / metrics.jsonl / manifest.json /"
@@ -91,10 +99,9 @@ class CynosureCli:
         )
         return 0
 
-    def _eval(self, args: argparse.Namespace) -> int:
-        config = self._load_config(args.config)
-        if config is None:
-            return _EXIT_USAGE_ERROR
+    def _eval(
+        self, args: argparse.Namespace, config: CynosureConfig,
+    ) -> int:
         if args.run_dir is not None:
             run_root = Path(args.run_dir)
             if not run_root.is_dir():
@@ -111,10 +118,9 @@ class CynosureCli:
         )
         return 0
 
-    def _prepare(self, args: argparse.Namespace) -> int:
-        config = self._load_config(args.config)
-        if config is None:
-            return _EXIT_USAGE_ERROR
+    def _prepare(
+        self, args: argparse.Namespace, config: CynosureConfig,
+    ) -> int:
         print("prepare 将构建以下工件（由 prepare ticket 交付）：", file=self._stdout)
         for name in (
             "real_pool_manifest", "heldout_real_manifest", "channel_stats_json",

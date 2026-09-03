@@ -7,6 +7,7 @@ cynosure 为 MAISI 3D latent rectified-flow 医学影像 checkpoint 设计并实
 ## 开发
 
 ```bash
+# MONAI/torch 对 Python 3.14 无兼容 wheel，本地 venv 用 3.12–3.13
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'

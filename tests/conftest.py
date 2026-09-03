@@ -6,13 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from cynosure.config import DEFAULT_CROSS_MODAL_PAIRS
+
 # 12 个有序 src→tgt 对（脑 MRI 四序列，每序列作 anchor、其余三序列为目标）
-CROSS_MODAL_PAIRS = [
-    ["t1n", "t1c"], ["t1n", "t2w"], ["t1n", "t2f"],
-    ["t1c", "t1n"], ["t1c", "t2w"], ["t1c", "t2f"],
-    ["t2w", "t1n"], ["t2w", "t1c"], ["t2w", "t2f"],
-    ["t2f", "t1n"], ["t2f", "t1c"], ["t2f", "t2w"],
-]
+CROSS_MODAL_PAIRS = [[src, tgt] for src, tgt in DEFAULT_CROSS_MODAL_PAIRS]
 
 # 组1、生产尺寸的最小合法 config（必填字段全部显式给出）
 MINIMAL_CONFIG_DICT: dict = {

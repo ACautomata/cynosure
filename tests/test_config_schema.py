@@ -12,14 +12,6 @@ from cynosure.config import ConfigLoader, CynosureConfig
 from tests.conftest import CROSS_MODAL_PAIRS, MINIMAL_CONFIG_DICT
 
 
-def field_errors(exc: ValidationError) -> list[tuple]:
-    return [err["loc"] for err in exc.errors()]
-
-
-def _loc_msg(exc: ValidationError) -> list[tuple[tuple, str]]:
-    return [(err["loc"], err["msg"]) for err in exc.errors()]
-
-
 class TestValidConfigs:
     def test_minimal_config_passes(self, valid_config_dict: dict) -> None:
         config = CynosureConfig.model_validate(valid_config_dict)
@@ -69,12 +61,20 @@ class TestValidConfigs:
 
 
 class TestRejection:
+    @staticmethod
+    def _locations(exc: ValidationError) -> list[tuple]:
+        return [err["loc"] for err in exc.errors()]
+
+    @staticmethod
+    def _locations_with_messages(exc: ValidationError) -> list[tuple[tuple, str]]:
+        return [(err["loc"], err["msg"]) for err in exc.errors()]
+
     def test_missing_required_field_is_field_level_error(self) -> None:
         data = copy.deepcopy(MINIMAL_CONFIG_DICT)
         del data["experiment"]["group"]
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("experiment", "group") in field_errors(exc_info.value)
+        assert ("experiment", "group") in self._locations(exc_info.value)
 
     def test_unknown_field_rejected(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
@@ -88,7 +88,7 @@ class TestRejection:
         data["experiment"]["group"] = "mask-conditioned"
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("experiment", "group") in field_errors(exc_info.value)
+        assert ("experiment", "group") in self._locations(exc_info.value)
 
     def test_fixed_value_cannot_be_changed(self, valid_config_dict: dict) -> None:
         """定死项（ratio clip 1e-4）改值 → 字段级拒绝。"""
@@ -96,21 +96,21 @@ class TestRejection:
         data["policy"] = {"ratio_clip": 1e-3}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("policy", "ratio_clip") in field_errors(exc_info.value)
+        assert ("policy", "ratio_clip") in self._locations(exc_info.value)
 
     def test_fixed_reward_mode_cannot_be_changed(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
         data["reward"]["reward_mode"] = "sigmoid_prob"
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("reward", "reward_mode") in field_errors(exc_info.value)
+        assert ("reward", "reward_mode") in self._locations(exc_info.value)
 
     def test_latent_channel_is_fixed_at_4(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
         data["latent_shape"] = [8, 64, 64, 32]
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert any("latent" in str(loc) for loc in field_errors(exc_info.value))
+        assert any("latent" in str(loc) for loc in self._locations(exc_info.value))
 
     def test_input_img_size_numel_must_match_latent_shape(self, valid_config_dict: dict) -> None:
         """数值锚：input_img_size_numel 必须 == prod(latent_shape[1:])，防日程静默错位。"""
@@ -121,7 +121,7 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert any(
             ("policy",) == loc and "input_img_size_numel" in msg
-            for loc, msg in _loc_msg(exc_info.value)
+            for loc, msg in self._locations_with_messages(exc_info.value)
         )
         # 同语义值 2048 → 通过
         data["policy"] = {"input_img_size_numel": math.prod((16, 16, 8))}
@@ -134,12 +134,12 @@ class TestRejection:
         data["policy"] = {"train_step_indices_m": [0, 2, 3]}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("policy", "train_step_indices_m") in field_errors(exc_info.value)
+        assert ("policy", "train_step_indices_m") in self._locations(exc_info.value)
 
         data["policy"] = {"train_step_indices_m": [29]}  # 30 步日程的末下标
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("policy", "train_step_indices_m") in field_errors(exc_info.value)
+        assert ("policy", "train_step_indices_m") in self._locations(exc_info.value)
 
     def test_train_steps_m_out_of_schedule(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
@@ -147,14 +147,44 @@ class TestRejection:
                           "train_step_indices_m": [7]}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("policy", "train_step_indices_m") in field_errors(exc_info.value)
+        assert ("policy", "train_step_indices_m") in self._locations(exc_info.value)
 
     def test_granularity_lambda_positive(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
         data["policy"] = {"granularity_intervals_lambda": [0, 1]}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("policy", "granularity_intervals_lambda") in field_errors(exc_info.value)
+        assert ("policy", "granularity_intervals_lambda") in self._locations(exc_info.value)
+
+    def test_granularity_lambda_ablation_axis(self, valid_config_dict: dict) -> None:
+        """Λ 消融取值 = {1,2} 或 {1,2,3}（policy-modeling 章），其余拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"granularity_intervals_lambda": [5]}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("policy", "granularity_intervals_lambda") in self._locations(exc_info.value)
+        data["policy"] = {"granularity_intervals_lambda": [1, 2, 3]}
+        CynosureConfig.model_validate(data)  # 消融轴另一端合法
+
+    def test_baseline_samples_in_spec_range(self, valid_config_dict: dict) -> None:
+        """N_baseline 口径 200–500（experiment-design 章）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"].update({"baseline_samples": 100})
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("schedule", "baseline_samples") in self._locations(exc_info.value)
+        data["schedule"].update({"baseline_samples": 500})
+        CynosureConfig.model_validate(data)
+
+    def test_max_iterations_capped_at_spec_upper(self, valid_config_dict: dict) -> None:
+        """每组规模目标 200–500；50 sanity 合法、超出 500 拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"].update({"max_iterations": 50})
+        CynosureConfig.model_validate(data)  # sanity 运行合法
+        data["schedule"].update({"max_iterations": 501})
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("schedule", "max_iterations") in self._locations(exc_info.value)
 
     def test_cross_modal_requires_controlnet_ckpt(self, valid_config_dict: dict) -> None:
         """组2/组3 的训练对象含 ControlNet：无 checkpoint 即拒绝。"""
@@ -162,7 +192,7 @@ class TestRejection:
         data["experiment"]["group"] = "cross-modal"
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert any("controlnet" in msg for loc, msg in _loc_msg(exc_info.value))
+        assert any("controlnet" in msg for loc, msg in self._locations_with_messages(exc_info.value))
 
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         config = CynosureConfig.model_validate(data)
@@ -175,7 +205,7 @@ class TestRejection:
         data["experiment"]["cross_modal_pairs"] = [["t1n", "t1c"]] * 12  # 重复对
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("experiment", "cross_modal_pairs") in field_errors(exc_info.value)
+        assert ("experiment", "cross_modal_pairs") in self._locations(exc_info.value)
 
     def test_discriminator_depth_ablation_axis(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)

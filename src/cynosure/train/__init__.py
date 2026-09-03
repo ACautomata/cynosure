@@ -14,10 +14,10 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from cynosure.config import CynosureConfig
+from cynosure.config import CynosureConfig, MODALITIES
 
-_MODAL_LABEL_CONDITIONS: list[str] = ["t1n", "t1c", "t2w", "t2f"]
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
+"""组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
 
 
 class IterEvent(BaseModel):
@@ -68,10 +68,13 @@ class RunArtifacts:
 
     @classmethod
     def init(cls, config: CynosureConfig, root: Path) -> "RunArtifacts":
-        """创建 run 目录并落盘契约最小集工件。"""
+        """创建 run 目录并落盘契约最小集工件；run 目录已存在则拒绝
+        （每次运行一个 run 目录的隔离契约，续训须显式复用并经续训入口）。"""
         paths = cls.layout(root)
-        paths.root.mkdir(parents=True, exist_ok=True)
-        paths.checkpoints.mkdir(parents=True, exist_ok=True)
+        if paths.config_snapshot.exists():
+            raise FileExistsError(f"run 目录已存在（不静默覆盖）: {root}")
+        paths.root.mkdir(parents=True)
+        paths.checkpoints.mkdir()
         paths.config_snapshot.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
@@ -92,9 +95,9 @@ class RunArtifacts:
         )
 
     @classmethod
-    def default_root(cls, config: CynosureConfig, home: Path | None = None) -> Path:
+    def default_root(cls, config: CynosureConfig) -> Path:
         """默认 run 目录：``$HOME/.cynosure/runs/<UTC 微秒时间戳>-<group>``。"""
-        base = (home or Path.home()) / ".cynosure" / "runs"
+        base = Path.home() / ".cynosure" / "runs"
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         return base / f"{timestamp}-{config.experiment.group}"
 
@@ -106,7 +109,7 @@ class RunArtifacts:
         """
         group = config.experiment.group
         if group == "modal-label":
-            conditions: list = list(_MODAL_LABEL_CONDITIONS)
+            conditions: list = list(MODALITIES)
         elif group == "cross-modal":
             conditions = [list(pair) for pair in config.experiment.cross_modal_pairs]
         else:

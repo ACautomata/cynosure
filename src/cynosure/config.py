@@ -27,21 +27,37 @@ from pydantic import (
 Modality = Literal["t1n", "t1c", "t2w", "t2f"]
 """脑 MRI 四序列（BraTS2023）；CT↔MR 不在本轮实验矩阵（experiment-design 章）。"""
 
-_MODALITIES: tuple[str, ...] = ("t1n", "t1c", "t2w", "t2f")
+MODALITIES: tuple[str, ...] = ("t1n", "t1c", "t2w", "t2f")
+"""组1 模态标签条件与组2 跨模态方向共用的四序列清单（定死，experiment-design）。"""
+
+# 组1 采样场（ADR-0002 定死）：CFG=10 组合场，v_cfg = v_uncond + 10·(v_cond − v_uncond)
+CFG_MODAL_LABEL: float = 10.0
+# 组2 采样场（ADR-0002 定死）：基座代码强制 CFG=0，裸条件单前向
+CFG_CROSS_MODAL: float = 0.0
+# 无条件分支（policy-modeling 定死）：全零 label（label 0 实际承担「无条件」语义）
+UNCONDITIONAL_LABEL: int = 0
 
 # 组2 跨模态方向：12 个有序 src→tgt 对（每序列作 anchor、其余三序列为目标），定死集合
 DEFAULT_CROSS_MODAL_PAIRS: tuple[tuple[str, str], ...] = tuple(
-    (s, t) for s in _MODALITIES for t in _MODALITIES if s != t
+    (s, t) for s in MODALITIES for t in MODALITIES if s != t
 )
 
 
-def _spec(status: str, source: str, description: str, **kwargs: Any) -> Any:
-    """带状态标注的 Field：状态标注是配置项清单落 schema 的机器可读形式。"""
-    return Field(
-        description=description,
-        json_schema_extra={"status": status, "source": source},
-        **kwargs,
-    )
+class SpecField:
+    """spec 配置项清单的字段声明：状态（status）+ 出处（source）标注。
+
+    构造即产出对应的 pydantic ``Field``——
+    ``SpecField("tunable", "reward-model", "描述", default=4, ge=1)``
+    就是一个带标注的字段声明。状态标注是配置项清单落 schema 的
+    机器可读形式。
+    """
+
+    def __new__(cls, status: str, source: str, description: str, **field_kwargs: Any) -> Any:
+        return Field(
+            description=description,
+            json_schema_extra={"status": status, "source": source},
+            **field_kwargs,
+        )
 
 
 class Artifacts(BaseModel):
@@ -49,23 +65,23 @@ class Artifacts(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    unet_ckpt: Path = _spec(
+    unet_ckpt: Path = SpecField(
         "运行时", "experiment-design",
         "base UNet checkpoint（实验基座 diff_unet_3d_rflow-mr-brain_v1.pt）",
     )
-    vae_ckpt: Path = _spec(
+    vae_ckpt: Path = SpecField(
         "运行时", "experiment-design",
         "图像 VAE checkpoint（autoencoder_v1.pt，AutoencoderKlMaisi）",
     )
-    net_config_json: Path = _spec(
+    net_config_json: Path = SpecField(
         "运行时", "policy-modeling",
         "网络配置 JSON（UNet 构建参数与 scheduler 配置）",
     )
-    modality_mapping_json: Path = _spec(
+    modality_mapping_json: Path = SpecField(
         "运行时", "policy-modeling",
         "modality token 映射（t1n/t1c/t2w/t2f → 29/34/30/31）",
     )
-    controlnet_ckpt: Path | None = _spec(
+    controlnet_ckpt: Path | None = SpecField(
         "运行时", "experiment-design",
         "组2/组3 必需：fork P3 跨序列 ControlNet checkpoint（本地工件）",
         default=None,
@@ -77,27 +93,27 @@ class Experiment(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    group: Literal["modal-label", "cross-modal", "sequential"] = _spec(
+    group: Literal["modal-label", "cross-modal", "sequential"] = SpecField(
         "定死", "experiment-design",
         "实验组：modal-label（组1 模态标签）/ cross-modal（组2 跨模态）/ sequential（组3 序贯），"
         "每次运行三选一",
     )
-    base_model: Literal["rflow-mr-brain_v1"] = _spec(
+    base_model: Literal["rflow-mr-brain_v1"] = SpecField(
         "定死", "experiment-design",
         "实验基座 = rflow-mr-brain_v1 + BraTS2023",
         default="rflow-mr-brain_v1",
     )
-    dataset: Literal["BraTS2023"] = _spec(
+    dataset: Literal["BraTS2023"] = SpecField(
         "定死", "experiment-design",
         "数据集 = BraTS2023（下游 nnUNet 仪器与跨模态 ControlNet 同域）",
         default="BraTS2023",
     )
-    cross_modal_pairs: list[tuple[Modality, Modality]] = _spec(
+    cross_modal_pairs: list[tuple[Modality, Modality]] = SpecField(
         "定死", "experiment-design",
         "组2 跨模态方向 = 脑 MRI 四序列 12 个有序 src→tgt 对（非 CT↔MR），均匀采样",
         default_factory=lambda: list(DEFAULT_CROSS_MODAL_PAIRS),
     )
-    stage1_run_dir: Path | None = _spec(
+    stage1_run_dir: Path | None = SpecField(
         "定死", "本 spec 补钉",
         "组3：既有 stage-1 产物路径（指定则跳过 stage-1 训练；None = 同一次运行内先跑 stage-1）",
         default=None,
@@ -128,64 +144,64 @@ class PolicyConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    num_inference_steps: int = _spec(
+    num_inference_steps: int = SpecField(
         "定死（fixture 可缩小）", "policy-modeling",
         "ODE 步数（基座行为 30 步、timestep transform、实际 scale=1.0；fixture 缩小为 3）",
         default=30, gt=1,
     )
-    input_img_size_numel: int = _spec(
+    input_img_size_numel: int = SpecField(
         "定死", "policy-modeling",
         "数值锚 = prod(latent_shape[1:])（30 步 = 131072；fixture [4,16,16,8] = 2048）",
         default=131072, gt=0,
     )
-    group_size_g: int = _spec(
+    group_size_g: int = SpecField(
         "tunable", "policy-modeling",
         "G（Group 大小）：组内共享初始噪声的方向数"
         "（显存不够降 6–8 或逐 k 释放；fixture 亦保持 12）",
         default=12, ge=2,
     )
-    sde_eta: float = _spec(
+    sde_eta: float = SpecField(
         "扫描接口", "policy-modeling",
         "η（SDE 噪声强度）：被优化训练步的高斯核强度，0 = 精确退化为 MONAI step()",
         default=0.7, ge=0.0,
     )
-    sde_s_max: float = _spec(
+    sde_s_max: float = SpecField(
         "tunable", "policy-modeling",
         "SDE 奇异点钳制 s_max：s_k > s_max 时钳到 s_max（对齐参考实现同语义，近 1）",
         default=0.999, gt=0.0,
     )
-    train_step_indices_m: set[int] = _spec(
+    train_step_indices_m: set[int] = SpecField(
         "配置化 + 扫描", "policy-modeling",
         "M（被优化训练步集合）：沿 timesteps 数组下标、0=最噪端；"
         "排除 0 与末下标（避 s≈1 奇异端 / 保证扰动后有 ODE 续跑空间）",
         default_factory=lambda: set(range(2, 16)),
     )
-    granularity_intervals_lambda: set[int] = _spec(
+    granularity_intervals_lambda: set[int] = SpecField(
         "消融", "policy-modeling",
         "Λ（Granularity 间隔集合）：{1,2} 或 {1,2,3}，MGAI 各 λ 的 advantage 组内标准化后求和",
         default_factory=lambda: {1, 2},
     )
-    ratio_clip: float = _spec(
+    ratio_clip: float = SpecField(
         "定死", "policy-modeling",
         "ratio clip = 1e-4 极窄 trust region（无 KL 时的主要稳定器）",
         default=1e-4,
     )
-    optimizer: Literal["AdamW"] = _spec(
+    optimizer: Literal["AdamW"] = SpecField(
         "定死", "policy-modeling",
         "policy 优化器类型 = AdamW",
         default="AdamW",
     )
-    policy_lr: float = _spec(
+    policy_lr: float = SpecField(
         "起步值", "policy-modeling",
         "policy 学习率（AdamW），bf16 autocast + fp32 master weights 配套",
         default=2e-6, gt=0.0,
     )
-    amp_dtype: Literal["bf16"] = _spec(
+    amp_dtype: Literal["bf16"] = SpecField(
         "定死", "policy-modeling",
         "autocast dtype = bf16（gfx936 上需 profile 验证生效，见 M0 门槛）",
         default="bf16",
     )
-    master_weights: Literal["fp32"] = _spec(
+    master_weights: Literal["fp32"] = SpecField(
         "定死", "policy-modeling",
         "fp32 master weights（bf16 autocast 配套）",
         default="fp32",
@@ -225,6 +241,11 @@ class PolicyConfig(BaseModel):
     def _lambda_within_schedule(cls, value: set[int], info: ValidationInfo) -> set[int]:
         if not value or min(value) < 1:
             raise ValueError("Λ 的间隔 λ 必须为正整数")
+        if not set(value) <= {1, 2, 3}:
+            raise ValueError(
+                "Λ 消融取值为 {1,2} 或 {1,2,3}（policy-modeling 章），得到"
+                f" {sorted(value)}"
+            )
         num_steps = info.data.get("num_inference_steps")
         if num_steps is not None and max(value) > num_steps - 1:
             raise ValueError(
@@ -238,17 +259,17 @@ class GrpoConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    advantage_clamp: float = _spec(
+    advantage_clamp: float = SpecField(
         "定死", "policy-modeling",
         "advantage clamp = ±5（跨 λ 求和后统一截断，参考实现顺序）",
         default=5.0,
     )
-    kl_beta: float = _spec(
+    kl_beta: float = SpecField(
         "定死", "ADR-0001",
         "KL 系数 = 0：无 KL、无参考模型（省一整份 UNet 显存）",
         default=0.0,
     )
-    ema_anchor_enabled: bool = _spec(
+    ema_anchor_enabled: bool = SpecField(
         "升级项", "ADR-0001",
         "参数 EMA 锚（hacking 签名出现时启用的软约束，不常驻参考模型）",
         default=False,
@@ -274,79 +295,80 @@ class RewardConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    disc_num_layers_d: int = _spec(
+    disc_num_layers_d: int = SpecField(
         "消融", "reward-model",
         "判别器深度 num_layers_d：2 起步（感受野 ~34³、输出 16×16×8 patch），{1,2} 消融",
         default=2,
     )
-    disc_num_scales: int = _spec(
+    disc_num_scales: int = SpecField(
         "消融", "reward-model",
         "判别器尺度 num_d：单尺度 1 起步，{1,2,3} 消融（多尺度臂各尺度 mean 后相加）",
         default=1,
     )
-    patch_aggregation: Literal["mean", "min"] = _spec(
+    patch_aggregation: Literal["mean", "min"] = SpecField(
         "消融", "reward-model",
         "patch logit 图聚合：mean 为主，min 作正交消融（对局部伪影更敏感）",
         default="mean",
     )
-    disc_norm: Literal["group"] = _spec(
+    disc_norm: Literal["group"] = SpecField(
         "定死", "ADR-0001",
         "判别器归一化 = GroupNorm（弃默认 BatchNorm：在线小 batch 不泄漏 batch 统计）",
         default="group",
     )
-    spectral_norm_enabled: bool = _spec(
+    spectral_norm_enabled: bool = SpecField(
         "触发式", "ADR-0001",
         "SpectralNorm 叠加：默认关闭，判别器过锐/不稳时触发式启用（消融轴）",
         default=False,
     )
-    loss_type: Literal["lsgan"] = _spec(
+    loss_type: Literal["lsgan"] = SpecField(
         "定死", "ADR-0001",
         "判别器损失 = LSGAN（least squares，非饱和梯度）",
         default="lsgan",
     )
-    reward_mode: Literal["raw_real_logit"] = _spec(
+    reward_mode: Literal["raw_real_logit"] = SpecField(
         "定死", "ADR-0001",
         "reward = raw real-logit（不过 sigmoid，保留组内分辨率）",
         default="raw_real_logit",
     )
-    reward_tanh_bounding: bool = _spec(
+    reward_tanh_bounding: bool = SpecField(
         "触发式", "reward-model",
         "reward 有界化：默认关闭；logit 幅度持续膨胀时 tanh 压 (-1,1) 一行保险",
         default=False,
     )
-    disc_update_interval_n_d: int = _spec(
+    disc_update_interval_n_d: int = SpecField(
         "tunable", "reward-model",
         "判别器更新节奏 N_d：每个 RL iteration 都更新（D:G 更新比 ≈ 1:1）",
         default=1, ge=1,
     )
-    disc_batch_size_k: int = _spec(
+    disc_batch_size_k: int = SpecField(
         "tunable", "reward-model",
         "判别器每批样本量 K（章节未定值，待 rollout 吞吐 profile 后定，执行期）",
     )
-    disc_lr: float = _spec(
+    disc_lr: float = SpecField(
         "tunable", "reward-model",
         "判别器学习率（AdamW），5e-5 = 区间 1e-5~1e-4 中点（profile 后定）",
         default=5e-5, gt=0.0,
     )
-    replay_buffer_capacity: int = _spec(
+    replay_buffer_capacity: int = SpecField(
         "tunable", "reward-model",
-        "Replay buffer 容量（固定 base 分区 + FIFO 近期分区；base 分区由初始 policy rollout 填满）",
+        "Replay buffer 容量（固定 base 分区 + FIFO 近期分区；base 分区由初始 policy "
+        "rollout 填满；章节未定值，待 rollout 吞吐 profile 后定，执行期）",
     )
-    replay_current_fraction: float = _spec(
+    replay_current_fraction: float = SpecField(
         "定死", "reward-model",
         "更新判别器时当前 fake 占比 = 0.5（50% 当前 / 50% 回放，防灾难性遗忘）",
         default=0.5,
     )
-    real_pool_manifest: Path = _spec(
+    real_pool_manifest: Path = SpecField(
         "运行时", "reward-model",
         "Real sample pool manifest（train split 全量 VAE 预编码 latent，按序列分层；prepare 产出）",
     )
-    heldout_real_manifest: Path = _spec(
+    heldout_real_manifest: Path = SpecField(
         "运行时", "本 spec 补钉",
         "Held-out real manifest（val split 预编码 latent；与 D 训练 real 不相交、"
         "永不参与判别器更新）",
     )
-    channel_stats_json: Path = _spec(
+    channel_stats_json: Path = SpecField(
         "运行时", "reward-model",
         "判别器输入 per-channel 标准化统计量（来自 Real sample pool 所用训练集；prepare 产出）",
     )
@@ -385,32 +407,32 @@ class ScheduleConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    max_iterations: int = _spec(
+    max_iterations: int = SpecField(
         "运行时", "experiment-design",
-        "每组 RL iteration 数（200–500，先 50 sanity 再扩）",
-        default=200, ge=1,
+        "每组 RL iteration 数（目标 200–500；先 50 sanity 再扩，故下界不设限）",
+        default=200, ge=1, le=500,
     )
-    baseline_samples: int = _spec(
+    baseline_samples: int = SpecField(
         "运行时", "experiment-design",
-        "N_baseline：Baseline 样本量 200–500（与评估集同规模、同 seed 同条件、冻结只采一次）",
-        default=200, ge=1,
+        "N_baseline：Baseline 样本量（与评估集同规模、同 seed 同条件、冻结只采一次）",
+        default=200, ge=200, le=500,
     )
-    n_plateau: int = _spec(
+    n_plateau: int = SpecField(
         "运行时", "experiment-design",
         "N_plateau：早停 plateau 里程碑数（默认 3）",
         default=3, ge=1,
     )
-    milestone_interval: int = _spec(
+    milestone_interval: int = SpecField(
         "tunable", "本 spec 补钉",
         "里程碑评测间隔（iteration；默认每 50，解码评测只发生在里程碑）",
         default=50, ge=1,
     )
-    checkpoint_interval: int = _spec(
+    checkpoint_interval: int = SpecField(
         "tunable", "本 spec 补钉",
         "续训 checkpoint 周期（默认每 10 iteration；每里程碑强制落盘）",
         default=10, ge=1,
     )
-    seed: int = _spec(
+    seed: int = SpecField(
         "运行时", "experiment-design",
         "随机种子（随机性控制：Baseline 与 RL 后同 seed 同条件，差异唯一归因于 RL）",
     )
@@ -421,12 +443,12 @@ class ShardingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    strategy: Literal["fsdp", "ddp", "zero3"] = _spec(
+    strategy: Literal["fsdp", "ddp", "zero3"] = SpecField(
         "定死 + fallback", "orchestration",
         "分片策略：FSDP full-shard 起步（降级链 DDP → ZeRO-3，fallback 非默认）",
         default="fsdp",
     )
-    gradient_checkpointing: Literal[True] = _spec(
+    gradient_checkpointing: Literal[True] = SpecField(
         "定死", "orchestration",
         "FSDP 配套梯度检查点",
         default=True,
@@ -438,27 +460,27 @@ class SlurmConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    partition: str = _spec(
+    partition: str = SpecField(
         "部署默认", "orchestration",
         "sbatch 分区（zzeshell：hx1hdnormal）",
         default="hx1hdnormal",
     )
-    gres: str = _spec(
+    gres: str = SpecField(
         "部署默认", "orchestration",
         "GPU 资源请求（单节点 8 卡：dcu:8）",
         default="dcu:8",
     )
-    ntasks_per_node: int = _spec(
+    ntasks_per_node: int = SpecField(
         "部署默认", "orchestration",
         "每节点任务数（1 任务 × torchrun --nproc_per_node=8）",
         default=1, ge=1,
     )
-    num_nodes: int = _spec(
+    num_nodes: int = SpecField(
         "起步值", "orchestration",
         "节点数：单节点 1 优先（多节点 = rollout 吞吐升级杠杆，非默认）",
         default=1, ge=1,
     )
-    max_walltime: str = _spec(
+    max_walltime: str = SpecField(
         "部署默认", "orchestration",
         "MAX_WALLTIME = 3 天（长训依赖断点续训跨 sbatch 恢复）",
         default="3-00:00:00",
@@ -470,25 +492,25 @@ class CynosureConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    experiment: Experiment = _spec("定死", "experiment-design", "实验组矩阵（三选一）")
-    artifacts: Artifacts = _spec("运行时", "experiment-design", "输入工件路径")
-    latent_shape: tuple[int, int, int, int] = _spec(
+    experiment: Experiment = SpecField("定死", "experiment-design", "实验组矩阵（三选一）")
+    artifacts: Artifacts = SpecField("运行时", "experiment-design", "输入工件路径")
+    latent_shape: tuple[int, int, int, int] = SpecField(
         "定死（fixture 可缩小）", "reward-model",
         "latent 形状 [4,64,64,32]（256×256×128 影像体 ÷4 空间压缩；fixture 缩小为 [4,16,16,8]）",
         default=(4, 64, 64, 32),
     )
-    policy: PolicyConfig = _spec(
+    policy: PolicyConfig = SpecField(
         "定死", "policy-modeling", "policy 采样场与单步 SDE", default_factory=PolicyConfig,
     )
-    grpo: GrpoConfig = _spec(
+    grpo: GrpoConfig = SpecField(
         "定死", "policy-modeling", "GRPO 核心", default_factory=GrpoConfig,
     )
-    reward: RewardConfig = _spec("定死", "reward-model", "Reward model（在线 PatchDiscriminator）")
-    schedule: ScheduleConfig = _spec("运行时", "experiment-design", "运行时 knobs（规模/里程碑/早停/续训）")
-    sharding: ShardingConfig = _spec(
+    reward: RewardConfig = SpecField("定死", "reward-model", "Reward model（在线 PatchDiscriminator）")
+    schedule: ScheduleConfig = SpecField("运行时", "experiment-design", "运行时 knobs（规模/里程碑/早停/续训）")
+    sharding: ShardingConfig = SpecField(
         "定死", "orchestration", "分布式分片", default_factory=ShardingConfig,
     )
-    slurm: SlurmConfig = _spec(
+    slurm: SlurmConfig = SpecField(
         "部署默认", "orchestration", "Slurm 部署默认", default_factory=SlurmConfig,
     )
 
@@ -554,15 +576,20 @@ class ConfigLoader:
 
 __all__ = [
     "Artifacts",
+    "CFG_CROSS_MODAL",
+    "CFG_MODAL_LABEL",
     "ConfigLoader",
     "CynosureConfig",
     "DEFAULT_CROSS_MODAL_PAIRS",
     "Experiment",
     "GrpoConfig",
+    "MODALITIES",
     "Modality",
     "PolicyConfig",
     "RewardConfig",
     "ScheduleConfig",
     "ShardingConfig",
     "SlurmConfig",
+    "SpecField",
+    "UNCONDITIONAL_LABEL",
 ]

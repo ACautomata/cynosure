@@ -10,6 +10,7 @@ ControlNetMaisi 装配由后续 ticket 在真实工件可得后深化。
 
 import inspect
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +22,18 @@ from monai.networks.nets import PatchDiscriminator
 from monai.networks.schedulers import RFlowScheduler
 
 
+@dataclass
+class NetworkArtifact:
+    """网络工件（零依赖原则的「唯一接口」）：网络配置 + checkpoint 文件对。"""
+
+    config: dict
+    checkpoint: Path | None = None
+
+
 class NetworkAssembler:
     """按 artifact 装配可前向 MONAI 网络（零依赖原则：网络类全部来自 MONAI）。
 
-    网络配置 JSON 的键即 MONAI 构造参数名（fixture 生成器写出的就是这个约定）；
+    网络配置的键即 MONAI 构造参数名（fixture 生成器写出的就是这个约定）；
     非构造参数（如基座 config 字面 ``scale`` 死参数）静默过滤，不复刻其语义
     （ADR-0002：对齐实际生效行为，不照抄 config 字面值）。
     """
@@ -35,33 +44,33 @@ class NetworkAssembler:
             return json.load(fh)
 
     @classmethod
-    def unet(cls, net_config: dict, ckpt: Path | None = None) -> DiffusionModelUNetMaisi:
-        """按网络配置构建 UNet 并装载 checkpoint。"""
+    def unet(cls, artifact: NetworkArtifact) -> DiffusionModelUNetMaisi:
+        """按网络工件构建 UNet 并装载 checkpoint。"""
         model = DiffusionModelUNetMaisi(
-            **cls._known_kwargs(DiffusionModelUNetMaisi, net_config),
+            **cls._known_kwargs(DiffusionModelUNetMaisi, artifact.config),
         )
-        cls._load_state_dict(model, ckpt)
+        cls._load_state_dict(model, artifact.checkpoint)
         return model
 
     @classmethod
-    def discriminator(
-        cls, disc_config: dict, ckpt: Path | None = None,
-    ) -> PatchDiscriminator:
-        """按配置构建 PatchDiscriminator（GroupNorm 等 norm 参数随 dict 传入）。"""
-        model = PatchDiscriminator(**cls._known_kwargs(PatchDiscriminator, disc_config))
-        cls._load_state_dict(model, ckpt)
+    def discriminator(cls, artifact: NetworkArtifact) -> PatchDiscriminator:
+        """按网络工件构建 PatchDiscriminator（GroupNorm 等 norm 参数随配置传入）。"""
+        model = PatchDiscriminator(
+            **cls._known_kwargs(PatchDiscriminator, artifact.config),
+        )
+        cls._load_state_dict(model, artifact.checkpoint)
         return model
 
     @classmethod
     def rflow_scheduler(
-        cls,
-        num_inference_steps: int,
-        input_img_size_numel: int,
-        use_timestep_transform: bool = True,
+        cls, num_inference_steps: int, input_img_size_numel: int,
     ) -> RFlowScheduler:
-        """装配 RFlowScheduler 并读入实际 timesteps（sigma 日程以 MONAI 实际
-        输出为准，timestep transform 的实际 scale=1.0）。"""
-        scheduler = RFlowScheduler(use_timestep_transform=use_timestep_transform)
+        """装配 RFlowScheduler 并读入实际 timesteps。
+
+        sigma 日程以 MONAI 实际输出为准（use_timestep_transform=true、
+        实际 scale=1.0，均为基座行为定死，不设开关）。
+        """
+        scheduler = RFlowScheduler(use_timestep_transform=True)
         scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             input_img_size_numel=input_img_size_numel,
@@ -82,4 +91,4 @@ class NetworkAssembler:
         model.load_state_dict(state, strict=True)
 
 
-__all__ = ["NetworkAssembler"]
+__all__ = ["NetworkArtifact", "NetworkAssembler"]
