@@ -38,8 +38,7 @@ packages = ["src/cynosure"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# src layout 的测试导入路径（pytest 官方推荐）：不依赖 editable 安装的
-# .pth 注入——macOS 对 ~/Documents 下 pip 所建 .pth 会置 UF_HIDDEN 标志
-# （fileproviderd 异步重打），Python 3.14 起静默跳过 hidden .pth，
-# editable 安装会间歇性失效；pythonpath 使测试导入与该环境怪癖解耦。
+# source layout 的导入兜底：macOS 安全软件会持续给 site-packages 的 .pth 打
+# hidden 标记，Python 3.14 site 模块跳过 hidden .pth，editable 安装因此静默失效；
+# pythonpath 让 pytest 不依赖 .pth 也能从 src/ 导入本包（对正常 editable 无冲突）。
 pythonpath = ["src"]

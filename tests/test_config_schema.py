@@ -41,6 +41,9 @@ class TestValidConfigs:
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
         assert config.sharding.strategy == "fsdp"
+        # 部署行（orchestration + ADR-0005）：单实例 4 卡、产物根在持久分区下
+        assert config.deployment.nproc_per_node == 4
+        assert config.deployment.output_root == Path("/root/private_data/cynosure")
 
     def test_cross_modal_pairs_default_is_ordered_12(self) -> None:
         config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
@@ -287,6 +290,28 @@ class TestRejection:
         data["policy"] = {"sde_s_max": 1.0}
         with pytest.raises(ValidationError):
             CynosureConfig.model_validate(data)
+
+    def test_sbatch_fields_are_gone_after_platform_migration(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """ADR-0005：sbatch 专属字段（partition/gres 等）随平台迁移删除，拼入即拒。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["deployment"] = {"partition": "hx1hdnormal", "gres": "dcu:4"}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert any(
+            ("deployment",) == loc[:1] and "partition" in str(loc)
+            for loc in self._locations(exc_info.value)
+        )
+
+    def test_old_slurm_section_is_rejected(self, valid_config_dict: dict) -> None:
+        """旧平台的 slurm 段必须显式拒绝：旧 config 不能静默通过迁移。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["slurm"] = {"partition": "hx1hdnormal"}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "slurm" in str(exc_info.value.errors()[0]["loc"])
+        assert "slurm" not in CynosureConfig.model_fields
 
 
 class TestStatusAnnotations:
