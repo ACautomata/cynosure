@@ -11,8 +11,8 @@ fixture 让全循环在本地 CPU 跑，与生产走同一 netbuild 装载契约
 - 判别器 ``num_layers_d=2`` 在 fixture 第三维（8）上空间不足（MONAI 的
   Pix2PixHD 式层叠在 8 体素上不足两次 kernel-4 卷积），fixture 取消融轴
   另一端 ``num_layers_d=1``——这是 spec「需确认」项的确认结果；
-- VAE / modality mapping 不进 fixture 循环（解码只发生在里程碑评测），
-  config 中相应工件为占位路径。
+- VAE 不进 fixture 循环（解码只发生在里程碑评测），config 中相应工件为
+  占位路径；modality mapping 作为真实输入工件落盘（诊断经它装载标签）。
 """
 
 import json
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from torch import nn
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
 )
@@ -51,6 +52,13 @@ FIXTURE_DISCRIMINATOR_CONFIG: dict = {
     "norm": ["GROUP", {"num_groups": 8}],
 }
 
+FIXTURE_MODALITY_MAPPING: dict[str, int] = {"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31}
+"""基座 modality_mapping 的文档值（config Artifacts.modality_mapping_json
+同口径：t1n/t1c/t2w/t2f → 29/34/30/31），fixture 以工件形式落盘。"""
+
+_ZERO_CONV_REINIT_STD = 0.02
+"""全零卷积权重的重初始化尺度（见 Fixture.unet 的说明）。"""
+
 
 @dataclass
 class FixtureArtifacts:
@@ -60,6 +68,7 @@ class FixtureArtifacts:
     unet_config_json: Path
     discriminator_ckpt: Path
     discriminator_config_json: Path
+    modality_mapping_json: Path
 
 
 class Fixture:
@@ -72,8 +81,20 @@ class Fixture:
     INPUT_IMG_SIZE_NUMEL: int = 16 * 16 * 8  # = 2048，数值锚与 latent 同语义
 
     def unet(self) -> DiffusionModelUNetMaisi:
-        """随机初始化的 MONAI 迷你 UNet（CPU、seed 由调用方固定以保证复现）。"""
-        return DiffusionModelUNetMaisi(**FIXTURE_UNET_CONFIG)
+        """随机初始化的 MONAI 迷你 UNet（CPU、seed 由调用方固定以保证复现）。
+
+        MONAI 扩散 UNet 把每个 resnet 末层卷积与输出卷积 zero-init（训练期
+        恒等起步的惯例）——未训练的零卷积会把 resnet 的 temb 条件通道
+        （label / timestep / spacing）数值归零，使 CFG 组合场在 fixture 上
+        退化为常量场。fixture 消费的是采样机制数值而非训练初值，故对所有
+        全零卷积权重重新随机初始化（小尺度正态、bias 保持零），条件敏感性
+        真实化；网络类与确定性（seed 固定）不变。
+        """
+        unet = DiffusionModelUNetMaisi(**FIXTURE_UNET_CONFIG)
+        for module in unet.modules():
+            if isinstance(module, nn.Conv3d) and not module.weight.abs().any():
+                nn.init.normal_(module.weight, std=_ZERO_CONV_REINIT_STD)
+        return unet
 
     def discriminator(self) -> PatchDiscriminator:
         """随机初始化的 MONAI PatchDiscriminator（GroupNorm、fixture 深度）。"""
@@ -89,6 +110,7 @@ class Fixture:
             unet_config_json=directory / "unet_config.json",
             discriminator_ckpt=directory / "discriminator.pt",
             discriminator_config_json=directory / "discriminator_config.json",
+            modality_mapping_json=directory / "modality_mapping.json",
         )
         torch.save(self.unet().state_dict(), artifacts.unet_ckpt)
         artifacts.unet_config_json.write_text(
@@ -97,6 +119,9 @@ class Fixture:
         torch.save(self.discriminator().state_dict(), artifacts.discriminator_ckpt)
         artifacts.discriminator_config_json.write_text(
             json.dumps(FIXTURE_DISCRIMINATOR_CONFIG, indent=2), encoding="utf-8",
+        )
+        artifacts.modality_mapping_json.write_text(
+            json.dumps(FIXTURE_MODALITY_MAPPING, indent=2), encoding="utf-8",
         )
         return artifacts
 

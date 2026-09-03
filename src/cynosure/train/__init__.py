@@ -73,6 +73,8 @@ class RunPaths:
     metrics: Path
     manifest: Path
     checkpoints: Path
+    trajectory_diagnostic: Path
+    """轨迹诊断工件（fixture 诊断开关 --dump-trajectory 产出；诊断未跑则无此文件）。"""
 
 
 class RunArtifacts:
@@ -136,6 +138,7 @@ class RunArtifacts:
             metrics=root / "metrics.jsonl",
             manifest=root / "manifest.json",
             checkpoints=root / "checkpoints",
+            trajectory_diagnostic=root / "trajectory.json",
         )
 
     @classmethod
