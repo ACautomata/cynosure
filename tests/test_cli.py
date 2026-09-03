@@ -6,13 +6,15 @@ run 目录与工件契约最小版（config 快照 + metrics.jsonl + manifest + 
 import copy
 import io
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from cynosure.cli import CynosureCli
-from cynosure.config import ConfigLoader
+from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.train import IterEvent, MilestoneEvent, RunArtifacts
 from tests.conftest import MINIMAL_CONFIG_DICT
 
@@ -203,6 +205,7 @@ class TestPrepareCommand:
         assert "real_pool.json" in result.stdout
         assert "heldout_real.json" in result.stdout
         assert "channel_stats.json" in result.stdout
+        assert "data/brats2023" in result.stdout  # 源数据集根目录随 prepare 计划报告
 
     def test_invalid_config_rejected(
         self, cli: CliSession, tmp_path: Path,
@@ -214,6 +217,75 @@ class TestPrepareCommand:
         result = cli.run("prepare", "--config", str(config_path))
         assert result.code == 2
         assert "disc_batch_size_k" in result.stderr
+
+
+class TestDistributedRunDir:
+    """torchrun 多 rank（RANK env）下的 run 目录初始化：rank 0 创建、
+    其余 rank 轮询等待采用（spec：多 rank 下指标由 rank 0 归并写出）。"""
+
+    @pytest.fixture
+    def config(self) -> CynosureConfig:
+        return CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
+
+    def test_rank0_creates_run_dir(
+        self, config: CynosureConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        artifacts = RunArtifacts.init(config, tmp_path / "run")
+        assert artifacts.paths.config_snapshot.is_file()
+
+    def test_nonzero_rank_adopts_dir_created_by_rank0(
+        self, config: CynosureConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """非 0 rank 不创建：rank 0 先行建好目录时，等待方直接采用、不再报 FileExistsError。"""
+        monkeypatch.setenv("RANK", "3")
+        run_root = tmp_path / "run"
+        run_root.mkdir()
+        (run_root / "config.json").write_text("{}", encoding="utf-8")  # rank 0 已创建
+        artifacts = RunArtifacts.init(config, run_root)
+        assert artifacts.paths.config_snapshot.is_file()
+
+    def test_nonzero_rank_times_out_when_rank0_never_creates(
+        self, config: CynosureConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """rank 0 迟迟不建目录 → 等待超时显式失败，而非各 rank 静默自建、分裂 run。"""
+        monkeypatch.setenv("RANK", "3")
+        with pytest.raises(TimeoutError):
+            RunArtifacts.init(config, tmp_path / "never", wait_timeout_s=0.1)
+
+    def test_nonzero_rank_waits_then_adopts(
+        self, config: CynosureConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """rank 0 稍后创建：等待方阻塞至目录出现后采用，且自身不落盘。"""
+        monkeypatch.setenv("RANK", "3")
+        run_root = tmp_path / "run"
+
+        def _create_as_rank0() -> None:
+            run_root.mkdir()
+            (run_root / "config.json").write_text("{}", encoding="utf-8")
+
+        timer = threading.Timer(0.2, _create_as_rank0)
+        timer.start()
+        try:
+            artifacts = RunArtifacts.init(config, run_root, wait_timeout_s=5.0)
+        finally:
+            timer.join()
+        assert artifacts.paths.root == run_root
+        assert artifacts.paths.config_snapshot.is_file()
+
+    def test_train_under_torchrun_requires_explicit_run_dir(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：分布式启动必须显式 --run-dir。"""
+        monkeypatch.setenv("RANK", "2")
+        result = cli.train(cli.write_config(tmp_path))
+        assert result.code == 2
+        assert "--run-dir" in result.stderr
 
 
 class TestMetricsStream:
@@ -251,6 +323,29 @@ class TestMetricsStream:
         assert events[0]["event"] == "milestone"
         assert events[0]["fid"] == pytest.approx(12.3)
         assert events[0]["ssim"] is None  # 跨模态组才带 SSIM/MAE
+
+    @staticmethod
+    def _iter_event(**overrides: object) -> IterEvent:
+        values: dict = dict(
+            iteration=0, anchor_eval_reward=-1.5, intra_group_reward_std=0.3,
+            heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
+            buffer_replay_fraction=0.5, lr=2e-6, elapsed_s=12.3,
+        )
+        values.update(overrides)
+        return IterEvent(**values)
+
+    def test_iter_event_rejects_non_finite_reward(self) -> None:
+        """NaN/Inf 事件会以非标准 token 落盘 JSONL、严格消费方拒读：必须构造期拒绝。"""
+        with pytest.raises(ValidationError):
+            self._iter_event(anchor_eval_reward=float("nan"))
+
+    def test_iter_event_rejects_non_finite_loss_value(self) -> None:
+        with pytest.raises(ValidationError):
+            self._iter_event(loss={"policy": float("inf")})
+
+    def test_milestone_event_rejects_non_finite_fid(self) -> None:
+        with pytest.raises(ValidationError):
+            MilestoneEvent(iteration=50, fid=float("inf"))
 
     def test_events_coexist_in_single_stream(
         self, cli: CliSession, fake_home: Path, tmp_path: Path,

@@ -20,6 +20,7 @@ class TestFixtureConfig:
     def test_spec_fixture_values(self, tmp_path: Path) -> None:
         """spec「Fixture 策略」的数值：缩小 latent、3 步 ODE、M={1}、G 保持 12。"""
         config = Fixture().config(tmp_path)
+        assert config.fixture_mode is True  # 缩小日程的显式声明通道
         assert config.latent_shape == (4, 16, 16, 8)
         assert config.policy.num_inference_steps == 3
         assert config.policy.train_step_indices_m == {1}  # 避开 s≈1 奇异端

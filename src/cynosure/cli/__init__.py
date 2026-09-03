@@ -3,10 +3,14 @@
 
 三子命令共享同一 config schema；本 ticket（#16，prefactor）交付 seam 与
 run 目录契约最小版，训练 / 评测 / prepare 的实际循环由后续 ticket 填充。
+
+单进程 seam：torchrun 入口（FSDP 初始化等）属 orchestration ticket；
+分布式启动须经显式 --run-dir（跨 rank 的 run 目录 barrier 见 train.RunArtifacts）。
 """
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -79,6 +83,15 @@ class CynosureCli:
             return None
 
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
+        if args.run_dir is None and "RANK" in os.environ:
+            # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
+            print(
+                "检测到 torchrun 环境（RANK="
+                f"{os.environ['RANK']}）：默认 run 目录按进程时间戳生成、"
+                "无法跨 rank 对齐，分布式启动必须显式指定 --run-dir",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         run_root = (
             Path(args.run_dir) if args.run_dir
             else RunArtifacts.default_root(config)
@@ -91,12 +104,16 @@ class CynosureCli:
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
+        except TimeoutError:
+            print(f"等待 rank 0 创建 run 目录超时: {run_root}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
         print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
-        print(
-            "工件契约最小版已落盘：config.json / metrics.jsonl / manifest.json /"
-            " checkpoints/（训练循环由后续 ticket 填充）",
-            file=self._stdout,
-        )
+        if os.environ.get("RANK") in (None, "0"):  # 非 0 rank 只采用、不落盘
+            print(
+                "工件契约最小版已落盘：config.json / metrics.jsonl / manifest.json /"
+                " checkpoints/（训练循环由后续 ticket 填充）",
+                file=self._stdout,
+            )
         return 0
 
     def _eval(
@@ -127,6 +144,10 @@ class CynosureCli:
         ):
             target = getattr(config.reward, name)
             print(f"  - {name}: {target}", file=self._stdout)
+        print(
+            f"源数据集（BraTS 原始影像根目录）: {config.artifacts.dataset_root}",
+            file=self._stdout,
+        )
         return 0
 
 

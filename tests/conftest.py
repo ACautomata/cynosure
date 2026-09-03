@@ -20,6 +20,7 @@ MINIMAL_CONFIG_DICT: dict = {
         "vae_ckpt": "ckpts/vae.pt",
         "net_config_json": "configs/net.json",
         "modality_mapping_json": "configs/modality_mapping.json",
+        "dataset_root": "data/brats2023",
     },
     "reward": {
         "disc_batch_size_k": 4,

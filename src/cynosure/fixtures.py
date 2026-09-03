@@ -105,12 +105,14 @@ class Fixture:
         return CynosureConfig.model_validate({
             "experiment": {"group": "modal-label"},
             "latent_shape": list(self.LATENT_SHAPE),
+            "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "artifacts": {
                 "unet_ckpt": str(artifacts_dir / "unet.pt"),
-                # VAE / modality mapping 不进 fixture 循环，占位路径
+                # VAE / modality mapping / 源数据集不进 fixture 循环，占位路径
                 "vae_ckpt": str(artifacts_dir / "vae.pt"),
                 "net_config_json": str(artifacts_dir / "unet_config.json"),
                 "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
+                "dataset_root": str(artifacts_dir / "dataset"),
             },
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,

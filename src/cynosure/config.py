@@ -22,6 +22,7 @@ from pydantic import (
     Field,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
 
 Modality = Literal["t1n", "t1c", "t2w", "t2f"]
@@ -61,7 +62,8 @@ class SpecField:
 
 
 class Artifacts(BaseModel):
-    """输入工件路径（零依赖原则：唯一接口是 checkpoint 文件 + 网络配置 JSON）。"""
+    """输入工件路径（零依赖原则：唯一接口是 checkpoint 文件 + 网络配置 JSON；
+    prepare 子命令另需源影像数据集根目录）。"""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -85,6 +87,11 @@ class Artifacts(BaseModel):
         "运行时", "experiment-design",
         "组2/组3 必需：fork P3 跨序列 ControlNet checkpoint（本地工件）",
         default=None,
+    )
+    dataset_root: Path = SpecField(
+        "运行时", "experiment-design",
+        "源影像数据集根目录（BraTS 原始影像；prepare 预编码的输入，"
+        "experiment-design「real 样本库」节）",
     )
 
 
@@ -145,8 +152,9 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     num_inference_steps: int = SpecField(
-        "定死（fixture 可缩小）", "policy-modeling",
-        "ODE 步数（基座行为 30 步、timestep transform、实际 scale=1.0；fixture 缩小为 3）",
+        "定死", "policy-modeling",
+        "ODE 步数定死 30（基座行为、timestep transform、实际 scale=1.0）；"
+        "缩小日程属 fixture，须经顶层 fixture_mode=true 显式声明",
         default=30, gt=1,
     )
     input_img_size_numel: int = SpecField(
@@ -228,6 +236,10 @@ class PolicyConfig(BaseModel):
             raise ValueError("M（被优化训练步集合）不得为空")
         if 0 in value:
             raise ValueError("M 的下标 0 是 s≈1 奇异端（最噪端），必须排除")
+        if min(value) < 1:
+            raise ValueError(
+                f"M 的下标沿 timesteps 数组取、0=最噪端，负下标（{min(value)}）无意义"
+            )
         num_steps = info.data.get("num_inference_steps")
         if num_steps is not None and max(value) > num_steps - 2:
             raise ValueError(
@@ -239,11 +251,10 @@ class PolicyConfig(BaseModel):
     @field_validator("granularity_intervals_lambda")
     @classmethod
     def _lambda_within_schedule(cls, value: set[int], info: ValidationInfo) -> set[int]:
-        if not value or min(value) < 1:
-            raise ValueError("Λ 的间隔 λ 必须为正整数")
-        if not set(value) <= {1, 2, 3}:
+        if frozenset(value) not in ({1, 2}, {1, 2, 3}):
             raise ValueError(
-                "Λ 消融取值为 {1,2} 或 {1,2,3}（policy-modeling 章），得到"
+                "Λ 消融取值须为完整集合 {1,2} 或 {1,2,3}"
+                "（policy-modeling 章，MGAI 可比性），得到"
                 f" {sorted(value)}"
             )
         num_steps = info.data.get("num_inference_steps")
@@ -499,6 +510,12 @@ class CynosureConfig(BaseModel):
         "latent 形状 [4,64,64,32]（256×256×128 影像体 ÷4 空间压缩；fixture 缩小为 [4,16,16,8]）",
         default=(4, 64, 64, 32),
     )
+    fixture_mode: bool = SpecField(
+        "运行时", "Fixture 策略",
+        "fixture 诊断模式显式声明：true 才允许缩小采样日程（如 3 步 ODE）；"
+        "缺省 false 时生产 config 钉 30 步",
+        default=False,
+    )
     policy: PolicyConfig = SpecField(
         "定死", "policy-modeling", "policy 采样场与单步 SDE", default_factory=PolicyConfig,
     )
@@ -560,6 +577,17 @@ class CynosureConfig(BaseModel):
                 "（artifacts.controlnet_ckpt）"
             )
         return artifacts
+
+    @model_validator(mode="after")
+    def _inference_steps_match_mode(self) -> "CynosureConfig":
+        """缩小采样日程的通道显式化：fixture_mode=false 时 num_inference_steps 钉 30。"""
+        if not self.fixture_mode and self.policy.num_inference_steps != 30:
+            raise ValueError(
+                "生产 config（fixture_mode=false）下 num_inference_steps 定死 30"
+                f"（policy-modeling 章），得到 {self.policy.num_inference_steps}；"
+                "缩小日程属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
 
 
 class ConfigLoader:

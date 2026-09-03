@@ -59,6 +59,20 @@ class TestValidConfigs:
         config = ConfigLoader.load(valid_config_json)
         assert config.experiment.group == "modal-label"
 
+    def test_fixture_mode_allows_reduced_schedule(self, valid_config_dict: dict) -> None:
+        """fixture_mode=true 显式声明后才允许缩小采样日程（spec「Fixture 策略」）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["fixture_mode"] = True
+        data["latent_shape"] = [4, 16, 16, 8]
+        data["policy"] = {
+            "num_inference_steps": 3,
+            "input_img_size_numel": math.prod((16, 16, 8)),
+            "train_step_indices_m": [1],
+        }
+        config = CynosureConfig.model_validate(data)
+        assert config.fixture_mode is True
+        assert config.policy.num_inference_steps == 3
+
 
 class TestRejection:
     @staticmethod
@@ -141,6 +155,14 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert ("policy", "train_step_indices_m") in self._locations(exc_info.value)
 
+    def test_train_steps_m_reject_negative_index(self, valid_config_dict: dict) -> None:
+        """M 沿 timesteps 数组取下标（0=最噪端）：负下标无意义，必须拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"train_step_indices_m": [-1, 2]}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("policy", "train_step_indices_m") in self._locations(exc_info.value)
+
     def test_train_steps_m_out_of_schedule(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
         data["policy"] = {"num_inference_steps": 3, "input_img_size_numel": 131072,
@@ -157,14 +179,46 @@ class TestRejection:
         assert ("policy", "granularity_intervals_lambda") in self._locations(exc_info.value)
 
     def test_granularity_lambda_ablation_axis(self, valid_config_dict: dict) -> None:
-        """Λ 消融取值 = {1,2} 或 {1,2,3}（policy-modeling 章），其余拒绝。"""
+        """Λ 消融取值 = {1,2} 或 {1,2,3} 完整集合（policy-modeling 章），其余拒绝。"""
         data = copy.deepcopy(valid_config_dict)
         data["policy"] = {"granularity_intervals_lambda": [5]}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
         assert ("policy", "granularity_intervals_lambda") in self._locations(exc_info.value)
+        for partial in ([1], [2], [1, 3]):  # 子集不是完整消融集（MGAI 可比性）
+            data["policy"] = {"granularity_intervals_lambda": partial}
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert (
+                ("policy", "granularity_intervals_lambda")
+                in self._locations(exc_info.value)
+            )
         data["policy"] = {"granularity_intervals_lambda": [1, 2, 3]}
         CynosureConfig.model_validate(data)  # 消融轴另一端合法
+
+    def test_production_steps_fixed_without_fixture_mode(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config（fixture_mode 缺省 = false）下 num_inference_steps 定死 30：typo 静默改采样场必须拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"num_inference_steps": 29}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "num_inference_steps" in str(exc_info.value.errors())
+
+    def test_artifacts_declare_source_dataset_root(self, valid_config_dict: dict) -> None:
+        """prepare 的输入 = 原始影像 + VAE：源数据集根目录是必填工件路径（experiment-design「real 样本库」）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["artifacts"]["dataset_root"] = "data/brats2023"
+        config = CynosureConfig.model_validate(data)
+        assert config.artifacts.dataset_root == Path("data/brats2023")
+
+    def test_missing_dataset_root_is_field_level_error(self) -> None:
+        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+        del data["artifacts"]["dataset_root"]
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("artifacts", "dataset_root") in self._locations(exc_info.value)
 
     def test_baseline_samples_in_spec_range(self, valid_config_dict: dict) -> None:
         """N_baseline 口径 200–500（experiment-design 章）。"""
