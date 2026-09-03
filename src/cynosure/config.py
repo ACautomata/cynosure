@@ -4,6 +4,8 @@
 
 - 每个 config 字段都在 ``json_schema_extra`` 里携带结构化的状态标注
   （``status`` + ``source``），对应 spec 配置项清单的「状态」与「出处」两列；
+  ``source`` 一般为单一文档名，决策同时落在 ADR 时用复合串
+  （如 ``"orchestration + ADR-0005"``，对应 spec 配置项清单出处列）；
 - 「定死」项用 ``Literal`` 单值类型或等值 validator 表达——改动即字段级拒绝；
 - ``extra="forbid"``：拼错/多余的字段名直接被拒，配合 CLI 输出字段级错误；
 - 数值锚（ADR-0002）：``input_img_size_numel`` 必须等于
@@ -466,35 +468,25 @@ class ShardingConfig(BaseModel):
     )
 
 
-class SlurmConfig(BaseModel):
-    """Slurm 部署默认（orchestration 章）：单节点 8 卡优先、产物落 $HOME。"""
+class DeploymentConfig(BaseModel):
+    """部署默认（orchestration 章 + ADR-0005）：SothisAI 单实例 4 卡 torchrun、产物落持久分区。
+
+    原为 zzeshell SLURM 的 ``SlurmConfig``（partition/gres/walltime），集群访问权
+    永久失去后随平台迁移整体替换；无作业调度器，sbatch 专属字段不再存在。
+    """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    partition: str = SpecField(
-        "部署默认", "orchestration",
-        "sbatch 分区（zzeshell：hx1hdnormal）",
-        default="hx1hdnormal",
+    nproc_per_node: int = SpecField(
+        "部署默认", "orchestration + ADR-0005",
+        "每实例进程数 = DCU 卡数（torchrun --nproc_per_node=4；BW/gfx936 4×64GiB/实例）",
+        default=4, ge=1,
     )
-    gres: str = SpecField(
-        "部署默认", "orchestration",
-        "GPU 资源请求（单节点 8 卡：dcu:8）",
-        default="dcu:8",
-    )
-    ntasks_per_node: int = SpecField(
-        "部署默认", "orchestration",
-        "每节点任务数（1 任务 × torchrun --nproc_per_node=8）",
-        default=1, ge=1,
-    )
-    num_nodes: int = SpecField(
-        "起步值", "orchestration",
-        "节点数：单节点 1 优先（多节点 = rollout 吞吐升级杠杆，非默认）",
-        default=1, ge=1,
-    )
-    max_walltime: str = SpecField(
-        "部署默认", "orchestration",
-        "MAX_WALLTIME = 3 天（长训依赖断点续训跨 sbatch 恢复）",
-        default="3-00:00:00",
+    output_root: Path = SpecField(
+        "部署默认", "orchestration + ADR-0005",
+        "产物根目录（run 目录/checkpoint 落盘根；持久分区 /root/private_data 下，"
+        "绝不落易失系统盘 /）",
+        default=Path("/root/private_data/cynosure"),
     )
 
 
@@ -527,8 +519,10 @@ class CynosureConfig(BaseModel):
     sharding: ShardingConfig = SpecField(
         "定死", "orchestration", "分布式分片", default_factory=ShardingConfig,
     )
-    slurm: SlurmConfig = SpecField(
-        "部署默认", "orchestration", "Slurm 部署默认", default_factory=SlurmConfig,
+    deployment: DeploymentConfig = SpecField(
+        "部署默认", "orchestration + ADR-0005",
+        "部署默认（SothisAI 单实例 4 卡、产物落持久分区）",
+        default_factory=DeploymentConfig,
     )
 
     @field_validator("latent_shape")
@@ -609,6 +603,7 @@ __all__ = [
     "ConfigLoader",
     "CynosureConfig",
     "DEFAULT_CROSS_MODAL_PAIRS",
+    "DeploymentConfig",
     "Experiment",
     "GrpoConfig",
     "MODALITIES",
@@ -617,7 +612,6 @@ __all__ = [
     "RewardConfig",
     "ScheduleConfig",
     "ShardingConfig",
-    "SlurmConfig",
     "SpecField",
     "UNCONDITIONAL_LABEL",
 ]
