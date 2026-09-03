@@ -1,0 +1,132 @@
+"""微型合成 fixture 生成器（spec「Fixture 策略」）。
+
+fixture 让全循环在本地 CPU 跑，与生产走同一 netbuild 装载契约：
+
+- MONAI 迷你 UNet（~0.1M 参数）+ 缩小 latent ``[4,16,16,8]`` + 3 步 ODE；
+- **G 保持 12**——G 是组内方向数、与网络尺寸无关；G=2 会使组内标准化
+  退化为恒 ±1、advantage clamp 永不触发，统计行为失真；
+- |M| 按日程长度缩放：3 步日程取 ``{1}``，避开 s≈1 奇异端；
+- ``input_img_size_numel`` 按 fixture latent 的同语义值传
+  （``prod((16,16,8)) = 2048``，数值锚口径见 ADR-0002）；
+- 判别器 ``num_layers_d=2`` 在 fixture 第三维（8）上空间不足（MONAI 的
+  Pix2PixHD 式层叠在 8 体素上不足两次 kernel-4 卷积），fixture 取消融轴
+  另一端 ``num_layers_d=1``——这是 spec「需确认」项的确认结果；
+- VAE / modality mapping 不进 fixture 循环（解码只发生在里程碑评测），
+  config 中相应工件为占位路径。
+"""
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
+    DiffusionModelUNetMaisi,
+)
+from monai.networks.nets import PatchDiscriminator
+
+from cynosure.config import CynosureConfig
+
+# fixture 迷你 UNet 构造参数（键 = MONAI 构造参数名，netbuild 直接消费）
+FIXTURE_UNET_CONFIG: dict = {
+    "spatial_dims": 3,
+    "in_channels": 4,
+    "out_channels": 4,
+    "num_res_blocks": [1, 1],
+    "num_channels": [8, 16],
+    "attention_levels": [False, False],
+    "norm_num_groups": 8,
+    "num_head_channels": 8,
+    "with_conditioning": False,
+    "num_class_embeds": 128,
+    "include_spacing_input": True,
+}
+
+# fixture 判别器构造参数（GroupNorm、num_layers_d=1，见模块 docstring）
+FIXTURE_DISCRIMINATOR_CONFIG: dict = {
+    "spatial_dims": 3,
+    "channels": 8,
+    "in_channels": 4,
+    "num_layers_d": 1,
+    "norm": ["GROUP", {"num_groups": 8}],
+}
+
+
+@dataclass
+class FixtureArtifacts:
+    """fixture 网络工件的落盘路径（与生产 artifact 同构：ckpt + 网络 JSON）。"""
+
+    unet_ckpt: Path
+    unet_config_json: Path
+    discriminator_ckpt: Path
+    discriminator_config_json: Path
+
+
+class Fixture:
+    """微型合成 fixture：MONAI 迷你网络 + 缩小 latent 的合法全循环配置。"""
+
+    LATENT_SHAPE: tuple[int, int, int, int] = (4, 16, 16, 8)
+    NUM_INFERENCE_STEPS: int = 3
+    TRAIN_STEP_INDICES_M: frozenset[int] = frozenset({1})
+    GROUP_SIZE_G: int = 12
+    INPUT_IMG_SIZE_NUMEL: int = 16 * 16 * 8  # = 2048，数值锚与 latent 同语义
+
+    def unet(self) -> DiffusionModelUNetMaisi:
+        """随机初始化的 MONAI 迷你 UNet（CPU、seed 由调用方固定以保证复现）。"""
+        return DiffusionModelUNetMaisi(**FIXTURE_UNET_CONFIG)
+
+    def discriminator(self) -> PatchDiscriminator:
+        """随机初始化的 MONAI PatchDiscriminator（GroupNorm、fixture 深度）。"""
+        config = dict(FIXTURE_DISCRIMINATOR_CONFIG)
+        config["norm"] = tuple(config["norm"])
+        return PatchDiscriminator(**config)
+
+    def write_artifacts(self, directory: Path) -> FixtureArtifacts:
+        """把 fixture 网络写成 ckpt + 网络配置 JSON（netbuild 可直接装载）。"""
+        directory.mkdir(parents=True, exist_ok=True)
+        artifacts = FixtureArtifacts(
+            unet_ckpt=directory / "unet.pt",
+            unet_config_json=directory / "unet_config.json",
+            discriminator_ckpt=directory / "discriminator.pt",
+            discriminator_config_json=directory / "discriminator_config.json",
+        )
+        torch.save(self.unet().state_dict(), artifacts.unet_ckpt)
+        artifacts.unet_config_json.write_text(
+            json.dumps(FIXTURE_UNET_CONFIG, indent=2), encoding="utf-8",
+        )
+        torch.save(self.discriminator().state_dict(), artifacts.discriminator_ckpt)
+        artifacts.discriminator_config_json.write_text(
+            json.dumps(FIXTURE_DISCRIMINATOR_CONFIG, indent=2), encoding="utf-8",
+        )
+        return artifacts
+
+    def config(self, artifacts_dir: Path) -> CynosureConfig:
+        """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。"""
+        return CynosureConfig.model_validate({
+            "experiment": {"group": "modal-label"},
+            "latent_shape": list(self.LATENT_SHAPE),
+            "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
+            "artifacts": {
+                "unet_ckpt": str(artifacts_dir / "unet.pt"),
+                # VAE / modality mapping / 源数据集不进 fixture 循环，占位路径
+                "vae_ckpt": str(artifacts_dir / "vae.pt"),
+                "net_config_json": str(artifacts_dir / "unet_config.json"),
+                "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
+                "dataset_root": str(artifacts_dir / "dataset"),
+            },
+            "policy": {
+                "num_inference_steps": self.NUM_INFERENCE_STEPS,
+                "input_img_size_numel": self.INPUT_IMG_SIZE_NUMEL,
+                "group_size_g": self.GROUP_SIZE_G,
+                "train_step_indices_m": sorted(self.TRAIN_STEP_INDICES_M),
+            },
+            "reward": {
+                "disc_num_layers_d": 1,
+                "disc_batch_size_k": 4,
+                "replay_buffer_capacity": 64,
+                "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
+                "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
+                "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
+            },
+            "schedule": {"seed": 0},
+        })
