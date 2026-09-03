@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
 
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
@@ -41,6 +42,16 @@ class TestFixtureArtifacts:
         assert artifacts.unet_config_json.is_file()
         assert artifacts.discriminator_ckpt.is_file()
         assert artifacts.discriminator_config_json.is_file()
+        assert artifacts.modality_mapping_json.is_file()
+
+    def test_modality_mapping_artifact_covers_four_modalities(
+        self, tmp_path: Path,
+    ) -> None:
+        """spec 输入物 modality_mapping 以工件形式落盘（诊断经它装载标签，
+        不设代码内常量副本）。"""
+        artifacts = Fixture().write_artifacts(tmp_path)
+        mapping = json.loads(artifacts.modality_mapping_json.read_text(encoding="utf-8"))
+        assert mapping == {"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31}
 
     def test_same_seed_reproduces_weights(self, tmp_path: Path) -> None:
         torch.manual_seed(7)
@@ -49,6 +60,27 @@ class TestFixtureArtifacts:
         second = Fixture().unet().state_dict()
         for key in first:
             assert torch.equal(first[key], second[key]), key
+
+    def test_fixture_unet_is_condition_sensitive(self) -> None:
+        """条件敏感性守卫（AC「组合场逐字对齐」的前提）：fixture UNet 的
+        velocity 须真实响应 label / timestep / spacing——MONAI 的 zero-init
+        末层卷积会把未训练网络的 resnet 条件通道数值归零，fixture 对全零
+        卷积重初始化，此测试防该修复回退（组合场退化静默复现）。"""
+        torch.manual_seed(7)
+        unet = Fixture().unet()
+        x = torch.randn(1, 4, 16, 16, 8)
+        with torch.no_grad():
+            kwargs = dict(x=x, spacing_tensor=torch.full((1, 3), 100.0))
+            v29 = unet(timesteps=torch.tensor([442]), class_labels=torch.tensor([29]), **kwargs)
+            v0 = unet(timesteps=torch.tensor([442]), class_labels=torch.tensor([0]), **kwargs)
+            v165 = unet(timesteps=torch.tensor([165]), class_labels=torch.tensor([29]), **kwargs)
+            vsp = unet(
+                timesteps=torch.tensor([442]), class_labels=torch.tensor([29]),
+                x=x, spacing_tensor=torch.full((1, 3), 200.0),
+            )
+        assert not torch.equal(v29, v0)  # 全零 label ≠ 条件 label（无条件分支语义的前提）
+        assert not torch.equal(v29, v165)  # timestep 影响 velocity（日程真实参与）
+        assert not torch.equal(v29, vsp)  # spacing 影响 velocity（恒传条件真实参与）
 
 
 class TestNetbuildForward:
@@ -93,6 +125,19 @@ class TestNetbuildForward:
         )
         assert scheduler.timesteps.tolist() == [1000, 442, 165]
 
+    def test_production_schedule_anchors_monai_transform_output(self) -> None:
+        """生产数值锚 131072（= 64·64·32）：日程 = MONAI set_timesteps 实际
+        输出，timestep transform 生效（无 transform 为 [1000,967,933,…]），
+        实际 scale=1.0——config 字面 scale=1.4 是死参数，禁止照抄（ADR-0002）。"""
+        scheduler = NetworkAssembler.rflow_scheduler(
+            num_inference_steps=30, input_img_size_numel=131072,
+        )
+        assert scheduler.timesteps.tolist() == [
+            1000, 979, 956, 934, 912, 888, 864, 839, 813, 787,
+            760, 732, 704, 675, 644, 613, 581, 548, 514, 479,
+            442, 404, 366, 325, 284, 241, 195, 149, 102, 51,
+        ]
+
     def test_unet_config_json_roundtrip_unknown_keys_ignored(
         self, fixture_artifacts: object,
     ) -> None:
@@ -101,3 +146,44 @@ class TestNetbuildForward:
         net_config["scale"] = 1.4  # config 字面死参数陷阱（ADR-0002）
         unet = NetworkAssembler.unet(NetworkArtifact(config=net_config))
         assert unet is not None
+
+
+class TestNetbuildVae:
+    """netbuild VAE 装配（AutoencoderKlMaisi）：网络配置 JSON + checkpoint
+    构建、装载、前向与直接构造一致（生产预编码侧的装载契约）。"""
+
+    VAE_CONFIG: dict = {
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 1,
+        "num_res_blocks": [1, 1],
+        "num_channels": [4, 8],
+        "attention_levels": [False, False],
+        "latent_channels": 4,
+        "norm_num_groups": 4,
+        "include_fc": False,
+        "use_combined_linear": False,
+        "num_splits": 1,  # 微型体积小于默认 16 切分的 save_mem 下限
+    }
+
+    def test_vae_assembly_loads_checkpoint_and_matches_direct_construction(
+        self, tmp_path: Path,
+    ) -> None:
+        torch.manual_seed(3)
+        direct = AutoencoderKlMaisi(**self.VAE_CONFIG).eval()
+        ckpt = tmp_path / "vae.pt"
+        torch.save(direct.state_dict(), ckpt)
+        (tmp_path / "vae_config.json").write_text(
+            json.dumps(self.VAE_CONFIG), encoding="utf-8",
+        )
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(tmp_path / "vae_config.json"),
+            checkpoint=ckpt,
+        )
+        assembled = NetworkAssembler.vae(artifact).eval()
+        image = torch.randn(1, 1, 8, 8, 4)
+        with torch.no_grad():
+            mu_direct, _ = direct.encode(image)
+            mu_assembled, _ = assembled.encode(image)
+        assert torch.equal(mu_direct, mu_assembled)
+        assert mu_assembled.shape[1] == self.VAE_CONFIG["latent_channels"]

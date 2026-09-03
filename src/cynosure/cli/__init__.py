@@ -19,6 +19,7 @@ from typing import TextIO
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
 from cynosure.train import RunArtifacts
 
@@ -60,10 +61,20 @@ class CynosureCli:
         ):
             sub = subparsers.add_parser(name, help=help_text)
             sub.add_argument("--config", required=True, help="config JSON 路径")
-            if name in ("train", "eval"):
+            if name == "train":
                 sub.add_argument(
                     "--run-dir", default=None,
                     help="run 目录（默认 $HOME/.cynosure/runs/<时间戳>-<组>）",
+                )
+                sub.add_argument(
+                    "--dump-trajectory", action="store_true",
+                    help="fixture 诊断开关：落盘 per-step 轨迹统计/哈希、log-prob 对"
+                         "与双样本分布统计量（限 fixture_mode=true）",
+                )
+            elif name == "eval":
+                sub.add_argument(
+                    "--run-dir", default=None,
+                    help="run 目录（评测目标 run）",
                 )
         return parser
 
@@ -85,6 +96,15 @@ class CynosureCli:
             return None
 
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
+        if args.dump_trajectory and not config.fixture_mode:
+            # 诊断工件属 fixture 诊断模式（spec「产物工件契约」）：生产采样
+            # 诊断随训练循环 ticket 交付，当前显式拒绝、不建 run 目录
+            print(
+                "轨迹诊断当前仅支持 fixture（fixture_mode=true）：生产 config "
+                "须先经 fixture_mode=true 显式声明",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         if args.run_dir is None and "RANK" in os.environ:
             # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
             print(
@@ -110,12 +130,35 @@ class CynosureCli:
             print(f"等待 rank 0 创建 run 目录超时: {run_root}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
+        if args.dump_trajectory:
+            return self._dump_trajectory(config, artifacts)
         if os.environ.get("RANK") in (None, "0"):  # 非 0 rank 只采用、不落盘
             print(
                 "工件契约最小版已落盘：config.json / metrics.jsonl / manifest.json /"
                 " checkpoints/（训练循环由后续 ticket 填充）",
                 file=self._stdout,
             )
+        return 0
+
+    def _dump_trajectory(
+        self, config: CynosureConfig, artifacts: RunArtifacts,
+    ) -> int:
+        """fixture 轨迹诊断（--dump-trajectory）：policy 采样路径 + MONAI
+        直接步对照 + log-prob 对 + 双样本分布统计量落盘为诊断工件。"""
+        try:
+            report = TrajectoryDiagnosticRunner(config).run()
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"轨迹诊断输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        artifacts.paths.trajectory_diagnostic.write_text(
+            report.model_dump_json(indent=2), encoding="utf-8",
+        )
+        print(
+            f"轨迹诊断工件已落盘: {artifacts.paths.trajectory_diagnostic}"
+            f"（η={report.eta}、扰动步 {report.perturbation_steps}、"
+            f"log-prob 对 {len(report.logprob_pairs)} 组）",
+            file=self._stdout,
+        )
         return 0
 
     def _eval(

@@ -171,6 +171,22 @@ class TestPrepareCommand:
         assert "disc_batch_size_k" in result.stderr
 
 
+class TestTrajectoryDiagnosticFlag:
+    """train --dump-trajectory（fixture 诊断开关）：生产 config 显式拒绝，
+    不建 run 目录、不产出残缺工件（spec「产物工件契约」诊断模式）。"""
+
+    def test_production_mode_rejected_before_run_dir_created(
+        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+    ) -> None:
+        result = cli.run(
+            "train", "--config", str(cli.write_config(tmp_path)),
+            "--run-dir", str(tmp_path / "run"), "--dump-trajectory",
+        )
+        assert result.code == 2
+        assert "fixture_mode" in result.stderr
+        assert not (tmp_path / "run").exists()  # fail fast：不留半初始化 run 目录
+
+
 class TestDistributedRunDir:
     """torchrun 多 rank（RANK env）下的 run 目录初始化：rank 0 创建、
     其余 rank 轮询等待采用（spec：多 rank 下指标由 rank 0 归并写出）。"""
