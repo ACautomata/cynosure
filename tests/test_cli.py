@@ -4,63 +4,16 @@ run 目录与工件契约最小版（config 快照 + metrics.jsonl + manifest + 
 测试原则（spec「Testing Decisions」）：只断言经 CLI 边界可观测的外部行为。"""
 
 import copy
-import io
 import json
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from cynosure.cli import CynosureCli
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.train import IterEvent, MilestoneEvent, RunArtifacts
-from tests.conftest import MINIMAL_CONFIG_DICT
-
-
-@dataclass
-class CliResult:
-    """一次进程内 CLI 调用的外部可观测结果。"""
-
-    code: int
-    stdout: str
-    stderr: str
-
-
-class CliSession:
-    """CLI 会话：向 cynosure 命令行提交 argv 并捕获输出。"""
-
-    def run(self, *args: str) -> CliResult:
-        stdout, stderr = io.StringIO(), io.StringIO()
-        code = CynosureCli(list(args), stdout, stderr).run()
-        return CliResult(code, stdout.getvalue(), stderr.getvalue())
-
-    def write_config(self, directory: Path, overrides: dict | None = None) -> Path:
-        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
-        for key, value in (overrides or {}).items():
-            if isinstance(value, dict) and isinstance(data.get(key), dict):
-                data[key].update(value)
-            else:
-                data[key] = value
-        path = directory / "config.json"
-        path.write_text(json.dumps(data), encoding="utf-8")
-        return path
-
-    def train(self, config_path: Path, run_dir: Path | None = None) -> CliResult:
-        argv = ["train", "--config", str(config_path)]
-        if run_dir is not None:
-            argv += ["--run-dir", str(run_dir)]
-        return self.run(*argv)
-
-    def sole_run_directory(self, home: Path) -> Path:
-        """本会话（$HOME 下）唯一一次 train 产出的 run 目录。"""
-        return next((home / ".cynosure" / "runs").iterdir())
-
-
-@pytest.fixture
-def cli() -> CliSession:
-    return CliSession()
+from tests.conftest import CliSession, MINIMAL_CONFIG_DICT
 
 
 @pytest.fixture
@@ -197,15 +150,14 @@ class TestEvalCommand:
 
 
 class TestPrepareCommand:
-    def test_valid_config_passes_and_reports_artifacts(
+    def test_production_mode_rejected_until_vae_ticket(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
+        """fixture_mode=false 的生产 prepare 须 MONAI VAE 预编码（后续 ticket
+        交付），当前显式拒绝而非静默产出。"""
         result = cli.run("prepare", "--config", str(cli.write_config(tmp_path)))
-        assert result.code == 0
-        assert "real_pool.json" in result.stdout
-        assert "heldout_real.json" in result.stdout
-        assert "channel_stats.json" in result.stdout
-        assert "data/brats2023" in result.stdout  # 源数据集根目录随 prepare 计划报告
+        assert result.code == 2
+        assert "fixture_mode" in result.stderr
 
     def test_invalid_config_rejected(
         self, cli: CliSession, tmp_path: Path,

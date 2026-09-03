@@ -2,7 +2,8 @@
 ——全库唯一测试 seam（spec「Testing Decisions」）。
 
 三子命令共享同一 config schema；本 ticket（#16，prefactor）交付 seam 与
-run 目录契约最小版，训练 / 评测 / prepare 的实际循环由后续 ticket 填充。
+run 目录契约最小版，训练 / 评测的实际循环由后续 ticket 填充（prepare
+数据工件管线已由 #18 交付，fixture 合成数据下端到端可跑）。
 
 单进程 seam：torchrun 入口（FSDP 初始化等）属 orchestration ticket；
 分布式启动须经显式 --run-dir（跨 rank 的 run 目录 barrier 见 train.RunArtifacts）。
@@ -18,6 +19,7 @@ from typing import TextIO
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
 from cynosure.train import RunArtifacts
 
 _EXIT_USAGE_ERROR = 2
@@ -138,14 +140,41 @@ class CynosureCli:
     def _prepare(
         self, args: argparse.Namespace, config: CynosureConfig,
     ) -> int:
-        print("prepare 将构建以下工件（由 prepare ticket 交付）：", file=self._stdout)
-        for name in (
-            "real_pool_manifest", "heldout_real_manifest", "channel_stats_json",
-        ):
-            target = getattr(config.reward, name)
-            print(f"  - {name}: {target}", file=self._stdout)
+        if not config.fixture_mode:
+            # 生产预编码（MONAI AutoencoderKlMaisi 装载 vae_ckpt）待基座
+            # checkpoint 落地后的 ticket 校准交付，当前显式拒绝、不静默产出
+            print(
+                "prepare 当前仅支持 fixture 合成数据端到端：生产 config 须"
+                "经 fixture_mode=true 显式声明（MONAI VAE 预编码由后续 "
+                "ticket 交付）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        try:
+            report = PreparePipeline(config, SyntheticLatentEncoder()).run()
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"prepare 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
         print(
-            f"源数据集（BraTS 原始影像根目录）: {config.artifacts.dataset_root}",
+            f"prepare 完成（病例级 split seed={config.schedule.seed}："
+            f"train {report.split_sizes['train']} / val "
+            f"{report.split_sizes['val']} / test {report.split_sizes['test']}）:",
+            file=self._stdout,
+        )
+        print(
+            f"  - Real sample pool: {report.pool_manifest}"
+            f"（{report.pool_entries} 条，按序列分层）",
+            file=self._stdout,
+        )
+        print(
+            f"  - Held-out real: {report.heldout_manifest}"
+            f"（{report.heldout_entries} 条，与 pool 病例级不相交、"
+            "永不参与判别器更新）",
+            file=self._stdout,
+        )
+        print(
+            f"  - per-channel 标准化统计量: {report.channel_stats}"
+            f"（mean/std × {len(report.mean)} 通道）",
             file=self._stdout,
         )
         return 0

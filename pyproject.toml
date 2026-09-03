@@ -20,6 +20,9 @@ dependencies = [
     # import 白名单的显式依赖；集群侧钉 numpy==1.26.4（pytorch-dcu wheel 回验），
     # 见 docs/spec/orchestration.md
     "numpy>=1.26",
+    # prepare 源影像读取的运行时依赖：src 经 MONAI LoadImage 懒加载 NIfTI
+    # （import 层面仍只有 monai，零依赖白名单不变），见 reward/dataset
+    "nibabel>=5",
 ]
 
 [project.optional-dependencies]

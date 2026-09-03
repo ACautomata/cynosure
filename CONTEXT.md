@@ -62,6 +62,10 @@ MONAI 的 PatchGAN 判别器（Pix2PixHD 式），输出 patch logit 图而非�
 训练集（本轮 = BraTS train split）全量影像经 VAE 预编码的 latent 集合，按序列 token 分层；判别器的「真」与评测参照都取自它。
 _Avoid_: 真样本集
 
+**Held-out real（留出真样本）**:
+基座 val split（BraTS 病例级 70/10/20 之 10%）影像经 VAE 预编码的 latent 工件，按序列分层；与 Real sample pool 病例级不相交、永久不参与判别器更新——保证 held-out AUC 是 out-of-sample 的 hacking 监控信号（reward-model 章，`prepare` 产出）。
+_Avoid_: 验证集（val split 是划分段，held-out real 是其预编码工件）
+
 **Fake sample（伪样本）**:
 当前 policy rollout 的去噪输出 latent，作为判别器的「假」。
 _Avoid_: 生成样本、负样本
