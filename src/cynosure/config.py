@@ -95,6 +95,18 @@ class Artifacts(BaseModel):
         "源影像数据集根目录（BraTS 原始影像；prepare 预编码的输入，"
         "experiment-design「real 样本库」节）",
     )
+    discriminator_config_json: Path | None = SpecField(
+        "运行时", "reward-model",
+        "判别器网络配置 JSON（键 = MONAI PatchDiscriminator 构造参数名；"
+        "reward 打分与在线更新的网络装配源）",
+        default=None,
+    )
+    discriminator_ckpt: Path | None = SpecField(
+        "运行时", "reward-model",
+        "判别器 checkpoint（reward 网络工件的装配源；None = 随机初始化起步"
+        "的在线训练）",
+        default=None,
+    )
 
 
 class Experiment(BaseModel):

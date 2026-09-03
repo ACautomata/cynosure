@@ -113,6 +113,9 @@ class Fixture:
                 "net_config_json": str(artifacts_dir / "unet_config.json"),
                 "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
                 "dataset_root": str(artifacts_dir / "dataset"),
+                # 判别器工件与 write_artifacts 同构：fixture 打分/在线更新装载源
+                "discriminator_config_json": str(artifacts_dir / "discriminator_config.json"),
+                "discriminator_ckpt": str(artifacts_dir / "discriminator.pt"),
             },
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,
