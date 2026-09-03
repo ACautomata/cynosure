@@ -25,6 +25,21 @@ class RolloutCondition:
     spacing: torch.Tensor
     """体素间距 ×1e2，形状 [B, 3]；同批共享时可为 [1, 3]。"""
 
+    def broadcast_to(self, batch: int) -> "RolloutCondition":
+        """同批 rollout 的条件共享：batch=1 的 label/spacing 广播到整批
+        （G 方向并行续跑共享同一条件），batch 数不符即显式拒绝。"""
+        if self.label.shape[0] == 1 and batch > 1:
+            return RolloutCondition(
+                label=self.label.expand(batch, *self.label.shape[1:]),
+                spacing=self.spacing.expand(batch, *self.spacing.shape[1:]),
+            )
+        if self.label.shape[0] != batch:
+            raise ValueError(
+                f"条件 batch {self.label.shape[0]} 与样本 batch {batch} 不符"
+                "（仅支持 batch=1 广播或逐元素对齐）",
+            )
+        return self
+
 
 class ModalityMapping:
     """组1 模态标签映射（spec 输入物 modality_mapping：t1n/t1c/t2w/t2f →

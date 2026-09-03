@@ -14,7 +14,7 @@ import torch
 from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
-from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.kernel import SdeKernel, SdeTransition
 
 
 class RolloutSampler:
@@ -60,16 +60,7 @@ class RolloutSampler:
         log-prob 返回 ``None``（确定性步不存在策略密度，非缺数据）。
         """
         group_size = noise.shape[0]
-        velocity = self._field.group_velocity(
-            x_k, self._cursor.timestep(index), condition, group_size,
-        )
-        transition = self._kernel.transition(
-            x_k.expand(group_size, *x_k.shape[1:]),
-            velocity,
-            self._cursor.sigma_level(index),
-            self._cursor.delta_s(index),
-            noise=noise,
-        )
+        transition = self._group_transition(x_k, index, condition, group_size, noise=noise)
         if self._kernel.eta <= 0.0:
             return transition.sample, None
         return transition.sample, self._kernel.log_prob(transition.sample, transition)
@@ -87,15 +78,8 @@ class RolloutSampler:
         无条件分支 batch=1 一次评估全组复用；与 batch=2 前向的口径一致，
         仅 batch 尺寸的 fp32 舍入差）。
         """
-        group_size = samples.shape[0]
-        velocity = self._field.group_velocity(
-            x_k, self._cursor.timestep(index), condition, group_size,
-        )
-        transition = self._kernel.transition(
-            x_k.expand(group_size, *x_k.shape[1:]),
-            velocity,
-            self._cursor.sigma_level(index),
-            self._cursor.delta_s(index),
+        transition = self._group_transition(
+            x_k, index, condition, samples.shape[0],
         )
         return self._kernel.log_prob(samples, transition)
 
@@ -111,6 +95,27 @@ class RolloutSampler:
         for step in range(index + 1, self._cursor.num_steps):
             x = self._deterministic_step(x, step, condition)
         return x
+
+    def _group_transition(
+        self,
+        x_k: torch.Tensor,
+        index: int,
+        condition: RolloutCondition,
+        group_size: int,
+        noise: torch.Tensor | None = None,
+    ) -> SdeTransition:
+        """共享 anchor 的组内转移：velocity 走全组复用评估，核参数取自
+        同一日程位（扰动步与 log-prob 重算共用，保证两侧口径一致）。"""
+        velocity = self._field.group_velocity(
+            x_k, self._cursor.timestep(index), condition, group_size,
+        )
+        return self._kernel.transition(
+            x_k.expand(group_size, *x_k.shape[1:]),
+            velocity,
+            self._cursor.sigma_level(index),
+            self._cursor.delta_s(index),
+            noise=noise,
+        )
 
     def _deterministic_step(
         self,

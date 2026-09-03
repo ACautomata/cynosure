@@ -97,7 +97,7 @@ class TrajectoryDiagnosticReport(BaseModel):
     实际 scale=1.0）——日程锚定断言面（ADR-0002）。"""
     anchor_trajectory: list[TrajectoryStepStats]
     """policy 封装路径（η=0 Anchor 轨迹）的 per-step 统计/哈希。"""
-    monai_reference_trajectory: list[TrajectoryStepStats]
+    monai_step_trajectory: list[TrajectoryStepStats]
     """MONAI ``step()`` 直接对照路径的 per-step 统计/哈希（真值锚列）。"""
     logprob_pairs: list[LogProbPair]
     control_terminals: TerminalSampleStats
@@ -167,7 +167,7 @@ class TrajectoryDiagnosticRunner:
                 spacing=torch.full((self.ANCHOR_NOISES, 3), CONDITION_SPACING),
             )
             anchor = self._sampler.anchor_trajectory(noises, condition)
-            reference = self._monai_reference_trajectory(noises, condition)
+            monai_steps = self._monai_step_trajectory(noises, condition)
             pairs, perturbed = self._perturb_all(anchor, generator, condition)
             return TrajectoryDiagnosticReport(
                 eta=self._kernel.eta,
@@ -177,13 +177,13 @@ class TrajectoryDiagnosticRunner:
                 perturbation_steps=sorted(self._config.policy.train_step_indices_m),
                 schedule_timesteps=self._cursor.timesteps.tolist(),
                 anchor_trajectory=self._fingerprint_trajectory(anchor),
-                monai_reference_trajectory=self._fingerprint_trajectory(reference),
+                monai_step_trajectory=self._fingerprint_trajectory(monai_steps),
                 logprob_pairs=pairs,
                 control_terminals=TerminalSampleStats.of(anchor[-1]),
                 perturbed_terminals=TerminalSampleStats.of(perturbed),
             )
 
-    def _monai_reference_trajectory(
+    def _monai_step_trajectory(
         self,
         noises: torch.Tensor,
         condition: RolloutCondition,

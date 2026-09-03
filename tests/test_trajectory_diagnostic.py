@@ -83,7 +83,7 @@ class TestDiagnosticArtifact:
     ) -> None:
         assert scenario.run().code == 0
         report = scenario.report()
-        for column in ("anchor_trajectory", "monai_reference_trajectory"):
+        for column in ("anchor_trajectory", "monai_step_trajectory"):
             steps = report[column]
             assert [entry["step_index"] for entry in steps] == [0, 1, 2, 3]
             assert [entry["timestep"] for entry in steps] == [1000.0, 442.0, 165.0, 0.0]
@@ -145,12 +145,12 @@ class TestEtaZeroParity:
     """测试面 #1（AC）：η=0 时 policy 采样路径与直接调 MONAI 确定性步
     逐位一致——经诊断工件双列断言 per-step 轨迹。"""
 
-    def test_policy_trajectory_equals_monai_reference(
+    def test_policy_trajectory_equals_monai_step(
         self, scenario: DiagnosticScenario,
     ) -> None:
         assert scenario.run(eta=0.7).code == 0  # parity 双列与 η 取值无关
         report = scenario.report()
-        assert report["anchor_trajectory"] == report["monai_reference_trajectory"]
+        assert report["anchor_trajectory"] == report["monai_step_trajectory"]
 
     def test_eta0_control_terminals_identical(
         self, scenario: DiagnosticScenario,
@@ -176,7 +176,11 @@ class TestEtaZeroParity:
 
 class TestNoiseInjectionSanity:
     """测试面 #2（AC）：单步 SDE 扰动 + ODE 续跑的样本分布统计量与原模型
-    一致（边缘分布保持；η=0 对照见 TestEtaZeroParity）。"""
+    一致（边缘分布保持；η=0 对照见 TestEtaZeroParity）。
+
+    fixture 级 sanity 只验证「机制未破坏分布」（诊断工件是该面的信号载体）；
+    spec 的开工门槛在 M4 实例上对真实基座执行（非单元测试）。
+    """
 
     # 容差按 fixture 实测（seed 固定、数值确定）放大：η=0.7 实测 |Δmean|≈1.3e-2、
     # relΔstd≈0.17（单步扰动经 ODE 收缩后的真实分布移动）；量级失控的核

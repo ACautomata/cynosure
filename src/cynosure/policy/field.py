@@ -38,13 +38,10 @@ class CfgCombinedField:
         """组合场 velocity：batch=2B 单次前向、序 [cond, uncond]、无条件
         分支全零 label（锚轨迹与 ODE 续跑走此基座组织）。"""
         batch = x.shape[0]
-        cond_labels = self._broadcast(condition.label, batch)
+        cond = condition.broadcast_to(batch)
         paired_x = torch.cat((x, x), dim=0)
-        paired_labels = torch.cat((cond_labels, torch.zeros_like(cond_labels)), dim=0)
-        paired_spacing = torch.cat(
-            (self._broadcast(condition.spacing, batch), self._broadcast(condition.spacing, batch)),
-            dim=0,
-        )
+        paired_labels = torch.cat((cond.label, torch.zeros_like(cond.label)), dim=0)
+        paired_spacing = torch.cat((cond.spacing, cond.spacing), dim=0)
         paired_velocity = self._forward(paired_x, batch * 2, timesteps, paired_labels, paired_spacing)
         v_cond, v_uncond = torch.chunk(paired_velocity, 2)
         return self._combine(v_cond, v_uncond)
@@ -84,16 +81,3 @@ class CfgCombinedField:
             class_labels=labels,
             spacing_tensor=spacing,
         )
-
-    @staticmethod
-    def _broadcast(condition: torch.Tensor, batch: int) -> torch.Tensor:
-        """同批 rollout 的条件共享：batch=1 的 label/spacing 广播到整批
-        （G 方向并行续跑共享同一条件），batch 数不符即显式拒绝。"""
-        if condition.shape[0] == 1 and batch > 1:
-            return condition.expand(batch, *condition.shape[1:])
-        if condition.shape[0] != batch:
-            raise ValueError(
-                f"条件 batch {condition.shape[0]} 与样本 batch {batch} 不符"
-                "（仅支持 batch=1 广播或逐元素对齐）",
-            )
-        return condition
