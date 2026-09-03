@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cynosure"
+version = "0.1.0"
+description = "Granular-GRPO RL 后训练：MAISI 3D latent rectified-flow 医学影像 checkpoint 的 RL post-training"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Joel Young" }]
+dependencies = [
+    # 网络类全部来自 MONAI 库本身（零依赖原则：不 import NV-Generate-CTMR 任何代码）
+    "monai>=1.6,<2",
+    "torch>=2.4",
+    "pydantic>=2.7",
+    # MONAI 推荐依赖（MAISI UNet 的 attention block 需要）
+    "einops>=0.8",
+    # 集群侧钉 numpy==1.26.4（pytorch-dcu wheel 回验），本地开发不钉，见 docs/spec/orchestration.md
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+cynosure = "cynosure.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cynosure"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

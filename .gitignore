@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
