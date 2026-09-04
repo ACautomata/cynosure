@@ -30,7 +30,7 @@ from pydantic import (
 Modality = Literal["t1n", "t1c", "t2w", "t2f"]
 """脑 MRI 四序列（BraTS2023）；CT↔MR 不在本轮实验矩阵（experiment-design 章）。"""
 
-MODALITIES: tuple[str, ...] = ("t1n", "t1c", "t2w", "t2f")
+MODALITIES: tuple[Modality, ...] = ("t1n", "t1c", "t2w", "t2f")
 """组1 模态标签条件与组2 跨模态方向共用的四序列清单（定死，experiment-design）。"""
 
 # 组1 采样场（ADR-0002 定死）：CFG=10 组合场，v_cfg = v_uncond + 10·(v_cond − v_uncond)
@@ -217,6 +217,12 @@ class PolicyConfig(BaseModel):
         "起步值", "policy-modeling",
         "policy 学习率（AdamW），bf16 autocast + fp32 master weights 配套",
         default=2e-6, gt=0.0,
+    )
+    policy_weight_decay: float = SpecField(
+        "起步值", "policy-modeling",
+        "policy AdamW 的 weight decay（参考实现超参总表 1e-4；PyTorch 默认"
+        " 1e-2 是 100× 过正则，会淹没 2e-6 的 policy 学习步，故显式落位）",
+        default=1e-4, ge=0.0,
     )
     amp_dtype: Literal["bf16"] = SpecField(
         "定死", "policy-modeling",

@@ -97,7 +97,7 @@ class LatentManifest(BaseModel):
 
     @model_validator(mode="after")
     def _modalities_from_entries(self) -> "LatentManifest":
-        counts: dict[str, int] = {}
+        counts: dict[Modality, int] = {}
         for entry in self.entries:
             counts[entry.modality] = counts.get(entry.modality, 0) + 1
         if self.modalities and self.modalities != counts:

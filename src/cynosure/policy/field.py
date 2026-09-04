@@ -77,7 +77,9 @@ class CfgCombinedField:
     ) -> torch.Tensor:
         return self._unet(
             x=x,
-            timesteps=torch.full((batch,), timesteps, dtype=torch.int64),
+            timesteps=torch.full(
+                (batch,), timesteps, dtype=torch.int64, device=x.device,
+            ),
             class_labels=labels,
             spacing_tensor=spacing,
         )

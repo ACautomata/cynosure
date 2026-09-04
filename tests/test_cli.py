@@ -23,40 +23,43 @@ def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 class TestTrainCommand:
+    """run 目录契约（直接驱动 RunArtifacts；CLI train 的训练全链路由
+    test_train_loop.py 的 fixture 场景覆盖——train 命令自 #21 起真实执行
+    训练循环，需要可装载的网络工件）。"""
+
+    @staticmethod
+    def _initialized_artifacts(config: CynosureConfig, tmp_path: Path) -> RunArtifacts:
+        return RunArtifacts.init(config, tmp_path / "run")
+
     def test_creates_run_artifact_layout_under_home(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        result = cli.train(cli.write_config(tmp_path))
-        assert result.code == 0
-        run_dir = cli.sole_run_directory(fake_home)
-        assert (run_dir / "config.json").is_file()
-        assert (run_dir / "metrics.jsonl").is_file()
-        assert (run_dir / "manifest.json").is_file()
-        assert (run_dir / "checkpoints").is_dir()
-        assert "run" in result.stdout  # stdout 报告 run 目录位置
+        config = CynosureConfig.model_validate(valid_config_dict)
+        artifacts = self._initialized_artifacts(config, tmp_path)
+        assert (artifacts.paths.config_snapshot).is_file()
+        assert (artifacts.paths.metrics).is_file()
+        assert (artifacts.paths.manifest).is_file()
+        assert (artifacts.paths.checkpoints).is_dir()
 
     def test_config_snapshot_is_normalized_input(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_json: Path, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        config_path = cli.write_config(tmp_path)
-        assert cli.train(config_path).code == 0
+        config = CynosureConfig.model_validate(valid_config_dict)
+        artifacts = self._initialized_artifacts(config, tmp_path)
         snapshot = json.loads(
-            cli.sole_run_directory(fake_home).joinpath("config.json").read_text(
-                encoding="utf-8",
-            ),
+            artifacts.paths.config_snapshot.read_text(encoding="utf-8"),
         )
-        expected = ConfigLoader.load(config_path).model_dump(mode="json")
+        expected = ConfigLoader.load(valid_config_json).model_dump(mode="json")
         assert snapshot == expected
 
     def test_manifest_contract_minimal(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
         """manifest 契约最小集：seed、group、conditions、samples。"""
-        assert cli.train(cli.write_config(tmp_path)).code == 0
+        config = CynosureConfig.model_validate(valid_config_dict)
+        artifacts = self._initialized_artifacts(config, tmp_path)
         manifest = json.loads(
-            cli.sole_run_directory(fake_home)
-            .joinpath("manifest.json")
-            .read_text(encoding="utf-8"),
+            artifacts.paths.manifest.read_text(encoding="utf-8"),
         )
         assert manifest["seed"] == 0
         assert manifest["group"] == "modal-label"
@@ -64,39 +67,39 @@ class TestTrainCommand:
         assert manifest["samples"] == []
 
     def test_manifest_conditions_for_cross_modal_group(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        config_path = cli.write_config(tmp_path, {
-            "experiment": {"group": "cross-modal"},
-            "artifacts": {"controlnet_ckpt": "ckpts/controlnet.pt"},
-        })
-        assert cli.train(config_path).code == 0
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"] = {"group": "cross-modal"}
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        config = CynosureConfig.model_validate(data)
+        artifacts = self._initialized_artifacts(config, tmp_path)
         manifest = json.loads(
-            cli.sole_run_directory(fake_home)
-            .joinpath("manifest.json")
-            .read_text(encoding="utf-8"),
+            artifacts.paths.manifest.read_text(encoding="utf-8"),
         )
         assert len(manifest["conditions"]) == 12
 
     def test_explicit_run_dir_is_honored(
-        self, cli: CliSession, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
+        config = CynosureConfig.model_validate(valid_config_dict)
         run_dir = tmp_path / "my-run"
-        result = cli.train(cli.write_config(tmp_path), run_dir=run_dir)
-        assert result.code == 0
-        assert (run_dir / "metrics.jsonl").is_file()
+        artifacts = RunArtifacts.init(config, run_dir)
+        assert (artifacts.paths.metrics).is_file()
 
     def test_existing_run_dir_is_not_silently_overwritten(
-        self, cli: CliSession, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
         """每次运行一个 run 目录的隔离契约：重跑同一目录被拒。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
         run_dir = tmp_path / "my-run"
-        assert cli.train(cli.write_config(tmp_path), run_dir=run_dir).code == 0
+        RunArtifacts.init(config, run_dir)
         (run_dir / "metrics.jsonl").write_text("sentinel\n", encoding="utf-8")
-        result = cli.train(cli.write_config(tmp_path), run_dir=run_dir)
-        assert result.code == 2
-        assert "已存在" in result.stderr
-        assert (run_dir / "metrics.jsonl").read_text(encoding="utf-8") == "sentinel\n"
+        with pytest.raises(FileExistsError):
+            RunArtifacts.init(config, run_dir)
+        assert (run_dir / "metrics.jsonl").read_text(
+            encoding="utf-8",
+        ) == "sentinel\n"
 
     def test_invalid_config_is_rejected_with_field_level_error(
         self, cli: CliSession, tmp_path: Path,
@@ -121,6 +124,40 @@ class TestTrainCommand:
         result = cli.train(tmp_path / "nope.json")
         assert result.code == 2
         assert "nope.json" in result.stderr
+
+
+class TestSingleProcessGuard:
+    """单进程训练循环（#21 tracer bullet）的 rank 守卫：FSDP 梯度聚合与
+    rank 0 归并落盘由 orchestration ticket 交付前，非 0 rank 显式拒绝——
+    否则每个 rank 各自跑完整循环，重复追加 iter 事件、覆写同一 checkpoint
+    文件名（RunArtifacts 的 rank 0 写盘契约被静默破坏）。"""
+
+    def test_nonzero_rank_rejected_even_when_run_dir_ready(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """run 目录已就绪（rank 0 已创建）也不进训练循环：显式拒绝、
+        消息指明单进程版边界——而非沿用「等待 rank 0」的 barrier 语义
+        （barrier 之后各 rank 重复训练才是要防的故障）。"""
+        monkeypatch.setenv("RANK", "3")
+        run_root = tmp_path / "run"
+        run_root.mkdir()
+        (run_root / "config.json").write_text("{}", encoding="utf-8")
+        result = cli.train(cli.write_config(tmp_path), run_dir=run_root)
+        assert result.code == 2
+        assert "单进程" in result.stderr
+        assert "训练输入契约违反" not in result.stderr  # 未进训练循环
+
+    def test_rank0_passes_guard_into_training(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """rank 0 通过守卫进入训练循环（生产 config 在循环装配期因工件
+        缺失得到契约错误——走到该错误证明守卫未拦截）。"""
+        monkeypatch.setenv("RANK", "0")
+        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
+        assert "训练输入契约违反" in result.stderr
+        assert (tmp_path / "run").is_dir()
 
 
 class TestEvalCommand:
@@ -249,8 +286,9 @@ class TestDistributedRunDir:
     def test_train_under_torchrun_requires_explicit_run_dir(
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：分布式启动必须显式 --run-dir。"""
-        monkeypatch.setenv("RANK", "2")
+        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：torchrun 下
+        （rank 0）也必须显式 --run-dir（非 0 rank 已被单进程守卫更早拒绝）。"""
+        monkeypatch.setenv("RANK", "0")
         result = cli.train(cli.write_config(tmp_path))
         assert result.code == 2
         assert "--run-dir" in result.stderr
@@ -260,19 +298,21 @@ class TestMetricsStream:
     """训练指标流契约（spec「产物工件契约」）：单一 JSONL 两类事件。"""
 
     def _trained_artifacts(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> RunArtifacts:
-        assert cli.train(cli.write_config(tmp_path)).code == 0
-        return RunArtifacts(RunArtifacts.layout(cli.sole_run_directory(fake_home)))
+        config = CynosureConfig.model_validate(valid_config_dict)
+        return RunArtifacts.init(config, tmp_path / "run")
 
     def test_iter_event_roundtrip(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        artifacts = self._trained_artifacts(cli, fake_home, tmp_path)
+        artifacts = self._trained_artifacts(valid_config_dict, tmp_path)
         event = IterEvent(
-            iteration=0, anchor_eval_reward=-1.5, intra_group_reward_std=0.3,
+            iteration=0, modality="t1n", anchor_eval_reward=-1.5,
+            intra_group_reward_std=0.3,
             heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, lr=2e-6, elapsed_s=12.3,
+            buffer_replay_fraction=0.5, buffer_base_occupied=32,
+            buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
         )
         artifacts.append_event(event)
         events = artifacts.read_events()
@@ -282,9 +322,9 @@ class TestMetricsStream:
         assert events[0]["anchor_eval_reward"] == pytest.approx(-1.5)
 
     def test_milestone_event_roundtrip(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        artifacts = self._trained_artifacts(cli, fake_home, tmp_path)
+        artifacts = self._trained_artifacts(valid_config_dict, tmp_path)
         event = MilestoneEvent(iteration=50, fid=12.3, early_stop=False)
         artifacts.append_event(event)
         events = artifacts.read_events()
@@ -295,9 +335,11 @@ class TestMetricsStream:
     @staticmethod
     def _iter_event(**overrides: object) -> IterEvent:
         values: dict = dict(
-            iteration=0, anchor_eval_reward=-1.5, intra_group_reward_std=0.3,
+            iteration=0, modality="t1n", anchor_eval_reward=-1.5,
+            intra_group_reward_std=0.3,
             heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, lr=2e-6, elapsed_s=12.3,
+            buffer_replay_fraction=0.5, buffer_base_occupied=32,
+            buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
         )
         values.update(overrides)
         return IterEvent(**values)
@@ -316,13 +358,15 @@ class TestMetricsStream:
             MilestoneEvent(iteration=50, fid=float("inf"))
 
     def test_events_coexist_in_single_stream(
-        self, cli: CliSession, fake_home: Path, tmp_path: Path,
+        self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
-        artifacts = self._trained_artifacts(cli, fake_home, tmp_path)
+        artifacts = self._trained_artifacts(valid_config_dict, tmp_path)
         artifacts.append_event(IterEvent(
-            iteration=0, anchor_eval_reward=0.0, intra_group_reward_std=0.0,
+            iteration=0, modality="t1n", anchor_eval_reward=0.0,
+            intra_group_reward_std=0.0,
             heldout_auc=0.5, loss={}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, lr=2e-6, elapsed_s=1.0,
+            buffer_replay_fraction=0.5, buffer_base_occupied=32,
+            buffer_recent_occupied=0, lr=2e-6, elapsed_s=1.0,
         ))
         artifacts.append_event(MilestoneEvent(iteration=50, fid=1.0))
         assert [e["event"] for e in artifacts.read_events()] == ["iter", "milestone"]

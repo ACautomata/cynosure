@@ -8,6 +8,8 @@ PatchDiscriminator 封装。
 - SpectralNorm 默认关闭、经 config 触发启用（叠在 conv 上，Lipschitz 约束）；
 - 数值锚：网络配置 JSON 的 norm（GroupNorm 定死）/ num_layers_d /
   in_channels 与 config 契约一致（静默错位即拒绝）；
+- RewardScorer / ChannelNormalizer 是 nn.Module 聚合（统计量为 buffer）：
+  device 迁移由 ``.to()`` 沿模块树递归单点接管；
 - 多尺度判别器（``disc_num_scales>1``）属消融矩阵施工，显式拒绝而非静默
   退化为单尺度。
 """
@@ -60,41 +62,61 @@ class LatentScorer(Protocol):
         ...
 
 
-class ChannelNormalizer:
+class ChannelNormalizer(torch.nn.Module):
     """per-channel 标准化（判别器输入前处理，消费 prepare 的统计量工件）。
 
     统计量来自 Real sample pool 所用训练集；判别器在线小 batch 更新、
-    fake 分布逐 iter 漂移，输入先标准化使打分面稳定。
+    fake 分布逐 iter 漂移，输入先标准化使打分面稳定。mean/std 是持久
+    统计量，注册为 buffer：device 随 ``nn.Module.to()`` 递归迁移
+    （RewardScorer 聚合本模块后单点 ``.to()`` 接管，见 trainer 装配）。
     """
 
     def __init__(self, stats: ChannelStats) -> None:
+        super().__init__()
+        # 显式标注：mypy 无法从 register_buffer 收窄 __getattr__ 的返回类型
+        self.mean: torch.Tensor
+        self.std: torch.Tensor
         mean = torch.tensor(stats.mean, dtype=torch.float32)
         std = torch.tensor(stats.std, dtype=torch.float32)
         if torch.any(std == 0):
             raise ValueError(f"统计量 std 含 0（不可标准化）: {stats.std}")
-        self._mean = mean.view(-1, 1, 1, 1)
-        self._std = std.view(-1, 1, 1, 1)
+        self.register_buffer("mean", mean.view(-1, 1, 1, 1))
+        self.register_buffer("std", std.view(-1, 1, 1, 1))
 
     def normalize(self, latents: torch.Tensor) -> torch.Tensor:
-        """[B,C,D,H,W] → (x − mean) / std（通道数须与统计量一致，定死 4）。"""
+        """[B,C,D,H,W] → (x − mean) / std（通道数与 device 须与统计量一致）。
+
+        buffer 已随 ``scorer.to()`` 迁至判别器所在 device，输入须同源：
+        device 不符 fail-fast（错位输入即装配契约违例，不再静默对齐）。
+        """
         if latents.dim() != 5:
             raise ValueError(
                 f"latent 批须为 [B,C,D,H,W]，得到 {tuple(latents.shape)}"
             )
-        if latents.shape[1] != self._mean.shape[0]:
+        if latents.shape[1] != self.mean.shape[0]:
             raise ValueError(
                 f"latent 通道数 {latents.shape[1]} 与统计量通道数 "
-                f"{self._mean.shape[0]} 不符（VAE latent_channels 定死 4）"
+                f"{self.mean.shape[0]} 不符（VAE latent_channels 定死 4）"
             )
-        return (latents - self._mean) / self._std
+        if latents.device != self.mean.device:
+            raise ValueError(
+                f"latent device {latents.device} 与统计量 buffer device "
+                f"{self.mean.device} 不符（统计量随 scorer.to() 迁移，"
+                "输入须同源对齐）"
+            )
+        return (latents - self.mean) / self.std
 
 
-class RewardScorer:
+class RewardScorer(torch.nn.Module):
     """Reward model 打分核心（Facade）：标准化 → PatchDiscriminator →
     patch logit 图 → raw real-logit 聚合，产出 GRPO 的 reward 标量。
 
     MONAI PatchDiscriminator 输出 patch logit 图（Pix2PixHD 式，
     forward 返回中间特征 list，末元素为判别输出）；聚合后的标量即 reward。
+
+    聚合判别器与 normalizer 为子模块（属性赋值即注册）：device 迁移由
+    torch 的 ``.to()`` 沿模块树递归接管——trainer 装配只调一次
+    ``scorer.to(device)``（判别器参数 + 统计量 buffer 一并迁移）。
     """
 
     def __init__(
@@ -103,6 +125,7 @@ class RewardScorer:
         config: RewardConfig,
         stats: ChannelStats,
     ) -> None:
+        super().__init__()
         self._check_network_contract(artifact.config, config)
         discriminator = NetworkAssembler.discriminator(artifact)
         if config.spectral_norm_enabled:

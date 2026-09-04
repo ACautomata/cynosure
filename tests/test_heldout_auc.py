@@ -55,6 +55,29 @@ class TestAucNumericContract:
         )
         assert isinstance(auc, float)
 
+    def test_chunked_matches_unchunked_reference(self) -> None:
+        """分块配对计算与不分块参考逐位一致（生产 337 fake × 2048
+        patch/latent 的 n×m 配对矩阵若整块分配约需 TB 级内存——第一次
+        iteration 即 OOM；配对统计数学上可分块精确累加）。tie 跨块边界
+        语义不变（并列计 0.5）。"""
+        generator = torch.Generator().manual_seed(0)
+        real = torch.randn(37, generator=generator)
+        fake = torch.randn(53, generator=generator)
+        reference = HeldOutAuc.auc_from_scores(real, fake, chunk_elements=10**9)
+        for chunk in (1, 3, 37, 38, 10**9):
+            assert HeldOutAuc.auc_from_scores(
+                real, fake, chunk_elements=chunk,
+            ) == reference
+
+    def test_chunked_large_input_stays_bounded(self) -> None:
+        """大输入（1e5 real × 1e4 fake = 1e9 配对）以固定块内存跑完——
+        不分块实现此输入需 ~4 GB 差异矩阵（生产规模则会更大）。"""
+        generator = torch.Generator().manual_seed(1)
+        real = torch.randn(100_000, generator=generator)
+        fake = torch.randn(10_000, generator=generator)
+        auc = HeldOutAuc.auc_from_scores(real, fake, chunk_elements=2**20)
+        assert 0.0 <= auc <= 1.0
+
 
 class TestHeldOutSemantics:
     def test_heldout_manifest_required_kind(self, scenario: UpdateScenario) -> None:

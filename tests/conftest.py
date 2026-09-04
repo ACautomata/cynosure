@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from cynosure.cli import CynosureCli
-from cynosure.config import DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
+from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
 
 
 @dataclass
@@ -123,3 +123,35 @@ class SyntheticBratsDataset:
     @staticmethod
     def _write_nifti(path: Path, volume: np.ndarray) -> None:
         nib.save(nib.Nifti1Image(volume, np.eye(4)), path)
+
+
+class FixturePrepareScenario:
+    """prepare 子命令的 fixture 端到端场景（reward 侧测试共用）：合成
+    BraTS 数据集 → prepare 跑通 → pool / held-out / channel stats 三工件。"""
+
+    NUM_CASES: int = 20
+    SERIES_SHAPE: tuple[int, int, int] = (64, 64, 32)
+
+    def __init__(
+        self, cli: CliSession, config: CynosureConfig, work_dir: Path,
+    ) -> None:
+        self._cli = cli
+        self._config = config
+        self._work_dir = work_dir
+
+    def run(self, config_path: Path) -> CynosureConfig:
+        """写合成数据集并经 CLI prepare 落三工件（断言退出码 0）；
+        返回驱动 prepare 的 config（seed 定死 0，供后续训练复用工件）。"""
+        self._config.schedule.seed = 0
+        SyntheticBratsDataset(
+            self._config.artifacts.dataset_root,
+            [f"BraTS-GLI-{index:05d}-000" for index in range(self.NUM_CASES)],
+            self.SERIES_SHAPE,
+            seed=0,
+        ).write()
+        config_path.write_text(
+            self._config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = self._cli.run("prepare", "--config", str(config_path))
+        assert result.code == 0, result.stderr
+        return self._config

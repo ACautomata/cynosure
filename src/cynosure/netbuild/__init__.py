@@ -90,7 +90,7 @@ class NetworkAssembler:
     @classmethod
     def _known_kwargs(cls, target: type, config: dict) -> dict:
         """过滤出 target 构造器接受的键（网络配置 JSON 的其余键静默忽略）。"""
-        params = inspect.signature(target.__init__).parameters
+        params = inspect.signature(target).parameters  # 类签名：等价 __init__ 且剔除 self
         return {key: value for key, value in config.items() if key in params}
 
     @classmethod

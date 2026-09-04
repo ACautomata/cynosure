@@ -38,10 +38,13 @@ class TrajectoryCursor:
         (1−s)·x0 + s·noise，速度目标 v = x0 − noise）。"""
         return self.timestep(index) / self._num_train_timesteps
 
-    def delta_s(self, index: int) -> float:
-        """步长 Δs = s_k − s_{k+1}，与 MONAI ``step()`` 内部 dt 同式同精度
-        （η=0 逐位 parity 的前提）。"""
-        return (
-            float(self.timestep(index) - self.next_timestep(index))
-            / self._num_train_timesteps
+    def delta_s(self, index: int, stride: int = 1) -> float:
+        """步长 Δs = (t_k − t_next)/1000，与 MONAI ``step()`` 内部 dt 同式
+        同精度（η=0 逐位 parity 的前提）；stride > 1 时 next 取抽稀日程的
+        访问位 k+stride（MGAI 粒度续跑的大步），越过日程末端时取 0
+        （末段直落 σ=0 终点）。"""
+        next_index = index + stride
+        next_timestep = (
+            self.timestep(next_index) if next_index < self.num_steps else 0
         )
+        return (self.timestep(index) - next_timestep) / self._num_train_timesteps

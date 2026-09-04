@@ -88,12 +88,42 @@ class RolloutSampler:
         latents: torch.Tensor,
         index: int,
         condition: RolloutCondition,
+        stride: int = 1,
     ) -> torch.Tensor:
-        """从第 index+1 步 ODE 续跑到 x_0（确定性），batch 维并行；
-        index 为最后一步时原样返回（无续跑空间）。"""
+        """从第 index 步之后 ODE 续跑到 x_0（确定性），batch 维并行；
+        index 为最后一步时原样返回（无续跑空间）。
+
+        ``stride`` = Granularity λ（MGAI）：按时间步间隔 λ 抽稀 sigma 日程
+        积分——λ=1 逐步（默认，与 MONAI 推理循环同组织）；λ>1 首段走一个
+        与 λ=1 同粒度的细步（扰动后 latent 位于 index+1，参考实现的访问
+        日程 ``suffix = sigma_schedule[eta_step+2::g]`` 从 index+2 起才
+        抽稀——跳过该细步会漏掉普通续跑的第一个端点），之后访问点相隔
+        λ（大步 Δs = 相邻访问位 σ 之差、velocity 在段起点评估），末段
+        一律从最后位置直达 σ=0 终点。"""
         x = latents
-        for step in range(index + 1, self._cursor.num_steps):
-            x = self._deterministic_step(x, step, condition)
+        current = index + 1
+        if stride > 1 and current < self._cursor.num_steps:
+            velocity = self._field.velocity(
+                x, self._cursor.timestep(current), condition,
+            )
+            x = self._deterministic.transition(
+                x,
+                velocity,
+                self._cursor.sigma_level(current),
+                self._cursor.delta_s(current),
+            ).sample
+            current += 1
+        while current < self._cursor.num_steps:
+            velocity = self._field.velocity(
+                x, self._cursor.timestep(current), condition,
+            )
+            x = self._deterministic.transition(
+                x,
+                velocity,
+                self._cursor.sigma_level(current),
+                self._cursor.delta_s(current, stride),
+            ).sample
+            current += stride
         return x
 
     def _group_transition(
