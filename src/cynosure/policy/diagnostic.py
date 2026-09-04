@@ -138,6 +138,14 @@ class TrajectoryDiagnosticRunner:
     """噪声注入 sanity 的初始噪声样本量：四序列各一份（模态条件全覆盖）。"""
 
     def __init__(self, config: CynosureConfig) -> None:
+        if config.experiment.group != "modal-label":
+            # 诊断的 MONAI 直接步对照路径是 CFG=10 组合场的 η=0 锚：
+            # 组2/组3-stage2 的 ControlNet 采样场无此对照，显式拒绝而非
+            # 静默产出组1 诊断（CLI --dump-trajectory 已有同语义守卫）
+            raise ValueError(
+                "轨迹诊断当前仅覆盖组1（modal-label）采样场，得到组 "
+                f"{config.experiment.group}",
+            )
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,

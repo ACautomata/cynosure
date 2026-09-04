@@ -18,6 +18,27 @@ class TestFixtureConfig:
         config = Fixture().config(tmp_path)
         assert isinstance(config, CynosureConfig)
 
+    def test_fixture_config_passes_schema_for_all_three_groups(
+        self, tmp_path: Path,
+    ) -> None:
+        """三组配置矩阵走同一 config schema（issue #23 验收「测试面 #4 绿」
+        的 fixture 面）：组1/组2/组3 的 fixture config 全字段校验通过。"""
+        for group in ("modal-label", "cross-modal", "sequential"):
+            config = Fixture().config(tmp_path, group=group)  # type: ignore[arg-type]
+            assert config.experiment.group == group
+
+    def test_cross_modal_fixture_config_carries_controlnet_artifacts(
+        self, tmp_path: Path,
+    ) -> None:
+        """组2/组3 config 携带 ControlNet 工件对（ckpt + 网络配置 JSON，
+        schema 强制）。"""
+        config = Fixture().config(tmp_path, group="cross-modal")
+        assert config.artifacts.controlnet_ckpt == tmp_path / "controlnet.pt"
+        assert (
+            config.artifacts.controlnet_config_json
+            == tmp_path / "controlnet_config.json"
+        )
+
     def test_spec_fixture_values(self, tmp_path: Path) -> None:
         """spec「Fixture 策略」的数值：缩小 latent、3 步 ODE、M={1}、G 保持 12。"""
         config = Fixture().config(tmp_path)
@@ -43,6 +64,42 @@ class TestFixtureArtifacts:
         assert artifacts.discriminator_ckpt.is_file()
         assert artifacts.discriminator_config_json.is_file()
         assert artifacts.modality_mapping_json.is_file()
+        assert artifacts.controlnet_ckpt.is_file()
+        assert artifacts.controlnet_config_json.is_file()
+
+    def test_controlnet_artifact_loads_and_forward_injects_residuals(
+        self, tmp_path: Path,
+    ) -> None:
+        """netbuild 扩展 ControlNet（issue #23）：fixture ControlNet 按
+        artifact 装载、前向产出残差并注入同构 fixture UNet（残差注入
+        管线 CPU 可跑）；controlnet 残差块零初始化被 fixture 重初始化，
+        源影像条件真实参与前向（防组合场退化式静默复现）。"""
+        torch.manual_seed(7)
+        artifacts = Fixture().write_artifacts(tmp_path)
+        controlnet = NetworkAssembler.controlnet(NetworkArtifact(
+            config=NetworkAssembler.load_json(artifacts.controlnet_config_json),
+            checkpoint=artifacts.controlnet_ckpt,
+        ))
+        x = torch.randn(2, 4, 16, 16, 8)
+        timesteps = torch.tensor([442, 442])
+        labels = torch.tensor([29, 34])
+        down_residuals, mid_residual = controlnet(
+            x=x, timesteps=timesteps, controlnet_cond=x, class_labels=labels,
+        )
+        assert mid_residual.shape[0] == 2
+        assert sum(r.abs().sum().item() for r in down_residuals) > 0.0
+        assert mid_residual.abs().sum().item() > 0.0  # 非零初始化：条件真实参与
+        unet = NetworkAssembler.unet(NetworkArtifact(
+            config=NetworkAssembler.load_json(artifacts.unet_config_json),
+            checkpoint=artifacts.unet_ckpt,
+        ))
+        out = unet(
+            x=x, timesteps=timesteps, class_labels=labels,
+            spacing_tensor=torch.full((2, 3), 100.0),
+            down_block_additional_residuals=tuple(down_residuals),
+            mid_block_additional_residual=mid_residual,
+        )
+        assert out.shape == x.shape
 
     def test_modality_mapping_artifact_covers_four_modalities(
         self, tmp_path: Path,

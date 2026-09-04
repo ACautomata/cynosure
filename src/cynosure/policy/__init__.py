@@ -18,11 +18,12 @@ from cynosure.policy.diagnostic import (
     TrajectoryDiagnosticRunner,
     TrajectoryStepStats,
 )
-from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.field import BareConditionField, CfgCombinedField, VelocityField
 from cynosure.policy.kernel import SdeKernel, SdeTransition
 from cynosure.policy.sampler import RolloutSampler
 
 __all__ = [
+    "BareConditionField",
     "CfgCombinedField",
     "LatentFingerprint",
     "LogProbPair",
@@ -36,4 +37,5 @@ __all__ = [
     "TrajectoryDiagnosticReport",
     "TrajectoryDiagnosticRunner",
     "TrajectoryStepStats",
+    "VelocityField",
 ]

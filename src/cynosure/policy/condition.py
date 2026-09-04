@@ -1,9 +1,9 @@
 """组条件 c：MDP state ``s_t = (c, t, x_t)`` 里的条件（policy-modeling 章）。
 
-组1 = (modality label, spacing)；组2 将再带源影像 latent × scale_factor
-（ControlNet 条件）。同批 rollout 的条件共享：label 允许 batch=1 广播
-（广播由组合场负责），spacing（体素间距 ×1e2）恒传（基座
-``include_spacing_input=true``）。
+组1 = (modality label, spacing)；组2 再带源影像 latent（ControlNet 条件，
+乘 scale_factor 发生在组2 采样场——条件的唯一缩放点）。同批 rollout 的
+条件共享：label/spacing/源 latent 允许 batch=1 广播（广播由采样场负责），
+spacing（体素间距 ×1e2）恒传（基座 ``include_spacing_input=true``）。
 """
 
 import json
@@ -17,7 +17,7 @@ from cynosure.config import MODALITIES
 
 @dataclass(frozen=True)
 class RolloutCondition:
-    """一条 rollout 的采样条件：模态标签 token + 体素间距。"""
+    """一条 rollout 的采样条件：模态标签 token + 体素间距（+ 组2 的源影像 latent）。"""
 
     label: torch.Tensor
     """modality token（int64），形状 [B]；同批共享时可为 [1]。"""
@@ -25,13 +25,37 @@ class RolloutCondition:
     spacing: torch.Tensor
     """体素间距 ×1e2，形状 [B, 3]；同批共享时可为 [1, 3]。"""
 
+    source_latent: torch.Tensor | None = None
+    """组2 双条件之一：源影像 latent（[B, C, D, H, W]，ControlNet 条件的
+    缩放前形态）；组1 为 ``None``。与 label/spacing 同 batch（构造即校验）。"""
+
+    def __post_init__(self) -> None:
+        if self.label.shape[0] != self.spacing.shape[0]:
+            raise ValueError(
+                f"条件 batch 不符：label {self.label.shape[0]} vs spacing "
+                f"{self.spacing.shape[0]}"
+            )
+        if (
+            self.source_latent is not None
+            and self.source_latent.shape[0] != self.label.shape[0]
+        ):
+            raise ValueError(
+                f"条件 batch 不符：label {self.label.shape[0]} vs source_latent "
+                f"{self.source_latent.shape[0]}"
+            )
+
     def broadcast_to(self, batch: int) -> "RolloutCondition":
-        """同批 rollout 的条件共享：batch=1 的 label/spacing 广播到整批
+        """同批 rollout 的条件共享：batch=1 的条件广播到整批
         （G 方向并行续跑共享同一条件），batch 数不符即显式拒绝。"""
         if self.label.shape[0] == 1 and batch > 1:
+            source_latent = (
+                self.source_latent.expand(batch, *self.source_latent.shape[1:])
+                if self.source_latent is not None else None
+            )
             return RolloutCondition(
                 label=self.label.expand(batch, *self.label.shape[1:]),
                 spacing=self.spacing.expand(batch, *self.spacing.shape[1:]),
+                source_latent=source_latent,
             )
         if self.label.shape[0] != batch:
             raise ValueError(

@@ -72,6 +72,7 @@ class TestTrainCommand:
         data = copy.deepcopy(valid_config_dict)
         data["experiment"] = {"group": "cross-modal"}
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
         config = CynosureConfig.model_validate(data)
         artifacts = self._initialized_artifacts(config, tmp_path)
         manifest = json.loads(

@@ -253,13 +253,69 @@ class TestRejection:
         assert any("controlnet" in msg for loc, msg in self._locations_with_messages(exc_info.value))
 
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
         config = CynosureConfig.model_validate(data)
         assert config.experiment.group == "cross-modal"
+
+    def test_stage2_groups_require_controlnet_network_config(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """组2/组3 的 ControlNet 装配源 = checkpoint + 网络配置 JSON 两者
+        （netbuild 按 artifact 构建契约，与 UNet 同构）：缺网络配置即拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert any(
+            "controlnet_config_json" in msg
+            for loc, msg in self._locations_with_messages(exc_info.value)
+        )
+
+    def test_sequential_group_minimal_config(self, valid_config_dict: dict) -> None:
+        """组3 最小合法 config：stage1_run_dir 缺省 = 同一次运行内先跑 stage-1
+        （spec 配置项清单「组3 衔接」行的两个分支之一）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "sequential"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        config = CynosureConfig.model_validate(data)
+        assert config.experiment.group == "sequential"
+        assert config.experiment.stage1_run_dir is None
+
+    def test_stage1_run_dir_only_valid_for_sequential(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """既有 stage-1 产物路径只对组3 有语义：组1/组2 config 携带即拒绝
+        （拼错组名时静默跳过 stage-1 比显式拒绝危险）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "modal-label"
+        data["experiment"]["stage1_run_dir"] = "runs/stage1"
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("experiment", "stage1_run_dir") in self._locations(exc_info.value)
+
+        data["experiment"]["group"] = "sequential"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        config = CynosureConfig.model_validate(data)
+        assert config.experiment.stage1_run_dir == Path("runs/stage1")
+
+    def test_source_latent_scale_factor_default(self, valid_config_dict: dict) -> None:
+        """组2 双条件之一：ControlNet 条件 = 源影像 latent × scale_factor；
+        fixture 中性默认 1.0（生产随基座 ControlNet 推理 config 核对）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        config = CynosureConfig.model_validate(data)
+        assert config.policy.source_latent_scale_factor == pytest.approx(1.0)
 
     def test_cross_modal_pairs_must_be_the_ordered_12(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)
         data["experiment"]["group"] = "cross-modal"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
         data["experiment"]["cross_modal_pairs"] = [["t1n", "t1c"]] * 12  # 重复对
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)

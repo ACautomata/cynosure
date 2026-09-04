@@ -14,16 +14,21 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 
 import json
 import math
+from collections import Counter
+from itertools import product
 from pathlib import Path
 
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader, MODALITIES
-from cynosure.fixtures import Fixture
+from cynosure.config import ConfigLoader, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
+from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.policy.condition import ModalityMapping
+from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
+from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
 from tests.conftest import CliSession, FixturePrepareScenario
 
 
@@ -43,15 +48,17 @@ class TrainingLoopScenario:
         num_steps: int = 3,
         train_steps: set[int] = frozenset({1}),
         seed: int = 0,
+        group: str = "modal-label",
     ) -> None:
-        """落盘 fixture 网络工件 + prepare 三工件 + 训练 config。"""
+        """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
+        选实验组：组2/组3 的 config 携带 ControlNet 工件）。"""
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(self.fixture_dir)
         prepare_config = FixturePrepareScenario(
-            self.cli, fixture.config(self.fixture_dir), self.tmp_path,
+            self.cli, fixture.config(self.fixture_dir, group=group), self.tmp_path,
         ).run(self.tmp_path / "prepare_config.json")
-        config = fixture.config(self.fixture_dir)
+        config = fixture.config(self.fixture_dir, group=group)
         config.policy.num_inference_steps = num_steps
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
@@ -179,21 +186,36 @@ class TestSingleIterationLoop:
         assert "policy_step_2" in event["loss"]
         assert "discriminator" in event["loss"]
 
-    def test_non_modal_label_groups_rejected_until_later_tickets(
+    def test_sequential_group_rejected_outside_sequential_trainer(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """组2/组3 采样场（ControlNet）由后续 ticket 交付：显式拒绝而非
-        静默退化为组1 路径。"""
+        """组3 的两阶段序贯由 SequentialTrainer 编排：绕过 CLI 分派、直接
+        把 sequential config 塞进单阶段训练循环时显式拒绝（不静默只跑一段）。"""
+        scenario.write_inputs(group="sequential")
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        with pytest.raises(ValueError, match="SequentialTrainer"):
+            GranularGrpoTrainer(config, artifacts)
+
+    def test_only_unet_params_updated(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """AC「组1：仅 UNet 参数被更新」：组1 的 policy = UNet 本体（无第二
+        个可训练对象）、全参 requires_grad，一次 iteration 后权重真实演化。"""
         scenario.write_inputs()
-        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-        data["experiment"]["group"] = "cross-modal"
-        data["artifacts"]["controlnet_ckpt"] = str(
-            scenario.fixture_dir / "controlnet.pt",
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        assert trainer.policy.network is trainer.unet
+        assert all(p.requires_grad for p in trainer.unet.parameters())
+        initial = {
+            name: value.clone() for name, value in trainer.unet.state_dict().items()
+        }
+        assert trainer.run() == 1
+        assert any(
+            not torch.equal(initial[name], value)
+            for name, value in trainer.unet.state_dict().items()
         )
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        result = scenario.train()
-        assert result.code == 2
-        assert "cross-modal" in result.stderr
 
     def test_missing_artifacts_reported_cleanly(
         self, cli: CliSession, tmp_path: Path,
@@ -225,6 +247,194 @@ class TestPolicyOptimizerConfig:
             config.policy.policy_weight_decay,
         )
         assert group["weight_decay"] == pytest.approx(1e-4)
+
+
+class TestCrossModalLoop:
+    """issue #23 组2 验收：仅 ControlNet 更新（base 冻结）、CFG=0 裸条件
+    单前向走全循环、双条件注入生效、checkpoint 契约 = ControlNet 权重。"""
+
+    def test_cross_modal_single_iteration_runs_green(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs(group="cross-modal")
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        events = scenario.events()
+        assert [event["event"] for event in events] == ["iter"]
+        event = events[0]
+        assert event["modality"] in MODALITIES  # 目标序列归因轴（12 对的目标端）
+        assert event["intra_group_reward_std"] > 0.0  # CFG=0 场的组内方差非退化
+        assert "policy_step_1" in event["loss"]
+        assert "discriminator" in event["loss"]
+        assert event["buffer_base_occupied"] == 32  # 本组判别器/buffer 独立装配
+
+    def test_policy_checkpoint_is_controlnet_and_loadable(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """组2 的 policy checkpoint = ControlNet state_dict：按 ControlNet
+        网络配置可重新装载（产物契约按组指向可训练对象）。"""
+        scenario.write_inputs(group="cross-modal")
+        assert scenario.train().code == 0
+        config = ConfigLoader.load(scenario.config_path)
+        reloaded = NetworkAssembler.controlnet(NetworkArtifact(
+            config=NetworkAssembler.load_json(
+                config.artifacts.controlnet_config_json,
+            ),
+            checkpoint=scenario.run_dir / "checkpoints" / "policy_iter1.pt",
+        ))
+        assert any(p.requires_grad for p in reloaded.parameters())
+
+    def test_only_controlnet_params_updated_base_frozen(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """AC「仅 ControlNet 参数被更新（base 冻结经断言验证）」：一次
+        iteration 后 base UNet 全部参数逐位未动（无梯度、无优化器步），
+        ControlNet 有参数真实演化；冻结在装配期即被 requires_grad 断言。"""
+        scenario.write_inputs(group="cross-modal")
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        initial_unet = {
+            name: value.clone() for name, value in trainer.unet.state_dict().items()
+        }
+        initial_controlnet = {
+            name: value.clone()
+            for name, value in trainer.policy.network.state_dict().items()
+        }
+        assert not any(
+            p.requires_grad for p in trainer.unet.parameters()
+        )  # base 冻结：装配期断言的对外可观测面
+        assert all(p.requires_grad for p in trainer.policy.network.parameters())
+        assert trainer.run() == 1
+        for name, value in trainer.unet.state_dict().items():
+            assert torch.equal(initial_unet[name], value), name
+        assert any(
+            not torch.equal(initial_controlnet[name], value)
+            for name, value in trainer.policy.network.state_dict().items()
+        )
+
+    def test_cross_modal_logprob_pairs_survive_to_update_time(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """CFG=0 单前向场的 log-prob 一致性（测试面 #3 对组2 的延伸）：
+        rollout 记录的 π_old 与更新前重算逐位一致——残差注入路径在
+        rollout 与重算两侧同权重同口径。"""
+        scenario.write_inputs(group="cross-modal")
+        assert scenario.train(dump=True).code == 0
+        report = json.loads(
+            (scenario.run_dir / "training.json").read_text(encoding="utf-8"),
+        )
+        pairs = report["logprob_pairs"]
+        assert len(pairs) == 12  # |M| × G
+        for pair in pairs:
+            assert math.isfinite(pair["recorded"])
+            assert pair["recorded"] == pair["recomputed"]
+
+
+class TestCrossModalPairSampling:
+    """组2 条件分布：12 有序对均匀采样（清单来自 config 注入，无代码内
+    副本）；源影像 latent 按源序列从 real pool 分层抽取。"""
+
+    LATENT_SHAPE = (4, 16, 16, 8)
+
+    @staticmethod
+    def _write_identifiable_pool(root: Path) -> Path:
+        """每序列恰一枚、以序列序号填充的 latent（源序列可从张量内容
+        识别，使 12 对的完整计数可观测）。"""
+        shape = (4, 16, 16, 8)
+        latents_dir = root / "latents"
+        latents_dir.mkdir(parents=True)
+        entries = []
+        for modality_index, modality in enumerate(MODALITIES):
+            name = f"{modality}.pt"
+            torch.save(
+                torch.full(shape, float(modality_index)),
+                latents_dir / name,
+            )
+            entries.append({
+                "case_id": f"case-{modality}",
+                "modality": modality,
+                "latent": f"latents/{name}",
+            })
+        manifest = {
+            "kind": "real_pool",
+            "encoder": "fixture-test",
+            "latent_shape": list(shape),
+            "split_seed": 0,
+            "split_sizes": {"train": 4, "val": 0, "test": 0},
+            "entries": entries,
+        }
+        path = root / "real_pool.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _sampler(root: Path, seed: int) -> CrossModalConditionSampler:
+        pool = SourceLatentPool(
+            LatentManifest.load(root / "real_pool.json", kind="real_pool"),
+            torch.device("cpu"),
+        )
+        return CrossModalConditionSampler(
+            ModalityMapping(dict(FIXTURE_MODALITY_MAPPING)),
+            [tuple(pair) for pair in DEFAULT_CROSS_MODAL_PAIRS],
+            pool,
+            torch.Generator().manual_seed(seed),
+            torch.device("cpu"),
+        )
+
+    def test_all_12_ordered_pairs_drawn_uniformly(self, tmp_path: Path) -> None:
+        """1440 次采样覆盖全部 12 个有序对，各对频次落在均匀 3σ 带内
+        （p=1/12、n=1440：均值 120、σ≈10.5，取 ±40 宽松带防 flake）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        draws = 12 * 120
+        counts: Counter[tuple[str, str]] = Counter()
+        for _ in range(draws):
+            condition, target = sampler.sample()
+            source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+            counts[(source, target)] += 1
+        expected_pairs = {(src, tgt) for src, tgt in product(MODALITIES, repeat=2) if src != tgt}
+        assert set(counts) == expected_pairs  # 12 对全覆盖、无序外对
+        for pair, count in counts.items():
+            assert abs(count - draws / 12) < 40, pair
+
+    def test_pairs_come_from_injected_list(self, tmp_path: Path) -> None:
+        """均匀采样的清单 = 注入的 config 清单（cross_modal_pairs 的单一
+        来源语义）：采样目标端分布随清单而非随硬编码常量。"""
+        torch.manual_seed(0)
+        pool_path = self._write_identifiable_pool(tmp_path)
+        pool = SourceLatentPool(
+            LatentManifest.load(pool_path, kind="real_pool"), torch.device("cpu"),
+        )
+        pairs = sorted(DEFAULT_CROSS_MODAL_PAIRS, reverse=True)  # 非默认顺序注入
+        sampler = CrossModalConditionSampler(
+            ModalityMapping(dict(FIXTURE_MODALITY_MAPPING)),
+            list(pairs),
+            pool,
+            torch.Generator().manual_seed(1),
+            torch.device("cpu"),
+        )
+        targets = {sampler.sample()[1] for _ in range(48)}
+        assert targets <= set(MODALITIES)
+        assert len(targets) == 4
+
+    def test_pool_missing_modality_rejected(self, tmp_path: Path) -> None:
+        """源影像库缺任一序列 = 组2 条件分布不可用：显式拒绝。"""
+        manifest_path = self._write_identifiable_pool(tmp_path)
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data["entries"] = [
+            entry for entry in data["entries"] if entry["modality"] != "t2f"
+        ]
+        manifest_path.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ValueError, match="t2f"):
+            SourceLatentPool(
+                LatentManifest.load(manifest_path, kind="real_pool"),
+                torch.device("cpu"),
+            )
 
 
 class RecordingScorer:
