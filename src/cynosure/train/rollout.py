@@ -20,19 +20,17 @@ from typing import Protocol
 import torch
 
 from cynosure.config import CynosureConfig, MODALITIES, Modality
-from cynosure.policy.condition import ModalityMapping, RolloutCondition
+from cynosure.policy.condition import (
+    CONDITION_SPACING_X1E2,
+    ModalityMapping,
+    RolloutCondition,
+)
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.scorer import LatentScorer
 
 _BASE_BATCH = 8
 """base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）。"""
-
-CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
-"""组1 条件的体素间距常量（1.0 × 1e2，fixture 单位间距；基座
-include_spacing_input=true 的 ×1e2 恒传口径）。组1 条件只含 label、无源影像
-case 可依；组2 源影像条件的 spacing 已改接 manifest per-case 侧车
-（issue #46），不再消费本常量。"""
 
 
 @dataclass(frozen=True)

@@ -82,14 +82,22 @@ class SequentialTrainer:
         """顺序执行全部阶段，返回完成的 iteration 总数（= Σ 各阶段）。
 
         ``resume=True`` 属 CLI 分派的防御性兜底（序贯续训入口未交付，
-        CLI 层已显式拒绝）；到达此处即分派漏洞。"""
+        CLI 层已显式拒绝）；到达此处即分派漏洞。
+        stage-2 的 base′ 在 stage-1 跑完后按**实际盘上产物**重解析——
+        stage-1 可能早停（最终 checkpoint 的 iteration < max_iterations），
+        计划期的固定文件名会指向不存在的产物。"""
         if resume:
             raise ValueError(
                 "组3（sequential）的续训入口未交付：--resume 仅覆盖"
                 "单阶段运行（组1/组2）"
             )
         completed = 0
-        for item in self.plan():
+        plans = self.plan()
+        for position, item in enumerate(plans):
+            if position > 0 and plans[position - 1].stage == 1:
+                item = self._stage2_plan(
+                    self._locate_stage1_product(self._artifacts.paths.root),
+                )
             completed += GranularGrpoTrainer(
                 item.config,
                 self._artifacts,

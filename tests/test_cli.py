@@ -52,19 +52,27 @@ class TestTrainCommand:
         expected = ConfigLoader.load(valid_config_json).model_dump(mode="json")
         assert snapshot == expected
 
-    def test_manifest_contract_minimal(
-        self, valid_config_dict: dict, tmp_path: Path,
-    ) -> None:
-        """manifest 契约最小集：seed、group、conditions、samples。"""
+    def test_manifest_contract_minimal(self, valid_config_dict: dict, tmp_path: Path) -> None:
+        """manifest 契约最小集：seed、group、conditions + 采样条目
+        （seed、条件、噪声种子；样本路径由 baseline/重采先后填入）。"""
         config = CynosureConfig.model_validate(valid_config_dict)
         artifacts = self._initialized_artifacts(config, tmp_path)
-        manifest = json.loads(
-            artifacts.paths.manifest.read_text(encoding="utf-8"),
-        )
+        manifest = json.loads(artifacts.paths.manifest.read_text(encoding="utf-8"))
         assert manifest["seed"] == 0
         assert manifest["group"] == "modal-label"
         assert manifest["conditions"] == ["t1n", "t1c", "t2w", "t2f"]
-        assert manifest["samples"] == []
+        entries = manifest["entries"]
+        assert len(entries) == config.schedule.baseline_samples  # 每条目一个采样位
+        assert [entry["index"] for entry in entries[:4]] == [0, 1, 2, 3]
+        assert [entry["condition"] for entry in entries[:4]] == [
+            "t1n", "t1c", "t2w", "t2f",
+        ]  # 四序列轮转
+        assert all(
+            isinstance(entry["noise_seed"], int) and entry["noise_seed"] > 0
+            for entry in entries
+        )
+        assert all(entry["baseline_sample"] is None for entry in entries)
+        assert all(entry["resample_sample"] is None for entry in entries)
 
     def test_manifest_conditions_for_cross_modal_group(
         self, valid_config_dict: dict, tmp_path: Path,

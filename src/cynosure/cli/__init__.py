@@ -291,13 +291,16 @@ class CynosureCli:
             if not run_root.is_dir():
                 print(f"run 目录不存在: {run_root}", file=self._stderr)
                 return _EXIT_USAGE_ERROR
-            # milestone 事件写入既有 run 目录的 metrics 流（eval ticket 交付）
             print(f"评测目标 run 目录: {run_root}", file=self._stdout)
         print(
             f"评测计划：group={config.experiment.group}"
             f" N_baseline={config.schedule.baseline_samples}"
             f" 里程碑间隔={config.schedule.milestone_interval} iteration"
-            "（像素域 2.5D FID 基础设施由 eval ticket 交付）",
+            f" N_plateau={config.schedule.n_plateau}。里程碑解码评测"
+            "（2.5D FID/KID，milestone 事件入训练指标流）随 train 循环在"
+            "里程碑间隔触发；Baseline 采样与 RL 后重采随 train 落盘"
+            " manifest 样本路径。独立 eval 子命令（验收阶梯汇总）由后续 "
+            "ticket 交付",
             file=self._stdout,
         )
         return 0

@@ -225,14 +225,67 @@ class TestRejection:
         assert ("artifacts", "dataset_root") in self._locations(exc_info.value)
 
     def test_baseline_samples_in_spec_range(self, valid_config_dict: dict) -> None:
-        """N_baseline 口径 200–500（experiment-design 章）。"""
+        """N_baseline 生产口径 200–500（experiment-design 章）；fixture_mode
+        显式声明后放宽（Baseline manifest 条目随 fixture 全流程走）。"""
         data = copy.deepcopy(valid_config_dict)
         data["schedule"].update({"baseline_samples": 100})
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert ("schedule", "baseline_samples") in self._locations(exc_info.value)
+        assert "baseline_samples" in str(exc_info.value.errors())
+        data["fixture_mode"] = True
+        config = CynosureConfig.model_validate(data)  # fixture 显式声明后合法
+        assert config.schedule.baseline_samples == 100
+        data["fixture_mode"] = False
         data["schedule"].update({"baseline_samples": 500})
         CynosureConfig.model_validate(data)
+
+    def test_early_stop_params_schema(self, valid_config_dict: dict) -> None:
+        """早停参数落 config schema（AC：里程碑间隔/N_plateau/早停参数）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"].update({
+            "milestone_interval": 25,
+            "milestone_eval_samples": 4,
+            "n_plateau": 2,
+            "plateau_tolerance": 0.1,
+            "auc_chance_epsilon": 0.05,
+            "reward_trend_window": 20,
+        })
+        config = CynosureConfig.model_validate(data)
+        assert config.schedule.milestone_interval == 25
+        assert config.schedule.milestone_eval_samples == 4
+        assert config.schedule.n_plateau == 2
+        assert config.schedule.plateau_tolerance == pytest.approx(0.1)
+        assert config.schedule.auc_chance_epsilon == pytest.approx(0.05)
+        assert config.schedule.reward_trend_window == 20
+
+    def test_milestone_eval_samples_needs_at_least_two(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"] = {"milestone_eval_samples": 1}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("schedule", "milestone_eval_samples") in self._locations(exc_info.value)
+
+    def test_auc_chance_epsilon_below_half(self, valid_config_dict: dict) -> None:
+        """AUC 近 chance 判定带半径 ≥0.5 即恒真：hacking 签名失去判别力，拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"] = {"auc_chance_epsilon": 0.5}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("schedule", "auc_chance_epsilon") in self._locations(exc_info.value)
+
+    def test_vae_and_radimagenet_artifact_fields(self, valid_config_dict: dict) -> None:
+        """评测路径的新工件位：VAE 网络配置 JSON 与 RadImageNet 权重路径
+        （可缺省——装配时按用途显式拒绝），schema 可承载。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["artifacts"]["vae_config_json"] = "configs/vae.json"
+        data["artifacts"]["radimagenet_weights"] = "weights/radimagenet_resnet50.pth"
+        config = CynosureConfig.model_validate(data)
+        assert config.artifacts.vae_config_json == Path("configs/vae.json")
+        assert config.artifacts.radimagenet_weights == Path(
+            "weights/radimagenet_resnet50.pth",
+        )
 
     def test_max_iterations_capped_at_spec_upper(self, valid_config_dict: dict) -> None:
         """每组规模目标 200–500；50 sanity 合法、超出 500 拒绝。"""

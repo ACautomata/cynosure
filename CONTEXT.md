@@ -103,8 +103,12 @@ _Avoid_: 分辨率、尺度（尺度另有所指，见单/多尺度判别器）
 _Avoid_: 对照组、基准线
 
 **Quantitative evaluation（定量评测）**:
-像素域 2.5D FID（XY/YZ/ZX 三正交面、RadImageNet-ResNet50）+ KID/bootstrap CI 的自动化质量评测；跨模态组另加 3D SSIM/MAE。
+像素域 2.5D FID（XY/YZ/ZX 三正交面、RadImageNet-ResNet50）+ KID/bootstrap CI 的自动化质量评测；跨模态组另加 3D SSIM/MAE/PSNR（合成 target 与同一病例 ground-truth target 配对比较）。
 _Avoid_: L1
+
+**Milestone evaluation（里程碑评测）**:
+按里程碑间隔（默认每 50 iteration）在 train 循环内触发的解码评测——VAE 解码当前 policy 采样到像素域算 FID/KID，结果以 `milestone` 事件写入训练指标流。解码只发生在里程碑路径，不进逐 iteration 训练循环。
+_Avoid_: 定期评测、周期评测
 
 **Downstream distribution alignment（下游指标分布对齐）**:
 用 nnUNet 仪器产出肿瘤体积/质心/ET-WT，对合成影像与真实分布做 TOST/KS/EMD 对齐检验；合成影像无 GT，不比 Dice。

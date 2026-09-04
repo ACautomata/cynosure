@@ -82,6 +82,18 @@ class Artifacts(BaseModel):
         "运行时", "experiment-design",
         "图像 VAE checkpoint（autoencoder_v1.pt，AutoencoderKlMaisi）",
     )
+    vae_config_json: Path | None = SpecField(
+        "运行时", "reward-model",
+        "VAE 网络配置 JSON（键 = MONAI AutoencoderKlMaisi 构造参数名；"
+        "里程碑解码评测与生产预编码的装配源，与判别器工件对同构）",
+        default=None,
+    )
+    radimagenet_weights: Path | None = SpecField(
+        "运行时", "experiment-design",
+        "RadImageNet-ResNet50 权重文件（像素域 2.5D FID/KID 特征提取器的"
+        "生产装载源；公开发布权重的下载属施工，fixture 走 stub 注入）",
+        default=None,
+    )
     net_config_json: Path = SpecField(
         "运行时", "policy-modeling",
         "网络配置 JSON（UNet 构建参数与 scheduler 配置）",
@@ -499,13 +511,42 @@ class ScheduleConfig(BaseModel):
     )
     baseline_samples: int = SpecField(
         "运行时", "experiment-design",
-        "N_baseline：Baseline 样本量（与评估集同规模、同 seed 同条件、冻结只采一次）",
-        default=200, ge=200, le=500,
+        "N_baseline：Baseline 样本量（与评估集同规模、同 seed 同条件、冻结只采一次；"
+        "生产 200–500，fixture_mode 下放宽——Baseline manifest 条目随训练全流程走）",
+        default=200, ge=1, le=500,
+    )
+    milestone_eval_samples: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "里程碑解码评测样本数（取 Baseline manifest 条目的前缀，同 seed 同条件，"
+        "使里程碑 FID/KID 跨里程碑可比）",
+        default=8, ge=2,
+    )
+    kid_bootstrap_replicates: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "KID 置信区的无放回重采样重复数（重复越多 CI 越稳，代价线性增长）",
+        default=20, ge=1,
     )
     n_plateau: int = SpecField(
         "运行时", "experiment-design",
         "N_plateau：早停 plateau 里程碑数（默认 3）",
         default=3, ge=1,
+    )
+    plateau_tolerance: float = SpecField(
+        "tunable", "experiment-design",
+        "主判据（FID）plateau 判定容差：里程碑 FID 相对历史最优的改善 ≤ 容差"
+        "视为 plateau（绝对阈值为训练期经验数据，spec 只钉判据形态）",
+        default=0.5, ge=0.0,
+    )
+    auc_chance_epsilon: float = SpecField(
+        "tunable", "experiment-design",
+        "hacking 签名的「AUC 近 chance」判定带半径：|AUC − 0.5| ≤ ε",
+        default=0.02, gt=0.0,
+    )
+    reward_trend_window: int = SpecField(
+        "tunable", "experiment-design",
+        "「eval reward 仍升」判定的迭代窗口（最近 W 个 iter 事件的"
+        " anchor eval reward 线性斜率 > 0）",
+        default=10, ge=2,
     )
     milestone_interval: int = SpecField(
         "tunable", "本 spec 补钉",
@@ -521,6 +562,16 @@ class ScheduleConfig(BaseModel):
         "运行时", "experiment-design",
         "随机种子（随机性控制：Baseline 与 RL 后同 seed 同条件，差异唯一归因于 RL）",
     )
+
+    @field_validator("auc_chance_epsilon")
+    @classmethod
+    def _chance_band_within_half(cls, value: float) -> float:
+        if value >= 0.5:
+            raise ValueError(
+                "AUC 近 chance 判定带半径必须小于 0.5（带触 0.5 即恒真，"
+                "hacking 签名失去判别力）"
+            )
+        return value
 
 
 class ShardingConfig(BaseModel):
@@ -664,6 +715,12 @@ class CynosureConfig(BaseModel):
                 "生产 config（fixture_mode=false）下 num_inference_steps 定死 30"
                 f"（policy-modeling 章），得到 {self.policy.num_inference_steps}；"
                 "缩小日程属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        if not self.fixture_mode and self.schedule.baseline_samples < 200:
+            raise ValueError(
+                f"生产 config（fixture_mode=false）下 N_baseline 口径 200–500"
+                f"（experiment-design 章），得到 {self.schedule.baseline_samples}；"
+                "缩小样本量属 fixture，须经顶层 fixture_mode=true 显式声明"
             )
         return self
 
