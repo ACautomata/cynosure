@@ -74,11 +74,14 @@ class NetworkAssembler:
     @classmethod
     def loadable_state_dict(cls, model: Any) -> dict:
         """模型 state_dict 的可重载形式（与 ``_load_state_dict`` 的严格
-        装载成对的导出面）：parametrization（如 spectral norm）视图键
-        ``<prefix>.parametrizations.<attr>.original`` 固化回原键
-        ``<prefix>.<attr>``，parametrization 内部状态（power iteration
-        buffer ``_u``/``_v``）可从原始参数重建、不落盘——本方法产出的
-        checkpoint 可经本类装配路径严格重载（无参数化模型逐键同一）。"""
+        装载成对的导出面）：parametrization（如 spectral norm）的视图键
+        ``<prefix>.parametrizations.<attr>.original`` 与其内部状态
+        （power iteration buffer ``_u``/``_v``）不落盘，取而代之固化该
+        参数化属性的**有效权重**（parametrization 输出，即训练前向实际
+        使用的张量）到原键 ``<prefix>.<attr>``——本方法产出的 checkpoint
+        经本类装配路径严格重载后，重建的裸网络判别函数与保存时逐位
+        一致（固化原始参数则装载静默成功但前向漂移；无参数化模型逐键
+        同一）。"""
         state = model.state_dict()
         if not any(".parametrizations." in key for key in state):
             return state
@@ -90,7 +93,8 @@ class NetworkAssembler:
                 continue
             attribute, _, tail = rest.partition(".")
             if tail == "original":
-                loadable[f"{prefix}.{attribute}"] = value
+                parametrized = getattr(model.get_submodule(prefix), attribute)
+                loadable[f"{prefix}.{attribute}"] = parametrized.detach()
         return loadable
 
     @classmethod

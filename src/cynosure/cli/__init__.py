@@ -172,10 +172,19 @@ class CynosureCli:
         """训练循环（ticket #21 tracer bullet）：MGAI → 逐 k 梯度步 →
         判别器 Online update → iter 事件流 + checkpoint 落盘；
         ``--dump-trajectory`` 额外产出训练侧 log-prob 对（training.json）。"""
+        # 构造期 = 装配/输入契约（网络与 manifest 工件装载、跨字段守卫）：
+        # checkpoint 键/shape 不匹配的严格装载失败（RuntimeError）同属
+        # 输入契约违反，得到干净消息 + 未产出工件的 run 目录回滚
         try:
-            completed = GranularGrpoTrainer(
+            trainer = GranularGrpoTrainer(
                 config, artifacts, dump_trajectory=dump_trajectory,
-            ).run()
+            )
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            print(f"训练输入契约违反: {exc}", file=self._stderr)
+            self._rollback_untouched_run(artifacts)
+            return _EXIT_USAGE_ERROR
+        try:
+            completed = trainer.run()
         except (ValueError, FileNotFoundError) as exc:
             print(f"训练输入契约违反: {exc}", file=self._stderr)
             self._rollback_untouched_run(artifacts)

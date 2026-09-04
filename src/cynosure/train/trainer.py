@@ -290,16 +290,22 @@ class GranularGrpoTrainer:
                 "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
                 "随机初始化起步的在线训练，冷启动工作流）"
             )
-        scorer = RewardScorer(
-            NetworkArtifact(
-                config=NetworkAssembler.load_json(
-                    config.artifacts.discriminator_config_json,
+        # 网络构建（含冷启动随机初始化）在 schedule.seed 的派生流下进行，
+        # 并 fork 隔离全局 RNG——同 config 的两次冷启动判别器权重逐位
+        # 可复现，且不扰动进程全局 RNG 状态（sampling generators 独立
+        # 对象本就不受影响）
+        with torch.random.fork_rng():
+            torch.manual_seed(config.schedule.seed + 6)
+            scorer = RewardScorer(
+                NetworkArtifact(
+                    config=NetworkAssembler.load_json(
+                        config.artifacts.discriminator_config_json,
+                    ),
+                    checkpoint=config.artifacts.discriminator_ckpt,
                 ),
-                checkpoint=config.artifacts.discriminator_ckpt,
-            ),
-            config.reward,
-            ChannelStats.load(config.reward.channel_stats_json),
-        )
+                config.reward,
+                ChannelStats.load(config.reward.channel_stats_json),
+            )
         scorer.to(self._device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         seed = config.schedule.seed
         update = OnlineUpdate(

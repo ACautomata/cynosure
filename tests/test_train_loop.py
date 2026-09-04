@@ -22,7 +22,9 @@ import torch
 from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.buffer import ReplayBuffer
+from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from tests.conftest import CliSession, FixturePrepareScenario
@@ -173,10 +175,15 @@ class TestSingleIterationLoop:
     ) -> None:
         """spectral norm 启用时判别器 checkpoint 以可重载形式落盘：
         parametrization 键（``*.parametrizations.<attr>.original`` 与其
-        power iteration buffer ``_u``/``_v``）不进保存面——保存面固化到
-        原始键形（netbuild 装载源 = 未参数化键形的严格装载），否则该
-        支持配置（spectral_norm_enabled=true）的判别器 checkpoint 无法
-        经装配路径重载（strict load 报 missing/unexpected keys）。"""
+        power iteration buffer ``_u``/``_v``）不进保存面——保存面固化
+        **有效权重**（parametrization 输出），netbuild 严格装载路径重建
+        的裸网络判别函数与训练时**数值等价**（固化原始参数则前向不同：
+        装载静默成功但 reward/评测漂移）。
+
+        等价断言用严格容差（rtol 1e-5）而非逐位：跨「保存→磁盘→装载」
+        链的前向在同一权重下可差 1 ulp（浮点执行路径的进程态选择，
+        实测 maxdiff 1.19e-07 = 2^-23）；语义错误（固化参数视图）的
+        偏离是 σ 偏离 1 的百分量级，容差区分度充分。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -194,24 +201,24 @@ class TestSingleIterationLoop:
             ),
         ))
         assert set(saved.keys()) == set(fresh.state_dict().keys())
-        # 严格装载成功（netbuild 装配路径直接可用）
+        # 严格装载成功（netbuild 装配路径直接可用），且重建的裸网络
+        # 判别函数与训练时数值等价（有效权重语义，eval 相对照）
         reloaded = NetworkAssembler.discriminator(NetworkArtifact(
             config=NetworkAssembler.load_json(
                 config.artifacts.discriminator_config_json,
             ),
             checkpoint=checkpoint,
         ))
-        # 装载的是训练后的原始参数（parametrization 的 .original 视图：
-        # trained 键形 <prefix>.parametrizations.<attr>.original）
-        trained_state = trainer.rewards.discriminator.state_dict()
-        for name, value in reloaded.named_parameters():
-            prefix, _, attribute = name.rpartition(".")
-            parametrized = (
-                f"{prefix}.parametrizations.{attribute}.original"
-                if prefix else f"parametrizations.{attribute}.original"
-            )
-            expected = trained_state[parametrized if parametrized in trained_state else name]
-            assert torch.equal(value, expected)
+        reloaded.eval()
+        sample = trainer.rewards.buffer.recent_samples()[0].unsqueeze(0)
+        normalizer = ChannelNormalizer(
+            ChannelStats.load(config.reward.channel_stats_json),
+        )
+        normalized = normalizer.normalize(sample)
+        expected = trainer.rewards.discriminator(normalized)[-1]
+        assert torch.allclose(
+            reloaded(normalized)[-1], expected, rtol=1e-5, atol=1e-6,
+        )
 
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
@@ -302,6 +309,24 @@ class TestSingleIterationLoop:
         assert result.code == 2
         assert "训练输入契约违反" in result.stderr
         assert not run_dir.exists()  # 未产出工件 → 已回滚，可重试
+
+    def test_incompatible_checkpoint_rolls_back_run(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """checkpoint 装载失败（键/shape 不匹配 → 严格装载 RuntimeError）
+        同属输入契约违反：构造期得到干净消息 + 未产出工件的 run 目录
+        回滚——RuntimeError 不在捕获集内则裸 traceback 且目录残留，
+        修正 checkpoint 后同 --run-dir 重试被拒。"""
+        scenario.write_inputs()
+        bad = scenario.tmp_path / "bad_discriminator.pt"
+        torch.save({"bogus": torch.zeros(1)}, bad)  # 键形与网络不符
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["artifacts"]["discriminator_ckpt"] = str(bad)
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        result = scenario.train()
+        assert result.code == 2
+        assert "训练输入契约违反" in result.stderr
+        assert not scenario.run_dir.exists()  # 已回滚，可重试
 
 
 class TestPolicyOptimizerConfig:
@@ -458,6 +483,33 @@ class TestDevicePlacement:
             trainer.rewards.discriminator.parameters().__next__().device.type
             == "cpu"
         )
+
+    def test_cold_start_discriminator_is_seeded_deterministically(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """冷启动判别器在 schedule.seed 的派生流下确定初始化：随机初始化
+        消耗全局 RNG，而 sampling generators 在装配序列更后才创建——同
+        config 的两次冷启动若依赖进程全局 RNG 状态，判别器初始权重不同，
+        初始 reward 与其后所有 policy update 都不可复现（seeded 实验
+        失效）。两次独立构造（不同进程内全局状态、同 seed）判别器权重
+        须逐位一致。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["artifacts"]["discriminator_ckpt"] = None
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        weights: list[list[torch.Tensor]] = []
+        for name in ("a", "b"):
+            config = ConfigLoader.load(scenario.config_path)
+            artifacts = RunArtifacts.init(
+                config, scenario.tmp_path / f"run_cold_{name}",
+            )
+            trainer = GranularGrpoTrainer(config, artifacts)
+            weights.append([
+                param.detach().clone()
+                for param in trainer.rewards.discriminator.parameters()
+            ])
+        for first, second in zip(weights[0], weights[1]):
+            assert torch.equal(first, second)
 
     def test_scoring_inputs_carry_no_stray_cpu_tensors(
         self, scenario: TrainingLoopScenario,
