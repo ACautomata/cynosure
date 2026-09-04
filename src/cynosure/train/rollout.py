@@ -4,22 +4,33 @@
 latent）→ 每个被优化训练步 k 单步 SDE 扰动 G 方向 → 各 Granularity λ
 ODE 续跑到终点 → 判别器 raw real-logit 打分 → π_old 记录。
 
+条件分布按组定义、均匀采样（experiment-design）：组1 = ModalLabelCondition
+Sampler（四序列均匀）；组2 = CrossModalConditionSampler（12 有序对均匀，
+源影像 latent 按 real sample pool 的序列分层抽取）。RolloutPhase 经构造
+注入条件分布——rollout 编排本身组无关。
+
 数值口径：采样（Anchor/扰动/续跑的 policy 前向）进 bf16 autocast（与
 更新相同口径，保证 π_old 可被逐位重算）；判别器打分在 autocast 外
 fp32（T05 已锚定的 reward 数值口径）。
 """
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 
-from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.config import CynosureConfig, MODALITIES, Modality
 from cynosure.policy.condition import ModalityMapping, RolloutCondition
 from cynosure.policy.sampler import RolloutSampler
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.scorer import LatentScorer
 
 _BASE_BATCH = 8
 """base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）。"""
+
+CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
+"""条件分布的体素间距（1.0 × 1e2，fixture 单位间距；生产 spacing 分布由
+数据侧 ticket 接管）——两组条件分布共用同一常量（单一来源）。"""
 
 
 @dataclass(frozen=True)
@@ -42,8 +53,8 @@ class IterationRollout:
     """一个 RL iteration 的 rollout 相产出（eval + no_grad 的完整记录）。"""
 
     condition: RolloutCondition
-    modality: str
-    """本 iteration 采样的目标序列（条件分布四序列均匀采样）——iter
+    modality: Modality
+    """本 iteration 采样的目标序列（条件分布均匀采样的目标端）——iter
     事件按目标序列归因 reward/loss/AUC 的依据。"""
     anchor_eval_reward: float
     """Anchor 全 ODE 终点的判别器 reward（训练曲线信号，不参与 loss）。"""
@@ -56,15 +67,29 @@ class IterationRollout:
     """组内 reward std（各 (k, λ) 组内 std 的均值）——非退化观测面。"""
 
 
+class ConditionSampler(Protocol):
+    """组条件分布的策略接口（experiment-design「条件分布按组定义、均匀采样」）。
+
+    ``sample()`` 连同采中的目标序列名返回——iter 事件按目标序列归因
+    健康指标（per-sequence 健康监控）的依据。
+    """
+
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, Modality]:
+        """均匀采一个条件的 rollout 条件（batch=1，采样场负责广播）。
+
+        ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流
+        （不漂移训练 rollout 的抽样流，各组实现同一约定）。"""
+        ...
+
+
 class ModalLabelConditionSampler:
     """组1 条件分布：四序列均匀采样（experiment-design「条件分布按组定义」）。
 
     条件 c = (modality label, spacing)。spacing 生产语义为数据分布的体素
     间距（×1e2 恒传，基座 include_spacing_input=true）；fixture 无源数据
     分布，取单位间距。"""
-
-    SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
-    """fixture 单位间距（1.0 × 1e2）；生产 spacing 分布由数据侧 ticket 接管。"""
 
     def __init__(
         self,
@@ -78,7 +103,7 @@ class ModalLabelConditionSampler:
 
     def sample(
         self, generator: torch.Generator | None = None,
-    ) -> tuple[RolloutCondition, str]:
+    ) -> tuple[RolloutCondition, Modality]:
         """均匀采一个序列的 rollout 条件（label batch=1，组合场负责广播），
         连同采中的序列名返回——iter 事件按目标序列归因健康指标的依据。
         随机数经 CPU generator 生成（跨设备可复现的 fixture「固定 seed」
@@ -90,9 +115,90 @@ class ModalLabelConditionSampler:
         return (
             RolloutCondition(
                 label=torch.tensor([label], device=self._device),
-                spacing=torch.tensor([self.SPACING_X1E2], device=self._device),
+                spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
             ),
             MODALITIES[index],
+        )
+
+
+class SourceLatentPool:
+    """组2 条件的源影像 latent 库（按源序列分层的均匀抽取）。
+
+    源影像分布 = VAE 预编码 train split——工件复用 Real sample pool
+    manifest（同一次 prepare 产出、experiment-design「组2 按 4 序列分层」），
+    与判别器 real 侧共用工件、各自独立采样（policy 条件与 reward real 是
+    两个消费方，不是同一份采样状态）。"""
+
+    def __init__(self, manifest: LatentManifest, device: torch.device) -> None:
+        self._manifest = manifest
+        self._device = device
+        self._entries: dict[Modality, list[PoolEntry]] = {
+            modality: [] for modality in MODALITIES
+        }
+        for entry in manifest.entries:
+            self._entries[entry.modality].append(entry)
+        empty = [m for m, entries in self._entries.items() if not entries]
+        if empty:
+            raise ValueError(
+                f"real pool manifest 缺少序列 {empty} 的条目"
+                "（组2 源影像条件要求四序列全部分层非空）"
+            )
+
+    def size(self, modality: Modality) -> int:
+        """该序列的条目数（均匀抽样的总体）。"""
+        return len(self._entries[modality])
+
+    def latent(self, modality: Modality, index: int) -> torch.Tensor:
+        """按序列取第 index 枚预编码 latent（[C, D, H, W]，已迁移到
+        rollout 设备；懒加载与判别器 real 侧同一装载契约）。"""
+        entry = self._entries[modality][index]
+        return self._manifest.load_latent(entry).to(self._device)
+
+
+class CrossModalConditionSampler:
+    """组2 条件分布：四序列 12 有序 src→tgt 对均匀采样（experiment-design）。
+
+    条件 c = (源影像 latent, 目标序列 label, spacing)——两个条件都带
+    （policy-modeling 章 MDP）；源影像 latent 按源序列从 SourceLatentPool
+    均匀抽取，scale_factor 缩放发生在组2 采样场（条件的唯一缩放点）。
+    ``pairs`` 来自 config（cross_modal_pairs 可配置），不设代码内副本。"""
+
+    def __init__(
+        self,
+        mapping: ModalityMapping,
+        pairs: list[tuple[Modality, Modality]],
+        pool: SourceLatentPool,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> None:
+        if not pairs:
+            raise ValueError("组2 条件分布的有序对清单不得为空")
+        self._mapping = mapping
+        self._pairs = list(pairs)
+        self._pool = pool
+        self._generator = generator
+        self._device = device
+
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, Modality]:
+        """均匀采一个有序对（目标 label batch=1 + 源影像 latent batch=1），
+        连同目标序列名返回——iter 事件按目标序列归因健康指标的依据；
+        ``generator`` 缺省用主流（base 分区种子生成传独立流）。"""
+        stream = generator if generator is not None else self._generator
+        pair_index = int(torch.randint(len(self._pairs), (1,), generator=stream))
+        source_modality, target_modality = self._pairs[pair_index]
+        source_index = int(torch.randint(
+            self._pool.size(source_modality), (1,), generator=stream,
+        ))
+        label = self._mapping.label(target_modality)
+        return (
+            RolloutCondition(
+                label=torch.tensor([label], device=self._device),
+                spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
+                source_latent=self._pool.latent(source_modality, source_index).unsqueeze(0),
+            ),
+            target_modality,
         )
 
 
@@ -105,6 +211,7 @@ class RolloutPhase:
         sampler: RolloutSampler,
         scorer: LatentScorer,
         generator: torch.Generator,
+        condition_sampler: ConditionSampler,
         device_type: str = "cpu",
         autocast_dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
@@ -117,14 +224,10 @@ class RolloutPhase:
         self._device_type = device_type
         self._amp_dtype = autocast_dtype
         self._device = device
+        self._condition_sampler = condition_sampler
         # base 分区种子生成的独立流：其抽取数随 replay_buffer_capacity
         # 变化，与训练 rollout 共流会让 buffer 容量实验漂移 policy 样本流
         self._base_generator = base_generator
-        self._condition_sampler = ModalLabelConditionSampler(
-            ModalityMapping.load(config.artifacts.modality_mapping_json),
-            generator,
-            device,
-        )
 
     def run_iteration(self) -> IterationRollout:
         """单条件组的完整 rollout 与打分（执行序第 1 相的单进程版）。"""

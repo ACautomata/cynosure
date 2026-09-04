@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
 )
@@ -13,6 +14,7 @@ from monai.networks.schedulers import RFlowScheduler
 from cynosure.fixtures import Fixture, FIXTURE_UNET_CONFIG
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy import (
+    BareConditionField,
     CfgCombinedField,
     RolloutCondition,
     RolloutSampler,
@@ -266,6 +268,203 @@ class TestCfgCombinedField:
             )
         # batch 组织的 fp32 归约序差（实测 max |Δ| ≈ 1e-5）
         assert torch.allclose(grouped, expanded, rtol=1e-4, atol=2e-5)
+
+
+class RecordingControlnet:
+    """测试仪器：委托真实 ControlNet 前向、记录每次调用的输入组织。"""
+
+    def __init__(self, controlnet: ControlNetMaisi) -> None:
+        self._controlnet = controlnet
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs: object):
+        self.calls.append({
+            "batch": int(kwargs["x"].shape[0]),
+            "timesteps": kwargs["timesteps"].tolist(),
+            "labels": kwargs["class_labels"].tolist(),
+            "controlnet_cond": kwargs["controlnet_cond"],
+        })
+        return self._controlnet(**kwargs)
+
+
+class TestBareConditionField:
+    """组2 CFG=0 裸条件单前向：frozen base UNet + ControlNet 残差注入，
+    双条件（源影像 latent × scale_factor + 目标序列 token）都参与（ADR-0002：
+    基座代码强制 cfg==0，无无条件分支）。"""
+
+    LABEL = 34  # t1c 的 modality token（目标序列）
+    SCALE_FACTOR = 2.0
+
+    @pytest.fixture
+    def fixture_controlnet(self) -> ControlNetMaisi:
+        torch.manual_seed(7)
+        return Fixture().controlnet().eval()
+
+    @pytest.fixture
+    def recording_unet(self, fixture_unet: DiffusionModelUNetMaisi) -> RecordingUnet:
+        return RecordingUnet(fixture_unet)
+
+    @pytest.fixture
+    def recording_controlnet(self, fixture_controlnet: ControlNetMaisi) -> RecordingControlnet:
+        return RecordingControlnet(fixture_controlnet)
+
+    @pytest.fixture
+    def field(
+        self, recording_unet: RecordingUnet, recording_controlnet: RecordingControlnet,
+    ) -> BareConditionField:
+        return BareConditionField(
+            recording_unet, recording_controlnet,
+            source_latent_scale_factor=self.SCALE_FACTOR,
+        )
+
+    @pytest.fixture
+    def condition(self) -> RolloutCondition:
+        torch.manual_seed(13)
+        return RolloutCondition(
+            label=torch.tensor([self.LABEL]),
+            spacing=SPACING,
+            source_latent=torch.randn(1, *LATENT_SHAPE),
+        )
+
+    def test_velocity_single_bare_forward_with_residuals(
+        self, field: BareConditionField, recording_unet: RecordingUnet,
+        recording_controlnet: RecordingControlnet, condition: RolloutCondition,
+    ) -> None:
+        """单前向（无 CFG 拆分）：ControlNet batch=1 产出残差注入 UNet，
+        条件 = 源 latent × scale_factor + 目标 label 双条件。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        field.velocity(x, timesteps=442, condition=condition)
+        assert len(recording_controlnet.calls) == 1
+        call = recording_controlnet.calls[0]
+        assert call["batch"] == 1
+        assert call["labels"] == [self.LABEL]  # 目标序列 token 进 ControlNet
+        assert torch.equal(
+            call["controlnet_cond"],
+            condition.source_latent * self.SCALE_FACTOR,  # 源 latent × scale_factor
+        )
+        assert len(recording_unet.calls) == 1
+        assert recording_unet.calls[0]["batch"] == 1
+
+    def test_velocity_matches_manual_residual_injection(
+        self, field: BareConditionField, fixture_unet: DiffusionModelUNetMaisi,
+        fixture_controlnet: ControlNetMaisi, condition: RolloutCondition,
+    ) -> None:
+        """数值 = UNet(x, residuals=ControlNet(x, cond=src·scale, label))
+        （残差注入的逐位对照）。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        down, mid = fixture_controlnet(
+            x=x,
+            timesteps=torch.tensor([442]),
+            controlnet_cond=condition.source_latent * self.SCALE_FACTOR,
+            class_labels=condition.label,
+        )
+        with torch.no_grad():
+            expected = fixture_unet(
+                x=x,
+                timesteps=torch.tensor([442]),
+                class_labels=condition.label,
+                spacing_tensor=SPACING,
+                down_block_additional_residuals=tuple(down),
+                mid_block_additional_residual=mid,
+            )
+            actual = field.velocity(x, timesteps=442, condition=condition)
+        assert torch.equal(actual, expected)
+
+    def test_source_latent_condition_changes_velocity(
+        self, field: BareConditionField, condition: RolloutCondition,
+    ) -> None:
+        """双条件注入生效：源影像 latent 不同 → velocity 不同（ControlNet
+        条件通道真实参与，非摆设参数）。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        other = RolloutCondition(
+            label=condition.label,
+            spacing=condition.spacing,
+            source_latent=torch.randn(1, *LATENT_SHAPE),
+        )
+        with torch.no_grad():
+            v_first = field.velocity(x, timesteps=442, condition=condition)
+            v_second = field.velocity(x, timesteps=442, condition=other)
+        assert not torch.equal(v_first, v_second)
+
+    def test_group_velocity_single_batch1_forward_reused_across_group(
+        self, field: BareConditionField, recording_unet: RecordingUnet,
+        recording_controlnet: RecordingControlnet, condition: RolloutCondition,
+    ) -> None:
+        """全组复用（G²RPO 技巧，spec policy-modeling 实现接缝 #2）：
+        ControlNet 与 UNet 各 batch=1 一次前向，velocity 输出 expand 成 G
+        ——组内 G 条方向共享同一 x_k 与条件，batch-G 前向是 12× 的纯浪费。"""
+        x = torch.randn(1, *LATENT_SHAPE)
+        v = field.group_velocity(x, timesteps=442, condition=condition, group_size=12)
+        assert v.shape == (12, *LATENT_SHAPE)
+        assert len(recording_controlnet.calls) == 1
+        assert len(recording_unet.calls) == 1
+        assert recording_controlnet.calls[0]["batch"] == 1
+        assert recording_unet.calls[0]["batch"] == 1  # G²RPO：batch=1 评估后 expand
+
+    def test_group_velocity_matches_expanded_velocity(
+        self, field: BareConditionField, condition: RolloutCondition,
+    ) -> None:
+        """复用路径与逐方向前向数值一致（batch 尺寸仅引入 fp32 舍入差）。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        with torch.no_grad():
+            grouped = field.group_velocity(
+                x, timesteps=442, condition=condition, group_size=12,
+            )
+            expanded = field.velocity(
+                x.expand(12, -1, -1, -1, -1), timesteps=442,
+                condition=condition.broadcast_to(12),
+            )
+        assert torch.allclose(grouped, expanded, rtol=1e-4, atol=2e-5)
+
+    def test_missing_source_latent_rejected(
+        self, recording_unet: RecordingUnet, recording_controlnet: RecordingControlnet,
+    ) -> None:
+        """组2 采样场缺源影像条件 = 装配契约违例：显式拒绝而非静默单条件
+        前向（跨模态对齐会静默失效）。"""
+        field = BareConditionField(recording_unet, recording_controlnet, 1.0)
+        condition = RolloutCondition(label=torch.tensor([29]), spacing=SPACING)
+        with pytest.raises(ValueError, match="source_latent"):
+            field.velocity(torch.randn(1, *LATENT_SHAPE), 442, condition)
+
+
+class TestRolloutConditionSourceLatent:
+    """组2 条件扩展：source_latent 与 label/spacing 同 batch 约束与广播。"""
+
+    def test_broadcast_expands_source_latent(self) -> None:
+        torch.manual_seed(17)
+        condition = RolloutCondition(
+            label=torch.tensor([29]),
+            spacing=SPACING,
+            source_latent=torch.randn(1, *LATENT_SHAPE),
+        )
+        broadcast = condition.broadcast_to(12)
+        assert broadcast.label.shape == (12,)
+        assert broadcast.spacing.shape == (12, 3)
+        assert broadcast.source_latent.shape == (12, *LATENT_SHAPE)
+        assert torch.equal(broadcast.source_latent[0], condition.source_latent[0])
+
+    def test_batch_mismatch_between_label_and_source_rejected(self) -> None:
+        torch.manual_seed(17)
+        with pytest.raises(ValueError, match="batch"):
+            RolloutCondition(
+                label=torch.tensor([29]),
+                spacing=SPACING,
+                source_latent=torch.randn(3, *LATENT_SHAPE),
+            )
+
+    def test_batch_mismatch_on_broadcast_rejected(self) -> None:
+        torch.manual_seed(17)
+        condition = RolloutCondition(
+            label=torch.tensor([29, 34]),
+            spacing=SPACING.expand(2, -1),
+            source_latent=torch.randn(2, *LATENT_SHAPE),
+        )
+        with pytest.raises(ValueError, match="batch"):
+            condition.broadcast_to(12)
 
 
 class TestRolloutSampler:

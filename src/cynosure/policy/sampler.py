@@ -13,7 +13,7 @@ import torch
 
 from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.cursor import TrajectoryCursor
-from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel, SdeTransition
 
 
@@ -22,7 +22,7 @@ class RolloutSampler:
 
     def __init__(
         self,
-        field: CfgCombinedField,
+        field: VelocityField,
         kernel: SdeKernel,
         cursor: TrajectoryCursor,
     ) -> None:

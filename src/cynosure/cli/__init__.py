@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
-from cynosure.train import GranularGrpoTrainer, RunArtifacts
+from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
 
 _EXIT_USAGE_ERROR = 2
 
@@ -118,6 +118,27 @@ class CynosureCli:
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
+        run_trajectory_diagnostic = (
+            args.dump_trajectory and config.experiment.group == "modal-label"
+        )
+        if args.dump_trajectory and not run_trajectory_diagnostic:
+            # trajectory.json 的 MONAI 直接步对照是组1（CFG=10 组合场）专属
+            # 诊断：组2/组3 跳过该工件而非静默产出组1 对照。组2 的训练侧
+            # log-prob 对（training.json，测试面 #3）与采样场无关、照常产出；
+            # 组3 的两阶段会互相覆写同名 training.json，暂不产出。
+            if config.experiment.group == "sequential":
+                print(
+                    "轨迹诊断工件（trajectory.json / training.json）暂不覆盖"
+                    "组3 两阶段序贯，本运行跳过",
+                    file=self._stderr,
+                )
+            else:
+                print(
+                    "轨迹诊断工件（trajectory.json）当前仅覆盖组1"
+                    "（modal-label）采样场，本运行跳过；训练侧 log-prob 对"
+                    "（training.json）照常产出",
+                    file=self._stderr,
+                )
         if args.run_dir is None and "RANK" in os.environ:
             # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
             print(
@@ -143,7 +164,7 @@ class CynosureCli:
             print(f"等待 rank 0 创建 run 目录超时: {run_root}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
-        if args.dump_trajectory:
+        if run_trajectory_diagnostic:
             code = self._dump_trajectory(config, artifacts)
             if code != 0:
                 return code
@@ -169,16 +190,21 @@ class CynosureCli:
         self, config: CynosureConfig, artifacts: RunArtifacts,
         dump_trajectory: bool,
     ) -> int:
-        """训练循环（ticket #21 tracer bullet）：MGAI → 逐 k 梯度步 →
-        判别器 Online update → iter 事件流 + checkpoint 落盘；
+        """训练循环（ticket #21 tracer bullet，#23 扩展三组）：MGAI →
+        逐 k 梯度步 → 判别器 Online update → iter 事件流 + checkpoint
+        落盘；组3 经 SequentialTrainer 序贯两阶段（单 run 目录）；
         ``--dump-trajectory`` 额外产出训练侧 log-prob 对（training.json）。"""
         # 构造期 = 装配/输入契约（网络与 manifest 工件装载、跨字段守卫）：
         # checkpoint 键/shape 不匹配的严格装载失败（RuntimeError）同属
         # 输入契约违反，得到干净消息 + 未产出工件的 run 目录回滚
         try:
-            trainer = GranularGrpoTrainer(
-                config, artifacts, dump_trajectory=dump_trajectory,
-            )
+            trainer: GranularGrpoTrainer | SequentialTrainer
+            if config.experiment.group == "sequential":
+                trainer = SequentialTrainer(config, artifacts)
+            else:
+                trainer = GranularGrpoTrainer(
+                    config, artifacts, dump_trajectory=dump_trajectory,
+                )
         except (ValueError, FileNotFoundError, RuntimeError) as exc:
             print(f"训练输入契约违反: {exc}", file=self._stderr)
             self._rollback_untouched_run(artifacts)

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
 )
@@ -52,6 +53,26 @@ FIXTURE_DISCRIMINATOR_CONFIG: dict = {
     "norm": ["GROUP", {"num_groups": 8}],
 }
 
+# fixture ControlNet 构造参数（与 fixture UNet 同构：残差注入要求
+# num_channels / num_res_blocks / attention_levels 逐级对齐；
+# conditioning_embedding_in_channels = 源影像 latent 通道数 4，
+# conditioning_embedding_num_channels=[8]（单层 stride-1 卷积）使条件嵌入与
+# UNet conv_in 输出同形；use_checkpointing 关闭（fixture CPU 全循环无显存压力））
+FIXTURE_CONTROLNET_CONFIG: dict = {
+    "spatial_dims": 3,
+    "in_channels": 4,
+    "num_res_blocks": [1, 1],
+    "num_channels": [8, 16],
+    "attention_levels": [False, False],
+    "norm_num_groups": 8,
+    "num_head_channels": 8,
+    "with_conditioning": False,
+    "num_class_embeds": 128,
+    "conditioning_embedding_in_channels": 4,
+    "conditioning_embedding_num_channels": [8],
+    "use_checkpointing": False,
+}
+
 FIXTURE_MODALITY_MAPPING: dict[str, int] = {"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31}
 """基座 modality_mapping 的文档值（config Artifacts.modality_mapping_json
 同口径：t1n/t1c/t2w/t2f → 29/34/30/31），fixture 以工件形式落盘。"""
@@ -66,6 +87,8 @@ class FixtureArtifacts:
 
     unet_ckpt: Path
     unet_config_json: Path
+    controlnet_ckpt: Path
+    controlnet_config_json: Path
     discriminator_ckpt: Path
     discriminator_config_json: Path
     modality_mapping_json: Path
@@ -102,12 +125,26 @@ class Fixture:
         config["norm"] = tuple(config["norm"])
         return PatchDiscriminator(**config)
 
+    def controlnet(self) -> ControlNetMaisi:
+        """随机初始化的 MONAI ControlNetMaisi（与 fixture UNet 同构）。
+
+        ControlNet 惯例零初始化（controlnet 块与条件嵌入 conv_out）：未训练
+        时残差恒零、源影像条件不参与前向——与 unet 相同的全零卷积重初始化
+        使条件敏感性真实化（网络类与确定性不变）。"""
+        controlnet = ControlNetMaisi(**FIXTURE_CONTROLNET_CONFIG)
+        for module in controlnet.modules():
+            if isinstance(module, nn.Conv3d) and not module.weight.abs().any():
+                nn.init.normal_(module.weight, std=_ZERO_CONV_REINIT_STD)
+        return controlnet
+
     def write_artifacts(self, directory: Path) -> FixtureArtifacts:
         """把 fixture 网络写成 ckpt + 网络配置 JSON（netbuild 可直接装载）。"""
         directory.mkdir(parents=True, exist_ok=True)
         artifacts = FixtureArtifacts(
             unet_ckpt=directory / "unet.pt",
             unet_config_json=directory / "unet_config.json",
+            controlnet_ckpt=directory / "controlnet.pt",
+            controlnet_config_json=directory / "controlnet_config.json",
             discriminator_ckpt=directory / "discriminator.pt",
             discriminator_config_json=directory / "discriminator_config.json",
             modality_mapping_json=directory / "modality_mapping.json",
@@ -116,19 +153,31 @@ class Fixture:
         artifacts.unet_config_json.write_text(
             json.dumps(FIXTURE_UNET_CONFIG, indent=2), encoding="utf-8",
         )
+        # 判别器先于 ControlNet 构造：write_artifacts 的权重消费调用方的
+        # 环境 RNG 流，判别器保持历史流位（unet 之后第二个构造）——reward
+        # fixture 的 held-out AUC 门槛测试对该初始化敏感，不因新增工件重掷
         torch.save(self.discriminator().state_dict(), artifacts.discriminator_ckpt)
         artifacts.discriminator_config_json.write_text(
             json.dumps(FIXTURE_DISCRIMINATOR_CONFIG, indent=2), encoding="utf-8",
+        )
+        torch.save(self.controlnet().state_dict(), artifacts.controlnet_ckpt)
+        artifacts.controlnet_config_json.write_text(
+            json.dumps(FIXTURE_CONTROLNET_CONFIG, indent=2), encoding="utf-8",
         )
         artifacts.modality_mapping_json.write_text(
             json.dumps(FIXTURE_MODALITY_MAPPING, indent=2), encoding="utf-8",
         )
         return artifacts
 
-    def config(self, artifacts_dir: Path) -> CynosureConfig:
-        """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。"""
+    def config(
+        self, artifacts_dir: Path, group: str = "modal-label",
+    ) -> CynosureConfig:
+        """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。
+
+        ``group`` 选实验组（三选一）；组2/组3 的 config 携带 ControlNet
+        工件对（schema 强制），组1 携带亦无害（modal-label 训练不消费）。"""
         return CynosureConfig.model_validate({
-            "experiment": {"group": "modal-label"},
+            "experiment": {"group": group},
             "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "artifacts": {
@@ -138,6 +187,9 @@ class Fixture:
                 "net_config_json": str(artifacts_dir / "unet_config.json"),
                 "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
                 "dataset_root": str(artifacts_dir / "dataset"),
+                # ControlNet 工件与 write_artifacts 同构：组2/组3 的 policy 装配源
+                "controlnet_ckpt": str(artifacts_dir / "controlnet.pt"),
+                "controlnet_config_json": str(artifacts_dir / "controlnet_config.json"),
                 # 判别器工件与 write_artifacts 同构：fixture 打分/在线更新装载源
                 "discriminator_config_json": str(artifacts_dir / "discriminator_config.json"),
                 "discriminator_ckpt": str(artifacts_dir / "discriminator.pt"),
