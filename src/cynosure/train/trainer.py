@@ -1,4 +1,5 @@
-"""单进程 Granular-GRPO 训练循环（ticket #21 tracer bullet）。
+"""单进程 Granular-GRPO 训练循环（ticket #21 tracer bullet，#23 扩展到
+组2；组3 的两阶段序贯由 SequentialTrainer 编排本类）。
 
 spec #15 执行序的单进程版（分布式 allreduce/barrier 留 T09）：
 
@@ -7,13 +8,18 @@ spec #15 执行序的单进程版（分布式 allreduce/barrier 留 T09）：
       2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次）；
          判别器 Online update（50% 当前 fake + 50% 回放，单进程直通）
       3. iter 事件落盘（Anchor eval reward / 组内 reward std / held-out
-         AUC / loss 组件 / buffer 占比 / lr / 耗时）
+         AUC / loss 组件 / buffer 占比 / lr / 耗时；组3 stage-2 带 stage=2）
     train 启动时：用冻结初始 policy 自动生成 buffer base 分区。
+
+可训练对象按组装配（GroupPolicy）：组1 = UNet 全参、组2 = ControlNet
+（base UNet 冻结经装配期断言验证）。每组一次装配 → 判别器与 Replay
+buffer 随训练实例天然隔离（跨组/跨阶段不复用）。
 
 （dist.barrier() 与断点续训状态机分属 T09 / T07。）
 """
 
 import time
+from dataclasses import dataclass
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -22,7 +28,7 @@ from cynosure.config import CynosureConfig, Modality
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.cursor import TrajectoryCursor
-from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
@@ -31,11 +37,36 @@ from cynosure.reward.buffer import ReplayBuffer, ReplayStore
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate, UpdateReport
-from cynosure.train.artifacts import IterEvent, RunArtifacts
+from cynosure.train.artifacts import IterEvent, POLICY_CHECKPOINT_TEMPLATE, RunArtifacts
+from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase
 
 AMP_DTYPES: dict[str, torch.dtype] = {"bf16": torch.bfloat16}
 """config amp_dtype（Literal["bf16"] 定死）→ torch autocast dtype。"""
+
+
+@dataclass(frozen=True)
+class AmpContext:
+    """装配期单点选定的数值口径：设备 + autocast dtype（bf16 autocast +
+    fp32 master weights 的单进程落地）。所有模型与 rollout/打分张量随
+    device 放置——autocast(device_type) 只影响前向 dtype，不移动张量。"""
+
+    device: torch.device
+    dtype: torch.dtype
+
+    @property
+    def device_type(self) -> str:
+        return self.device.type
+
+
+@dataclass(frozen=True)
+class StageTag:
+    """本阶段在 run 目录内的产物归属（组3 两阶段隔离的载体）：指标事件
+    的 stage 号 + checkpoint 文件名前缀。单阶段组（组1/组2）用默认值
+    （stage 1、无前缀），产物名与历史布局逐字一致。"""
+
+    stage: int = 1
+    checkpoint_prefix: str = ""
 
 
 class TrainingLogProbPair(BaseModel):
@@ -117,7 +148,8 @@ class RewardCoordinator:
 
 
 class GranularGrpoTrainer:
-    """单进程 Granular-GRPO 训练循环编排（config 驱动装配）。"""
+    """单进程 Granular-GRPO 训练循环编排（config 驱动装配；一次装配 =
+    一个组的一个阶段）。"""
 
     def __init__(
         self,
@@ -126,11 +158,12 @@ class GranularGrpoTrainer:
         *,
         dump_trajectory: bool = False,
         device: torch.device | None = None,
+        stage: StageTag | None = None,
     ) -> None:
-        if config.experiment.group != "modal-label":
+        if config.experiment.group == "sequential":
             raise ValueError(
-                f"实验组 {config.experiment.group} 的采样场（ControlNet / "
-                "序贯衔接）由后续 ticket 交付，当前仅支持 modal-label"
+                "组3（sequential）的两阶段序贯由 SequentialTrainer 编排："
+                "stage-1/阶段-2 各自是一次本类的单阶段运行"
             )
         if config.policy.sde_eta <= 0.0:
             raise ValueError(
@@ -142,43 +175,47 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self.advantage = MgaiAdvantage(clamp=config.grpo.advantage_clamp)
         self._dump = dump_trajectory
+        self.stage_tag = stage if stage is not None else StageTag()
         # 装配期单点选设备（local rank 0 的加速器）；分布式 sharding 属 T09。
         # 所有模型与 rollout/打分张量随该设备放置——autocast(device_type)
         # 只影响前向 dtype，不移动任何张量
-        self._device = (
-            device if device is not None
-            else torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu",
-            )
+        self._amp = AmpContext(
+            device=(
+                device if device is not None
+                else torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu",
+                )
+            ),
+            dtype=AMP_DTYPES[config.policy.amp_dtype],
         )
-        self._amp_dtype = AMP_DTYPES[config.policy.amp_dtype]
-
-        self.unet = NetworkAssembler.unet(NetworkArtifact(
-            config=NetworkAssembler.load_json(config.artifacts.net_config_json),
-            checkpoint=config.artifacts.unet_ckpt,
-        )).to(self._device)
-        sampler = self._assemble_sampler()
+        # rollout 相与条件分布共享同一 generator：全循环确定性的单随机流
+        rollout_generator = torch.Generator().manual_seed(config.schedule.seed)
+        self.policy = GroupPolicy.build(config, rollout_generator, self._amp.device)
+        sampler = self._assemble_sampler(self.policy.field)
         self.rewards = self._assemble_rewards()
         self.updater = StepwisePolicyUpdate(
             sampler=sampler,
-            optimizer=torch.optim.AdamW(
-                self.unet.parameters(),
-                lr=config.policy.policy_lr,
-                weight_decay=config.policy.policy_weight_decay,
-            ),
+            optimizer=self.policy.optimizer,
             loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
-            device_type=self._device.type,
-            amp_dtype=self._amp_dtype,
+            device_type=self._amp.device_type,
+            amp_dtype=self._amp.dtype,
         )
         self.rollout = RolloutPhase(
             config,
             sampler,
             self.rewards.update.scorer,
-            torch.Generator().manual_seed(config.schedule.seed),
-            device_type=self._device.type,
-            autocast_dtype=self._amp_dtype,
-            device=self._device,
+            rollout_generator,
+            condition_sampler=self.policy.conditions,
+            device_type=self._amp.device_type,
+            autocast_dtype=self._amp.dtype,
+            device=self._amp.device,
         )
+
+    @property
+    def unet(self) -> torch.nn.Module:
+        """base UNet（组1 即可训练 policy 本体；组2/组3-stage2 为冻结 base，
+        经 GroupPolicy 装配期断言验证 requires_grad 全关）。"""
+        return self.policy.unet
 
     def seed_base_partition(self) -> None:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
@@ -192,7 +229,7 @@ class GranularGrpoTrainer:
     def run(self) -> int:
         """训练主循环：base 分区自动生成 → 逐 iteration 执行序 → checkpoint。
         返回完成的 iteration 数。"""
-        self.unet.eval()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
+        self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         self.seed_base_partition()
         pairs: list[TrainingLogProbPair] = []
@@ -200,11 +237,11 @@ class GranularGrpoTrainer:
         update_interval = self.config.reward.disc_update_interval_n_d
         for iteration in range(self.config.schedule.max_iterations):
             started = time.monotonic()
-            self.unet.eval()  # 执行序第 1 相：eval() + no_grad 的 Rollout
+            self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
             record = self.rollout.run_iteration()
             if self._dump:
                 pairs.extend(self._consistency_pairs(record, iteration))
-            self.unet.train()  # 执行序第 2 相：train() 逐 k 更新
+            self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
             loss_terms = self._update_policy(record)
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
             # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）
@@ -218,6 +255,7 @@ class GranularGrpoTrainer:
             zone_sizes = self.rewards.buffer.zone_sizes()
             self.artifacts.append_event(IterEvent(
                 iteration=iteration,
+                stage=self.stage_tag.stage,
                 modality=record.modality,
                 anchor_eval_reward=record.anchor_eval_reward,
                 intra_group_reward_std=record.intra_group_reward_std,
@@ -253,17 +291,15 @@ class GranularGrpoTrainer:
             )
         return self.config.schedule.max_iterations
 
-    def _assemble_sampler(self) -> RolloutSampler:
-        """policy 采样封装装配（netbuild 日程 + 组合场 + SDE 核）。"""
+    def _assemble_sampler(self, field: VelocityField) -> RolloutSampler:
+        """policy 采样封装装配（netbuild 日程 + 本组采样场 + SDE 核）。"""
         policy = self.config.policy
         scheduler = NetworkAssembler.rflow_scheduler(
             num_inference_steps=policy.num_inference_steps,
             input_img_size_numel=policy.input_img_size_numel,
         )
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
-        return RolloutSampler(
-            CfgCombinedField(self.unet), kernel, TrajectoryCursor(scheduler),
-        )
+        return RolloutSampler(field, kernel, TrajectoryCursor(scheduler))
 
     def _assemble_rewards(self) -> RewardCoordinator:
         """判别器侧装配（T05 管线的同一组合方式）。"""
@@ -286,7 +322,7 @@ class GranularGrpoTrainer:
             config.reward,
             ChannelStats.load(config.reward.channel_stats_json),
         )
-        scorer.to(self._device)  # 单点递归迁移：判别器参数 + 统计量 buffer
+        scorer.to(self._amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         seed = config.schedule.seed
         update = OnlineUpdate(
             scorer=scorer,
@@ -296,7 +332,7 @@ class GranularGrpoTrainer:
                     config.reward.real_pool_manifest, kind="real_pool",
                 ),
                 torch.Generator().manual_seed(seed + 1),
-                self._device,
+                self._amp.device,
             ),
             config=config.reward,
             generator=torch.Generator().manual_seed(seed + 2),
@@ -307,7 +343,7 @@ class GranularGrpoTrainer:
             ),
             scorer=scorer,
             generator=torch.Generator().manual_seed(seed + 3),
-            device=self._device,
+            device=self._amp.device,
         )
         return RewardCoordinator(
             update, auc, torch.Generator().manual_seed(seed + 4),
@@ -337,7 +373,7 @@ class GranularGrpoTrainer:
         成对——同权重同口径，测试面 #3 断言两侧逐位一致。"""
         pairs: list[TrainingLogProbPair] = []
         with torch.no_grad(), torch.autocast(
-            self._device.type, dtype=self._amp_dtype,
+            self._amp.device_type, dtype=self._amp.dtype,
         ):
             for step in record.steps:
                 recomputed = self.updater.sampler.evaluate_log_prob(
@@ -355,13 +391,18 @@ class GranularGrpoTrainer:
         return pairs
 
     def _write_checkpoint(self, iteration: int) -> None:
-        """policy 与判别器权重落盘（可装载 state_dict；断点续训全状态
-        （optimizer/RNG/buffer）属 T07）。"""
+        """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict；
+        断点续训全状态（optimizer/RNG/buffer）属 T07）。stage 前缀隔离
+        组3 两阶段的同名产物（stage-1 无前缀 = 历史布局逐字一致）。"""
+        prefix = self.stage_tag.checkpoint_prefix
         torch.save(
-            self.unet.state_dict(),
-            self.artifacts.paths.checkpoints / f"policy_iter{iteration}.pt",
+            self.policy.network.state_dict(),
+            self.artifacts.paths.checkpoints / (
+                f"{prefix}{POLICY_CHECKPOINT_TEMPLATE.format(iteration=iteration)}"
+            ),
         )
         torch.save(
             self.rewards.discriminator.state_dict(),
-            self.artifacts.paths.checkpoints / f"discriminator_iter{iteration}.pt",
+            self.artifacts.paths.checkpoints
+            / f"{prefix}discriminator_iter{iteration}.pt",
         )

@@ -90,6 +90,12 @@ class Artifacts(BaseModel):
         "组2/组3 必需：fork P3 跨序列 ControlNet checkpoint（本地工件）",
         default=None,
     )
+    controlnet_config_json: Path | None = SpecField(
+        "运行时", "policy-modeling",
+        "组2/组3 必需：ControlNet 网络配置 JSON（键 = MONAI ControlNetMaisi "
+        "构造参数名；netbuild 与 UNet 同构的 artifact 构建契约）",
+        default=None,
+    )
     dataset_root: Path = SpecField(
         "运行时", "experiment-design",
         "源影像数据集根目录（BraTS 原始影像；prepare 预编码的输入，"
@@ -151,6 +157,21 @@ class Experiment(BaseModel):
             raise ValueError(
                 "cross_modal_pairs 定死为四序列 12 个有序 src→tgt 对，"
                 f"期望 {sorted(expected)}，得到 {sorted(seen)}"
+            )
+        return value
+
+    @field_validator("stage1_run_dir")
+    @classmethod
+    def _stage1_product_only_for_sequential(
+        cls, value: Path | None, info: ValidationInfo,
+    ) -> Path | None:
+        """既有 stage-1 产物路径只对组3 有语义：其他组携带即拒绝
+        （拼错组名时静默跳过 stage-1 比显式拒绝危险）。"""
+        group = info.data.get("group")
+        if value is not None and group != "sequential":
+            raise ValueError(
+                "stage1_run_dir 仅对组3（sequential）有语义：既有 stage-1 "
+                f"产物路径用于跳过 stage-1 训练，得到组 {group}"
             )
         return value
 
@@ -233,6 +254,13 @@ class PolicyConfig(BaseModel):
         "定死", "policy-modeling",
         "fp32 master weights（bf16 autocast 配套）",
         default="fp32",
+    )
+    source_latent_scale_factor: float = SpecField(
+        "运行时", "policy-modeling",
+        "组2 双条件之一：ControlNet 条件 = 源影像 latent × scale_factor"
+        "（policy-modeling 章 MDP 条件 c；生产值随基座 ControlNet 推理 "
+        "config 核对，fixture 取中性 1.0）",
+        default=1.0, gt=0.0,
     )
 
     @field_validator("ratio_clip")
@@ -579,15 +607,21 @@ class CynosureConfig(BaseModel):
     def _controlnet_required_for_stage2_groups(
         cls, artifacts: Artifacts, info: ValidationInfo,
     ) -> Artifacts:
-        """组2/组3 的训练对象含 ControlNet：checkpoint 必需。"""
+        """组2/组3 的训练对象含 ControlNet：checkpoint 与网络配置 JSON
+        构成的 artifact 对都必需（netbuild 按 artifact 构建的同一契约）。"""
         experiment = info.data.get("experiment")
         if experiment is None:
             return artifacts
-        if experiment.group in ("cross-modal", "sequential") and artifacts.controlnet_ckpt is None:
-            raise ValueError(
-                f"组 {experiment.group} 需要 ControlNet checkpoint"
-                "（artifacts.controlnet_ckpt）"
-            )
+        if experiment.group in ("cross-modal", "sequential"):
+            missing = [
+                name for name in ("controlnet_ckpt", "controlnet_config_json")
+                if getattr(artifacts, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"组 {experiment.group} 需要 ControlNet 工件（artifacts."
+                    f"{' / artifacts.'.join(missing)}）"
+                )
         return artifacts
 
     @model_validator(mode="after")

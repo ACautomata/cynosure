@@ -28,6 +28,10 @@ _RANK_WAIT_TIMEOUT_S: float = 60.0
 _RANK_POLL_INTERVAL_S: float = 0.05
 """非 0 rank 轮询 run 目录出现的间隔（秒）。"""
 
+POLICY_CHECKPOINT_TEMPLATE = "policy_iter{iteration}.pt"
+"""policy checkpoint 文件名模板（契约布局的一部分：组3 stage-1 的复用
+查找 ``SequentialTrainer._locate_stage1_product`` 按同一形态解析）。"""
+
 
 class IterEvent(BaseModel):
     """训练指标流的 per-iteration 事件（契约最小集：施工可扩不可改名）。
@@ -40,6 +44,10 @@ class IterEvent(BaseModel):
 
     event: Literal["iter"] = "iter"
     iteration: int
+    stage: int = 1
+    """组内阶段号（序贯两阶段的归因轴）：单阶段组（组1/组2）恒 1，
+    组3 stage-2 事件 = 2——「每组判别器与 buffer 独立」在指标流上的
+    观测面（各阶段事件互不混淆）。"""
     modality: str
     """本 iteration 采样的目标序列（条件分布四序列均匀采样）——reward/
     loss/AUC 按目标序列归因的轴（per-sequence 健康监控，experiment-design）。"""

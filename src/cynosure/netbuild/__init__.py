@@ -2,9 +2,9 @@
 
 职责（spec #15 模块划分）：UNet / VAE / ControlNet / RFlowScheduler /
 PatchDiscriminator 的按 artifact 构建与装载、per-channel 标准化统计量。
-已交付 UNet / VAE / PatchDiscriminator / RFlowScheduler 装配面；
-生产网络配置 JSON（NV-Generate 字段名 → MONAI 构造参数）的完整映射与
-ControlNetMaisi 装配由后续 ticket 在真实工件可得后深化。
+已交付 UNet / VAE / ControlNet / PatchDiscriminator / RFlowScheduler 装配面；
+生产网络配置 JSON（NV-Generate 字段名 → MONAI 构造参数）的完整映射
+由后续 ticket 在真实工件可得后深化。
 """
 
 import inspect
@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
+from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
 )
@@ -58,6 +59,17 @@ class NetworkAssembler:
         （生产预编码与里程碑评测解码的装载契约；latent 域 RL 循环本身不经它）。"""
         model = AutoencoderKlMaisi(
             **cls._known_kwargs(AutoencoderKlMaisi, artifact.config),
+        )
+        cls._load_state_dict(model, artifact.checkpoint)
+        return model
+
+    @classmethod
+    def controlnet(cls, artifact: NetworkArtifact) -> ControlNetMaisi:
+        """按网络工件构建 ControlNet（ControlNetMaisi）并装载 checkpoint
+        （组2/组3 的 policy：残差每次前向注入 frozen base UNet，
+        policy-modeling 章「实现接缝」第 5 条）。"""
+        model = ControlNetMaisi(
+            **cls._known_kwargs(ControlNetMaisi, artifact.config),
         )
         cls._load_state_dict(model, artifact.checkpoint)
         return model
