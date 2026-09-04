@@ -171,6 +171,24 @@ class GranularGrpoTrainer:
                 "训练循环需要 η>0 才存在 policy gradient；η=0 对照属纯诊断路径"
                 "（trajectory.json 仍随 --dump-trajectory 产出）",
             )
+        # 回放供给跨字段守卫：首次判别器更新时近期分区为空，回放半区
+        # （floor(K/2) 条，50/50 混采定死）全由 base 分区（capacity//2）
+        # 承担；K=1 则回放半区为 0 条、回放采样 API 直接拒绝。无效组合
+        # 在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本
+        replay_count = config.reward.disc_batch_size_k // 2
+        if replay_count < 1:
+            raise ValueError(
+                f"回放供给不足：disc_batch_size_k={config.reward.disc_batch_size_k}"
+                " 的回放半区为 0 条（K 须 ≥2）"
+            )
+        if config.reward.replay_buffer_capacity // 2 < replay_count:
+            raise ValueError(
+                "回放供给不足：replay_buffer_capacity="
+                f"{config.reward.replay_buffer_capacity} 的 base 分区仅 "
+                f"{config.reward.replay_buffer_capacity // 2} 条，不足以承担"
+                f"首次判别器更新的回放半区 {replay_count} 条"
+                f"（disc_batch_size_k={config.reward.disc_batch_size_k}）"
+            )
         self.config = config
         self.artifacts = run_artifacts
         self.advantage = MgaiAdvantage(clamp=config.grpo.advantage_clamp)
@@ -209,6 +227,11 @@ class GranularGrpoTrainer:
             device_type=self._amp.device_type,
             autocast_dtype=self._amp.dtype,
             device=self._amp.device,
+            # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
+            # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
+            base_generator=torch.Generator().manual_seed(
+                config.schedule.seed + 5,
+            ),
         )
 
     @property
@@ -243,6 +266,13 @@ class GranularGrpoTrainer:
                 pairs.extend(self._consistency_pairs(record, iteration))
             self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
             loss_terms = self._update_policy(record)
+            # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
+            # 判别器快照（更新后测同一 fake 批会把 in-sample 拟合计入 AUC，
+            # 联合 hacking 签名失真）；real 侧按本 iteration 采样的目标
+            # 序列过滤（per-target-sequence 归因，#40）
+            heldout_auc = self.rewards.heldout_auc(
+                record.new_fakes, record.modality,
+            )
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
             # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）
             report = (
@@ -259,9 +289,7 @@ class GranularGrpoTrainer:
                 modality=record.modality,
                 anchor_eval_reward=record.anchor_eval_reward,
                 intra_group_reward_std=record.intra_group_reward_std,
-                heldout_auc=self.rewards.heldout_auc(
-                    record.new_fakes, record.modality,
-                ),
+                heldout_auc=heldout_auc,
                 loss=loss_terms,
                 buffer_current_fraction=(
                     report.num_current / batch_size_k if report else 0.0
@@ -304,24 +332,28 @@ class GranularGrpoTrainer:
     def _assemble_rewards(self) -> RewardCoordinator:
         """判别器侧装配（T05 管线的同一组合方式）。"""
         config = self.config
-        if (
-            config.artifacts.discriminator_config_json is None
-            or config.artifacts.discriminator_ckpt is None
-        ):
+        if config.artifacts.discriminator_config_json is None:
             raise ValueError(
-                "训练循环需要判别器网络工件（discriminator_config_json / "
-                "discriminator_ckpt）：在线 reward model 的装配源"
+                "训练循环需要判别器网络配置（discriminator_config_json）："
+                "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
+                "随机初始化起步的在线训练，冷启动工作流）"
             )
-        scorer = RewardScorer(
-            NetworkArtifact(
-                config=NetworkAssembler.load_json(
-                    config.artifacts.discriminator_config_json,
+        # 网络构建（含冷启动随机初始化）在 schedule.seed 的派生流下进行，
+        # 并 fork 隔离全局 RNG——同 config 的两次冷启动判别器权重逐位
+        # 可复现，且不扰动进程全局 RNG 状态（sampling generators 独立
+        # 对象本就不受影响）
+        with torch.random.fork_rng():
+            torch.manual_seed(config.schedule.seed + 6)
+            scorer = RewardScorer(
+                NetworkArtifact(
+                    config=NetworkAssembler.load_json(
+                        config.artifacts.discriminator_config_json,
+                    ),
+                    checkpoint=config.artifacts.discriminator_ckpt,
                 ),
-                checkpoint=config.artifacts.discriminator_ckpt,
-            ),
-            config.reward,
-            ChannelStats.load(config.reward.channel_stats_json),
-        )
+                config.reward,
+                ChannelStats.load(config.reward.channel_stats_json),
+            )
         scorer.to(self._amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         seed = config.schedule.seed
         update = OnlineUpdate(
@@ -392,8 +424,10 @@ class GranularGrpoTrainer:
 
     def _write_checkpoint(self, iteration: int) -> None:
         """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict；
-        断点续训全状态（optimizer/RNG/buffer）属 T07）。stage 前缀隔离
-        组3 两阶段的同名产物（stage-1 无前缀 = 历史布局逐字一致）。"""
+        断点续训全状态（optimizer/RNG/buffer）属 T07）。判别器经
+        loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
+        重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
+        历史布局逐字一致）。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
             self.policy.network.state_dict(),
@@ -402,7 +436,7 @@ class GranularGrpoTrainer:
             ),
         )
         torch.save(
-            self.rewards.discriminator.state_dict(),
+            NetworkAssembler.loadable_state_dict(self.rewards.discriminator),
             self.artifacts.paths.checkpoints
             / f"{prefix}discriminator_iter{iteration}.pt",
         )

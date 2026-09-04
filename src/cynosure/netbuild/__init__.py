@@ -84,6 +84,32 @@ class NetworkAssembler:
         return model
 
     @classmethod
+    def loadable_state_dict(cls, model: Any) -> dict:
+        """模型 state_dict 的可重载形式（与 ``_load_state_dict`` 的严格
+        装载成对的导出面）：parametrization（如 spectral norm）的视图键
+        ``<prefix>.parametrizations.<attr>.original`` 与其内部状态
+        （power iteration buffer ``_u``/``_v``）不落盘，取而代之固化该
+        参数化属性的**有效权重**（parametrization 输出，即训练前向实际
+        使用的张量）到原键 ``<prefix>.<attr>``——本方法产出的 checkpoint
+        经本类装配路径严格重载后，重建的裸网络判别函数与保存时逐位
+        一致（固化原始参数则装载静默成功但前向漂移；无参数化模型逐键
+        同一）。"""
+        state = model.state_dict()
+        if not any(".parametrizations." in key for key in state):
+            return state
+        loadable: dict = {}
+        for key, value in state.items():
+            prefix, marker, rest = key.partition(".parametrizations.")
+            if not marker:
+                loadable[key] = value
+                continue
+            attribute, _, tail = rest.partition(".")
+            if tail == "original":
+                parametrized = getattr(model.get_submodule(prefix), attribute)
+                loadable[f"{prefix}.{attribute}"] = parametrized.detach()
+        return loadable
+
+    @classmethod
     def rflow_scheduler(
         cls, num_inference_steps: int, input_img_size_numel: int,
     ) -> RFlowScheduler:

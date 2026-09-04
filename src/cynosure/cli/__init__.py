@@ -12,6 +12,7 @@ fixture 诊断工件（轨迹双列/log-prob 对）。分布式 torchrun 入口
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -169,6 +170,22 @@ class CynosureCli:
                 return code
         return self._run_training(config, artifacts, args.dump_trajectory)
 
+    def _rollback_untouched_run(self, artifacts: RunArtifacts) -> None:
+        """训练装配/启动失败且回滚 run 目录：目录若除 init 契约最小集外
+        未产出任何工件（无 iter 事件、无 checkpoint、无诊断工件），删除
+        本次预占的目录——用户修复输入后可用同一 --run-dir 重试（run 目录
+        已存在语义拒绝重跑、续训入口未交付）。已有真实产出（如 η=0 对照
+        的 trajectory.json 在训练拒绝前产出，spec 诊断契约）则保留目录。"""
+        paths = artifacts.paths
+        produced = (
+            paths.metrics.stat().st_size > 0
+            or paths.trajectory_diagnostic.exists()
+            or paths.training_diagnostic.exists()
+            or any(paths.checkpoints.iterdir())
+        )
+        if not produced:
+            shutil.rmtree(paths.root)
+
     def _run_training(
         self, config: CynosureConfig, artifacts: RunArtifacts,
         dump_trajectory: bool,
@@ -177,15 +194,26 @@ class CynosureCli:
         逐 k 梯度步 → 判别器 Online update → iter 事件流 + checkpoint
         落盘；组3 经 SequentialTrainer 序贯两阶段（单 run 目录）；
         ``--dump-trajectory`` 额外产出训练侧 log-prob 对（training.json）。"""
+        # 构造期 = 装配/输入契约（网络与 manifest 工件装载、跨字段守卫）：
+        # checkpoint 键/shape 不匹配的严格装载失败（RuntimeError）同属
+        # 输入契约违反，得到干净消息 + 未产出工件的 run 目录回滚
         try:
+            trainer: GranularGrpoTrainer | SequentialTrainer
             if config.experiment.group == "sequential":
-                completed = SequentialTrainer(config, artifacts).run()
+                trainer = SequentialTrainer(config, artifacts)
             else:
-                completed = GranularGrpoTrainer(
+                trainer = GranularGrpoTrainer(
                     config, artifacts, dump_trajectory=dump_trajectory,
-                ).run()
+                )
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            print(f"训练输入契约违反: {exc}", file=self._stderr)
+            self._rollback_untouched_run(artifacts)
+            return _EXIT_USAGE_ERROR
+        try:
+            completed = trainer.run()
         except (ValueError, FileNotFoundError) as exc:
             print(f"训练输入契约违反: {exc}", file=self._stderr)
+            self._rollback_untouched_run(artifacts)
             return _EXIT_USAGE_ERROR
         if os.environ.get("RANK") in (None, "0"):
             print(

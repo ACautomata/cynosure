@@ -53,7 +53,7 @@ class IterationRollout:
     """一个 RL iteration 的 rollout 相产出（eval + no_grad 的完整记录）。"""
 
     condition: RolloutCondition
-    modality: str
+    modality: Modality
     """本 iteration 采样的目标序列（条件分布均匀采样的目标端）——iter
     事件按目标序列归因 reward/loss/AUC 的依据。"""
     anchor_eval_reward: float
@@ -74,8 +74,13 @@ class ConditionSampler(Protocol):
     健康指标（per-sequence 健康监控）的依据。
     """
 
-    def sample(self) -> tuple[RolloutCondition, str]:
-        """均匀采一个条件的 rollout 条件（batch=1，采样场负责广播）。"""
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, Modality]:
+        """均匀采一个条件的 rollout 条件（batch=1，采样场负责广播）。
+
+        ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流
+        （不漂移训练 rollout 的抽样流，各组实现同一约定）。"""
         ...
 
 
@@ -96,12 +101,16 @@ class ModalLabelConditionSampler:
         self._generator = generator
         self._device = device
 
-    def sample(self) -> tuple[RolloutCondition, str]:
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, Modality]:
         """均匀采一个序列的 rollout 条件（label batch=1，组合场负责广播），
         连同采中的序列名返回——iter 事件按目标序列归因健康指标的依据。
         随机数经 CPU generator 生成（跨设备可复现的 fixture「固定 seed」
-        语义）后迁移到 rollout 设备。"""
-        index = int(torch.randint(len(MODALITIES), (1,), generator=self._generator))
+        语义）后迁移到 rollout 设备；``generator`` 缺省用主流，base 分区
+        种子生成传独立流（不漂移训练 rollout 的抽样流）。"""
+        stream = generator if generator is not None else self._generator
+        index = int(torch.randint(len(MODALITIES), (1,), generator=stream))
         label = self._mapping.label(MODALITIES[index])
         return (
             RolloutCondition(
@@ -170,13 +179,17 @@ class CrossModalConditionSampler:
         self._generator = generator
         self._device = device
 
-    def sample(self) -> tuple[RolloutCondition, str]:
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, Modality]:
         """均匀采一个有序对（目标 label batch=1 + 源影像 latent batch=1），
-        连同目标序列名返回——iter 事件按目标序列归因健康指标的依据。"""
-        pair_index = int(torch.randint(len(self._pairs), (1,), generator=self._generator))
+        连同目标序列名返回——iter 事件按目标序列归因健康指标的依据；
+        ``generator`` 缺省用主流（base 分区种子生成传独立流）。"""
+        stream = generator if generator is not None else self._generator
+        pair_index = int(torch.randint(len(self._pairs), (1,), generator=stream))
         source_modality, target_modality = self._pairs[pair_index]
         source_index = int(torch.randint(
-            self._pool.size(source_modality), (1,), generator=self._generator,
+            self._pool.size(source_modality), (1,), generator=stream,
         ))
         label = self._mapping.label(target_modality)
         return (
@@ -202,6 +215,7 @@ class RolloutPhase:
         device_type: str = "cpu",
         autocast_dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
+        base_generator: torch.Generator | None = None,
     ) -> None:
         self._config = config
         self._sampler = sampler
@@ -211,6 +225,9 @@ class RolloutPhase:
         self._amp_dtype = autocast_dtype
         self._device = device
         self._condition_sampler = condition_sampler
+        # base 分区种子生成的独立流：其抽取数随 replay_buffer_capacity
+        # 变化，与训练 rollout 共流会让 buffer 容量实验漂移 policy 样本流
+        self._base_generator = base_generator
 
     def run_iteration(self) -> IterationRollout:
         """单条件组的完整 rollout 与打分（执行序第 1 相的单进程版）。"""
@@ -263,15 +280,23 @@ class RolloutPhase:
 
     def base_partition_samples(self, total: int) -> torch.Tensor:
         """冻结初始 policy 的 rollout 产出（Anchor 全 ODE 终点）——
-        buffer base 分区的种子（train 启动时自动生成，spec 补钉）。"""
+        buffer base 分区的种子（train 启动时自动生成，spec 补钉）。
+
+        走独立 base 流（构造注入 base_generator）：其抽取数随 buffer
+        容量变化，不占训练 rollout 的抽样流（同 seed 下容量实验的
+        rollout 流保持不变）。"""
+        generator = (
+            self._base_generator
+            if self._base_generator is not None else self._generator
+        )
         terminals: list[torch.Tensor] = []
         produced = 0
         with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
             while produced < total:
                 count = min(_BASE_BATCH, total - produced)
-                condition = self._condition_sampler.sample()[0]
+                condition = self._condition_sampler.sample(generator)[0]
                 noise = torch.randn(
-                    (count, *self._config.latent_shape), generator=self._generator,
+                    (count, *self._config.latent_shape), generator=generator,
                 ).to(self._device)
                 anchor = self._sampler.anchor_trajectory(noise, condition)
                 terminals.append(anchor[-1])
