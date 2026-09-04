@@ -23,6 +23,7 @@ from cynosure.reward.dataset import (
 )
 from cynosure.reward.encoder import LatentEncoder, SyntheticLatentEncoder
 from cynosure.reward.pipeline import PreparePipeline, PrepareReport
+from cynosure.reward.preprocessing import UpstreamPreprocessChain
 from cynosure.reward.sampler import RealPoolSampler, RealSampling
 from cynosure.reward.scorer import (
     ChannelNormalizer,
@@ -56,5 +57,6 @@ __all__ = [
     "RewardScorer",
     "SyntheticLatentEncoder",
     "UpdateReport",
+    "UpstreamPreprocessChain",
     "ZoneSizes",
 ]

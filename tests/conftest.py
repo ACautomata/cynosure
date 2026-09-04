@@ -62,6 +62,22 @@ def cli() -> CliSession:
 # 12 个有序 src→tgt 对（脑 MRI 四序列，每序列作 anchor、其余三序列为目标）
 CROSS_MODAL_PAIRS = [[src, tgt] for src, tgt in DEFAULT_CROSS_MODAL_PAIRS]
 
+# 合成夹具的方向语义（issue #45）：非单位 affine（1mm iso、带平移）——
+# LPS 为主（BraTS 原生 ~89% LPS，flip-only 可达 RAS）、少量 RAS 覆盖
+# 「方向已合规」分支；方向重定向因此在 prepare 端到端中真实发生
+LPS_AFFINE = np.array(
+    [[-1.0, 0.0, 0.0, 90.0],
+     [0.0, -1.0, 0.0, 120.0],
+     [0.0, 0.0, 1.0, 80.0],
+     [0.0, 0.0, 0.0, 1.0]],
+)
+RAS_AFFINE = np.array(
+    [[1.0, 0.0, 0.0, 10.0],
+     [0.0, 1.0, 0.0, 20.0],
+     [0.0, 0.0, 1.0, 30.0],
+     [0.0, 0.0, 0.0, 1.0]],
+)
+
 # 组1、生产尺寸的最小合法 config（必填字段全部显式给出）
 MINIMAL_CONFIG_DICT: dict = {
     "experiment": {"group": "modal-label"},
@@ -98,7 +114,11 @@ def valid_config_json(tmp_path: Path, valid_config_dict: dict) -> Path:
 
 class SyntheticBratsDataset:
     """合成 BraTS2023 病例数据集（fixture 策略）：每病例一目录、四序列 NIfTI，
-    与生产 dataset_root 同一目录布局，供 prepare 全循环在本地 CPU 跑。"""
+    与生产 dataset_root 同一目录布局，供 prepare 全循环在本地 CPU 跑。
+
+    夹具影像携带真实方向语义（issue #45，affine 常量见模块级 LPS_AFFINE /
+    RAS_AFFINE）：非单位 affine，LPS 为主、确定性混入 RAS（每第 5 个病例
+    RAS）——方向重定向在 prepare 端到端中真实发生，而不是被单位 affine 架空。"""
 
     def __init__(self, root: Path, case_ids: list[str], shape: tuple[int, int, int],
                  seed: int) -> None:
@@ -108,21 +128,25 @@ class SyntheticBratsDataset:
         self._seed = seed
 
     def write(self) -> Path:
-        """按病例目录布局落盘四序列 NIfTI（确定性：seed + 病例/序列派生子种子）。"""
+        """按病例目录布局落盘四序列 NIfTI（确定性：seed + 病例/序列派生子种子
+        决定体数据；病例下标决定方向语义）。"""
         for case_index, case_id in enumerate(self._case_ids):
             case_dir = self._root / case_id
             case_dir.mkdir(parents=True, exist_ok=True)
+            affine = RAS_AFFINE if case_index % 5 == 0 else LPS_AFFINE
             for modality_index, modality in enumerate(MODALITIES):
                 rng = np.random.default_rng(
                     (self._seed, case_index, modality_index),
                 )
                 volume = rng.standard_normal(self._shape).astype(np.float32)
-                self._write_nifti(case_dir / f"{case_id}-{modality}.nii.gz", volume)
+                self._write_nifti(
+                    case_dir / f"{case_id}-{modality}.nii.gz", volume, affine,
+                )
         return self._root
 
     @staticmethod
-    def _write_nifti(path: Path, volume: np.ndarray) -> None:
-        nib.save(nib.Nifti1Image(volume, np.eye(4)), path)
+    def _write_nifti(path: Path, volume: np.ndarray, affine: np.ndarray) -> None:
+        nib.save(nib.Nifti1Image(volume, affine), path)
 
 
 class FixturePrepareScenario:

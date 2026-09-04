@@ -102,6 +102,10 @@ class Fixture:
     TRAIN_STEP_INDICES_M: frozenset[int] = frozenset({1})
     GROUP_SIZE_G: int = 12
     INPUT_IMG_SIZE_NUMEL: int = 16 * 16 * 8  # = 2048，数值锚与 latent 同语义
+    RESIZE_BASE: int = 16
+    """fixture 预处理链 resize 基数（config PreprocessingConfig 注入）：夹具影像
+    64×64×32 全为 16 的倍数，过链尺寸不变；方向/强度/dtype 步照走全链。
+    fixture 不是对齐对象，基数不取生产上游值 128（本模块 docstring 同旨）。"""
 
     def unet(self) -> DiffusionModelUNetMaisi:
         """随机初始化的 MONAI 迷你 UNet（CPU、seed 由调用方固定以保证复现）。
@@ -180,6 +184,7 @@ class Fixture:
             "experiment": {"group": group},
             "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
+            "preprocessing": {"resize_base": self.RESIZE_BASE},
             "artifacts": {
                 "unet_ckpt": str(artifacts_dir / "unet.pt"),
                 # VAE / modality mapping / 源数据集不进 fixture 循环，占位路径

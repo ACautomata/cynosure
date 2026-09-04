@@ -45,6 +45,11 @@ DEFAULT_CROSS_MODAL_PAIRS: tuple[tuple[str, str], ...] = tuple(
     (s, t) for s in MODALITIES for t in MODALITIES if s != t
 )
 
+UPSTREAM_RESIZE_BASE = 128
+"""prepare transform 链的上游 resize 基数（fork create_training_data 的
+round_number，data-preparation + ADR-0006）：生产定死值、schema 权威单一来源，
+fixture 经 fixture_mode=true 显式声明后可注入小基数替代。"""
+
 
 class SpecField:
     """spec 配置项清单的字段声明：状态（status）+ 出处（source）标注。
@@ -461,6 +466,27 @@ class RewardConfig(BaseModel):
         return value
 
 
+class PreprocessingConfig(BaseModel):
+    """prepare 读图编码的上游 recipe 参数（data-preparation spec + ADR-0006）。
+
+    transform 链本体在 ``cynosure.reward.preprocessing``（MONAI 六步语义重写，
+    零依赖）；config 只携带可注入参数：resize 基数。链中不存在 spacing 重采样 /
+    foreground crop / z-score，均为对齐结论、无参数可暴露。
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    resize_base: int = SpecField(
+        "定死（fixture 可缩小）", "data-preparation + ADR-0006",
+        "transform 链 resize 基数：每轴 max(round(size/base),1)×base，"
+        "size 从 RAS 重定向后的空间形状读取；生产钉上游基数"
+        f"（{UPSTREAM_RESIZE_BASE}，BraTS 240×240×155 → 256×256×128），"
+        "fixture 注入小基数使夹具影像尺寸不变（须经 fixture_mode=true "
+        "显式声明）",
+        default=UPSTREAM_RESIZE_BASE, ge=1,
+    )
+
+
 class ScheduleConfig(BaseModel):
     """运行时 knobs：规模、里程碑、早停、续训周期与随机性控制。"""
 
@@ -550,9 +576,15 @@ class CynosureConfig(BaseModel):
     )
     fixture_mode: bool = SpecField(
         "运行时", "Fixture 策略",
-        "fixture 诊断模式显式声明：true 才允许缩小采样日程（如 3 步 ODE）；"
-        "缺省 false 时生产 config 钉 30 步",
+        "fixture 诊断模式显式声明：true 才允许缩小采样日程（如 3 步 ODE）与"
+        "缩小预处理链参数（resize_base）；缺省 false 时生产 config 钉 30 步、"
+        "上游 resize 基数",
         default=False,
+    )
+    preprocessing: PreprocessingConfig = SpecField(
+        "定死", "data-preparation + ADR-0006",
+        "prepare 读图编码的上游 recipe 参数（transform 链的 resize 基数）",
+        default_factory=PreprocessingConfig,
     )
     policy: PolicyConfig = SpecField(
         "定死", "policy-modeling", "policy 采样场与单步 SDE", default_factory=PolicyConfig,
@@ -635,6 +667,19 @@ class CynosureConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _resize_base_matches_mode(self) -> "CynosureConfig":
+        """缩小预处理链参数的通道显式化：fixture_mode=false 时 resize_base 钉
+        上游基数——生产上静默偏离上游 recipe 等于换基座训练分布（ADR-0006）。"""
+        if not self.fixture_mode and self.preprocessing.resize_base != UPSTREAM_RESIZE_BASE:
+            raise ValueError(
+                "生产 config（fixture_mode=false）下 preprocessing.resize_base "
+                f"定死上游基数 {UPSTREAM_RESIZE_BASE}（ADR-0006），得到 "
+                f"{self.preprocessing.resize_base}；注入小基数属 fixture，"
+                "须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
+
 
 class ConfigLoader:
     """config 文件装载：JSON 反序列化 + schema 校验（三子命令共用）。"""
@@ -661,9 +706,11 @@ __all__ = [
     "MODALITIES",
     "Modality",
     "PolicyConfig",
+    "PreprocessingConfig",
     "RewardConfig",
     "ScheduleConfig",
     "ShardingConfig",
     "SpecField",
     "UNCONDITIONAL_LABEL",
+    "UPSTREAM_RESIZE_BASE",
 ]
