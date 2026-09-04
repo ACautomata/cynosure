@@ -4,6 +4,7 @@
 
 - Python 项目，采用 **source layout**：包代码位于 `src/cynosure/`，不在仓库根目录。
 - 构建后端为 **hatchling**，项目元数据与依赖定义在 `pyproject.toml`。
+- 实验期间编写的临时脚本（启动、结果计算）一律写进 run 目录的 `scripts/` 子目录，不提交进仓库；发布时随 experiment-release skill 归档进实验 release。
 
 ## 环境与命令
 
