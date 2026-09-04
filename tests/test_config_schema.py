@@ -371,6 +371,47 @@ class TestRejection:
         assert "slurm" not in CynosureConfig.model_fields
 
 
+class TestPreprocessingSchema:
+    """prepare 读图编码的 recipe 参数（issue #45；data-preparation + ADR-0006）：
+    resize 基数生产钉上游 128，fixture 经 fixture_mode 声明后可注入小基数。"""
+
+    def test_resize_base_defaults_to_upstream(self, valid_config_dict: dict) -> None:
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.preprocessing.resize_base == 128
+
+    def test_production_resize_base_fixed_without_fixture_mode(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config（fixture_mode 缺省 = false）下 resize_base 钉上游 128：
+        静默偏离上游 recipe 等于换基座训练分布（ADR-0006），必须拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["preprocessing"] = {"resize_base": 64}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "resize_base" in str(exc_info.value.errors())
+
+    def test_fixture_mode_allows_injected_small_base(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["fixture_mode"] = True
+        data["preprocessing"] = {"resize_base": 16}
+        config = CynosureConfig.model_validate(data)
+        assert config.preprocessing.resize_base == 16
+
+    def test_resize_base_must_be_positive(self, valid_config_dict: dict) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["fixture_mode"] = True
+        data["preprocessing"] = {"resize_base": 0}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("preprocessing", "resize_base") in self._locations(exc_info.value)
+
+    @staticmethod
+    def _locations(exc: ValidationError) -> list[tuple]:
+        return [err["loc"] for err in exc.errors()]
+
+
 class TestStatusAnnotations:
     ALL_MODELS = [
         CynosureConfig,

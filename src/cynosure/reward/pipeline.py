@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from monai.data import MetaTensor
-from monai.transforms import LoadImage
 from pydantic import BaseModel, ConfigDict
 
 import torch
@@ -32,6 +31,7 @@ from cynosure.reward.dataset import (
     SplitPart,
 )
 from cynosure.reward.encoder import LatentEncoder
+from cynosure.reward.preprocessing import UpstreamPreprocessChain
 
 
 @dataclass
@@ -94,7 +94,11 @@ class PreparePipeline:
         self._encoder = encoder
         self._layout = BratsSeriesLayout(config.artifacts.dataset_root)
         self._splitter = CaseSplitter(config.schedule.seed)
-        self._reader = LoadImage(image_only=True)
+        # 读图编码走上游训练 recipe 六步链（data-preparation + ADR-0006）：
+        # resize 基数从 config 注入（生产 128 / fixture 小基数），链逻辑单份
+        self._preprocess = UpstreamPreprocessChain(
+            resize_base=config.preprocessing.resize_base,
+        )
 
     def run(self) -> PrepareReport:
         cases = self._layout.scan()
@@ -178,21 +182,22 @@ class PreparePipeline:
         # 的异常类面不可枚举，nibabel 异常又不在 import 白名单内无法按类型接；
         # 保留异常链（from exc）不吞根因，原始类名入消息供分诊。
         try:
-            loaded = self._reader(series_path)
+            image = self._preprocess(series_path)
         except Exception as exc:
             raise ValueError(
                 f"影像读取失败: {series_path}"
                 f"（{type(exc).__name__}: {exc}）"
             ) from exc
         # 剥离 MetaTensor 的 numpy 元数据：工件落纯张量，weights_only 装载才可行
-        image = torch.as_tensor(
-            loaded.as_tensor() if isinstance(loaded, MetaTensor) else loaded,
-        ).unsqueeze(0)
-        latent = self._encoder.encode(image)
+        # （链末端已是 [1, D, H, W]：EnsureChannelFirst 起通道在前）
+        tensor = torch.as_tensor(
+            image.as_tensor() if isinstance(image, MetaTensor) else image,
+        )
+        latent = self._encoder.encode(tensor)
         if tuple(latent.shape) != self._config.latent_shape:
             raise ValueError(
                 f"预编码输出形状 {tuple(latent.shape)} 与 latent_shape 契约"
-                f" {self._config.latent_shape} 不符（输入 {tuple(image.shape)}）"
+                f" {self._config.latent_shape} 不符（输入 {tuple(tensor.shape)}）"
             )
         return latent
 

@@ -6,6 +6,7 @@
 
 from pathlib import Path
 
+import nibabel as nib
 import pytest
 import torch
 
@@ -278,6 +279,40 @@ class TestPrepareIdempotency:
         assert not config.reward.real_pool_manifest.exists()
         assert not config.reward.heldout_real_manifest.exists()
         assert not config.reward.channel_stats_json.exists()
+
+
+class TestPrepareChainSemantics:
+    """端到端走 transform 链（issue #45）：夹具影像携带真实方向语义
+    （非单位 affine，LPS 为主、混入 RAS），方向重定向在端到端中真实发生；
+    fixture 经 config 注入小 resize 基数，与生产共用同一条链逻辑。"""
+
+    def test_dataset_carries_lps_dominant_affines(
+        self, scenario: PrepareScenario,
+    ) -> None:
+        """夹具 affine 非单位：LPS 为主、确定性混入 RAS（方向步被真实驱动）。"""
+        scenario.run()
+        dataset_root = scenario.config().artifacts.dataset_root
+        axcodes = [
+            tuple(nib.aff2axcodes(
+                nib.load(case_dir / f"{case_dir.name}-t1n.nii.gz").affine,
+            ))
+            for case_dir in sorted(dataset_root.iterdir())
+        ]
+        assert set(axcodes) == {("L", "P", "S"), ("R", "A", "S")}
+        assert axcodes.count(("L", "P", "S")) > axcodes.count(("R", "A", "S"))
+
+    def test_chain_encoded_latents_satisfy_contract(
+        self, scenario: PrepareScenario,
+    ) -> None:
+        """全链（方向/强度/dtype/resize）真实执行后 latent 形状契约满足。"""
+        assert scenario.run().code == 0
+        pool = scenario.load_pool()
+        config = scenario.config()
+        assert len(pool.entries) == TRAIN_CASES * 4
+        for entry in pool.entries:
+            latent = pool.load_latent(entry)
+            assert tuple(latent.shape) == config.latent_shape
+            assert latent.dtype == torch.float32
 
 
 class TestPrepareInputGuard:
