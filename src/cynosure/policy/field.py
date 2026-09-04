@@ -149,23 +149,16 @@ class BareConditionField:
         group_size: int,
     ) -> torch.Tensor:
         """扰动步的组内 velocity（全组共享 x_k）：ControlNet 与 UNet 各
-        batch=1 一次前向，残差与 velocity expand 成 G（零拷贝复用）。"""
+        batch=1 一次前向（G²RPO 效率技巧，与组1 组合同构），velocity
+        输出 expand 成 G（零拷贝复用）——组内 G 条方向共享同一 x_k 与
+        条件，batch-G 前向是 G 倍显存/算力的纯浪费。"""
         down_residuals, mid_residual = self._control_residuals(
             x_shared, 1, timesteps, condition,
         )
-        expanded_down = tuple(
-            residual.expand(group_size, *residual.shape[1:])
-            for residual in down_residuals
+        velocity = self._unet_forward(
+            x_shared, 1, timesteps, condition, down_residuals, mid_residual,
         )
-        expanded_mid = mid_residual.expand(group_size, *mid_residual.shape[1:])
-        return self._unet_forward(
-            x_shared.expand(group_size, *x_shared.shape[1:]),
-            group_size,
-            timesteps,
-            condition.broadcast_to(group_size),
-            expanded_down,
-            expanded_mid,
-        )
+        return velocity.expand(group_size, *velocity.shape[1:])
 
     def _control_residuals(
         self,

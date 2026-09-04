@@ -84,6 +84,28 @@ class TestStagePlan:
         assert result.code == 2
         assert "stage-1" in result.stderr
 
+    def test_stage1_run_dir_pointing_at_cross_modal_run_rejected(
+        self, scenario: TrainingLoopScenario, tmp_path: Path,
+    ) -> None:
+        """stage1_run_dir 指向跨模态 run = 输入契约违反：该 run 的
+        policy_iter*.pt 是 ControlNet checkpoint 而非 base′ UNet——须在
+        选定 checkpoint 前拒绝，而不是装载时裸 RuntimeError traceback。"""
+        scenario.write_inputs(group="cross-modal")
+        assert scenario.train().code == 0  # 先产出含 policy_iter1.pt 的跨模态 run
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["experiment"]["group"] = "sequential"  # 组3 config + 误指的 stage1_run_dir
+        data["experiment"]["stage1_run_dir"] = str(scenario.run_dir)
+        (tmp_path / "wrong_group_stage1.json").write_text(
+            json.dumps(data), encoding="utf-8",
+        )
+        result = scenario.cli.run(
+            "train", "--config", str(tmp_path / "wrong_group_stage1.json"),
+            "--run-dir", str(tmp_path / "wrong_group_run"),
+        )
+        assert result.code == 2
+        assert "modal-label" in result.stderr
+        assert "Traceback" not in result.stderr
+
 
 class TestSequentialRun:
     """CLI 端到端：两阶段顺序执行、产物布局、事件流按 stage 归因。"""

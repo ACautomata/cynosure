@@ -15,6 +15,7 @@ stage-1 传递（spec 配置项清单「组3 衔接」）：缺省时同一次�
 stage-1；config 指定既有 stage-1 产物 run 目录则跳过 stage-1，只跑 stage-2。
 """
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,11 @@ from cynosure.train.trainer import GranularGrpoTrainer, StageTag
 
 _STAGE2_CHECKPOINT_PREFIX = "stage2_"
 """stage-2 产物前缀：隔离两阶段同名 checkpoint（stage-1 无前缀保持复用布局）。"""
+
+_STAGE1_PRODUCT_SOURCE_GROUPS = ("modal-label", "sequential")
+"""可复用 stage-1 产物的来源 run 组别：这两组的无前缀 ``policy_iter*.pt``
+按构造是 base′ UNet checkpoint；跨模态 run 的同名文件是 ControlNet
+checkpoint（其可训练对象），不得混作 stage-2 的 base′。"""
 
 _POLICY_CKPT_PATTERN = re.compile(r"policy_iter(\d+)\.pt$")
 """stage-1 产物文件名形态（与 artifacts.POLICY_CHECKPOINT_TEMPLATE 同一字面，
@@ -108,7 +114,26 @@ class SequentialTrainer:
     @staticmethod
     def _locate_stage1_product(run_dir: Path) -> Path:
         """既有 stage-1 run 目录 → 最终 base′ checkpoint（policy_iter 取
-        最大 iteration；独立组1 run 与序贯 run 的 stage-1 同布局）。"""
+        最大 iteration）。来源 run 先验组别（config.json）：仅组1 run 与
+        序贯 run 的无前缀 ``policy_iter*.pt`` 按构造是 base′ UNet——跨模态
+        run 的同名文件是 ControlNet checkpoint，选定前拒绝（清晰输入契约
+        错误），而非 stage-2 装载时的裸 RuntimeError。"""
+        config_snapshot = Path(run_dir) / "config.json"
+        if not config_snapshot.is_file():
+            raise ValueError(
+                f"stage1_run_dir 缺 config.json（无法确认来源 run 的组别，"
+                f"stage-1 产物须来自组1/modal-label run 或序贯 run）: {run_dir}"
+            )
+        group = json.loads(
+            config_snapshot.read_text(encoding="utf-8"),
+        ).get("experiment", {}).get("group")
+        if group not in _STAGE1_PRODUCT_SOURCE_GROUPS:
+            raise ValueError(
+                f"stage1_run_dir 须指向组1（modal-label）run 或序贯 run 的 "
+                f"stage-1 产物（得到 experiment.group = {group!r}；跨模态 "
+                f"run 的 policy_iter*.pt 是 ControlNet checkpoint 而非 "
+                f"base′ UNet）: {run_dir}"
+            )
         checkpoints = Path(run_dir) / "checkpoints"
         candidates: list[tuple[int, Path]] = []
         for path in checkpoints.glob("policy_iter*.pt"):

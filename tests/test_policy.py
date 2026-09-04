@@ -393,14 +393,16 @@ class TestBareConditionField:
         self, field: BareConditionField, recording_unet: RecordingUnet,
         recording_controlnet: RecordingControlnet, condition: RolloutCondition,
     ) -> None:
-        """全组复用（G²RPO 技巧对组2 同样成立）：ControlNet 与 UNet 各
-        batch=1 一次前向，残差与输出 expand 成 G。"""
+        """全组复用（G²RPO 技巧，spec policy-modeling 实现接缝 #2）：
+        ControlNet 与 UNet 各 batch=1 一次前向，velocity 输出 expand 成 G
+        ——组内 G 条方向共享同一 x_k 与条件，batch-G 前向是 12× 的纯浪费。"""
         x = torch.randn(1, *LATENT_SHAPE)
         v = field.group_velocity(x, timesteps=442, condition=condition, group_size=12)
         assert v.shape == (12, *LATENT_SHAPE)
         assert len(recording_controlnet.calls) == 1
         assert len(recording_unet.calls) == 1
-        assert recording_unet.calls[0]["batch"] == 12  # 组并行单前向
+        assert recording_controlnet.calls[0]["batch"] == 1
+        assert recording_unet.calls[0]["batch"] == 1  # G²RPO：batch=1 评估后 expand
 
     def test_group_velocity_matches_expanded_velocity(
         self, field: BareConditionField, condition: RolloutCondition,
