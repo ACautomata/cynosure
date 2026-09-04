@@ -26,6 +26,16 @@ _Avoid_: 采样、生成
 NV-Generate-CTMR 的分阶段能力。本轮实验只用「模态标签条件生成」与「跨模态影像条件生成」两阶段；「掩码条件生成」不在本轮范围。
 _Avoid_: 任务、phase、step
 
+### 数据对齐
+
+**上游（Upstream）**:
+NV-Generate-CTMR fork——基座 checkpoint 的训练方项目。cynosure 对齐的是它的训练数据 recipe 与推理实际行为，不是代码：上游代码只读参照、永不 import（零依赖原则）。
+_Avoid_: 基座（base model 指 checkpoint 本体）、参考实现
+
+**RAS 方向**:
+全链影像方向约定：进入 VAE 的体数据一律先重定向到 RAS 轴码；BraTS 原生 LPS 靠轴翻转达成，无轴置换。
+_Avoid_: canonical 方向、ToCanonical（那是实现名）
+
 ### 策略建模
 
 **Velocity（速度场）**:
