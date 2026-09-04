@@ -62,11 +62,21 @@ class TrainingDiagnostic(BaseModel):
 
 class RewardCoordinator:
     """判别器侧协作者组（Facade）：聚合两区缓冲、Online update 与
-    held-out AUC——trainer 只面对「种植/更新/AUC」三个动作与判别器引用。"""
+    held-out AUC——trainer 只面对「种植/更新/AUC」三个动作与判别器引用。
 
-    def __init__(self, update: OnlineUpdate, auc: HeldOutAuc) -> None:
+    fake 供给与判别器相位约定：更新批的当前半区从全批 fake 随机抽取
+    （rollout 产出按 (k, λ) 有序堆叠，确定性取头部会使 K=4 的当前半区
+    永远只见最小 step、λ=1 的头部方向）；判别器默认保持 eval 相（打分
+    与监控前向不得推进 spectral norm power iteration），仅更新一步
+    期间短暂 train。"""
+
+    def __init__(
+        self, update: OnlineUpdate, auc: HeldOutAuc,
+        generator: torch.Generator,
+    ) -> None:
         self.update = update
         self.auc = auc
+        self._generator = generator
 
     @property
     def buffer(self) -> ReplayStore:
@@ -83,8 +93,17 @@ class RewardCoordinator:
         self.buffer.fill_base(samples)
 
     def update_step(self, current_fakes: torch.Tensor) -> UpdateReport:
-        """判别器 Online update 一步（50% 当前 fake + 50% 回放混采）。"""
-        return self.update.step(current_fakes)
+        """判别器 Online update 一步：全批 fake 随机置换后交更新
+        （50% 当前 / 50% 回放的混采由 update 消费置换批的头部），更新
+        期间判别器 train 相、结束后恢复 eval 相。置换过的整批照常入
+        近期分区（近期分布记录是集合语义，次序无关）。"""
+        order = torch.randperm(current_fakes.shape[0], generator=self._generator)
+        shuffled = current_fakes[order]
+        self.discriminator.train()
+        try:
+            return self.update.step(shuffled)
+        finally:
+            self.discriminator.eval()
 
     def heldout_auc(self, current_fakes: torch.Tensor) -> float:
         """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。"""
@@ -100,6 +119,7 @@ class GranularGrpoTrainer:
         run_artifacts: RunArtifacts,
         *,
         dump_trajectory: bool = False,
+        device: torch.device | None = None,
     ) -> None:
         if config.experiment.group != "modal-label":
             raise ValueError(
@@ -116,22 +136,32 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self.advantage = MgaiAdvantage(clamp=config.grpo.advantage_clamp)
         self._dump = dump_trajectory
-        self._device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        # 装配期单点选设备（local rank 0 的加速器）；分布式 sharding 属 T09。
+        # 所有模型与 rollout/打分张量随该设备放置——autocast(device_type)
+        # 只影响前向 dtype，不移动任何张量
+        self._device = (
+            device if device is not None
+            else torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu",
+            )
+        )
         self._amp_dtype = AMP_DTYPES[config.policy.amp_dtype]
 
         self.unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,
-        ))
+        )).to(self._device)
         sampler = self._assemble_sampler()
         self.rewards = self._assemble_rewards()
         self.updater = StepwisePolicyUpdate(
             sampler=sampler,
             optimizer=torch.optim.AdamW(
-                self.unet.parameters(), lr=config.policy.policy_lr,
+                self.unet.parameters(),
+                lr=config.policy.policy_lr,
+                weight_decay=config.policy.policy_weight_decay,
             ),
             loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
-            device_type=self._device_type,
+            device_type=self._device.type,
             amp_dtype=self._amp_dtype,
         )
         self.rollout = RolloutPhase(
@@ -139,8 +169,9 @@ class GranularGrpoTrainer:
             sampler,
             self.rewards.update.scorer,
             torch.Generator().manual_seed(config.schedule.seed),
-            device_type=self._device_type,
+            device_type=self._device.type,
             autocast_dtype=self._amp_dtype,
+            device=self._device,
         )
 
     def seed_base_partition(self) -> None:
@@ -156,6 +187,7 @@ class GranularGrpoTrainer:
         """训练主循环：base 分区自动生成 → 逐 iteration 执行序 → checkpoint。
         返回完成的 iteration 数。"""
         self.unet.eval()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
+        self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         self.seed_base_partition()
         pairs: list[TrainingLogProbPair] = []
         last_checkpoint = 0
@@ -180,6 +212,7 @@ class GranularGrpoTrainer:
             zone_sizes = self.rewards.buffer.zone_sizes()
             self.artifacts.append_event(IterEvent(
                 iteration=iteration,
+                modality=record.modality,
                 anchor_eval_reward=record.anchor_eval_reward,
                 intra_group_reward_std=record.intra_group_reward_std,
                 heldout_auc=self.rewards.heldout_auc(record.new_fakes),
@@ -242,6 +275,7 @@ class GranularGrpoTrainer:
             config.reward,
             ChannelStats.load(config.reward.channel_stats_json),
         )
+        scorer.discriminator.to(self._device)
         seed = config.schedule.seed
         update = OnlineUpdate(
             scorer=scorer,
@@ -251,6 +285,7 @@ class GranularGrpoTrainer:
                     config.reward.real_pool_manifest, kind="real_pool",
                 ),
                 torch.Generator().manual_seed(seed + 1),
+                self._device,
             ),
             config=config.reward,
             generator=torch.Generator().manual_seed(seed + 2),
@@ -261,8 +296,11 @@ class GranularGrpoTrainer:
             ),
             scorer=scorer,
             generator=torch.Generator().manual_seed(seed + 3),
+            device=self._device,
         )
-        return RewardCoordinator(update, auc)
+        return RewardCoordinator(
+            update, auc, torch.Generator().manual_seed(seed + 4),
+        )
 
     def _update_policy(self, record: IterationRollout) -> dict[str, float]:
         """逐 k 独立梯度步（执行序第 2 相）：每 k 一次
@@ -288,7 +326,7 @@ class GranularGrpoTrainer:
         成对——同权重同口径，测试面 #3 断言两侧逐位一致。"""
         pairs: list[TrainingLogProbPair] = []
         with torch.no_grad(), torch.autocast(
-            self._device_type, dtype=self._amp_dtype,
+            self._device.type, dtype=self._amp_dtype,
         ):
             for step in record.steps:
                 recomputed = self.updater.sampler.evaluate_log_prob(

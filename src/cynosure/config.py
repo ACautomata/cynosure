@@ -218,6 +218,12 @@ class PolicyConfig(BaseModel):
         "policy 学习率（AdamW），bf16 autocast + fp32 master weights 配套",
         default=2e-6, gt=0.0,
     )
+    policy_weight_decay: float = SpecField(
+        "起步值", "policy-modeling",
+        "policy AdamW 的 weight decay（参考实现超参总表 1e-4；PyTorch 默认"
+        " 1e-2 是 100× 过正则，会淹没 2e-6 的 policy 学习步，故显式落位）",
+        default=1e-4, ge=0.0,
+    )
     amp_dtype: Literal["bf16"] = SpecField(
         "定死", "policy-modeling",
         "autocast dtype = bf16（gfx936 上需 profile 验证生效，见 M0 门槛）",

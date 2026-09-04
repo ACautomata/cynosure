@@ -30,6 +30,7 @@ class TestValidConfigs:
         assert config.policy.granularity_intervals_lambda == {1, 2}
         assert config.policy.ratio_clip == pytest.approx(1e-4)
         assert config.policy.policy_lr == pytest.approx(2e-6)
+        assert config.policy.policy_weight_decay == pytest.approx(1e-4)
         assert config.grpo.advantage_clamp == pytest.approx(5.0)
         assert config.grpo.kl_beta == 0.0
         assert config.reward.disc_num_layers_d == 2

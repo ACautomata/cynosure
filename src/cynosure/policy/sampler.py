@@ -94,12 +94,25 @@ class RolloutSampler:
         index 为最后一步时原样返回（无续跑空间）。
 
         ``stride`` = Granularity λ（MGAI）：按时间步间隔 λ 抽稀 sigma 日程
-        积分——λ=1 逐步（默认，与 MONAI 推理循环同组织）；λ>1 访问点
-        相隔 λ（大步 Δs = 相邻访问位 σ 之差、velocity 在段起点评估），
-        末段一律从最后位置直达 σ=0 终点。输入 latent 位于第 index+1 步
-        （被优化步扰动后的产出）。"""
+        积分——λ=1 逐步（默认，与 MONAI 推理循环同组织）；λ>1 首段走一个
+        与 λ=1 同粒度的细步（扰动后 latent 位于 index+1，参考实现的访问
+        日程 ``suffix = sigma_schedule[eta_step+2::g]`` 从 index+2 起才
+        抽稀——跳过该细步会漏掉普通续跑的第一个端点），之后访问点相隔
+        λ（大步 Δs = 相邻访问位 σ 之差、velocity 在段起点评估），末段
+        一律从最后位置直达 σ=0 终点。"""
         x = latents
         current = index + 1
+        if stride > 1 and current < self._cursor.num_steps:
+            velocity = self._field.velocity(
+                x, self._cursor.timestep(current), condition,
+            )
+            x = self._deterministic.transition(
+                x,
+                velocity,
+                self._cursor.sigma_level(current),
+                self._cursor.delta_s(current),
+            ).sample
+            current += 1
         while current < self._cursor.num_steps:
             velocity = self._field.velocity(
                 x, self._cursor.timestep(current), condition,

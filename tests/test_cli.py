@@ -126,6 +126,40 @@ class TestTrainCommand:
         assert "nope.json" in result.stderr
 
 
+class TestSingleProcessGuard:
+    """单进程训练循环（#21 tracer bullet）的 rank 守卫：FSDP 梯度聚合与
+    rank 0 归并落盘由 orchestration ticket 交付前，非 0 rank 显式拒绝——
+    否则每个 rank 各自跑完整循环，重复追加 iter 事件、覆写同一 checkpoint
+    文件名（RunArtifacts 的 rank 0 写盘契约被静默破坏）。"""
+
+    def test_nonzero_rank_rejected_even_when_run_dir_ready(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """run 目录已就绪（rank 0 已创建）也不进训练循环：显式拒绝、
+        消息指明单进程版边界——而非沿用「等待 rank 0」的 barrier 语义
+        （barrier 之后各 rank 重复训练才是要防的故障）。"""
+        monkeypatch.setenv("RANK", "3")
+        run_root = tmp_path / "run"
+        run_root.mkdir()
+        (run_root / "config.json").write_text("{}", encoding="utf-8")
+        result = cli.train(cli.write_config(tmp_path), run_dir=run_root)
+        assert result.code == 2
+        assert "单进程" in result.stderr
+        assert "训练输入契约违反" not in result.stderr  # 未进训练循环
+
+    def test_rank0_passes_guard_into_training(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """rank 0 通过守卫进入训练循环（生产 config 在循环装配期因工件
+        缺失得到契约错误——走到该错误证明守卫未拦截）。"""
+        monkeypatch.setenv("RANK", "0")
+        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
+        assert "训练输入契约违反" in result.stderr
+        assert (tmp_path / "run").is_dir()
+
+
 class TestEvalCommand:
     def test_valid_config_passes(
         self, cli: CliSession, tmp_path: Path,
@@ -252,8 +286,9 @@ class TestDistributedRunDir:
     def test_train_under_torchrun_requires_explicit_run_dir(
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：分布式启动必须显式 --run-dir。"""
-        monkeypatch.setenv("RANK", "2")
+        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：torchrun 下
+        （rank 0）也必须显式 --run-dir（非 0 rank 已被单进程守卫更早拒绝）。"""
+        monkeypatch.setenv("RANK", "0")
         result = cli.train(cli.write_config(tmp_path))
         assert result.code == 2
         assert "--run-dir" in result.stderr
@@ -273,7 +308,8 @@ class TestMetricsStream:
     ) -> None:
         artifacts = self._trained_artifacts(valid_config_dict, tmp_path)
         event = IterEvent(
-            iteration=0, anchor_eval_reward=-1.5, intra_group_reward_std=0.3,
+            iteration=0, modality="t1n", anchor_eval_reward=-1.5,
+            intra_group_reward_std=0.3,
             heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
             buffer_replay_fraction=0.5, buffer_base_occupied=32,
             buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
@@ -299,7 +335,8 @@ class TestMetricsStream:
     @staticmethod
     def _iter_event(**overrides: object) -> IterEvent:
         values: dict = dict(
-            iteration=0, anchor_eval_reward=-1.5, intra_group_reward_std=0.3,
+            iteration=0, modality="t1n", anchor_eval_reward=-1.5,
+            intra_group_reward_std=0.3,
             heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
             buffer_replay_fraction=0.5, buffer_base_occupied=32,
             buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
@@ -325,7 +362,8 @@ class TestMetricsStream:
     ) -> None:
         artifacts = self._trained_artifacts(valid_config_dict, tmp_path)
         artifacts.append_event(IterEvent(
-            iteration=0, anchor_eval_reward=0.0, intra_group_reward_std=0.0,
+            iteration=0, modality="t1n", anchor_eval_reward=0.0,
+            intra_group_reward_std=0.0,
             heldout_auc=0.5, loss={}, buffer_current_fraction=0.5,
             buffer_replay_fraction=0.5, buffer_base_occupied=32,
             buffer_recent_occupied=0, lr=2e-6, elapsed_s=1.0,

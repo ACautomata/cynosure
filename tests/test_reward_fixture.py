@@ -148,6 +148,7 @@ class RewardFixtureScenario:
             auc = components.auc.compute(fake_batch)
             components.run_artifacts.append_event(IterEvent(
                 iteration=iteration,
+                modality="t1n",  # fixture 语义：固定 fake 批，无条件采样
                 # fixture 语义：固定 fake 批 = 冻结 policy 的锚终点（无扰动）
                 anchor_eval_reward=rewards.mean().item(),
                 intra_group_reward_std=rewards.std().item(),

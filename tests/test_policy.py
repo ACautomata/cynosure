@@ -392,8 +392,10 @@ class TestRolloutSampler:
 
 class TestGranularContinuation:
     """λ 粒度续跑（MGAI，research/granular-grpo.md §3）：按时间步间隔 λ
-    抽稀 sigma 日程做确定性 ODE 积分——λ=1 逐步（既有行为），λ>1 大步。
-    访问点 = index+λ, index+2λ, ...，末段一律从最后位置直达 σ=0 终点。"""
+    抽稀 sigma 日程做确定性 ODE 积分——λ=1 逐步（既有行为），λ>1 先走一个
+    逐步细步再按 λ 抽稀。参考实现的访问日程 ``suffix =
+    sigma_schedule[eta_step+2::g]`` 从 k+2 起才抽稀：扰动后 latent 位于
+    k+1，首段细步与 λ=1 同粒度，之后访问点相隔 λ，末段一律直达 σ=0 终点。"""
 
     NUM_STEPS = 5
 
@@ -460,33 +462,45 @@ class TestGranularContinuation:
         self, wide_sampler: RolloutSampler, wide_cursor: TrajectoryCursor,
         fixture_unet: DiffusionModelUNetMaisi, conditions: RolloutCondition,
     ) -> None:
-        """λ=2 续跑（index=2）：访问点 5 越过日程末端 → 单段大步直落 σ=0
-        （velocity 在段起点 t3 评估、Δs = t3/1000）。"""
+        """λ=2 续跑（index=2）：访问日程 suffix = σ[4::2] = [σ4]——首段
+        细步 (3→4) 与 λ=1 同粒度，末段 (4→σ=0) 单段大步直达终点。"""
         torch.manual_seed(0)
         latents = torch.randn(2, *LATENT_SHAPE)
         outcome = wide_sampler.continue_to_terminal(latents, 2, conditions, stride=2)
         deterministic = SdeKernel.deterministic(s_max=0.999)
-        velocity = CfgCombinedField(fixture_unet).velocity(
-            latents, wide_cursor.timestep(3), conditions,
-        )
-        expected = deterministic.transition(
-            latents, velocity, wide_cursor.sigma_level(3),
-            wide_cursor.sigma_level(3),
+        field = CfgCombinedField(fixture_unet)
+        x = latents
+        velocity = field.velocity(x, wide_cursor.timestep(3), conditions)
+        x = deterministic.transition(
+            x, velocity, wide_cursor.sigma_level(3),
+            wide_cursor.sigma_level(3) - wide_cursor.sigma_level(4),
         ).sample
-        assert torch.allclose(outcome, expected, rtol=1e-6, atol=1e-7)
+        velocity = field.velocity(x, wide_cursor.timestep(4), conditions)
+        x = deterministic.transition(
+            x, velocity, wide_cursor.sigma_level(4),
+            wide_cursor.sigma_level(4),
+        ).sample
+        assert torch.allclose(outcome, x, rtol=1e-6, atol=1e-7)
 
-    def test_stride2_keeps_midpoint_visit_when_in_range(
+    def test_stride2_fine_step_then_decimated_visits(
         self, wide_sampler: RolloutSampler, wide_cursor: TrajectoryCursor,
         fixture_unet: DiffusionModelUNetMaisi, conditions: RolloutCondition,
     ) -> None:
-        """λ=2 续跑（index=1）：访问点 3 在日程内 → 段 (1→3) 大步 + 末段
-        (3→σ=0)——抽稀日程的两段积分（粒度与 λ=1 真实分叉）。"""
+        """λ=2 续跑（index=0）：访问日程 suffix = σ[2::2] = [σ2, σ4]——
+        首段细步 (1→2) 与 λ=1 同粒度（参考实现从 k+2 起才抽稀，漏掉该步
+        会跳过普通续跑的第一个端点、改变全部粗粒度终点），之后大步
+        (2→4)，末段 (4→σ=0)。"""
         torch.manual_seed(0)
         latents = torch.randn(2, *LATENT_SHAPE)
-        outcome = wide_sampler.continue_to_terminal(latents, 1, conditions, stride=2)
+        outcome = wide_sampler.continue_to_terminal(latents, 0, conditions, stride=2)
         deterministic = SdeKernel.deterministic(s_max=0.999)
         field = CfgCombinedField(fixture_unet)
         x = latents
+        velocity = field.velocity(x, wide_cursor.timestep(1), conditions)
+        x = deterministic.transition(
+            x, velocity, wide_cursor.sigma_level(1),
+            wide_cursor.sigma_level(1) - wide_cursor.sigma_level(2),
+        ).sample
         velocity = field.velocity(x, wide_cursor.timestep(2), conditions)
         x = deterministic.transition(
             x, velocity, wide_cursor.sigma_level(2),
@@ -499,14 +513,43 @@ class TestGranularContinuation:
         ).sample
         assert torch.allclose(outcome, x, rtol=1e-6, atol=1e-7)
 
+    def test_stride2_leads_with_fine_step(
+        self, wide_sampler: RolloutSampler, wide_cursor: TrajectoryCursor,
+        fixture_unet: DiffusionModelUNetMaisi, conditions: RolloutCondition,
+    ) -> None:
+        """λ=2 续跑（index=1）：访问日程 suffix = σ[3::2] = [σ3]——首段
+        细步 (2→3) 与 λ=1 同粒度，末段 (3→σ=0)（粒度与 λ=1 真实分叉）。"""
+        torch.manual_seed(0)
+        latents = torch.randn(2, *LATENT_SHAPE)
+        outcome = wide_sampler.continue_to_terminal(latents, 1, conditions, stride=2)
+        deterministic = SdeKernel.deterministic(s_max=0.999)
+        field = CfgCombinedField(fixture_unet)
+        x = latents
+        velocity = field.velocity(x, wide_cursor.timestep(2), conditions)
+        x = deterministic.transition(
+            x, velocity, wide_cursor.sigma_level(2),
+            wide_cursor.sigma_level(2) - wide_cursor.sigma_level(3),
+        ).sample
+        velocity = field.velocity(x, wide_cursor.timestep(3), conditions)
+        x = deterministic.transition(
+            x, velocity, wide_cursor.sigma_level(3),
+            wide_cursor.sigma_level(3),
+        ).sample
+        assert torch.allclose(outcome, x, rtol=1e-6, atol=1e-7)
+
     def test_strides_diverge_after_schedule_shortens(
         self, wide_sampler: RolloutSampler, conditions: RolloutCondition,
     ) -> None:
-        """不同 λ 的续跑终点不同（粒度差异真实存在——MGAI 的前提）。"""
+        """不同 λ 的续跑终点不同（粒度差异真实存在——MGAI 的前提）。
+
+        index=1（剩余 3 步日程）：λ=1 走 (2→3)→(3→4)→(4→σ0)，λ=2 走
+        细步 (2→3) + 大步 (3→σ0)——首个细步之后分叉。（index=2 的剩余
+        2 步日程下两粒度访问日程重合：suffix = σ[4::2] = [σ4] 与逐步
+        同路径，分叉须剩余日程 > λ 才存在。）"""
         torch.manual_seed(0)
         latents = torch.randn(2, *LATENT_SHAPE)
-        stride1 = wide_sampler.continue_to_terminal(latents, 2, conditions, stride=1)
-        stride2 = wide_sampler.continue_to_terminal(latents, 2, conditions, stride=2)
+        stride1 = wide_sampler.continue_to_terminal(latents, 1, conditions, stride=1)
+        stride2 = wide_sampler.continue_to_terminal(latents, 1, conditions, stride=2)
         assert not torch.equal(stride1, stride2)
 
     def test_stride_beyond_schedule_is_single_terminal_leap(

@@ -76,7 +76,10 @@ class ChannelNormalizer:
         self._std = std.view(-1, 1, 1, 1)
 
     def normalize(self, latents: torch.Tensor) -> torch.Tensor:
-        """[B,C,D,H,W] → (x − mean) / std（通道数须与统计量一致，定死 4）。"""
+        """[B,C,D,H,W] → (x − mean) / std（通道数须与统计量一致，定死 4）。
+
+        统计量按输入张量的 device 对齐（判别器与 rollout 位于加速器时
+        统计量随迁——每调用 4×2 个标量的传输可忽略）。"""
         if latents.dim() != 5:
             raise ValueError(
                 f"latent 批须为 [B,C,D,H,W]，得到 {tuple(latents.shape)}"
@@ -86,7 +89,9 @@ class ChannelNormalizer:
                 f"latent 通道数 {latents.shape[1]} 与统计量通道数 "
                 f"{self._mean.shape[0]} 不符（VAE latent_channels 定死 4）"
             )
-        return (latents - self._mean) / self._std
+        return (latents - self._mean.to(latents.device)) / self._std.to(
+            latents.device,
+        )
 
 
 class RewardScorer:

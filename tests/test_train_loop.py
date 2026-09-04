@@ -19,10 +19,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader
+from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.train import GranularGrpoTrainer, RunArtifacts
+from cynosure.reward.update import UpdateReport
+from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from tests.conftest import CliSession, FixturePrepareScenario
 
 
@@ -94,11 +95,14 @@ class TestSingleIterationLoop:
     ) -> None:
         """iter 事件：Anchor eval reward、非退化组内 reward std（G=12）、
         held-out AUC、loss 组件（逐 k policy + discriminator）、buffer
-        占比（混合占比 + 两区占用）、lr。"""
+        占比（混合占比 + 两区占用）、lr、采样的目标序列（per-sequence
+        健康监控的归因轴——条件分布每 iter 均匀采一个序列，事件不记
+        序列名时 reward/loss/AUC 无法归因，随机序列变化会伪装成趋势）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         event = scenario.events()[0]
         assert event["iteration"] == 0
+        assert event["modality"] in MODALITIES
         assert math.isfinite(event["anchor_eval_reward"])
         assert event["intra_group_reward_std"] > 0.0  # G=12 组内标准化非退化
         assert 0.0 < event["heldout_auc"] < 1.0
@@ -201,6 +205,145 @@ class TestSingleIterationLoop:
         )
         assert result.code == 2
         assert "训练输入契约违反" in result.stderr
+
+
+class TestPolicyOptimizerConfig:
+    """policy 优化器装配：参考实现超参显式落位，不依赖 PyTorch 默认值。"""
+
+    def test_policy_optimizer_carries_reference_weight_decay(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """AdamW 显式带参考实现的 weight decay 1e-4（research/granular-grpo.md
+        超参总表）——PyTorch 默认 1e-2 是 100× 过正则，会淹没 2e-6 的
+        policy 学习步。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        (group,) = trainer.updater.optimizer.param_groups
+        assert group["weight_decay"] == pytest.approx(
+            config.policy.policy_weight_decay,
+        )
+        assert group["weight_decay"] == pytest.approx(1e-4)
+
+
+class RecordingScorer:
+    """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""
+
+    def __init__(self, discriminator: torch.nn.Module) -> None:
+        self.discriminator = discriminator
+
+
+class RecordingUpdate:
+    """测试仪器：记录 update.step 收到的批与调用时的判别器相位。"""
+
+    def __init__(self, discriminator: torch.nn.Module) -> None:
+        self.scorer = RecordingScorer(discriminator)
+        self.received: list[torch.Tensor] = []
+        self.training_at_call: list[bool] = []
+
+    def step(self, current_fakes: torch.Tensor) -> UpdateReport:
+        self.received.append(current_fakes)
+        self.training_at_call.append(self.scorer.discriminator.training)
+        return UpdateReport(
+            loss_discriminator=0.0,
+            loss_real_term=0.0,
+            loss_fake_term=0.0,
+            num_current=1,
+            num_replay=0,
+            num_base_replay=0,
+            num_recent_replay=0,
+        )
+
+
+class TestDiscriminatorSideOrchestration:
+    """判别器侧编排（train 循环第 2 相的 fake 供给与判别器相位）。"""
+
+    def test_update_step_draws_current_fakes_across_full_batch(self) -> None:
+        """当前 fake 半区跨全批均匀随机抽取：new_fakes 按训练步与粒度
+        有序堆叠（(k,λ) 升序 + Anchor 终点在末），若确定性取前 K/2 条，
+        K=4 时判别器当前半区只见最小 step、λ=1 的前两个方向——其余
+        分布从不进更新。判别器在更新期间处 train 相（spectral norm
+        power iteration 属训练语义）、结束后恢复 eval 相（打分/监控
+        前向不得漂移其有效权重）。"""
+        discriminator = torch.nn.Linear(1, 1)
+        update = RecordingUpdate(discriminator)
+        coordinator = RewardCoordinator(
+            update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
+            generator=torch.Generator().manual_seed(11),
+        )
+        fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
+        coordinator.update_step(fakes)
+        received = update.received[0]
+        expected_perm = torch.randperm(
+            6, generator=torch.Generator().manual_seed(11),
+        )
+        assert torch.equal(received, fakes[expected_perm])  # 跨全批置换
+        assert update.training_at_call[0] is True  # 更新期间 train 相
+        assert discriminator.training is False  # 结束恢复 eval 相
+
+    def test_scoring_forward_is_idempotent_under_spectral_norm(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """spectral norm 启用时打分幂等：打分/监控前向恒在 eval 相
+        （power iteration 不推进）——判别器若停在 train 相打分，同批
+        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["reward"]["spectral_norm_enabled"] = True
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        assert trainer.run() == 1
+        assert trainer.rewards.discriminator.training is False
+        sample = trainer.rewards.buffer.recent_samples()[0]
+        scorer = trainer.rewards.update.scorer
+        first = scorer.reward(sample.unsqueeze(0))
+        second = scorer.reward(sample.unsqueeze(0))
+        assert torch.equal(first, second)  # eval 相打分幂等
+
+
+class TestDevicePlacement:
+    """设备放置（装配期单点选设备、协作者经注入对齐）。
+
+    fixture 测试面是 CPU-only：本组断言锁「模型与张量同源于 trainer 的
+    设备」这一装配契约（accelerator 可用时的实际放置由 DCU 实例的
+    M0 门槛验证，fixture 无法覆盖 cuda 分支）。"""
+
+    def test_models_follow_trainer_device(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(
+            config, artifacts, device=torch.device("cpu"),
+        )
+        assert trainer.unet.parameters().__next__().device.type == "cpu"
+        assert (
+            trainer.rewards.discriminator.parameters().__next__().device.type
+            == "cpu"
+        )
+
+    def test_scoring_inputs_carry_no_stray_cpu_tensors(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """打分输入（rollout 终点、real 采样）与判别器同 device——CPU 上
+        退化为同源性 sanity（cuda 分支由 CfgCombinedField 的 timesteps
+        device 对齐与 RealPoolSampler 的迁移保证）。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(
+            config, artifacts, device=torch.device("cpu"),
+        )
+        trainer.seed_base_partition()
+        sample = trainer.rewards.buffer.base_samples()[0]
+        assert sample.device.type == "cpu"
+        assert trainer.rewards.update.scorer.reward(
+            sample.unsqueeze(0),
+        ).device.type == "cpu"
 
 
 class TestBufferBaseSeeding:

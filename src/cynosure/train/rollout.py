@@ -42,6 +42,9 @@ class IterationRollout:
     """一个 RL iteration 的 rollout 相产出（eval + no_grad 的完整记录）。"""
 
     condition: RolloutCondition
+    modality: str
+    """本 iteration 采样的目标序列（条件分布四序列均匀采样）——iter
+    事件按目标序列归因 reward/loss/AUC 的依据。"""
     anchor_eval_reward: float
     """Anchor 全 ODE 终点的判别器 reward（训练曲线信号，不参与 loss）。"""
     steps: list[StepRollout]
@@ -63,17 +66,29 @@ class ModalLabelConditionSampler:
     SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
     """fixture 单位间距（1.0 × 1e2）；生产 spacing 分布由数据侧 ticket 接管。"""
 
-    def __init__(self, mapping: ModalityMapping, generator: torch.Generator) -> None:
+    def __init__(
+        self,
+        mapping: ModalityMapping,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> None:
         self._mapping = mapping
         self._generator = generator
+        self._device = device
 
-    def sample(self) -> RolloutCondition:
-        """均匀采一个序列的 rollout 条件（label batch=1，组合场负责广播）。"""
+    def sample(self) -> tuple[RolloutCondition, str]:
+        """均匀采一个序列的 rollout 条件（label batch=1，组合场负责广播），
+        连同采中的序列名返回——iter 事件按目标序列归因健康指标的依据。
+        随机数经 CPU generator 生成（跨设备可复现的 fixture「固定 seed」
+        语义）后迁移到 rollout 设备。"""
         index = int(torch.randint(len(MODALITIES), (1,), generator=self._generator))
         label = self._mapping.label(MODALITIES[index])
-        return RolloutCondition(
-            label=torch.tensor([label]),
-            spacing=torch.tensor([self.SPACING_X1E2]),
+        return (
+            RolloutCondition(
+                label=torch.tensor([label], device=self._device),
+                spacing=torch.tensor([self.SPACING_X1E2], device=self._device),
+            ),
+            MODALITIES[index],
         )
 
 
@@ -88,6 +103,7 @@ class RolloutPhase:
         generator: torch.Generator,
         device_type: str = "cpu",
         autocast_dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = torch.device("cpu"),
     ) -> None:
         self._config = config
         self._sampler = sampler
@@ -95,18 +111,20 @@ class RolloutPhase:
         self._generator = generator
         self._device_type = device_type
         self._amp_dtype = autocast_dtype
+        self._device = device
         self._condition_sampler = ModalLabelConditionSampler(
             ModalityMapping.load(config.artifacts.modality_mapping_json),
             generator,
+            device,
         )
 
     def run_iteration(self) -> IterationRollout:
         """单条件组的完整 rollout 与打分（执行序第 1 相的单进程版）。"""
-        condition = self._condition_sampler.sample()
+        condition, modality = self._condition_sampler.sample()
         with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
             noise = torch.randn(
                 (1, *self._config.latent_shape), generator=self._generator,
-            )
+            ).to(self._device)
             anchor = self._sampler.anchor_trajectory(noise, condition)
             sampled = [
                 (
@@ -142,6 +160,7 @@ class RolloutPhase:
         fakes.append(anchor_terminal)
         return IterationRollout(
             condition=condition,
+            modality=modality,
             anchor_eval_reward=anchor_eval_reward,
             steps=steps,
             new_fakes=torch.cat(fakes),
@@ -156,10 +175,10 @@ class RolloutPhase:
         with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
             while produced < total:
                 count = min(_BASE_BATCH, total - produced)
-                condition = self._condition_sampler.sample()
+                condition = self._condition_sampler.sample()[0]
                 noise = torch.randn(
                     (count, *self._config.latent_shape), generator=self._generator,
-                )
+                ).to(self._device)
                 anchor = self._sampler.anchor_trajectory(noise, condition)
                 terminals.append(anchor[-1])
                 produced += count
@@ -179,7 +198,7 @@ class RolloutPhase:
         noise = torch.randn(
             (policy.group_size_g, *self._config.latent_shape),
             generator=self._generator,
-        )
+        ).to(self._device)
         directions, old_log_probs = self._sampler.perturb_group(
             anchor[step_index], step_index, condition, noise,
         )

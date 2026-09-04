@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -38,8 +38,11 @@ class IterEvent(BaseModel):
 
     model_config = ConfigDict(allow_inf_nan=False)
 
-    event: Annotated[Literal["iter"], Field(default="iter")]
+    event: Literal["iter"] = "iter"
     iteration: int
+    modality: str
+    """本 iteration 采样的目标序列（条件分布四序列均匀采样）——reward/
+    loss/AUC 按目标序列归因的轴（per-sequence 健康监控，experiment-design）。"""
     anchor_eval_reward: float
     intra_group_reward_std: float
     heldout_auc: float
@@ -61,7 +64,7 @@ class MilestoneEvent(BaseModel):
 
     model_config = ConfigDict(allow_inf_nan=False)
 
-    event: Annotated[Literal["milestone"], Field(default="milestone")]
+    event: Literal["milestone"] = "milestone"
     iteration: int
     fid: float
     kid: float | None = None

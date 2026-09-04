@@ -33,11 +33,20 @@ class RealSampling(Protocol):
 
 
 class RealPoolSampler:
-    """Real sample pool 的批采样器（无放回均匀采样）。"""
+    """Real sample pool 的批采样器（无放回均匀采样）。
 
-    def __init__(self, manifest: LatentManifest, generator: torch.Generator) -> None:
+    manifest latents 持久化在 CPU，采样结果经 ``device`` 迁移到消费方
+    （判别器/打分）所在设备——CPU generator 的采样决策与设备解耦。"""
+
+    def __init__(
+        self,
+        manifest: LatentManifest,
+        generator: torch.Generator,
+        device: torch.device = torch.device("cpu"),
+    ) -> None:
         self._manifest = manifest
         self._generator = generator
+        self._device = device
 
     @property
     def size(self) -> int:
@@ -54,4 +63,4 @@ class RealPoolSampler:
         return torch.stack([
             self._manifest.load_latent(self._manifest.entries[index])
             for index in indices.tolist()
-        ])
+        ]).to(self._device)

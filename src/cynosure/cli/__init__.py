@@ -96,6 +96,18 @@ class CynosureCli:
             return None
 
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
+        if os.environ.get("RANK") not in (None, "0"):
+            # 单进程训练循环（#21 tracer bullet）：FSDP 梯度聚合与 rank 0
+            # 归并落盘由 orchestration ticket（T09）交付。非 0 rank 放行会
+            # 各自跑完整循环——重复追加 iter 事件、覆写同一 checkpoint 文件
+            # 名（RunArtifacts 的 rank 0 写盘契约被静默破坏），故显式拒绝
+            print(
+                f"检测到 torchrun 非 0 rank（RANK={os.environ['RANK']}）："
+                "训练循环当前为单进程实现（FSDP 梯度聚合与 rank 0 归并落盘"
+                "由 orchestration ticket 交付），非 0 rank 显式拒绝",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         if args.dump_trajectory and not config.fixture_mode:
             # 诊断工件属 fixture 诊断模式（spec「产物工件契约」）：生产采样
             # 诊断随训练循环 ticket 交付，当前显式拒绝、不建 run 目录
