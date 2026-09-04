@@ -18,7 +18,7 @@ import time
 import torch
 from pydantic import BaseModel, ConfigDict
 
-from cynosure.config import CynosureConfig
+from cynosure.config import CynosureConfig, Modality
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.cursor import TrajectoryCursor
@@ -105,9 +105,15 @@ class RewardCoordinator:
         finally:
             self.discriminator.eval()
 
-    def heldout_auc(self, current_fakes: torch.Tensor) -> float:
-        """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。"""
-        return self.auc.compute(current_fakes)
+    def heldout_auc(
+        self, current_fakes: torch.Tensor, modality: Modality,
+    ) -> float:
+        """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。
+
+        real 侧按本 iteration 采样的目标序列过滤——iter 事件按序列归因
+        reward/loss/AUC，混采会让其他序列的判别器分数偏移伪装成本序列
+        realism 变化（per-target-sequence 健康监控）。"""
+        return self.auc.compute(current_fakes, modality=modality)
 
 
 class GranularGrpoTrainer:
@@ -215,7 +221,9 @@ class GranularGrpoTrainer:
                 modality=record.modality,
                 anchor_eval_reward=record.anchor_eval_reward,
                 intra_group_reward_std=record.intra_group_reward_std,
-                heldout_auc=self.rewards.heldout_auc(record.new_fakes),
+                heldout_auc=self.rewards.heldout_auc(
+                    record.new_fakes, record.modality,
+                ),
                 loss=loss_terms,
                 buffer_current_fraction=(
                     report.num_current / batch_size_k if report else 0.0
@@ -229,8 +237,11 @@ class GranularGrpoTrainer:
                 elapsed_s=time.monotonic() - started,
             ))
             if (
-                iteration + 1
-            ) % self.config.schedule.checkpoint_interval == 0:
+                (iteration + 1) % self.config.schedule.checkpoint_interval == 0
+                or (iteration + 1) % self.config.schedule.milestone_interval == 0
+            ):
+                # checkpoint 周期之外，每个里程碑也强制落盘（config 契约：
+                # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须产出）
                 self._write_checkpoint(iteration + 1)
                 last_checkpoint = iteration + 1
         if last_checkpoint != self.config.schedule.max_iterations:

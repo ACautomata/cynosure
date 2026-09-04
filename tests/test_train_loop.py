@@ -167,6 +167,27 @@ class TestSingleIterationLoop:
         ))
         assert any(p.requires_grad for p in reloaded_disc.parameters())
 
+    def test_milestone_iteration_forces_checkpoint(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """里程碑迭代强制落盘（schedule.checkpoint_interval 的 config 契约
+        「每里程碑强制落盘」）：checkpoint 周期不覆盖的里程碑也必须产出
+        checkpoint（milestone 评测器与恢复路径的取数点）。
+        milestone_interval=2、checkpoint_interval=5、max_iterations=3：
+        iter2 仅由里程碑节奏落盘（2 % 5 != 0），iter3 由收尾兜底写入，
+        iter3 兜底不受里程碑条件影响。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["schedule"]["max_iterations"] = 3
+        data["schedule"]["milestone_interval"] = 2
+        data["schedule"]["checkpoint_interval"] = 5
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        assert scenario.train().code == 0, scenario.stderr
+        checkpoints = scenario.run_dir / "checkpoints"
+        assert (checkpoints / "policy_iter2.pt").is_file()
+        assert (checkpoints / "discriminator_iter2.pt").is_file()
+        assert (checkpoints / "policy_iter3.pt").is_file()
+
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
     ) -> None:
