@@ -31,10 +31,8 @@ from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train import IterEvent, RunArtifacts
-from tests.conftest import CliSession, SyntheticBratsDataset
+from tests.conftest import CliSession, FixturePrepareScenario
 
-FIXTURE_SERIES_SHAPE = (64, 64, 32)
-NUM_CASES = 20
 # 200 步（patch 级 AUC 轨迹实测钉死）：loss 1.06→0.18 单调下降、
 # held-out AUC 0.48→0.92（patch 级口径收敛慢于样本级，~175 步后爬升）
 NUM_STEPS = 200
@@ -69,18 +67,9 @@ class RewardFixtureScenario:
     def prepare_artifacts(self) -> None:
         """prepare 端到端（fixture 合成数据）：pool / heldout / stats 三工件。"""
         config = Fixture().config(self.fixture_dir)
-        config.schedule.seed = 0
-        SyntheticBratsDataset(
-            config.artifacts.dataset_root,
-            [f"BraTS-GLI-{index:05d}-000" for index in range(NUM_CASES)],
-            FIXTURE_SERIES_SHAPE,
-            seed=0,
-        ).write()
-        self.config_path.write_text(
-            config.model_dump_json(indent=2), encoding="utf-8",
+        FixturePrepareScenario(self.cli, config, self.tmp_path).run(
+            self.config_path,
         )
-        result = self.cli.run("prepare", "--config", str(self.config_path))
-        assert result.code == 0, result.stderr
 
     def write_network_artifacts(self) -> None:
         # fixture 网络「固定 seed」机制：随机初始化随 seed 定死（轨迹可复现）
@@ -170,6 +159,8 @@ class RewardFixtureScenario:
                 buffer_replay_fraction=(
                     report.num_replay / config.reward.disc_batch_size_k
                 ),
+                buffer_base_occupied=components.buffer.zone_sizes().base,
+                buffer_recent_occupied=components.buffer.zone_sizes().recent,
                 lr=config.policy.policy_lr,
                 elapsed_s=0.0,
             ))

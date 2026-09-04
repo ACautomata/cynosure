@@ -1,6 +1,9 @@
 """轨迹诊断工件测试（ticket #19）：train --dump-trajectory 经 fixture 端到端，
 只断言诊断工件的外部行为——η=0 parity 双列、sigma 日程锚、log-prob 对、
-双样本分布统计量（测试面 #1–#3 的载体，spec「Testing Decisions」）。"""
+双样本分布统计量（测试面 #1–#3 的载体，spec「Testing Decisions」）。
+
+#21 起诊断开关 = 诊断回路 + 训练循环（同一 run 目录）：训练需要 reward
+工件，场景先跑 prepare（fixture 合成数据）。"""
 
 import json
 import math
@@ -9,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from cynosure.fixtures import Fixture
-from tests.conftest import CliSession, CliResult
+from tests.conftest import CliSession, CliResult, FixturePrepareScenario
 
 RUN_DIR = "diag-run"
 
@@ -20,14 +23,19 @@ class DiagnosticScenario:
     def __init__(self, cli: CliSession, tmp_path: Path) -> None:
         self._cli = cli
         self._tmp_path = tmp_path
+        self._fixture_dir = tmp_path / "fixtures"
         self._config_path = tmp_path / "config.json"
 
     def run(self, *, eta: float = 0.7, seed: int = 0) -> CliResult:
         fixture = Fixture()
-        fixture.write_artifacts(self._tmp_path / "fixtures")
-        config = fixture.config(self._tmp_path / "fixtures")
+        fixture.write_artifacts(self._fixture_dir)
+        config = fixture.config(self._fixture_dir)
         config.policy.sde_eta = eta
         config.schedule.seed = seed
+        config.schedule.max_iterations = 1  # 诊断场景聚焦工件：单 iteration
+        FixturePrepareScenario(self._cli, config, self._tmp_path).run(
+            self._tmp_path / "prepare_config.json",
+        )
         self._config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
@@ -156,8 +164,12 @@ class TestEtaZeroParity:
         self, scenario: DiagnosticScenario,
     ) -> None:
         """η=0 对照：扰动 + 续跑终点分布与 Anchor 终点一致（无噪声可注入，
-        仅 batch 组织的 fp32 归约序差异），log-prob 对为空（确定性步无密度）。"""
-        assert scenario.run(eta=0.0).code == 0
+        仅 batch 组织的 fp32 归约序差异），log-prob 对为空（确定性步无密度）。
+        #21 起诊断开关含训练循环：η=0 无策略密度、训练侧显式拒绝，但
+        trajectory.json 已在拒绝前产出（纯诊断路径仍然可用）。"""
+        result = scenario.run(eta=0.0)
+        assert result.code == 2
+        assert "η=0" in result.stderr
         report = scenario.report()
         control = report["control_terminals"]
         perturbed = report["perturbed_terminals"]

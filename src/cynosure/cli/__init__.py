@@ -1,12 +1,12 @@
 """cynosure 命令行：train / eval / prepare 三子命令与 config schema 校验
 ——全库唯一测试 seam（spec「Testing Decisions」）。
 
-三子命令共享同一 config schema；本 ticket（#16，prefactor）交付 seam 与
-run 目录契约最小版，训练 / 评测的实际循环由后续 ticket 填充（prepare
-数据工件管线已由 #18 交付，fixture 合成数据下端到端可跑）。
-
-单进程 seam：torchrun 入口（FSDP 初始化等）属 orchestration ticket；
-分布式启动须经显式 --run-dir（跨 rank 的 run 目录 barrier 见 train.RunArtifacts）。
+三子命令共享同一 config schema；dispatch 前统一校验。train 自 #21 起
+执行单进程 Granular-GRPO 训练循环（MGAI → 逐 k 梯度步 → 判别器 Online
+update → iter 事件流 + checkpoint）；``--dump-trajectory`` 额外产出
+fixture 诊断工件（轨迹双列/log-prob 对）。分布式 torchrun 入口
+（FSDP 初始化等）属 orchestration ticket（T09）；
+分布式启动须经显式 --run-dir（跨 rank 的 run 目录 barrier 见 train）。
 """
 
 import argparse
@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
-from cynosure.train import RunArtifacts
+from cynosure.train import GranularGrpoTrainer, RunArtifacts
 
 _EXIT_USAGE_ERROR = 2
 
@@ -131,11 +131,29 @@ class CynosureCli:
             return _EXIT_USAGE_ERROR
         print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
         if args.dump_trajectory:
-            return self._dump_trajectory(config, artifacts)
-        if os.environ.get("RANK") in (None, "0"):  # 非 0 rank 只采用、不落盘
+            code = self._dump_trajectory(config, artifacts)
+            if code != 0:
+                return code
+        return self._run_training(config, artifacts, args.dump_trajectory)
+
+    def _run_training(
+        self, config: CynosureConfig, artifacts: RunArtifacts,
+        dump_trajectory: bool,
+    ) -> int:
+        """训练循环（ticket #21 tracer bullet）：MGAI → 逐 k 梯度步 →
+        判别器 Online update → iter 事件流 + checkpoint 落盘；
+        ``--dump-trajectory`` 额外产出训练侧 log-prob 对（training.json）。"""
+        try:
+            completed = GranularGrpoTrainer(
+                config, artifacts, dump_trajectory=dump_trajectory,
+            ).run()
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"训练输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        if os.environ.get("RANK") in (None, "0"):
             print(
-                "工件契约最小版已落盘：config.json / metrics.jsonl / manifest.json /"
-                " checkpoints/（训练循环由后续 ticket 填充）",
+                f"训练完成（{completed} iteration）：iter 事件流 "
+                f"{artifacts.paths.metrics}、checkpoint {artifacts.paths.checkpoints}",
                 file=self._stdout,
             )
         return 0

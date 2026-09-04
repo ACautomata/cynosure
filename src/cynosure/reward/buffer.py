@@ -38,6 +38,11 @@ class ReplayStore(Protocol):
     Online update 依赖本接口而非具体两区实现。
     """
 
+    @property
+    def base_capacity(self) -> int:
+        """base 分区容量（train 启动期 base 分区种子生成的数量依据）。"""
+        ...
+
     def fill_base(self, latents: torch.Tensor) -> None:
         """初始冻结 policy 产出填充 base 分区。"""
         ...
