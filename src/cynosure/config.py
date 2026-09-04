@@ -30,7 +30,7 @@ from pydantic import (
 Modality = Literal["t1n", "t1c", "t2w", "t2f"]
 """脑 MRI 四序列（BraTS2023）；CT↔MR 不在本轮实验矩阵（experiment-design 章）。"""
 
-MODALITIES: tuple[str, ...] = ("t1n", "t1c", "t2w", "t2f")
+MODALITIES: tuple[Modality, ...] = ("t1n", "t1c", "t2w", "t2f")
 """组1 模态标签条件与组2 跨模态方向共用的四序列清单（定死，experiment-design）。"""
 
 # 组1 采样场（ADR-0002 定死）：CFG=10 组合场，v_cfg = v_uncond + 10·(v_cond − v_uncond)

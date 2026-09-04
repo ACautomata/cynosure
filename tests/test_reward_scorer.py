@@ -17,7 +17,7 @@ from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats
-from cynosure.reward.scorer import RewardScorer
+from cynosure.reward.scorer import ChannelNormalizer, RewardScorer
 
 
 class ScorerScenario:
@@ -174,6 +174,66 @@ class TestSpectralNorm:
         assert all(name.endswith(".conv") for name in parametrized)
         reward = scorer.reward(scenario.latents())
         assert torch.isfinite(reward).all()
+
+
+class TestModuleAggregation:
+    """设备迁移结构（nn.Module 聚合）：统计量注册为 buffer、scorer 单点 .to()。
+
+    reward 侧的 device 迁移由 torch 的 ``.to()`` 递归机制单点接管：
+    ChannelNormalizer 的 mean/std 是持久统计量（register_buffer），与
+    判别器参数同属 RewardScorer 的模块树；trainer 装配只调一次
+    ``scorer.to(device)``。fixture 测试面 CPU-only，cuda 分支留 M0 门槛。
+    """
+
+    def test_normalizer_registers_stats_as_buffers(
+        self, scenario: ScorerScenario,
+    ) -> None:
+        """mean/std 是注册 buffer（named_buffers 可见），不是普通属性。"""
+        normalizer = ChannelNormalizer(scenario.stats())
+        buffers = dict(normalizer.named_buffers())
+        assert set(buffers) == {"mean", "std"}
+        assert buffers["mean"].shape == (4, 1, 1, 1)
+        assert buffers["std"].shape == (4, 1, 1, 1)
+
+    def test_scorer_aggregates_discriminator_and_normalizer_as_submodules(
+        self, scenario: ScorerScenario,
+    ) -> None:
+        """normalizer 与 discriminator 都是 scorer 的注册子模块（属性赋值
+        即注册）——``.to()`` 沿模块树递归即可触达两者。"""
+        scorer = scenario.scorer()
+        modules = dict(scorer.named_modules())
+        assert modules.get("_normalizer") is not None
+        assert modules["_discriminator"] is scorer.discriminator
+
+    def test_scorer_to_moves_parameters_and_buffers(
+        self, scenario: ScorerScenario,
+    ) -> None:
+        """``scorer.to(device)`` 单点迁移：判别器参数与统计量 buffer 同 device。"""
+        scorer = scenario.scorer()
+        returned = scorer.to(torch.device("cpu"))
+        assert returned is scorer  # nn.Module.to 链式契约
+        assert scorer.discriminator.parameters().__next__().device.type == "cpu"
+        buffers = dict(scorer.named_buffers())
+        assert set(buffers) >= {"_normalizer.mean", "_normalizer.std"}
+        assert all(b.device.type == "cpu" for b in buffers.values())
+
+    def test_reward_invariant_under_to(self, scenario: ScorerScenario) -> None:
+        """纯结构迁移：``.to()`` 前后同批 reward 逐位不变（数值口径不动）。"""
+        scorer = scenario.scorer()
+        latents = scenario.latents()
+        before = scorer.reward(latents)
+        scorer.to(torch.device("cpu"))
+        assert torch.equal(before, scorer.reward(latents))
+
+    def test_device_mismatch_rejected_explicitly(
+        self, scenario: ScorerScenario,
+    ) -> None:
+        """normalize 的 device 契约 fail-fast：输入与统计量 buffer device
+        不符时显式拒绝（不再静默 ``.to()`` 对齐——错位输入即装配契约违例）。"""
+        normalizer = ChannelNormalizer(scenario.stats())
+        meta_latents = torch.empty(2, 4, 8, 8, 4, device=torch.device("meta"))
+        with pytest.raises(ValueError, match="device"):
+            normalizer.normalize(meta_latents)
 
 
 class TestDepthAnchor:

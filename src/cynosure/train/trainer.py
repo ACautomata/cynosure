@@ -275,7 +275,7 @@ class GranularGrpoTrainer:
             config.reward,
             ChannelStats.load(config.reward.channel_stats_json),
         )
-        scorer.discriminator.to(self._device)
+        scorer.to(self._device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         seed = config.schedule.seed
         update = OnlineUpdate(
             scorer=scorer,
