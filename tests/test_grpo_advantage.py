@@ -103,3 +103,14 @@ class TestMgaiAdvantage:
     def test_group_size_mismatch_rejected(self, advantage: MgaiAdvantage) -> None:
         with pytest.raises(ValueError, match="组内"):
             advantage.compute({1: torch.randn(3), 2: torch.randn(4)})
+
+    def test_advantage_follows_reward_device(self, advantage: MgaiAdvantage) -> None:
+        """累加器随 reward 的 device/dtype 初始化（new_zeros 语义）：加速器
+        resident 的判别器 reward 进 compute 时，CPU 零向量与之相加会跨设备
+        报错（cuda/HIP 训练路径在首个 policy update 前即中断）——输出须
+        与输入同 device。fixture 测试面 CPU-only，meta device 锁同一装配
+        契约（跨设备算术被 torch 拒绝的语义与 cuda 一致）。"""
+        rewards = {1: torch.randn(GROUP_SIZE, device="meta")}
+        outcome = advantage.compute(rewards)
+        assert outcome.device.type == "meta"
+        assert outcome.dtype == rewards[1].dtype

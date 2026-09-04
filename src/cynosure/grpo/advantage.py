@@ -33,7 +33,9 @@ class MgaiAdvantage:
         group_size = next(iter(rewards_by_lambda.values())).shape[0]
         if any(rewards.shape[0] != group_size for rewards in rewards_by_lambda.values()):
             raise ValueError("各 λ 的组内 reward 数须一致（同一组 G 个方向）")
-        total = torch.zeros(group_size)
+        # 累加器从 reward 张量初始化（new_zeros）：device/dtype 随 reward——
+        # 加速器 resident 的判别器 reward 与 CPU 零向量相加会跨设备报错
+        total = next(iter(rewards_by_lambda.values())).new_zeros(group_size)
         for rewards in rewards_by_lambda.values():
             total = total + self._normalize(rewards)
         return total.clamp(min=-self._clamp, max=self._clamp)

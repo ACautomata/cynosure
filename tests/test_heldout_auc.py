@@ -6,6 +6,8 @@ held-out real 永不参与判别器更新（prepare 工件 + kind 守卫保证�
 AUC 因此是 out-of-sample 的 hacking 监控信号。
 """
 
+import time
+
 import pytest
 import torch
 
@@ -55,28 +57,66 @@ class TestAucNumericContract:
         )
         assert isinstance(auc, float)
 
-    def test_chunked_matches_unchunked_reference(self) -> None:
-        """分块配对计算与不分块参考逐位一致（生产 337 fake × 2048
-        patch/latent 的 n×m 配对矩阵若整块分配约需 TB 级内存——第一次
-        iteration 即 OOM；配对统计数学上可分块精确累加）。tie 跨块边界
-        语义不变（并列计 0.5）。"""
-        generator = torch.Generator().manual_seed(0)
-        real = torch.randn(37, generator=generator)
-        fake = torch.randn(53, generator=generator)
-        reference = HeldOutAuc.auc_from_scores(real, fake, chunk_elements=10**9)
-        for chunk in (1, 3, 37, 38, 10**9):
-            assert HeldOutAuc.auc_from_scores(
-                real, fake, chunk_elements=chunk,
-            ) == reference
 
-    def test_chunked_large_input_stays_bounded(self) -> None:
-        """大输入（1e5 real × 1e4 fake = 1e9 配对）以固定块内存跑完——
-        不分块实现此输入需 ~4 GB 差异矩阵（生产规模则会更大）。"""
+class PairwiseAucReference:
+    """配对枚举口径的 AUC 参考实现（O(n·m) 朴素循环，等价性锚定用）。"""
+
+    @staticmethod
+    def compute(real_scores: torch.Tensor, fake_scores: torch.Tensor) -> float:
+        wins = 0.0
+        pairs = 0
+        for real in real_scores.tolist():
+            wins += sum(
+                1.0 if real > fake else 0.5 if real == fake else 0.0
+                for fake in fake_scores.tolist()
+            )
+            pairs += fake_scores.numel()
+        return wins / pairs
+
+
+class TestRankStatisticEquivalence:
+    """秩统计实现（排序 midrank）与配对枚举口径严格等价。
+
+    配对枚举在生产 patch 规模（数百 latent × 2048 patch/latent → ~5e11
+    配对）下工作量达 TB 级内存或百秒级 CPU——监控不得支配训练；秩实现
+    O((n+m)·log(n+m))，tie 取平均秩与「并列计 0.5」严格等价。"""
+
+    def test_random_scores_match_pairwise_reference(self) -> None:
+        generator = torch.Generator().manual_seed(0)
+        for real_size, fake_size in ((1, 1), (7, 13), (37, 53), (128, 91)):
+            real = torch.randn(real_size, generator=generator)
+            fake = torch.randn(fake_size, generator=generator)
+            assert HeldOutAuc.auc_from_scores(real, fake) == pytest.approx(
+                PairwiseAucReference.compute(real, fake), abs=1e-12,
+            )
+
+    def test_cross_group_tie_blocks_match_pairwise_reference(self) -> None:
+        """并列块跨 real/fake 边界（同一值同时出现在两侧）时 tie 各计
+        0.5 的口径不变——midrank 平均秩的等价性锚定。"""
+        real = torch.tensor([1.0, 2.0, 2.0, 3.0])
+        fake = torch.tensor([2.0, 2.0, 4.0])
+        assert HeldOutAuc.auc_from_scores(real, fake) == pytest.approx(
+            PairwiseAucReference.compute(real, fake), abs=1e-12,
+        )
+
+    def test_all_identical_scores_are_chance(self) -> None:
+        """全并列 → 每对 0.5 → AUC 0.5（chance）。"""
+        scores = torch.full((6,), 0.5)
+        auc = HeldOutAuc.auc_from_scores(scores[:3], scores[3:])
+        assert auc == pytest.approx(0.5)
+
+    def test_patch_scale_input_completes_via_ranking(self) -> None:
+        """生产 patch 规模（2e5 × 2e5 = 4e10 配对）在秒级完成——配对
+        枚举实现同输入需 ~4e10 元素差矩阵计算（实测 ~25s），监控不得
+        支配训练；排序秩实现与枚举实现相差三个数量级。"""
         generator = torch.Generator().manual_seed(1)
-        real = torch.randn(100_000, generator=generator)
-        fake = torch.randn(10_000, generator=generator)
-        auc = HeldOutAuc.auc_from_scores(real, fake, chunk_elements=2**20)
-        assert 0.0 <= auc <= 1.0
+        real = torch.randn(200_000, generator=generator)
+        fake = torch.randn(200_000, generator=generator)
+        started = time.monotonic()
+        auc = HeldOutAuc.auc_from_scores(real, fake)
+        elapsed = time.monotonic() - started
+        assert 0.0 < auc < 1.0
+        assert elapsed < 5.0  # 配对枚举实测 ~25s（多核），排序 <10ms
 
 
 class TestHeldOutSemantics:

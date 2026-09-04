@@ -22,6 +22,7 @@ import torch
 from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from tests.conftest import CliSession, FixturePrepareScenario
@@ -167,6 +168,51 @@ class TestSingleIterationLoop:
         ))
         assert any(p.requires_grad for p in reloaded_disc.parameters())
 
+    def test_spectral_norm_checkpoint_is_reloadable(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """spectral norm 启用时判别器 checkpoint 以可重载形式落盘：
+        parametrization 键（``*.parametrizations.<attr>.original`` 与其
+        power iteration buffer ``_u``/``_v``）不进保存面——保存面固化到
+        原始键形（netbuild 装载源 = 未参数化键形的严格装载），否则该
+        支持配置（spectral_norm_enabled=true）的判别器 checkpoint 无法
+        经装配路径重载（strict load 报 missing/unexpected keys）。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["reward"]["spectral_norm_enabled"] = True
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        assert trainer.run() == 1
+        checkpoint = scenario.run_dir / "checkpoints" / "discriminator_iter1.pt"
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        # 保存面键形 = 原始模块键形（parametrization 视图与可重建 buffer 不落盘）
+        fresh = NetworkAssembler.discriminator(NetworkArtifact(
+            config=NetworkAssembler.load_json(
+                config.artifacts.discriminator_config_json,
+            ),
+        ))
+        assert set(saved.keys()) == set(fresh.state_dict().keys())
+        # 严格装载成功（netbuild 装配路径直接可用）
+        reloaded = NetworkAssembler.discriminator(NetworkArtifact(
+            config=NetworkAssembler.load_json(
+                config.artifacts.discriminator_config_json,
+            ),
+            checkpoint=checkpoint,
+        ))
+        # 装载的是训练后的原始参数（parametrization 的 .original 视图：
+        # trained 键形 <prefix>.parametrizations.<attr>.original）
+        trained_state = trainer.rewards.discriminator.state_dict()
+        for name, value in reloaded.named_parameters():
+            prefix, _, attribute = name.rpartition(".")
+            parametrized = (
+                f"{prefix}.parametrizations.{attribute}.original"
+                if prefix else f"parametrizations.{attribute}.original"
+            )
+            expected = trained_state[parametrized if parametrized in trained_state else name]
+            assert torch.equal(value, expected)
+
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -195,6 +241,44 @@ class TestSingleIterationLoop:
         assert result.code == 2
         assert "cross-modal" in result.stderr
 
+    def test_discriminator_cold_start_without_checkpoint(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """冷启动在线判别器（schema 语义 ``discriminator_ckpt=None = 随机
+        初始化起步的在线训练``）：网络配置 JSON 必需、checkpoint 可缺省
+        ——训练全链路绿且判别器 checkpoint 正常落盘（冷启动工作流，
+        reward-model 章）。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["artifacts"]["discriminator_ckpt"] = None
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        assert scenario.train().code == 0, scenario.stderr
+        assert (scenario.run_dir / "checkpoints" / "discriminator_iter1.pt").is_file()
+
+    def test_replay_capacity_guard_rejects_undersized_combinations(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """回放供给跨字段守卫（装配期 fail-fast）：首次判别器更新时近期
+        分区为空、回放半区全由 base 分区承担（floor(K/2) 条）——
+        ``capacity//2 < floor(K/2)`` 的组合（如 K=4/capacity=2）在昂贵
+        rollout 完成后才会缺样本炸掉；K=1 则回放半区为 0 条、回放采样
+        API 直接拒绝。两类 schema 合法但集成无效的组合在装配期显式
+        拒绝。"""
+        scenario.write_inputs()
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        data["reward"]["disc_batch_size_k"] = 4
+        data["reward"]["replay_buffer_capacity"] = 2
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        result = scenario.train()
+        assert result.code == 2, result.stderr
+        assert "回放供给" in result.stderr
+        data["reward"]["disc_batch_size_k"] = 1
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        scenario.run_dir = scenario.tmp_path / "run_k1"  # 独立 run 目录
+        result = scenario.train()
+        assert result.code == 2, result.stderr
+        assert "回放供给" in result.stderr
+
     def test_missing_artifacts_reported_cleanly(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
@@ -205,6 +289,19 @@ class TestSingleIterationLoop:
         )
         assert result.code == 2
         assert "训练输入契约违反" in result.stderr
+
+    def test_preflight_failure_leaves_no_run_directory(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """训练装配失败回滚未产出工件的 run 目录：trainer 装配（网络/
+        manifest 工件装载、跨字段守卫）失败时，目录若除 init 契约最小集
+        外无任何产出则删除——用户修复输入后可用同一 --run-dir 重试
+        （run 目录已存在语义拒绝重跑、续训入口未交付）。"""
+        run_dir = tmp_path / "run"
+        result = cli.train(cli.write_config(tmp_path), run_dir=run_dir)
+        assert result.code == 2
+        assert "训练输入契约违反" in result.stderr
+        assert not run_dir.exists()  # 未产出工件 → 已回滚，可重试
 
 
 class TestPolicyOptimizerConfig:
@@ -235,10 +332,13 @@ class RecordingScorer:
 
 
 class RecordingUpdate:
-    """测试仪器：记录 update.step 收到的批与调用时的判别器相位。"""
+    """测试仪器：记录 update.step 收到的批与调用时的判别器相位
+    （buffer 用真实两区实现——RewardCoordinator 的 zone_sizes 观测面
+    经它委托）。"""
 
     def __init__(self, discriminator: torch.nn.Module) -> None:
         self.scorer = RecordingScorer(discriminator)
+        self.buffer = ReplayBuffer(64)
         self.received: list[torch.Tensor] = []
         self.training_at_call: list[bool] = []
 
@@ -254,6 +354,19 @@ class RecordingUpdate:
             num_base_replay=0,
             num_recent_replay=0,
         )
+
+
+class SequencedAuc:
+    """测试仪器：记录 held-out AUC 相对判别器更新的调用顺序
+    （每次调用时判别器 update 是否已执行过）。"""
+
+    def __init__(self, update: RecordingUpdate) -> None:
+        self._update = update
+        self.calls: list[bool] = []
+
+    def compute(self, fake_latents: torch.Tensor) -> float:
+        self.calls.append(len(self._update.received) > 0)
+        return 0.5
 
 
 class TestDiscriminatorSideOrchestration:
@@ -302,6 +415,26 @@ class TestDiscriminatorSideOrchestration:
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
         assert torch.equal(first, second)  # eval 相打分幂等
+
+    def test_heldout_auc_precedes_discriminator_update(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """held-out AUC 在判别器更新之前测得（与 anchor_eval_reward 同一
+        判别器快照）：update 之后测同一 fake 批会把 in-sample 拟合计入
+        AUC（当前批子集刚被训练过、分数被抬高），且与 rollout 相记录的
+        anchor reward 分属不同判别器快照——联合 hacking 签名（AUC 掉
+        而 eval-reward 升）失真。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        update = RecordingUpdate(trainer.rewards.discriminator)
+        auc = SequencedAuc(update)
+        trainer.rewards.update = update
+        trainer.rewards.auc = auc
+        assert trainer.run() == 1
+        assert update.received  # N_d=1 的首 iteration 应执行判别器更新
+        assert auc.calls == [False]  # AUC 先于判别器更新（同一快照）
 
 
 class TestDevicePlacement:
@@ -377,6 +510,44 @@ class TestBufferBaseSeeding:
         event = scenario.events()[0]
         # 首 iter 回放半区即可用（base 已在启动期生成完毕）
         assert event["buffer_replay_fraction"] > 0.0
+
+
+class TestBaseSeedingIsolation:
+    """base 分区种子生成与训练 rollout 的 RNG 流隔离。"""
+
+    def test_capacity_change_does_not_shift_rollout_stream(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """base seeding 走独立派生 generator：base seeding 消耗的条件/
+        噪声抽取数由 replay_buffer_capacity 决定——与训练 rollout 共用
+        流时，改 buffer 容量（保持 schedule.seed）会漂移后续全部 rollout
+        抽样（modality、初始噪声、SDE 方向），buffer 容量实验与 policy
+        样本流混淆（不同 capacity 的同 seed run 不可比）。"""
+        scenario.write_inputs()
+        streams: dict[int, tuple] = {}
+        for capacity in (64, 80):
+            data = json.loads(
+                scenario.config_path.read_text(encoding="utf-8"),
+            )
+            data["reward"]["replay_buffer_capacity"] = capacity
+            scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+            config = ConfigLoader.load(scenario.config_path)
+            artifacts = RunArtifacts.init(
+                config, scenario.tmp_path / f"run_capacity{capacity}",
+            )
+            trainer = GranularGrpoTrainer(
+                config, artifacts, device=torch.device("cpu"),
+            )
+            trainer.seed_base_partition()
+            record = trainer.rollout.run_iteration()
+            streams[capacity] = (
+                record.modality,
+                record.steps[0].anchor_latent,
+                record.steps[0].directions,
+            )
+        assert streams[64][0] == streams[80][0]  # modality 不随容量漂移
+        assert torch.equal(streams[64][1], streams[80][1])  # anchor 逐位同
+        assert torch.equal(streams[64][2], streams[80][2])  # 扰动方向逐位同
 
 
 class TestLogProbConsistency:

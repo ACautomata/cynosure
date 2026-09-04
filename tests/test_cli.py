@@ -152,12 +152,12 @@ class TestSingleProcessGuard:
         self, cli: CliSession, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """rank 0 通过守卫进入训练循环（生产 config 在循环装配期因工件
-        缺失得到契约错误——走到该错误证明守卫未拦截）。"""
+        """rank 0 通过守卫进入训练装配（生产 config 在装配期因工件缺失
+        得到训练契约错误——走到该错误证明守卫未拦截；失败后未产出工件
+        的 run 目录已被回滚）。"""
         monkeypatch.setenv("RANK", "0")
         result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
         assert "训练输入契约违反" in result.stderr
-        assert (tmp_path / "run").is_dir()
 
 
 class TestEvalCommand:

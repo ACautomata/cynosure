@@ -7,10 +7,12 @@ eval-reward 仍在升 = 典型 hacking 签名。held-out real 与训练 real
 
 口径：判别器在 patch logit 图的原生判定单位上打分——held-out real 与
 当前 fake 的全部 patch logit 展平后做 Mann-Whitney U 检验：real 高于
-fake 的配对占比（并列计 0.5，秩统计的标准 tie 口径）。torch 原生配对
-矩阵实现，不引入白名单外的统计库。fake 侧全量参与；real 侧采样数取
-min(fake 批量, held-out 条目数)（两侧数量不必相等，Mann-Whitney 对
-非对称 n×m 有效）。
+fake 的配对占比（并列计 0.5，秩统计的标准 tie 口径）。实现为排序
+midrank 秩统计（O((n+m)·log(n+m))）：生产 patch 规模（数百 latent ×
+2048 patch）的配对枚举达 ~5e11 次比较/iter，监控不得支配训练。
+torch 原生算子，不引入白名单外的统计库。fake 侧全量参与；real 侧采样
+数取 min(fake 批量, held-out 条目数)（两侧数量不必相等，Mann-Whitney
+对非对称 n×m 有效）。
 """
 
 import torch
@@ -18,11 +20,6 @@ import torch
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer
-
-_CHUNK_ELEMENTS: int = 2**24
-"""单块配对差异矩阵的元素上限（fp32 ≈ 64 MiB）：生产规模（数百 fake ×
-2048 patch/latent）的 n×m 配对若整块分配达 TB 级——分块精确累加，内存
-有界、tie 口径不变。"""
 
 
 class HeldOutAuc:
@@ -63,25 +60,24 @@ class HeldOutAuc:
     def auc_from_scores(
         real_scores: torch.Tensor,
         fake_scores: torch.Tensor,
-        chunk_elements: int = _CHUNK_ELEMENTS,
     ) -> float:
         """Mann-Whitney 口径 AUC：real 高于 fake 的配对占比（并列计 0.5）。
 
-        配对统计按 ``chunk_elements`` 上限分块精确累加（胜/平计数为整数，
-        分块不引入近似；内存有界——整块分配在生产 patch 规模下达 TB 级）。
+        排序 midrank 秩统计实现（与配对枚举口径严格等价）：U = R_real −
+        n(n+1)/2，AUC = U/(n·m)；并列块取平均秩（midrank）恰好等价于
+        「并列各计 0.5」。秩平方和 ~1e12 在 float64（2^53）内精确。
         """
         if real_scores.numel() == 0 or fake_scores.numel() == 0:
             raise ValueError("AUC 配对统计需要非空 real/fake 分数")
-        if chunk_elements < 1:
-            raise ValueError(f"chunk_elements 须 ≥1，得到 {chunk_elements}")
-        rows_per_chunk = max(1, chunk_elements // fake_scores.numel())
-        wins = 0.0
-        pairs = 0
-        for start in range(0, real_scores.numel(), rows_per_chunk):
-            block = (
-                real_scores[start:start + rows_per_chunk, None]
-                - fake_scores[None, :]
-            )
-            wins += float((block > 0).sum()) + 0.5 * float((block == 0).sum())
-            pairs += block.numel()
-        return wins / pairs
+        real_count = real_scores.numel()
+        combined = torch.cat([real_scores, fake_scores]).double()
+        order = combined.argsort()
+        sorted_scores = combined[order]
+        # 每个排序位置的值在其相等块内的 [first, last] 索引（二分定位，
+        # O(n·log n)）：midrank = (first + last)/2 + 1（平均秩，1-based）
+        block_start = torch.searchsorted(sorted_scores, sorted_scores, side="left")
+        block_end = torch.searchsorted(sorted_scores, sorted_scores, side="right") - 1
+        midranks = (block_start + block_end).double() / 2.0 + 1.0
+        real_rank_sum = midranks[order < real_count].sum().item()
+        u_real = real_rank_sum - real_count * (real_count + 1) / 2.0
+        return u_real / (real_count * (combined.numel() - real_count))

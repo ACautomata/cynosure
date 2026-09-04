@@ -72,6 +72,28 @@ class NetworkAssembler:
         return model
 
     @classmethod
+    def loadable_state_dict(cls, model: Any) -> dict:
+        """模型 state_dict 的可重载形式（与 ``_load_state_dict`` 的严格
+        装载成对的导出面）：parametrization（如 spectral norm）视图键
+        ``<prefix>.parametrizations.<attr>.original`` 固化回原键
+        ``<prefix>.<attr>``，parametrization 内部状态（power iteration
+        buffer ``_u``/``_v``）可从原始参数重建、不落盘——本方法产出的
+        checkpoint 可经本类装配路径严格重载（无参数化模型逐键同一）。"""
+        state = model.state_dict()
+        if not any(".parametrizations." in key for key in state):
+            return state
+        loadable: dict = {}
+        for key, value in state.items():
+            prefix, marker, rest = key.partition(".parametrizations.")
+            if not marker:
+                loadable[key] = value
+                continue
+            attribute, _, tail = rest.partition(".")
+            if tail == "original":
+                loadable[f"{prefix}.{attribute}"] = value
+        return loadable
+
+    @classmethod
     def rflow_scheduler(
         cls, num_inference_steps: int, input_img_size_numel: int,
     ) -> RFlowScheduler:
