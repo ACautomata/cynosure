@@ -29,8 +29,10 @@ _BASE_BATCH = 8
 """base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）。"""
 
 CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
-"""条件分布的体素间距（1.0 × 1e2，fixture 单位间距；生产 spacing 分布由
-数据侧 ticket 接管）——两组条件分布共用同一常量（单一来源）。"""
+"""组1 条件的体素间距常量（1.0 × 1e2，fixture 单位间距；基座
+include_spacing_input=true 的 ×1e2 恒传口径）。组1 条件只含 label、无源影像
+case 可依；组2 源影像条件的 spacing 已改接 manifest per-case 侧车
+（issue #46），不再消费本常量。"""
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,11 @@ class SourceLatentPool:
         """该序列的条目数（均匀抽样的总体）。"""
         return len(self._entries[modality])
 
+    def spacing(self, modality: Modality, index: int) -> tuple[float, float, float]:
+        """该条目的 per-case spacing（manifest 侧车值原样透传，×1e2 条件
+        单位；issue #46：组2 源影像条件的 spacing 与源 latent 同条目同源）。"""
+        return self._entries[modality][index].spacing
+
     def latent(self, modality: Modality, index: int) -> torch.Tensor:
         """按序列取第 index 枚预编码 latent（[C, D, H, W]，已迁移到
         rollout 设备；懒加载与判别器 real 侧同一装载契约）。"""
@@ -160,7 +167,9 @@ class CrossModalConditionSampler:
 
     条件 c = (源影像 latent, 目标序列 label, spacing)——两个条件都带
     （policy-modeling 章 MDP）；源影像 latent 按源序列从 SourceLatentPool
-    均匀抽取，scale_factor 缩放发生在组2 采样场（条件的唯一缩放点）。
+    均匀抽取，scale_factor 缩放发生在组2 采样场（条件的唯一缩放点）；
+    spacing 为源影像条目的 manifest per-case 侧车值（issue #46：条件来自
+    数据而非写死常量，与源 latent 同条目同源）。
     ``pairs`` 来自 config（cross_modal_pairs 可配置），不设代码内副本。"""
 
     def __init__(
@@ -195,7 +204,12 @@ class CrossModalConditionSampler:
         return (
             RolloutCondition(
                 label=torch.tensor([label], device=self._device),
-                spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
+                # per-case spacing 与源 latent 同条目同源（manifest 侧车，
+                # issue #46），控制网络条件路径的消费端取值
+                spacing=torch.tensor(
+                    [self._pool.spacing(source_modality, source_index)],
+                    device=self._device,
+                ),
                 source_latent=self._pool.latent(source_modality, source_index).unsqueeze(0),
             ),
             target_modality,

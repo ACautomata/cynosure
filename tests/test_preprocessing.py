@@ -3,7 +3,7 @@
 只断言链的外部行为（spec「Testing Decisions」）：方向码 RAS（flip-only
 无轴置换）、dtype float32、强度 clip 域、dim 公式、fixture 基数注入。
 工件契约（序列分层 / 病例级不相交 / 幂等）由 prepare 端到端覆盖（Seam ②，
-tests/test_prepare.py）。"""
+tests/test_prepare.py）。spacing 侧车读取同属读图环节（issue #46）。"""
 
 from pathlib import Path
 
@@ -11,9 +11,10 @@ import nibabel as nib
 import numpy as np
 import pytest
 import torch
+from monai.data import MetaTensor
 
-from cynosure.reward.preprocessing import UpstreamPreprocessChain
-from tests.conftest import LPS_AFFINE, RAS_AFFINE
+from cynosure.reward.preprocessing import SpacingSidecar, UpstreamPreprocessChain
+from tests.conftest import ANISOTROPIC_AFFINE, LPS_AFFINE, RAS_AFFINE
 
 # 各轴不等且全为 128 倍数：基数 128 的 resize 不变形状，末端形状即 RAS 后
 # 形状——若方向步发生轴置换，形状会重排，flip-only 断言由此可观测
@@ -136,3 +137,40 @@ class TestChainEndToEnd:
         image = UpstreamPreprocessChain(resize_base=16)(path)
         assert tuple(image.shape) == (1, 64, 64, 32)
         assert image.dtype == torch.float32
+
+
+class TestSpacingSidecar:
+    """spacing 侧车读取（issue #46）：链末端 MetaTensor 的 raw header
+    zooms ×1e2——读取不受 RAS 重定向影响（flip-only 下 zooms 顺序不变）。"""
+
+    def test_reads_anisotropic_zooms_scaled_x1e2(
+        self, chain_input: ChainInput,
+    ) -> None:
+        """各向异性 zooms 按存储轴顺序读出 ×1e2——值来自 header，非常量。"""
+        path = chain_input.write(
+            "anisotropic.nii.gz",
+            chain_input.volume((64, 64, 32)),
+            ANISOTROPIC_AFFINE,
+        )
+        image = UpstreamPreprocessChain(resize_base=16)(path)
+        assert SpacingSidecar().read(image) == (50.0, 100.0, 200.0)
+
+    def test_flip_only_redirect_keeps_zooms(
+        self, chain_input: ChainInput,
+    ) -> None:
+        """LPS→RAS 翻转后读值仍 = 原始 header zooms ×1e2：方向步只改
+        affine、不动 raw zooms（AC「不受方向重定向影响」）。"""
+        path = chain_input.write(
+            "lps.nii.gz", chain_input.volume((64, 64, 32)), LPS_AFFINE,
+        )
+        raw_zooms = nib.load(path).header.get_zooms()[:3]
+        image = UpstreamPreprocessChain(resize_base=16)(path)
+        assert tuple(nib.aff2axcodes(image.meta["affine"])) == ("R", "A", "S")
+        assert SpacingSidecar().read(image) == (
+            tuple(float(zoom) * 1e2 for zoom in raw_zooms)
+        )
+
+    def test_missing_zooms_metadata_rejected(self) -> None:
+        """meta 无 raw header zooms（非 NIfTI 输入、读图契约破坏）显式失败。"""
+        with pytest.raises(ValueError, match="zooms"):
+            SpacingSidecar().read(MetaTensor(torch.zeros(1, 4, 4, 4)))
