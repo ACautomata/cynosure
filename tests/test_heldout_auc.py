@@ -50,6 +50,7 @@ class HeldOutPoolWriter:
                     case_id=f"case-{index:03d}",
                     modality=modality,
                     latent=f"heldout_latents/{index}.pt",
+                    spacing=(100.0, 100.0, 100.0),
                 ))
                 index += 1
         manifest = LatentManifest(

@@ -78,6 +78,10 @@ RAS_AFFINE = np.array(
      [0.0, 0.0, 0.0, 1.0]],
 )
 
+# 各向异性 zooms（issue #46，float32 精确值 (0.5, 1.0, 2.0)）：per-case spacing
+# 变化的观测载体——写死常量必假绿的判别性断言用它驱动数据变化
+ANISOTROPIC_AFFINE = np.diag([-0.5, -1.0, 2.0, 1.0])
+
 # 组1、生产尺寸的最小合法 config（必填字段全部显式给出）
 MINIMAL_CONFIG_DICT: dict = {
     "experiment": {"group": "modal-label"},

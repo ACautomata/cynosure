@@ -479,10 +479,20 @@ class TestCrossModalPairSampling:
 
     LATENT_SHAPE = (4, 16, 16, 8)
 
+    # 各序列条目的 spacing 侧车值各不相同（issue #46）：消费端接线可从
+    # 条件 spacing 反查源条目（float32 精确值，断言可精确相等）
+    SPACING_BY_MODALITY: dict[str, tuple[float, float, float]] = {
+        "t1n": (50.0, 100.0, 200.0),
+        "t1c": (110.0, 120.0, 130.0),
+        "t2w": (140.0, 150.0, 160.0),
+        "t2f": (70.0, 80.0, 90.0),
+    }
+
     @staticmethod
     def _write_identifiable_pool(root: Path) -> Path:
         """每序列恰一枚、以序列序号填充的 latent（源序列可从张量内容
-        识别，使 12 对的完整计数可观测）。"""
+        识别，使 12 对的完整计数可观测）；spacing 侧车按序列取不同值
+        （issue #46 消费端接线的观测面）。"""
         shape = (4, 16, 16, 8)
         latents_dir = root / "latents"
         latents_dir.mkdir(parents=True)
@@ -497,6 +507,9 @@ class TestCrossModalPairSampling:
                 "case_id": f"case-{modality}",
                 "modality": modality,
                 "latent": f"latents/{name}",
+                "spacing": list(
+                    TestCrossModalPairSampling.SPACING_BY_MODALITY[modality]
+                ),
             })
         manifest = {
             "kind": "real_pool",
@@ -563,6 +576,27 @@ class TestCrossModalPairSampling:
         targets = {sampler.sample()[1] for _ in range(48)}
         assert targets <= set(MODALITIES)
         assert len(targets) == 4
+
+    def test_condition_spacing_comes_from_source_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        """组2 消费端接线（issue #46）：条件的 spacing tensor = 源影像条目
+        的 manifest 侧车值（per-case 来自数据，替换写死常量）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        seen: set[str] = set()
+        for _ in range(48):
+            condition, _ = sampler.sample()
+            source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+            seen.add(source)
+            assert tuple(condition.spacing[0].tolist()) == (
+                self.SPACING_BY_MODALITY[source]
+            )
+        assert seen == set(MODALITIES)  # 各源序列的接线都被真实走到
 
     def test_pool_missing_modality_rejected(self, tmp_path: Path) -> None:
         """源影像库缺任一序列 = 组2 条件分布不可用：显式拒绝。"""
