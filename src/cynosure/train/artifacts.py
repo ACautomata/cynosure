@@ -200,3 +200,31 @@ class RunArtifacts:
         """读回指标流全部事件（早停判定与评测脚本共同消费）。"""
         lines = self.paths.metrics.read_text(encoding="utf-8").splitlines()
         return [json.loads(line) for line in lines if line.strip()]
+
+    def rewind_events(self, iteration: int, stage: int) -> int:
+        """续训回退指标流：删除恢复点之后本 stage 的事件（iteration ≥
+        恢复点且 stage 匹配）——被中断的半截执行史由恢复后的重执行重写，
+        保住「每 iteration 每 stage 一条事件」的流不变量（重复事件会污染
+        早停判定等下游消费者）。milestone 事件暂不带 stage 字段、按 stage 1
+        归属（组3 两阶段的 milestone 归属待 eval ticket 随事件 schema 补
+        stage）。返回删除的事件数。"""
+        events = self.read_events()
+        kept = [
+            event for event in events
+            if event.get("iteration", 0) < iteration
+            or event.get("stage", 1) != stage
+        ]
+        removed = len(events) - len(kept)
+        if removed:
+            tmp = self.paths.metrics.with_name(
+                self.paths.metrics.name + ".rewind.tmp",
+            )
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for event in kept:
+                    fh.write(json.dumps(
+                        event, ensure_ascii=False, allow_nan=False,
+                    ) + "\n")
+            # 原子替换（与续训状态同一 durability 口径）：中途崩溃不留
+            # 半截重写的指标流
+            os.replace(tmp, self.paths.metrics)
+        return removed
