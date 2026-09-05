@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.config import CynosureConfig
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
@@ -74,12 +74,136 @@ class MilestoneEvent(BaseModel):
 
     event: Literal["milestone"] = "milestone"
     iteration: int
+    stage: int = 1
+    """里程碑归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
     fid: float
     kid: float | None = None
     ssim: float | None = None
     mae: float | None = None
+    psnr: float | None = None
     criteria_summary: dict[str, float] = Field(default_factory=dict)
     early_stop: bool = False
+    early_stop_reason: str | None = None
+    """触发早停的签名（"plateau" / "reward_hacking"）；未停为 None。"""
+
+
+class ManifestEntry(BaseModel):
+    """Baseline 采样清单的单条目：一个采样位（阶段 + 序号）的种子、条件
+    与样本路径（契约最小集：seed、条件、样本路径——spec「产物工件契约」）。
+
+    条目在 run 目录创建时按 config 确定性生成；``baseline_sample`` 由训练
+    启动期的冻结初始 policy 采样落盘填入（冻结只采一次），``resample_sample``
+    由 RL 后同 seed 重采填入——两侧复用同一 manifest（同 seed 同条件，
+    差异唯一归因于 RL）。``source_case``（组2）由 baseline 采样期记录：
+    源病例锁定后重采与里程碑评测读回同一病例。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: int = 1
+    index: int
+    condition: str | list[str]
+    """本采样位的条件（组1 = 目标序列名；组2/组3-stage2 = [源序列, 目标序列]）。"""
+    source_case: str | None = None
+    """组2 锁定的源病例 id（baseline 采样期写入；组1 为 None）。"""
+    noise_seed: int
+    """本采样位的初始噪声种子（确定性派生，重采与里程碑共用）。"""
+    baseline_sample: str | None = None
+    """Baseline 像素体文件路径（相对 run 目录）。"""
+    resample_sample: str | None = None
+    """RL 后重采像素体文件路径（相对 run 目录）。"""
+
+
+class BaselineManifest(BaseModel):
+    """Baseline 采样清单（run 目录 ``manifest.json`` 的契约）：seed、条件
+    词汇表与采样条目清单。Baseline 与 RL 后重采、里程碑评测共同消费——
+    同一条目 = 同一 seed 同一条件，是「差异唯一归因于 RL」的载体。
+
+    条目生成确定性：同 config 必得同 manifest（噪声种子为
+    ``(seed, stage, index)`` 的纯函数）；样本路径随 baseline 采样与重采
+    先后写入对应条目（T10 契约）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seed: int
+    group: str
+    conditions: list
+    """本组条件的词汇表（组1 四序列 / 组2 12 有序对 / 组3 两阶段名）。"""
+    entries: list[ManifestEntry] = Field(default_factory=list)
+
+    @staticmethod
+    def noise_seed(seed: int, stage: int, index: int) -> int:
+        """采样位初始噪声种子的确定性派生（splitmix64 终混）：
+        纯函数、与生成顺序无关——baseline / 重采 / 里程碑三侧独立重算同值。"""
+        mask = 0xFFFFFFFFFFFFFFFF
+        h = (seed + 0x9E3779B97F4A7C15 + (stage << 32) + index) & mask
+        h ^= h >> 30
+        h = (h * 0xBF58476D1CE4E5B9) & mask
+        h ^= h >> 27
+        h = (h * 0x94D049BB133111EB) & mask
+        h ^= h >> 31
+        return h
+
+    @classmethod
+    def build(cls, config: CynosureConfig) -> "BaselineManifest":
+        """按 config 确定性生成清单：组1 = 四序列轮转，组2 = 12 有序对
+        轮转，组3 = 两阶段各自的采样位（条目数均为 N_baseline）。"""
+        entries = [
+            ManifestEntry(
+                stage=stage,
+                index=index,
+                condition=conditions[index % len(conditions)],
+                noise_seed=cls.noise_seed(config.schedule.seed, stage, index),
+            )
+            for stage, conditions in cls._stage_conditions(config).items()
+            for index in range(config.schedule.baseline_samples)
+        ]
+        return cls(
+            seed=config.schedule.seed,
+            group=config.experiment.group,
+            conditions=cls._condition_vocabulary(config),
+            entries=entries,
+        )
+
+    @staticmethod
+    def _stage_conditions(config: CynosureConfig) -> dict[int, list]:
+        """group → {阶段号: 条件清单} 的执行映射（词汇表单一来源 =
+        ``config.stage_condition_vocabulary()``；本方法只叠加执行语义）。
+
+        组3 指定 ``stage1_run_dir``（复用既有 stage-1 产物）时只建
+        stage-2 条目：stage-1 不在本 run 执行，manifest 不留无人填充的
+        null 条目（stage-1 样本对住在源 run 自己的 manifest）。"""
+        stages = config.stage_condition_vocabulary()
+        if (
+            config.experiment.group == "sequential"
+            and config.experiment.stage1_run_dir is not None
+        ):
+            return {2: stages[2]}
+        return stages
+
+    @classmethod
+    def _condition_vocabulary(cls, config: CynosureConfig) -> list:
+        stages = cls._stage_conditions(config)
+        if len(stages) == 1:
+            return next(iter(stages.values()))
+        return list(_SEQUENTIAL_STAGES)
+
+    @classmethod
+    def load(cls, path: Path) -> "BaselineManifest":
+        """装载既有 run 目录的 manifest（重采与里程碑评测的读取入口）。"""
+        return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write(self, path: Path) -> None:
+        """落盘（baseline 采样与重采写入样本路径后回写）。"""
+        Path(path).write_text(self.model_dump_json(indent=2), encoding="utf-8")
+
+    def entries_for_stage(self, stage: int) -> list[ManifestEntry]:
+        """本阶段的采样条目（单阶段组恒 stage=1；组3 两阶段各取各的）。"""
+        entries = [entry for entry in self.entries if entry.stage == stage]
+        if not entries:
+            raise ValueError(f"manifest 无 stage={stage} 的采样条目")
+        return entries
 
 
 @dataclass
@@ -91,6 +215,8 @@ class RunPaths:
     metrics: Path
     manifest: Path
     checkpoints: Path
+    samples: Path
+    """Baseline 与 RL 后重采的解码像素体目录（评测材料，契约布局成员）。"""
     trajectory_diagnostic: Path
     """轨迹诊断工件（fixture 诊断开关 --dump-trajectory 产出；诊断未跑则无此文件）。"""
     training_diagnostic: Path
@@ -133,9 +259,7 @@ class RunArtifacts:
             config.model_dump_json(indent=2), encoding="utf-8",
         )
         paths.metrics.touch()
-        paths.manifest.write_text(
-            json.dumps(cls.manifest(config), indent=2), encoding="utf-8",
-        )
+        cls.manifest(config).write(paths.manifest)
 
     @classmethod
     def _await_rank0(cls, paths: RunPaths, wait_timeout_s: float) -> "RunArtifacts":
@@ -158,6 +282,7 @@ class RunArtifacts:
             metrics=root / "metrics.jsonl",
             manifest=root / "manifest.json",
             checkpoints=root / "checkpoints",
+            samples=root / "samples",
             trajectory_diagnostic=root / "trajectory.json",
             training_diagnostic=root / "training.json",
         )
@@ -170,24 +295,13 @@ class RunArtifacts:
         return base / f"{timestamp}-{config.experiment.group}"
 
     @classmethod
-    def manifest(cls, config: CynosureConfig) -> dict:
-        """Baseline 采样清单契约最小集：seed、条件、样本路径。
+    def manifest(cls, config: CynosureConfig) -> BaselineManifest:
+        """Baseline 采样清单（契约最小集：seed、条件、样本路径）。
 
-        Baseline 与 RL 后重采共用同一 manifest（同 seed 同条件）。
+        条目按 config 确定性生成；样本路径由训练启动期的 baseline 采样
+        与 RL 后同 seed 重采先后填入——两侧共用同一 manifest。
         """
-        group = config.experiment.group
-        if group == "modal-label":
-            conditions: list = list(MODALITIES)
-        elif group == "cross-modal":
-            conditions = [list(pair) for pair in config.experiment.cross_modal_pairs]
-        else:
-            conditions = list(_SEQUENTIAL_STAGES)
-        return {
-            "seed": config.schedule.seed,
-            "group": group,
-            "conditions": conditions,
-            "samples": [],
-        }
+        return BaselineManifest.build(config)
 
     def append_event(self, event: IterEvent | MilestoneEvent) -> None:
         """向训练指标流追加一行 JSON 事件（按行追加、rank 0 归并）。"""
@@ -202,18 +316,27 @@ class RunArtifacts:
         return [json.loads(line) for line in lines if line.strip()]
 
     def rewind_events(self, iteration: int, stage: int) -> int:
-        """续训回退指标流：删除恢复点之后本 stage 的事件（iteration ≥
-        恢复点且 stage 匹配）——被中断的半截执行史由恢复后的重执行重写，
-        保住「每 iteration 每 stage 一条事件」的流不变量（重复事件会污染
-        早停判定等下游消费者）。milestone 事件暂不带 stage 字段、按 stage 1
-        归属（组3 两阶段的 milestone 归属待 eval ticket 随事件 schema 补
-        stage）。返回删除的事件数。"""
+        """续训回退指标流：删除恢复点之后本 stage 的**半截**事件——
+        checkpoint 覆盖面之外的执行史由恢复后的重执行重写，保住「每
+        iteration 每 stage 一条事件」的流不变量（重复事件会污染早停判定
+        等下游消费者）。
+
+        保留边界按事件记账口径取：iter 事件以 0-based iteration 号记账
+        （保留号 < 恢复点）；milestone 事件以完成数记账、与恢复点
+        checkpoint 同批产出（保留完成数 ≤ 恢复点——若按 iter 边界删，
+        每次从里程碑 checkpoint 续训都会抹掉该里程碑的评测历史：FID
+        序列断点、早停 verdict 消失且不再重放）。stage 不匹配的事件
+        （其他阶段的历史）不动。返回删除的事件数。"""
         events = self.read_events()
-        kept = [
-            event for event in events
-            if event.get("iteration", 0) < iteration
-            or event.get("stage", 1) != stage
-        ]
+        kept: list[dict] = []
+        for event in events:
+            if event.get("stage", 1) != stage:
+                kept.append(event)
+                continue
+            number = event.get("iteration", 0)
+            milestone = event.get("event") == "milestone"
+            if number < iteration or (milestone and number <= iteration):
+                kept.append(event)
         removed = len(events) - len(kept)
         if removed:
             tmp = self.paths.metrics.with_name(

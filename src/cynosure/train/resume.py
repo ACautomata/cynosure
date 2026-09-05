@@ -24,7 +24,7 @@ iteration buffer ``_u``/``_v``；有效权重语义的可装载形式见
   恢复后显式对账；scheduler 对象落地后此处扩展为其 ``state_dict``。
 - EMA（条件项）：``ema_anchor_enabled=true`` 属升级项，trainer 装配期
   显式拒绝（静默忽略会让清单缺 EMA 权重），槽位预留、当前恒 ``None``。
-- RNG：六条命名 ``torch.Generator`` 流（trainer.generators 注册表）+
+- RNG：六条命名 ``torch.Generator`` 流（TrainingRngStreams 注册表）+
   进程全局 torch/CUDA/numpy/python——全部编码为 ``weights_only`` 可安全
   反序列化的原语（张量 / int / float / None）：numpy 的 MT19937 键数组
   转 uint32 张量，python random 状态转 int 列表。
@@ -159,7 +159,7 @@ def capture_state(trainer: "GranularGrpoTrainer", iteration: int) -> dict[str, A
         },
         "generators": {
             name: generator.get_state()
-            for name, generator in trainer.generators.items()
+            for name, generator in trainer.rng.named().items()
         },
         "rng": _global_rng_state(),
         "lr": {
@@ -271,13 +271,14 @@ def _restore_buffer(trainer: "GranularGrpoTrainer", saved: dict) -> None:
 
 
 def _restore_generators(trainer: "GranularGrpoTrainer", saved: dict) -> None:
-    if set(saved) != set(trainer.generators):
+    streams = trainer.rng.named()
+    if set(saved) != set(streams):
         raise ValueError(
             f"续训状态 generator 清单与当前装配不一致: "
-            f"{sorted(saved)} vs {sorted(trainer.generators)}"
+            f"{sorted(saved)} vs {sorted(streams)}"
         )
     for name, generator_state in saved.items():
-        trainer.generators[name].set_state(generator_state)
+        streams[name].set_state(generator_state)
 
 
 def _global_rng_state() -> dict[str, Any]:

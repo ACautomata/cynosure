@@ -11,8 +11,12 @@ fixture 让全循环在本地 CPU 跑，与生产走同一 netbuild 装载契约
 - 判别器 ``num_layers_d=2`` 在 fixture 第三维（8）上空间不足（MONAI 的
   Pix2PixHD 式层叠在 8 体素上不足两次 kernel-4 卷积），fixture 取消融轴
   另一端 ``num_layers_d=1``——这是 spec「需确认」项的确认结果；
-- VAE 不进 fixture 循环（解码只发生在里程碑评测），config 中相应工件为
-  占位路径；modality mapping 作为真实输入工件落盘（诊断经它装载标签）。
+- VAE 不进逐 iteration 训练循环，但里程碑评测与 Baseline/重采路径需要
+  解码：fixture 配真 MONAI ``AutoencoderKlMaisi`` 微型件（4× 空间压缩
+  [4,16,16,8] ↔ [1,64,64,32]，随机初始化即可），与生产同一 ``vae_ckpt``
+  + ``vae_config_json`` 工件对装载契约；RadImageNet 特征器由评测相按
+  fixture_mode 分派 stub，无需权重工件。modality mapping 作为真实输入
+  工件落盘（诊断经它装载标签）。
 """
 
 import json
@@ -21,6 +25,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
 from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
@@ -73,6 +78,22 @@ FIXTURE_CONTROLNET_CONFIG: dict = {
     "use_checkpointing": False,
 }
 
+# fixture 微型 VAE 构造参数（4× 空间压缩：三级通道两次 stride-2 下采样；
+# num_splits=1 关闭生产大体的分块卷积——分块在 fixture 小体上切块小于
+# kernel；latent_channels=4 与 latent 形状契约同构）
+FIXTURE_VAE_CONFIG: dict = {
+    "spatial_dims": 3,
+    "in_channels": 1,
+    "out_channels": 1,
+    "num_res_blocks": [1, 1, 1],
+    "num_channels": [8, 16, 16],
+    "attention_levels": [False, False, False],
+    "latent_channels": 4,
+    "norm_num_groups": 8,
+    "use_checkpointing": False,
+    "num_splits": 1,
+}
+
 FIXTURE_MODALITY_MAPPING: dict[str, int] = {"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31}
 """基座 modality_mapping 的文档值（config Artifacts.modality_mapping_json
 同口径：t1n/t1c/t2w/t2f → 29/34/30/31），fixture 以工件形式落盘。"""
@@ -91,6 +112,8 @@ class FixtureArtifacts:
     controlnet_config_json: Path
     discriminator_ckpt: Path
     discriminator_config_json: Path
+    vae_ckpt: Path
+    vae_config_json: Path
     modality_mapping_json: Path
 
 
@@ -141,6 +164,15 @@ class Fixture:
                 nn.init.normal_(module.weight, std=_ZERO_CONV_REINIT_STD)
         return controlnet
 
+    def vae(self) -> AutoencoderKlMaisi:
+        """随机初始化的 MONAI 微型 VAE（AutoencoderKlMaisi）。
+
+        解码语义 = 任意确定性 latent→像素映射即可（度量管线不依赖生成
+        质量）；随机权重保持 MONAI 网络类的真实前向路径（编码/解码结构、
+        4× 空间压缩形状契约）。构造消耗调用方环境 RNG 流——排在 unet/
+        判别器/ControlNet 之后（write_artifacts 保持历史流位）。"""
+        return AutoencoderKlMaisi(**FIXTURE_VAE_CONFIG)
+
     def write_artifacts(self, directory: Path) -> FixtureArtifacts:
         """把 fixture 网络写成 ckpt + 网络配置 JSON（netbuild 可直接装载）。"""
         directory.mkdir(parents=True, exist_ok=True)
@@ -151,6 +183,8 @@ class Fixture:
             controlnet_config_json=directory / "controlnet_config.json",
             discriminator_ckpt=directory / "discriminator.pt",
             discriminator_config_json=directory / "discriminator_config.json",
+            vae_ckpt=directory / "vae.pt",
+            vae_config_json=directory / "vae_config.json",
             modality_mapping_json=directory / "modality_mapping.json",
         )
         torch.save(self.unet().state_dict(), artifacts.unet_ckpt)
@@ -167,6 +201,11 @@ class Fixture:
         torch.save(self.controlnet().state_dict(), artifacts.controlnet_ckpt)
         artifacts.controlnet_config_json.write_text(
             json.dumps(FIXTURE_CONTROLNET_CONFIG, indent=2), encoding="utf-8",
+        )
+        # VAE 最后构造：不扰动既有工件的历史 RNG 流位（见上）
+        torch.save(self.vae().state_dict(), artifacts.vae_ckpt)
+        artifacts.vae_config_json.write_text(
+            json.dumps(FIXTURE_VAE_CONFIG, indent=2), encoding="utf-8",
         )
         artifacts.modality_mapping_json.write_text(
             json.dumps(FIXTURE_MODALITY_MAPPING, indent=2), encoding="utf-8",
@@ -187,8 +226,9 @@ class Fixture:
             "preprocessing": {"resize_base": self.RESIZE_BASE},
             "artifacts": {
                 "unet_ckpt": str(artifacts_dir / "unet.pt"),
-                # VAE / modality mapping / 源数据集不进 fixture 循环，占位路径
+                # VAE 工件对：里程碑解码评测与 Baseline/重采的解码装配源
                 "vae_ckpt": str(artifacts_dir / "vae.pt"),
+                "vae_config_json": str(artifacts_dir / "vae_config.json"),
                 "net_config_json": str(artifacts_dir / "unet_config.json"),
                 "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
                 "dataset_root": str(artifacts_dir / "dataset"),
@@ -213,5 +253,6 @@ class Fixture:
                 "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
                 "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
             },
-            "schedule": {"seed": 0},
+            # N_baseline fixture 缩小（Baseline manifest 条目随全流程走）
+            "schedule": {"seed": 0, "baseline_samples": 4},
         })

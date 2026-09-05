@@ -25,6 +25,10 @@ from cynosure.config import ConfigLoader, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
+from cynosure.policy.cursor import TrajectoryCursor
+from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import ChannelNormalizer
@@ -74,6 +78,32 @@ class TrainingLoopScenario:
         if dump:
             argv.append("--dump-trajectory")
         return self.cli.run(*argv)
+
+    def set_schedule(self, **values) -> None:
+        """改写 config 的 schedule 字段并重落盘（里程碑/早停参数变体）。"""
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        data["schedule"].update(values)
+        self.config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def standalone_sampler(
+        self, config, device: torch.device | None = None,
+    ) -> RolloutSampler:
+        """评测相注入测试用的独立采样封装（与 trainer._assemble_sampler
+        同一组合方式；独立于 trainer 内部装配）。网络落 ``device``
+        （缺省 CPU；设备归一测试传加速器设备）。"""
+        unet = NetworkAssembler.unet(NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.net_config_json),
+            checkpoint=config.artifacts.unet_ckpt,
+        )).to(device if device is not None else torch.device("cpu"))
+        scheduler = NetworkAssembler.rflow_scheduler(
+            num_inference_steps=config.policy.num_inference_steps,
+            input_img_size_numel=config.policy.input_img_size_numel,
+        )
+        return RolloutSampler(
+            CfgCombinedField(unet),
+            SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max),
+            TrajectoryCursor(scheduler),
+        )
 
     def artifacts(self) -> RunArtifacts:
         return RunArtifacts(RunArtifacts.layout(self.run_dir))
@@ -136,7 +166,8 @@ class TestSingleIterationLoop:
         data["schedule"]["max_iterations"] = 2
         data["reward"]["disc_update_interval_n_d"] = 2
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         first, second = scenario.events()
         assert "discriminator" in first["loss"]
         assert first["buffer_current_fraction"] == pytest.approx(0.5)
@@ -241,7 +272,8 @@ class TestSingleIterationLoop:
         data["schedule"]["milestone_interval"] = 2
         data["schedule"]["checkpoint_interval"] = 5
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         checkpoints = scenario.run_dir / "checkpoints"
         assert (checkpoints / "policy_iter2.pt").is_file()
         assert (checkpoints / "discriminator_iter2.pt").is_file()
@@ -301,7 +333,8 @@ class TestSingleIterationLoop:
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["artifacts"]["discriminator_ckpt"] = None
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         assert (scenario.run_dir / "checkpoints" / "discriminator_iter1.pt").is_file()
 
     def test_replay_capacity_guard_rejects_undersized_combinations(
@@ -384,7 +417,7 @@ class TestPolicyOptimizerConfig:
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         trainer = GranularGrpoTrainer(config, artifacts)
-        (group,) = trainer.updater.optimizer.param_groups
+        (group,) = trainer.loop.updater.optimizer.param_groups
         assert group["weight_decay"] == pytest.approx(
             config.policy.policy_weight_decay,
         )
@@ -859,7 +892,7 @@ class TestBaseSeedingIsolation:
                 config, artifacts, device=torch.device("cpu"),
             )
             trainer.seed_base_partition()
-            record = trainer.rollout.run_iteration()
+            record = trainer.loop.run_iteration()
             streams[capacity] = (
                 record.modality,
                 record.steps[0].anchor_latent,

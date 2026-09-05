@@ -17,11 +17,14 @@
 """
 
 from cynosure.train.artifacts import (
+    BaselineManifest,
     IterEvent,
+    ManifestEntry,
     MilestoneEvent,
     RunArtifacts,
     RunPaths,
 )
+from cynosure.train.earlystop import EarlyStopJudge, EarlyStopVerdict
 from cynosure.train.rollout import (
     ConditionSampler,
     CrossModalConditionSampler,
@@ -34,17 +37,23 @@ from cynosure.train.rollout import (
 from cynosure.train.sequential import SequentialTrainer, StagePlan
 from cynosure.train.trainer import (
     GranularGrpoTrainer,
+    IterationLoop,
     RewardCoordinator,
     TrainingDiagnostic,
     TrainingLogProbPair,
 )
 
 __all__ = [
+    "BaselineManifest",
     "ConditionSampler",
     "CrossModalConditionSampler",
+    "EarlyStopJudge",
+    "EarlyStopVerdict",
     "GranularGrpoTrainer",
+    "IterationLoop",
     "IterationRollout",
     "IterEvent",
+    "ManifestEntry",
     "MilestoneEvent",
     "ModalLabelConditionSampler",
     "RewardCoordinator",

@@ -82,6 +82,18 @@ class Artifacts(BaseModel):
         "运行时", "experiment-design",
         "图像 VAE checkpoint（autoencoder_v1.pt，AutoencoderKlMaisi）",
     )
+    vae_config_json: Path | None = SpecField(
+        "运行时", "reward-model",
+        "VAE 网络配置 JSON（键 = MONAI AutoencoderKlMaisi 构造参数名；"
+        "里程碑解码评测与生产预编码的装配源，与判别器工件对同构）",
+        default=None,
+    )
+    radimagenet_weights: Path | None = SpecField(
+        "运行时", "experiment-design",
+        "RadImageNet-ResNet50 权重文件（像素域 2.5D FID/KID 特征提取器的"
+        "生产装载源；公开发布权重的下载属施工，fixture 走 stub 注入）",
+        default=None,
+    )
     net_config_json: Path = SpecField(
         "运行时", "policy-modeling",
         "网络配置 JSON（UNet 构建参数与 scheduler 配置）",
@@ -265,6 +277,15 @@ class PolicyConfig(BaseModel):
         "组2 双条件之一：ControlNet 条件 = 源影像 latent × scale_factor"
         "（policy-modeling 章 MDP 条件 c；生产值随基座 ControlNet 推理 "
         "config 核对，fixture 取中性 1.0）",
+        default=1.0, gt=0.0,
+    )
+    latent_scale_factor: float = SpecField(
+        "运行时", "policy-modeling",
+        "主流 latent 的 checkpoint 域缩放因子（基座 diffusion UNet checkpoint "
+        "的 scale_factor = 1/std(z)）：官方权重在 scaled 域训练/采样，prepared "
+        "latents 按存储契约是 encode 原始输出（未乘）——policy 侧装载点乘入、"
+        "评测解码前除回（本字段消费点）。生产值随基座 checkpoint 核对，"
+        "fixture 取中性 1.0",
         default=1.0, gt=0.0,
     )
 
@@ -499,13 +520,68 @@ class ScheduleConfig(BaseModel):
     )
     baseline_samples: int = SpecField(
         "运行时", "experiment-design",
-        "N_baseline：Baseline 样本量（与评估集同规模、同 seed 同条件、冻结只采一次）",
-        default=200, ge=200, le=500,
+        "N_baseline：Baseline 样本量（与评估集同规模、同 seed 同条件、冻结只采一次；"
+        "生产 200–500，fixture_mode 下放宽——Baseline manifest 条目随训练全流程走）",
+        default=200, ge=1, le=500,
+    )
+    milestone_eval_samples: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "里程碑解码评测样本数（取 Baseline manifest 条目的前缀，同 seed 同条件，"
+        "使里程碑 FID/KID 跨里程碑可比）。小样本相对信号：K 只服务于训练期"
+        "跨里程碑 plateau 比较（特征空间高维、K 小则协方差秩亏，绝对值噪声"
+        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）",
+        default=8, ge=2,
+    )
+    decode_batch_size: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "解码像素体的分块批大小（Baseline/重采与里程碑评测共用）：每批解码后"
+        "即落盘/聚合，峰值显存以块为界——生产 200–500 条目的整 manifest "
+        "单批解码是 OOM 级分配",
+        default=8, ge=1,
+    )
+    decode_roi_size: list[int] = SpecField(
+        "tunable", "本 spec 补钉",
+        "VAE 解码滑动窗口的 latent 空间 roi（三轴；官方 NV-Generate-CTMR "
+        "config_infer 的 autoencoder_sliding_window_infer_size = [48,48,48]）"
+        "——生产大体积（256³ 级）整前向解码是 OOM 级分配；单样本元素数 "
+        "≤ roi 元素数时整前向（官方 dynamic_infer 小体豁免语义，fixture "
+        "恒走此路）",
+        default=[48, 48, 48],
+    )
+    decode_overlap: float = SpecField(
+        "tunable", "本 spec 补钉",
+        "VAE 解码滑动窗口的重叠比（官方 autoencoder_sliding_window_infer_"
+        "overlap 字面 0.6666 = 2/3 的四位截断；此处取满精度 2/3——MONAI "
+        "要求 overlap×roi×zoom_scale 逐维为整数，VAE 4× 上采样下 "
+        "48×2/3×4=128 整除成立）。mode 定死 gaussian（官方口径）",
+        default=0.6666666666666666, ge=0.0, lt=1.0,
+    )
+    kid_bootstrap_replicates: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "KID 置信区的无放回重采样重复数（重复越多 CI 越稳，代价线性增长）",
+        default=20, ge=1,
     )
     n_plateau: int = SpecField(
         "运行时", "experiment-design",
         "N_plateau：早停 plateau 里程碑数（默认 3）",
         default=3, ge=1,
+    )
+    plateau_tolerance: float = SpecField(
+        "tunable", "experiment-design",
+        "主判据（FID）plateau 判定容差：里程碑 FID 相对历史最优的改善 ≤ 容差"
+        "视为 plateau（绝对阈值为训练期经验数据，spec 只钉判据形态）",
+        default=0.5, ge=0.0,
+    )
+    auc_chance_epsilon: float = SpecField(
+        "tunable", "experiment-design",
+        "hacking 签名的「AUC 近 chance」判定带半径：|AUC − 0.5| ≤ ε",
+        default=0.02, gt=0.0,
+    )
+    reward_trend_window: int = SpecField(
+        "tunable", "experiment-design",
+        "「eval reward 仍升」判定的迭代窗口（最近 W 个 iter 事件的"
+        " anchor eval reward 线性斜率 > 0）",
+        default=10, ge=2,
     )
     milestone_interval: int = SpecField(
         "tunable", "本 spec 补钉",
@@ -521,6 +597,16 @@ class ScheduleConfig(BaseModel):
         "运行时", "experiment-design",
         "随机种子（随机性控制：Baseline 与 RL 后同 seed 同条件，差异唯一归因于 RL）",
     )
+
+    @field_validator("auc_chance_epsilon")
+    @classmethod
+    def _chance_band_within_half(cls, value: float) -> float:
+        if value >= 0.5:
+            raise ValueError(
+                "AUC 近 chance 判定带半径必须小于 0.5（带触 0.5 即恒真，"
+                "hacking 签名失去判别力）"
+            )
+        return value
 
 
 class ShardingConfig(BaseModel):
@@ -665,7 +751,24 @@ class CynosureConfig(BaseModel):
                 f"（policy-modeling 章），得到 {self.policy.num_inference_steps}；"
                 "缩小日程属 fixture，须经顶层 fixture_mode=true 显式声明"
             )
+        if not self.fixture_mode and self.schedule.baseline_samples < 200:
+            raise ValueError(
+                f"生产 config（fixture_mode=false）下 N_baseline 口径 200–500"
+                f"（experiment-design 章），得到 {self.schedule.baseline_samples}；"
+                "缩小样本量属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
         return self
+
+    def stage_condition_vocabulary(self) -> dict[int, list]:
+        """组 → {阶段号: 条件词汇表} 的唯一映射（组1 四序列、组2 12 有序对、
+        组3 两阶段各一份）——Baseline manifest 条目生成与本 validator 共同
+        消费（词汇表单一来源，组矩阵一变只改此处）。"""
+        pairs = [list(pair) for pair in self.experiment.cross_modal_pairs]
+        return {
+            "modal-label": {1: list(MODALITIES)},
+            "cross-modal": {1: pairs},
+            "sequential": {1: list(MODALITIES), 2: pairs},
+        }[self.experiment.group]
 
     @model_validator(mode="after")
     def _resize_base_matches_mode(self) -> "CynosureConfig":
@@ -677,6 +780,42 @@ class CynosureConfig(BaseModel):
                 f"定死上游基数 {UPSTREAM_RESIZE_BASE}（ADR-0006），得到 "
                 f"{self.preprocessing.resize_base}；注入小基数属 fixture，"
                 "须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _milestone_samples_match_manifest_support(self) -> "CynosureConfig":
+        """里程碑评测样本面与 manifest 支撑面一致（两个方向都显式拒绝）：
+
+        - **下界**：manifest 条目按条件轮转，前缀取样 K < 词汇表即
+          **永久**漏掉尾部方向——早停判据对那些方向失明（12 有序对只
+          评前 K 个）；
+        - **上界**：评测条目取 manifest 前缀，K > N_baseline 即静默
+          缩水到盘上条目数——配置声明的评测样本量与实际评测面失真。
+
+        fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。"""
+        if self.fixture_mode:
+            return self
+        vocabulary = max(
+            len(conditions)
+            for conditions in self.stage_condition_vocabulary().values()
+        )
+        if self.schedule.milestone_eval_samples < vocabulary:
+            raise ValueError(
+                f"生产 config 下 schedule.milestone_eval_samples 须覆盖本组"
+                f"条件词汇表（{vocabulary} 个条件；manifest 条件轮转下 K "
+                f"不足即永久漏方向），得到 "
+                f"{self.schedule.milestone_eval_samples}；"
+                "缩小评测面属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        if self.schedule.milestone_eval_samples > self.schedule.baseline_samples:
+            raise ValueError(
+                f"生产 config 下 schedule.milestone_eval_samples 不得超过 "
+                f"schedule.baseline_samples（评测条目取 manifest 前缀，"
+                f"超出即静默缩水到盘上条目数、评测面与配置声明失真），"
+                f"得到 {self.schedule.milestone_eval_samples} > "
+                f"{self.schedule.baseline_samples}；全量对照评估直接用 "
+                f"N_baseline 口径"
             )
         return self
 
