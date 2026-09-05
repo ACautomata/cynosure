@@ -1,16 +1,23 @@
 """eval 度量核单测：Frechet 距离 / 无偏 MMD² + bootstrap CI / 三正交面
-切片 / 特征提取器策略（stub 确定性、RadImageNet 装载契约）。"""
+切片 / 特征提取器策略（stub 确定性、RadImageNet 装载契约）/ 条目条件解析。"""
+
+import json
+from pathlib import Path
 
 import pytest
 import torch
 
+from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.frechet import BootstrapKernelMmd, FrechetDistance, KernelMmd
 from cynosure.eval.features import (
     RadImageNetFeatureExtractor,
     StubSliceFeatureExtractor,
 )
 from cynosure.eval.volumes import OrthoPlane, RealVolumeStore, VolumePairFidelity
+from cynosure.policy.condition import CONDITION_SPACING_X1E2, ModalityMapping
+from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.preprocessing import UpstreamPreprocessChain
+from cynosure.train.artifacts import ManifestEntry
 from tests.conftest import SyntheticBratsDataset
 
 
@@ -277,3 +284,75 @@ class TestVolumePairFidelity:
         assert close_mae < far_mae
         assert close_psnr > far_psnr  # PSNR 随失真增大单调下降
         assert 0.0 < far_psnr < VolumePairFidelity.PSNR_CAP
+
+
+class TestEntryConditionResolver:
+    """manifest 条目 → rollout 条件的解析（eval 侧与训练侧同源原则）：
+    组2 条件的 spacing = 源条目的 manifest per-case 侧车值（issue #46，
+    与源 latent 同条目同源——评测与训练对同一条目必得同一条件）；组1
+    无源条目可依，spacing 走条件常量。"""
+
+    SPACING_BY_MODALITY = {
+        "t1n": (50.0, 100.0, 200.0),
+        "t2w": (140.0, 150.0, 160.0),
+    }
+    """各序列侧车值互异（float32 精确值）——条件 spacing 可反查源条目。"""
+
+    @staticmethod
+    def _resolver(tmp_path: Path) -> EntryConditionResolver:
+        latents_dir = tmp_path / "latents"
+        latents_dir.mkdir(parents=True)
+        entries = []
+        for modality_index, modality in enumerate(("t1n", "t2w")):
+            name = f"{modality}.pt"
+            torch.save(
+                torch.full((4, 16, 16, 8), float(modality_index)),
+                latents_dir / name,
+            )
+            entries.append({
+                "case_id": f"case-{modality}",
+                "modality": modality,
+                "latent": f"latents/{name}",
+                "spacing": list(TestEntryConditionResolver.SPACING_BY_MODALITY[modality]),
+            })
+        manifest_path = tmp_path / "real_pool.json"
+        manifest_path.write_text(json.dumps({
+            "kind": "real_pool",
+            "encoder": "fixture-test",
+            "latent_shape": [4, 16, 16, 8],
+            "split_seed": 0,
+            "split_sizes": {"train": 2, "val": 0, "test": 0},
+            "entries": entries,
+        }), encoding="utf-8")
+        mapping = ModalityMapping({"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31})
+        return EntryConditionResolver(
+            mapping,
+            torch.device("cpu"),
+            pool=LatentManifest.load(manifest_path, kind="real_pool"),
+        )
+
+    def test_cross_modal_spacing_comes_from_source_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        """组2 条件 = 源条目侧车 spacing + 源 latent（同条目同源），
+        label = 目标端 token。"""
+        resolver = self._resolver(tmp_path)
+        entry = ManifestEntry(
+            stage=1, index=0, condition=["t1n", "t2w"],
+            source_case="case-t1n", noise_seed=0,
+        )
+        condition, target = resolver.resolve(entry)
+        assert target == "t2w"
+        assert condition.label.item() == 30
+        assert tuple(condition.spacing[0].tolist()) == (50.0, 100.0, 200.0)
+        assert condition.source_latent[0, 0, 0, 0, 0].item() == 0.0  # t1n 条目
+
+    def test_label_condition_keeps_constant_spacing(
+        self, tmp_path: Path,
+    ) -> None:
+        """组1 条件无源条目：spacing = 条件常量（组1 专用语义）。"""
+        resolver = self._resolver(tmp_path)
+        entry = ManifestEntry(stage=1, index=1, condition="t2w", noise_seed=1)
+        condition, target = resolver.resolve(entry)
+        assert target == "t2w"
+        assert tuple(condition.spacing[0].tolist()) == tuple(CONDITION_SPACING_X1E2)

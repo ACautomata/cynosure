@@ -15,9 +15,11 @@ import torch
 from cynosure.config import MODALITIES
 
 CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
-"""条件分布的体素间距（1.0 × 1e2，fixture 单位间距；生产 spacing 分布由
-数据侧 ticket 接管）——训练 rollout 与评测采样两组条件分布共用同一常量
-（单一来源；本模块是 import 环安全位，train/eval 两侧共同依赖）。"""
+"""组1 条件的体素间距常量（1.0 × 1e2，fixture 单位间距；基座
+``include_spacing_input=true`` 的 ×1e2 恒传口径）。组1 条件只含 label、
+无源影像 case 可依；组2 源影像条件的 spacing 已接 manifest per-case
+侧车（issue #46：与源 latent 同条目同源），不再消费本常量。本模块是
+import 环安全位——train/eval 两侧条件组装共同依赖。"""
 
 
 @dataclass(frozen=True)

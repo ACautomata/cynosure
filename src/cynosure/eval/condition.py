@@ -18,7 +18,7 @@ from cynosure.policy.condition import (
     ModalityMapping,
     RolloutCondition,
 )
-from cynosure.reward.artifacts import LatentManifest
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
 
 if TYPE_CHECKING:
     from cynosure.train.artifacts import ManifestEntry
@@ -38,19 +38,24 @@ class EntryConditionResolver:
         self._pool = pool
 
     def resolve(self, entry: ManifestEntry) -> tuple[RolloutCondition, str]:
-        """条目 → (rollout 条件, 目标序列名)。组2 的源影像 latent 按锁定
-        病例装载（缩放发生在采样场，与训练条件分布同口径）。"""
+        """条目 → (rollout 条件, 目标序列名)。组2 的源影像条件按锁定
+        病例整条装载——latent 与 per-case spacing 同条目同源（issue #46
+        侧车；与训练侧 CrossModalConditionSampler 同一原则），缩放发生
+        在采样场。"""
         if isinstance(entry.condition, str):
             return self._label_condition(entry.condition), entry.condition
         source_modality, target_modality = entry.condition
+        source_entry = self._source_entry(self.source_case(entry), source_modality)
         return (
             RolloutCondition(
                 label=torch.tensor(
                     [self._mapping.label(target_modality)], device=self._device,
                 ),
-                spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
-                source_latent=self._source_latent(
-                    self.source_case(entry), source_modality,
+                spacing=torch.tensor(
+                    [source_entry.spacing], device=self._device,
+                ),
+                source_latent=self._pool.load_latent(source_entry).unsqueeze(0).to(
+                    self._device,
                 ),
             ),
             target_modality,
@@ -85,9 +90,10 @@ class EntryConditionResolver:
             )
         return case_ids[entry.noise_seed % len(case_ids)]
 
-    def _source_latent(
+    def _source_entry(
         self, case_id: str, source_modality: Modality,
-    ) -> torch.Tensor:
+    ) -> PoolEntry:
+        """锁定病例某序列的 pool 条目（latent 与 spacing 侧车的共同取数点）。"""
         if self._pool is None:
             raise ValueError(
                 "组2 条目需要 Real sample pool manifest（源影像条件的病例池）"
@@ -97,9 +103,7 @@ class EntryConditionResolver:
                 pool_entry.case_id == case_id
                 and pool_entry.modality == source_modality
             ):
-                return self._pool.load_latent(pool_entry).unsqueeze(0).to(
-                    self._device,
-                )
+                return pool_entry
         raise ValueError(
             f"Real sample pool 无病例 {case_id!r} 的 {source_modality} 条目"
         )
