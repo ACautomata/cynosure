@@ -33,7 +33,7 @@ out-of-sample 监控侧），装载时以 kind 守卫互换使用。"""
 class PoolEntry(BaseModel):
     """manifest 条目：一病例一序列的一枚预编码 latent + spacing 侧车。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     case_id: str
     modality: Modality
