@@ -37,6 +37,7 @@ from cynosure.train.rollout import (
 from cynosure.train.sequential import SequentialTrainer, StagePlan
 from cynosure.train.trainer import (
     GranularGrpoTrainer,
+    IterationLoop,
     RewardCoordinator,
     TrainingDiagnostic,
     TrainingLogProbPair,
@@ -49,6 +50,7 @@ __all__ = [
     "EarlyStopJudge",
     "EarlyStopVerdict",
     "GranularGrpoTrainer",
+    "IterationLoop",
     "IterationRollout",
     "IterEvent",
     "ManifestEntry",

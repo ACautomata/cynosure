@@ -76,7 +76,13 @@ class MilestoneMetrics:
 
 
 class MilestoneEvaluator:
-    """里程碑解码评测编排（decode 的唯一调用方之一，均在里程碑路径）。"""
+    """里程碑解码评测编排（decode 的唯一调用方之一，均在里程碑路径）。
+
+    度量定位：本类产出的 FID/KID 是**训练期小样本相对信号**——条目前缀
+    K（同 seed 同条件）保证跨里程碑可比，服务于早停的 plateau 比较；
+    K 小则高维特征空间协方差秩亏、绝对值噪声大，验收判据以 N_baseline
+    全量样本的对照评估为准（experiment-design「对照基线」）。
+    """
 
     def __init__(
         self,

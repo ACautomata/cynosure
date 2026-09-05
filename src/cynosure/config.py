@@ -518,7 +518,9 @@ class ScheduleConfig(BaseModel):
     milestone_eval_samples: int = SpecField(
         "tunable", "本 spec 补钉",
         "里程碑解码评测样本数（取 Baseline manifest 条目的前缀，同 seed 同条件，"
-        "使里程碑 FID/KID 跨里程碑可比）",
+        "使里程碑 FID/KID 跨里程碑可比）。小样本相对信号：K 只服务于训练期"
+        "跨里程碑 plateau 比较（特征空间高维、K 小则协方差秩亏，绝对值噪声"
+        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）",
         default=8, ge=2,
     )
     decode_batch_size: int = SpecField(

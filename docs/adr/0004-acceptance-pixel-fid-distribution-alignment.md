@@ -12,7 +12,7 @@ RL 后训练的验收定为**复用基座的验收阶梯**——定量评测（�
 
 ## Consequences
 
-- 评测必须解码到像素域（FID、专家目检都要 pixel/NIfTI），RL 打分仍在 latent 域——解码只发生在里程碑评测，不进训练循环。
+- 评测必须解码到像素域（FID、专家目检都要 pixel/NIfTI），RL 打分仍在 latent 域——解码只发生在**评测路径**（Baseline 采样、里程碑评测、RL 后重采；#25 的 manifest 契约要求 Baseline 与 RL 后同条目解码样本对），不进逐 iteration 训练循环。
 - nnUNet 是**测量仪器**（产出分布，不比 Dice），与训练图解耦，只评估时调用。
 - 成功判据只钉「相对基线显著提升 + 触发规则」，绝对阈值（FID < X 等）为运行时 knobs，依赖训练期经验数据，超出 spec 范围。
 - 三块主判据 + 在线 reward 侧信号（held-out AUC / 组内 std / anchor eval reward）共同构成完整验收与早停。

@@ -25,7 +25,7 @@ import torch
 
 from cynosure.config import ConfigLoader
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.train import GranularGrpoTrainer, RunArtifacts
+from cynosure.train import GranularGrpoTrainer, IterationLoop, RunArtifacts
 from tests.test_train_loop import TrainingLoopScenario
 
 RESUME_STATE = "checkpoints/resume_state.pt"
@@ -81,9 +81,9 @@ def _assert_checkpoints_identical(
 
 
 def _crash_during_iteration(monkeypatch, iteration: int) -> None:
-    """把第 ``iteration + 1`` 次 _update_policy 调用替换为 KeyboardInterrupt
+    """把第 ``iteration + 1`` 次 update_policy 调用替换为 KeyboardInterrupt
     （iteration 为 0 起数的崩溃所在迭代；该迭代不产出事件）。"""
-    original = GranularGrpoTrainer._update_policy
+    original = IterationLoop.update_policy
     calls = {"count": 0}
 
     def crashing(self, record):
@@ -92,7 +92,7 @@ def _crash_during_iteration(monkeypatch, iteration: int) -> None:
             raise KeyboardInterrupt(f"模拟作业边界崩溃（iteration {iteration}）")
         return original(self, record)
 
-    monkeypatch.setattr(GranularGrpoTrainer, "_update_policy", crashing)
+    monkeypatch.setattr(IterationLoop, "update_policy", crashing)
 
 
 class TestRoundtripEquivalence:

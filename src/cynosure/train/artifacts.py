@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.config import CynosureConfig
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
@@ -168,23 +168,19 @@ class BaselineManifest(BaseModel):
 
     @staticmethod
     def _stage_conditions(config: CynosureConfig) -> dict[int, list]:
-        """group → {阶段号: 条件清单} 的唯一映射（组1 四序列、组2 12 有序对、
-        组3 两阶段各一份；build 与条件词汇表共同消费，单一来源）。
+        """group → {阶段号: 条件清单} 的执行映射（词汇表单一来源 =
+        ``config.stage_condition_vocabulary()``；本方法只叠加执行语义）。
 
         组3 指定 ``stage1_run_dir``（复用既有 stage-1 产物）时只建
         stage-2 条目：stage-1 不在本 run 执行，manifest 不留无人填充的
         null 条目（stage-1 样本对住在源 run 自己的 manifest）。"""
-        pairs = [list(pair) for pair in config.experiment.cross_modal_pairs]
+        stages = config.stage_condition_vocabulary()
         if (
             config.experiment.group == "sequential"
             and config.experiment.stage1_run_dir is not None
         ):
-            return {2: pairs}
-        return {
-            "modal-label": {1: list(MODALITIES)},
-            "cross-modal": {1: pairs},
-            "sequential": {1: list(MODALITIES), 2: pairs},
-        }[config.experiment.group]
+            return {2: stages[2]}
+        return stages
 
     @classmethod
     def _condition_vocabulary(cls, config: CynosureConfig) -> list:

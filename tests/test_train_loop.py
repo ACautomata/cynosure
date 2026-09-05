@@ -417,7 +417,7 @@ class TestPolicyOptimizerConfig:
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         trainer = GranularGrpoTrainer(config, artifacts)
-        (group,) = trainer.updater.optimizer.param_groups
+        (group,) = trainer.loop.updater.optimizer.param_groups
         assert group["weight_decay"] == pytest.approx(
             config.policy.policy_weight_decay,
         )
@@ -892,7 +892,7 @@ class TestBaseSeedingIsolation:
                 config, artifacts, device=torch.device("cpu"),
             )
             trainer.seed_base_partition()
-            record = trainer.rollout.run_iteration()
+            record = trainer.loop.run_iteration()
             streams[capacity] = (
                 record.modality,
                 record.steps[0].anchor_latent,

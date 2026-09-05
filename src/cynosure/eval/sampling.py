@@ -114,8 +114,16 @@ class ManifestVolumeSampler:
     def _sample(self, phase: str) -> None:
         """分块「采样→解码→落盘」流式编排：峰值显存以块为界（生产
         N_baseline 200–500 × 256×256×128 解码体，整 manifest 单批解码
-        是 OOM 级分配），每块解码后即落盘，不物化整 manifest 的解码体。"""
+        是 OOM 级分配），每块解码后即落盘，不物化整 manifest 的解码体。
+
+        baseline 相位跳过 ``baseline_sample`` 已填充的条目——「冻结只采
+        一次」的工件级幂等：续训恢复点 policy 已非冻结初始权重，重采会
+        把训练后样本污染进基线（experiment-design「对照基线」）。"""
         entries = self._manifest.entries_for_stage(self._stage)
+        if phase == PHASE_BASELINE:
+            entries = [
+                entry for entry in entries if entry.baseline_sample is None
+            ]
         for start in range(0, len(entries), self._decode_batch_size):
             chunk = entries[start:start + self._decode_batch_size]
             volumes = self._volumes(chunk)

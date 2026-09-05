@@ -33,7 +33,7 @@ import torch
 from pydantic import BaseModel, ConfigDict
 
 from cynosure.config import CynosureConfig, Modality
-from cynosure.eval import EvaluationPhase, MilestoneMetrics
+from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.cursor import TrajectoryCursor
@@ -58,6 +58,7 @@ from cynosure.train.earlystop import EarlyStopJudge
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase
 from cynosure.train.resume import resume_latest, save_resume_state
+from cynosure.train.rng import TrainingRngStreams
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,75 @@ class RewardCoordinator:
         return self.auc.compute(current_fakes, modality=modality)
 
 
+class IterationLoop:
+    """单 iteration 执行序的策略侧两相（判别器侧见 RewardCoordinator）：
+    eval 相 rollout（Anchor → 单步 SDE 扰动 → 各 λ ODE 续跑 → 打分）→
+    train 相逐 k 独立梯度步——两相共享采样场，由 trainer 逐 iteration
+    驱动；log-prob 一致性诊断（π_old 记录 vs 同权重重算）同属本循环面。"""
+
+    def __init__(
+        self,
+        config: CynosureConfig,
+        rollout: RolloutPhase,
+        updater: StepwisePolicyUpdate,
+        amp: AmpContext,
+    ) -> None:
+        self._config = config
+        self.rollout = rollout
+        self.updater = updater
+        self._amp = amp
+
+    def base_partition_samples(self, capacity: int) -> torch.Tensor:
+        """冻结初始 policy 的 base 分区供给（train 启动期一次）。"""
+        return self.rollout.base_partition_samples(capacity)
+
+    def run_iteration(self) -> IterationRollout:
+        """执行序第 1 相：eval 相 rollout（调用方负责相位于前就绪）。"""
+        return self.rollout.run_iteration()
+
+    def update_policy(self, record: IterationRollout) -> dict[str, float]:
+        """执行序第 2 相：逐 k 独立梯度步——每 k 一次
+        forward→backward→optimizer.step，返回逐 k loss 组件。"""
+        advantage = MgaiAdvantage(clamp=self._config.grpo.advantage_clamp)
+        loss_terms: dict[str, float] = {}
+        for step in record.steps:
+            advantages = advantage.compute(step.rewards)
+            value = self.updater.step(
+                step_index=step.step_index,
+                x_k=step.anchor_latent,
+                condition=record.condition,
+                directions=step.directions,
+                old_log_probs=step.old_log_probs,
+                advantages=advantages,
+            )
+            loss_terms[f"policy_step_{step.step_index}"] = value
+        return loss_terms
+
+    def consistency_pairs(
+        self, record: IterationRollout, iteration: int,
+    ) -> list[TrainingLogProbPair]:
+        """更新循环开始前（权重未变）逐 k 重算 log-prob，与 π_old 记录
+        成对——同权重同口径，测试面 #3 断言两侧逐位一致。"""
+        pairs: list[TrainingLogProbPair] = []
+        with torch.no_grad(), torch.autocast(
+            self._amp.device_type, dtype=self._amp.dtype,
+        ):
+            for step in record.steps:
+                recomputed = self.updater.sampler.evaluate_log_prob(
+                    step.anchor_latent, step.step_index,
+                    record.condition, step.directions,
+                )
+                for direction in range(self._config.policy.group_size_g):
+                    pairs.append(TrainingLogProbPair(
+                        iteration=iteration,
+                        step_index=step.step_index,
+                        direction=direction,
+                        recorded=float(step.old_log_probs[direction]),
+                        recomputed=float(recomputed[direction]),
+                    ))
+        return pairs
+
+
 class GranularGrpoTrainer:
     """单进程 Granular-GRPO 训练循环编排（config 驱动装配；一次装配 =
     一个组的一个阶段）。"""
@@ -214,48 +284,46 @@ class GranularGrpoTrainer:
             ),
             dtype=AMP_DTYPES[config.policy.amp_dtype],
         )
-        # 全循环的六条命名 RNG 流（续训状态机按名保存/恢复的注册表）：
-        # rollout 相与条件分布共享主流；real 采样 / 判别器更新 / AUC /
-        # fake 置换 / base 分区生成各自独立派生流（互不漂移）
-        seed = config.schedule.seed
-        self.generators: dict[str, torch.Generator] = {
-            "rollout": torch.Generator().manual_seed(seed),
-            "real_pool": torch.Generator().manual_seed(seed + 1),
-            "disc_update": torch.Generator().manual_seed(seed + 2),
-            "heldout_auc": torch.Generator().manual_seed(seed + 3),
-            "fake_shuffle": torch.Generator().manual_seed(seed + 4),
-            "base_partition": torch.Generator().manual_seed(seed + 5),
-        }
+        # 全循环的六条命名 RNG 流（TrainingRngStreams 注册表，resume 按名
+        # 保存/恢复）：rollout 相与条件分布共享主流；real 采样 / 判别器
+        # 更新 / AUC / fake 置换 / base 分区生成各自独立派生流（互不漂移）
+        self.rng = TrainingRngStreams(config.schedule.seed)
         self.policy = GroupPolicy.build(
-            config, self.generators["rollout"], self._amp.device,
+            config, self.rng.rollout, self._amp.device,
         )
         sampler = self._assemble_sampler(self.policy.field)
         self.rewards = self._assemble_rewards()
-        self.updater = StepwisePolicyUpdate(
-            sampler=sampler,
-            optimizer=self.policy.optimizer,
-            loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
-            device_type=self._amp.device_type,
-            amp_dtype=self._amp.dtype,
-        )
-        self.rollout = RolloutPhase(
-            config,
-            sampler,
-            self.rewards.update.scorer,
-            self.generators["rollout"],
-            condition_sampler=self.policy.conditions,
-            device_type=self._amp.device_type,
-            autocast_dtype=self._amp.dtype,
-            device=self._amp.device,
-            # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
-            # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
-            base_generator=self.generators["base_partition"],
+        # 策略侧执行序两相（eval 相 rollout → train 相逐 k 更新）合成
+        # 单 iteration 循环体（判别器侧协作者见 self.rewards）
+        self.loop = IterationLoop(
+            config=config,
+            rollout=RolloutPhase(
+                config,
+                sampler,
+                self.rewards.update.scorer,
+                self.rng.rollout,
+                condition_sampler=self.policy.conditions,
+                device_type=self._amp.device_type,
+                autocast_dtype=self._amp.dtype,
+                device=self._amp.device,
+                # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
+                # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
+                base_generator=self.rng.base_partition,
+            ),
+            updater=StepwisePolicyUpdate(
+                sampler=sampler,
+                optimizer=self.policy.optimizer,
+                loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
+                device_type=self._amp.device_type,
+                amp_dtype=self._amp.dtype,
+            ),
+            amp=self._amp,
         )
         # 评测相（Baseline 采样 / 里程碑解码评测 / RL 后重采）；测试可注入替身。
         # manifest 由本侧从 run 目录装载注入（eval 不反向依赖 train 契约模块）：
         # 组3 stage-2 各自重读盘上 manifest，天然含 stage-1 已回写的样本路径
         self.evaluation = evaluation if evaluation is not None else (
-            EvaluationPhase.build(
+            ManifestEvaluation.build(
                 config,
                 run_artifacts,
                 sampler,
@@ -280,7 +348,7 @@ class GranularGrpoTrainer:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
         （未参与任何梯度步）rollout 产出填满 base 分区（spec 补钉）。"""
         self.rewards.seed_base(
-            self.rollout.base_partition_samples(
+            self.loop.base_partition_samples(
                 self.rewards.buffer.base_capacity,
             ),
         )
@@ -310,11 +378,11 @@ class GranularGrpoTrainer:
         for iteration in range(start_iteration, self.config.schedule.max_iterations):
             started = time.monotonic()
             self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
-            record = self.rollout.run_iteration()
+            record = self.loop.run_iteration()
             if self._dump:
-                pairs.extend(self._consistency_pairs(record, iteration))
+                pairs.extend(self.loop.consistency_pairs(record, iteration))
             self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
-            loss_terms = self._update_policy(record)
+            loss_terms = self.loop.update_policy(record)
             # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
             # 判别器快照（更新后测同一 fake 批会把 in-sample 拟合计入 AUC，
             # 联合 hacking 签名失真）；real 侧按本 iteration 采样的目标
@@ -455,63 +523,21 @@ class GranularGrpoTrainer:
                 LatentManifest.load(
                     config.reward.real_pool_manifest, kind="real_pool",
                 ),
-                self.generators["real_pool"],
+                self.rng.real_pool,
                 self._amp.device,
             ),
             config=config.reward,
-            generator=self.generators["disc_update"],
+            generator=self.rng.disc_update,
         )
         auc = HeldOutAuc(
             heldout_manifest=LatentManifest.load(
                 config.reward.heldout_real_manifest, kind="heldout_real",
             ),
             scorer=scorer,
-            generator=self.generators["heldout_auc"],
+            generator=self.rng.heldout_auc,
             device=self._amp.device,
         )
-        return RewardCoordinator(update, auc, self.generators["fake_shuffle"])
-
-    def _update_policy(self, record: IterationRollout) -> dict[str, float]:
-        """逐 k 独立梯度步（执行序第 2 相）：每 k 一次
-        forward→backward→optimizer.step，返回逐 k loss 组件。"""
-        advantage = MgaiAdvantage(clamp=self.config.grpo.advantage_clamp)
-        loss_terms: dict[str, float] = {}
-        for step in record.steps:
-            advantages = advantage.compute(step.rewards)
-            value = self.updater.step(
-                step_index=step.step_index,
-                x_k=step.anchor_latent,
-                condition=record.condition,
-                directions=step.directions,
-                old_log_probs=step.old_log_probs,
-                advantages=advantages,
-            )
-            loss_terms[f"policy_step_{step.step_index}"] = value
-        return loss_terms
-
-    def _consistency_pairs(
-        self, record: IterationRollout, iteration: int,
-    ) -> list[TrainingLogProbPair]:
-        """更新循环开始前（权重未变）逐 k 重算 log-prob，与 π_old 记录
-        成对——同权重同口径，测试面 #3 断言两侧逐位一致。"""
-        pairs: list[TrainingLogProbPair] = []
-        with torch.no_grad(), torch.autocast(
-            self._amp.device_type, dtype=self._amp.dtype,
-        ):
-            for step in record.steps:
-                recomputed = self.updater.sampler.evaluate_log_prob(
-                    step.anchor_latent, step.step_index,
-                    record.condition, step.directions,
-                )
-                for direction in range(self.config.policy.group_size_g):
-                    pairs.append(TrainingLogProbPair(
-                        iteration=iteration,
-                        step_index=step.step_index,
-                        direction=direction,
-                        recorded=float(step.old_log_probs[direction]),
-                        recomputed=float(recomputed[direction]),
-                    ))
-        return pairs
+        return RewardCoordinator(update, auc, self.rng.fake_shuffle)
 
     def _write_checkpoint(self, iteration: int) -> None:
         """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict）。

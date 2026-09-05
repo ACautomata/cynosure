@@ -3,9 +3,10 @@
 - **三正交面**（ADR-0004）：XY/YZ/ZX 三平面各自把体切成 2D 切片，
   逐面提取特征算 FID/KID 后汇总——2.5D 的「2.5」即三维体的三组正交
   二维视图；
-- **真实参照**（experiment-design）：dataset_root 的真实影像体（BraTS
-  病例目录布局与 prepare 同一扫描器），里程碑评测的 FID 参照侧与
-  跨模态组 SSIM/MAE/PSNR 的 ground-truth 侧都取自它；
+- **真实参照**（experiment-design）：dataset_root 的真实影像体经上游
+  recipe 预处理链读入（与 prepare 预编码同一口径，ADR-0006），里程碑
+  评测的 FID 参照侧与跨模态组 SSIM/MAE/PSNR 的 ground-truth 侧都取自
+  它；
 - **配对保真度**（跨模态组另加 3D SSIM/MAE/PSNR）：合成 target 影像与
   **同一病例 ground-truth 的 target 序列影像**逐例配对比较——配对数据
   集里病例全序列齐全，参照取 entry 锁定源病例的目标序列（非 source
@@ -17,10 +18,10 @@ from pathlib import Path
 
 import torch
 from monai.metrics import MAEMetric, PSNRMetric, SSIMMetric
-from monai.transforms import LoadImage
 
 from cynosure.config import Modality
 from cynosure.reward.dataset import BratsSeriesLayout, CaseSeries
+from cynosure.reward.preprocessing import UpstreamPreprocessChain
 
 
 class OrthoPlane(enum.Enum):
@@ -55,17 +56,23 @@ class OrthoPlane(enum.Enum):
 class RealVolumeStore:
     """真实参照影像库：dataset_root 病例目录布局的装载与缓存。
 
+    参照影像经**上游 recipe 预处理链**（``UpstreamPreprocessChain``，与
+    prepare 预编码同一口径——RAS 重定向 + percentile 强度 + 128 倍数
+    resize）读入：里程碑合成侧（VAE 解码的预处理空间）与参照侧必须在
+    同一影像空间与强度域，裸读原生 NIfTI 构成跨域比较。
+    ``case_ids`` 白名单把参照病例锁进 real pool 的 train split（spec
+    「real 样本库」：real = 病例级 70% train split）——dataset_root 全树
+    含 val/test 分区，不筛就构成参照分布的分割泄漏。
     里程碑评测每个里程碑都取同一批参照体——按 (case, modality) 缓存
-    装载结果，重复评测不重复读盘。``case_ids`` 白名单把参照病例锁进
-    real pool 的 train split（spec「real 样本库」：real = 病例级 70%
-    train split）——dataset_root 全树含 val/test 分区，不篮就构成
-    参照分布的分割泄漏。
+    装载结果（缓存界 = 里程碑条目数个 (case, modality) 对），重复评测
+    不重复读盘。
     """
 
     def __init__(
         self,
         dataset_root: Path | str,
         case_ids: set[str] | None = None,
+        preprocess: UpstreamPreprocessChain | None = None,
     ) -> None:
         self._layout = BratsSeriesLayout(Path(dataset_root))
         cases: dict[str, CaseSeries] = {
@@ -85,14 +92,18 @@ class RealVolumeStore:
                 raise ValueError("参照病例白名单过滤后无可用病例")
         self._cases: dict[str, CaseSeries] = cases
         self._cache: dict[tuple[str, Modality], torch.Tensor] = {}
-        self._reader = NiftiVolumeReader()
+        # 缺省按上游基数构造（评测侧无 config 注入点时的独立使用面；
+        # EvaluationPhase 装配时随 config.preprocessing.resize_base 传入）
+        self._preprocess = (
+            preprocess if preprocess is not None else UpstreamPreprocessChain()
+        )
 
     def case_ids(self) -> list[str]:
         """全部病例 id（排序稳定——参照配对的确定性基础）。"""
         return sorted(self._cases)
 
     def volume(self, case_id: str, modality: Modality) -> torch.Tensor:
-        """病例某序列的真实影像体 [X, Y, Z]（缓存）。"""
+        """病例某序列的**预处理后**影像体 [X, Y, Z]（缓存）。"""
         if case_id not in self._cases:
             raise ValueError(
                 f"参照库无病例 {case_id!r}（dataset_root 布局与 prepare 扫描器不符）"
@@ -100,24 +111,11 @@ class RealVolumeStore:
         key = (case_id, modality)
         if key not in self._cache:
             path = self._cases[case_id].series[modality]
-            self._cache[key] = self._reader.read(path)
+            preprocessed = torch.as_tensor(
+                self._preprocess(path),
+            ).float()[0]  # 链产物 [1, D, H, W] → [X, Y, Z]
+            self._cache[key] = preprocessed
         return self._cache[key]
-
-
-class NiftiVolumeReader:
-    """NIfTI → [X, Y, Z] float 张量（MONAI LoadImage，与 prepare 同一口径）。"""
-
-    def __init__(self) -> None:
-        self._load = LoadImage(image_only=True)
-
-    def read(self, path: Path) -> torch.Tensor:
-        image = self._load(path)
-        volume = torch.as_tensor(image).float()
-        if volume.dim() != 3:
-            raise ValueError(
-                f"参照影像须为 3D 体，{path} 得到 {tuple(volume.shape)}"
-            )
-        return volume
 
 
 class VolumePairFidelity:

@@ -10,6 +10,7 @@ from cynosure.eval.features import (
     StubSliceFeatureExtractor,
 )
 from cynosure.eval.volumes import OrthoPlane, RealVolumeStore, VolumePairFidelity
+from cynosure.reward.preprocessing import UpstreamPreprocessChain
 from tests.conftest import SyntheticBratsDataset
 
 
@@ -207,9 +208,26 @@ class TestRealVolumeStore:
 
     def test_loads_reference_volume_by_case_and_modality(self, tmp_path) -> None:
         dataset = self._single_case_dataset(tmp_path)
-        store = RealVolumeStore(dataset)
+        store = RealVolumeStore(
+            dataset, preprocess=UpstreamPreprocessChain(4),
+        )  # resize 基数 4：8×8×4 体在链后保持原尺寸
         volume = store.volume("BraTS-GLI-00000-000", "t1n")
         assert volume.shape == (8, 8, 4)
+        assert torch.isfinite(volume).all()
+
+    def test_reference_loads_through_upstream_preprocess_chain(
+        self, tmp_path,
+    ) -> None:
+        """参照装载经上游 recipe 预处理链（与 prepare 预编码同口径）：
+        resize 基数驱动目标尺寸（8×8×4、基数 16 → 每轴 16 的倍数）。"""
+        dataset = self._single_case_dataset(tmp_path)
+        store = RealVolumeStore(
+            dataset, preprocess=UpstreamPreprocessChain(16),
+        )
+        volume = store.volume("BraTS-GLI-00000-000", "t1n")
+        assert volume.shape == UpstreamPreprocessChain.resize_target(
+            (8, 8, 4), 16,
+        )
         assert torch.isfinite(volume).all()
 
     def test_unknown_case_rejected(self, tmp_path) -> None:

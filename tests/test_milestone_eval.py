@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from cynosure.config import ConfigLoader, CynosureConfig
-from cynosure.eval import EvaluationPhase
+from cynosure.eval import EvaluationPhase, ManifestEvaluation
 from cynosure.eval.decode import LatentDecoder
 from cynosure.eval.features import StubSliceFeatureExtractor
 from cynosure.eval.milestone import MilestoneEvaluator, MilestoneMetrics
@@ -127,7 +127,7 @@ class TestDecodeOnlyInEvaluationPaths:
 
     def test_train_package_never_calls_decode_or_imports_decoder(self) -> None:
         """静态 AST 检查：train 包源码无 ``.decode`` 调用点、不引用任何
-        解码器类型（解码只属于 eval 包；trainer 只经 EvaluationPhase
+        解码器类型（解码只属于 eval 包；trainer 只经 EvaluationPhase 接口
         的三个评测动作间接触达）。"""
         offenders: list[str] = []
         decoder_names = {"LatentDecoder", "AutoencoderKlMaisi", "VolumeDecoder"}
@@ -188,7 +188,7 @@ class TestDecodeOnlyInEvaluationPaths:
             torch.device("cpu"),
         )
         counter = CountingDecoder(inner)
-        evaluation = EvaluationPhase.build(
+        evaluation = ManifestEvaluation.build(
             config,
             artifacts,
             scenario.standalone_sampler(config),
@@ -215,7 +215,7 @@ class TestBoundedVolumeSampling:
 
     def _evaluation_with_counter(
         self, scenario: TrainingLoopScenario, decode_batch_size: int,
-    ) -> tuple[EvaluationPhase, CountingDecoder]:
+    ) -> tuple[ManifestEvaluation, CountingDecoder]:
         scenario.write_inputs()
         scenario.set_schedule(decode_batch_size=decode_batch_size)
         config = ConfigLoader.load(scenario.config_path)
@@ -230,7 +230,7 @@ class TestBoundedVolumeSampling:
             torch.device("cpu"),
         )
         counter = CountingDecoder(inner)
-        evaluation = EvaluationPhase.build(
+        evaluation = ManifestEvaluation.build(
             config,
             artifacts,
             scenario.standalone_sampler(config),
@@ -396,7 +396,7 @@ class TestSingleDeviceMilestoneEvaluation:
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        evaluation = EvaluationPhase.build(
+        evaluation = ManifestEvaluation.build(
             config,
             artifacts,
             scenario.standalone_sampler(config, accelerator),
@@ -409,8 +409,55 @@ class TestSingleDeviceMilestoneEvaluation:
         assert math.isfinite(metrics.fid)
 
 
-class StubEvaluation:
-    """测试仪器：里程碑度量可控的评测相替身（早停接线断言用）。"""
+class TestBaselineSamplingIdempotence:
+    """「冻结模型只采一次」的工件级幂等：baseline_sample 已填充的条目
+    跳过不重采——续训恢复点 policy 已非冻结初始权重，重采会把训练后
+    样本污染进基线（experiment-design「对照基线」；trainer 侧 resume
+    跳过之外的第二道防线）。"""
+
+    def test_baseline_sampling_skips_prefilled_entries(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        assert scenario.train().code == 0, scenario.train().stderr
+        # sentinel 放在保持已填充的条目 1 上（断言不被覆盖）；条目 0 标回
+        # 未采——触发补采路径，验证只采缺的、不动已冻结的
+        run_paths = RunArtifacts.layout(scenario.run_dir)
+        manifest = BaselineManifest.load(run_paths.manifest)
+        frozen = manifest.entries[1]
+        sentinel_path = scenario.run_dir / frozen.baseline_sample
+        sentinel = torch.full_like(torch.load(sentinel_path), -7.0)
+        torch.save(sentinel, sentinel_path)
+        manifest.entries[0].baseline_sample = None
+        manifest.write(run_paths.manifest)
+
+        config = ConfigLoader.load(scenario.config_path)
+        counter = CountingDecoder(LatentDecoder(
+            NetworkArtifact(
+                config=NetworkAssembler.load_json(
+                    config.artifacts.vae_config_json,
+                ),
+                checkpoint=config.artifacts.vae_ckpt,
+            ),
+            torch.device("cpu"),
+        ))
+        evaluation = ManifestEvaluation.build(
+            config,
+            RunArtifacts(run_paths),
+            scenario.standalone_sampler(config),
+            1,
+            BaselineManifest.load(run_paths.manifest),
+            amp=AmpContext(torch.device("cpu"), torch.bfloat16),
+            decoder=counter,
+        )
+        evaluation.sample_baseline()
+        assert [shape[0] for shape in counter.calls] == [1]  # 只补采条目 0 这 1 条未填充
+        assert torch.equal(torch.load(sentinel_path), sentinel)  # 已填条目不覆盖
+
+
+class StubEvaluation(EvaluationPhase):
+    """测试仪器：里程碑度量可控的评测相替身（早停接线断言用）——显式
+    实现 ``EvaluationPhase`` 接口（trainer 依赖的契约面）。"""
 
     def __init__(self, fids: list[float]) -> None:
         self._fids = list(fids)
@@ -435,7 +482,7 @@ class StubEvaluation:
 
 
 class TestProductionEvaluationContract:
-    """生产装配契约（经公共 ``EvaluationPhase.build`` 口径断言，不直调
+    """生产装配契约（经公共 ``ManifestEvaluation.build`` 口径断言，不直调
     私有装配）：fixture 工件齐全、语义翻转为生产（fixture_mode=false）
     时，缺 RadImageNet 权重 / VAE 网络配置在装配期显式拒绝——不静默
     stub（生产静默 stub 会让里程碑指标变成无意义数字）。"""
@@ -451,7 +498,7 @@ class TestProductionEvaluationContract:
                 target = getattr(target, part)
             setattr(target, parts[-1], value)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        return EvaluationPhase.build(
+        return ManifestEvaluation.build(
             config,
             artifacts,
             scenario.standalone_sampler(config),
@@ -488,7 +535,7 @@ class TestReferencePoolRestriction:
         pool = LatentManifest.load(
             config.reward.real_pool_manifest, kind="real_pool",
         )
-        store = EvaluationPhase._build_reals(config, pool)
+        store = ManifestEvaluation._build_reals(config, pool)
         assert store.case_ids() == sorted({
             entry.case_id for entry in pool.entries
         })
