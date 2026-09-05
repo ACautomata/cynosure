@@ -589,11 +589,13 @@ class RecordingScorer:
 class RecordingUpdate:
     """测试仪器：记录 update.step 收到的批与调用时的判别器相位
     （buffer 用真实两区实现——RewardCoordinator 的 zone_sizes 观测面
-    经它委托）。"""
+    经它委托；optimizer 为真实现——续训状态机的判别器侧 checkpoint
+    经 RewardCoordinator 消费 update.optimizer，协作者契约面的一部分）。"""
 
     def __init__(self, discriminator: torch.nn.Module) -> None:
         self.scorer = RecordingScorer(discriminator)
         self.buffer = ReplayBuffer(64)
+        self.optimizer = torch.optim.AdamW(discriminator.parameters(), lr=5e-5)
         self.received: list[torch.Tensor] = []
         self.training_at_call: list[bool] = []
 

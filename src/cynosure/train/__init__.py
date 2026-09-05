@@ -8,7 +8,10 @@
   单点分派（issue #23 三组实验矩阵的组间差异收敛处）；
 - 循环编排（trainer）：单进程 Granular-GRPO iteration 循环——MGAI
   advantage → 逐 k 独立梯度步 → 判别器 Online update → iter 事件落盘，
-  train 启动时自动生成 buffer base 分区；
+  train 启动时自动生成 buffer base 分区，续训状态按周期落盘/恢复；
+- 续训状态机（resume）：断点续训全清单（两模型权重与 optimizer、buffer
+  两区、RNG、iteration 计数、LR/EMA 槽位）的单文件滚动落盘与整体恢复
+  （T07）；
 - 序贯编排（sequential）：组3 两阶段的单次运行（stage-1 组1 配置 →
   stage-2 base′ 冻结 + 预训练 ControlNet，支持既有产物跳过 stage-1）。
 """

@@ -9,13 +9,16 @@ spec #15 执行序的单进程版（分布式 allreduce/barrier 留 T09）：
          判别器 Online update（50% 当前 fake + 50% 回放，单进程直通）
       3. iter 事件落盘（Anchor eval reward / 组内 reward std / held-out
          AUC / loss 组件 / buffer 占比 / lr / 耗时；组3 stage-2 带 stage=2）
-    train 启动时：用冻结初始 policy 自动生成 buffer base 分区。
+    定期：续训状态全清单落盘（resume 模块，T07）——与产物 checkpoint 同
+    节奏（checkpoint_interval 周期 + 每里程碑强制 + 收尾兜底）
+    train 启动时：用冻结初始 policy 自动生成 buffer base 分区（续训恢复
+    时跳过——buffer 两区内容随状态整体回归）。
 
 可训练对象按组装配（GroupPolicy）：组1 = UNet 全参、组2 = ControlNet
 （base UNet 冻结经装配期断言验证）。每组一次装配 → 判别器与 Replay
 buffer 随训练实例天然隔离（跨组/跨阶段不复用）。
 
-（dist.barrier() 与断点续训状态机分属 T09 / T07。）
+（dist.barrier() 属 T09。）
 """
 
 import time
@@ -40,6 +43,7 @@ from cynosure.reward.update import OnlineUpdate, UpdateReport
 from cynosure.train.artifacts import IterEvent, POLICY_CHECKPOINT_TEMPLATE, RunArtifacts
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase
+from cynosure.train.resume import resume_latest, save_resume_state
 
 AMP_DTYPES: dict[str, torch.dtype] = {"bf16": torch.bfloat16}
 """config amp_dtype（Literal["bf16"] 定死）→ torch autocast dtype。"""
@@ -171,6 +175,13 @@ class GranularGrpoTrainer:
                 "训练循环需要 η>0 才存在 policy gradient；η=0 对照属纯诊断路径"
                 "（trajectory.json 仍随 --dump-trajectory 产出）",
             )
+        if config.grpo.ema_anchor_enabled:
+            # EMA 锚是升级项（ADR-0001：hacking 签名出现时启用）且实现未
+            # 交付：静默忽略会让续训状态清单的 EMA 条件项失真
+            raise ValueError(
+                "参数 EMA 锚为升级项（ADR-0001），实现未交付："
+                "ema_anchor_enabled=true 显式拒绝"
+            )
         # 回放供给跨字段守卫：首次判别器更新时近期分区为空，回放半区
         # （floor(K/2) 条，50/50 混采定死）全由 base 分区（capacity//2）
         # 承担；K=1 则回放半区为 0 条、回放采样 API 直接拒绝。无效组合
@@ -206,9 +217,21 @@ class GranularGrpoTrainer:
             ),
             dtype=AMP_DTYPES[config.policy.amp_dtype],
         )
-        # rollout 相与条件分布共享同一 generator：全循环确定性的单随机流
-        rollout_generator = torch.Generator().manual_seed(config.schedule.seed)
-        self.policy = GroupPolicy.build(config, rollout_generator, self._amp.device)
+        # 全循环的六条命名 RNG 流（续训状态机按名保存/恢复的注册表）：
+        # rollout 相与条件分布共享主流；real 采样 / 判别器更新 / AUC /
+        # fake 置换 / base 分区生成各自独立派生流（互不漂移）
+        seed = config.schedule.seed
+        self.generators: dict[str, torch.Generator] = {
+            "rollout": torch.Generator().manual_seed(seed),
+            "real_pool": torch.Generator().manual_seed(seed + 1),
+            "disc_update": torch.Generator().manual_seed(seed + 2),
+            "heldout_auc": torch.Generator().manual_seed(seed + 3),
+            "fake_shuffle": torch.Generator().manual_seed(seed + 4),
+            "base_partition": torch.Generator().manual_seed(seed + 5),
+        }
+        self.policy = GroupPolicy.build(
+            config, self.generators["rollout"], self._amp.device,
+        )
         sampler = self._assemble_sampler(self.policy.field)
         self.rewards = self._assemble_rewards()
         self.updater = StepwisePolicyUpdate(
@@ -222,16 +245,14 @@ class GranularGrpoTrainer:
             config,
             sampler,
             self.rewards.update.scorer,
-            rollout_generator,
+            self.generators["rollout"],
             condition_sampler=self.policy.conditions,
             device_type=self._amp.device_type,
             autocast_dtype=self._amp.dtype,
             device=self._amp.device,
             # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
             # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
-            base_generator=torch.Generator().manual_seed(
-                config.schedule.seed + 5,
-            ),
+            base_generator=self.generators["base_partition"],
         )
 
     @property
@@ -239,6 +260,11 @@ class GranularGrpoTrainer:
         """base UNet（组1 即可训练 policy 本体；组2/组3-stage2 为冻结 base，
         经 GroupPolicy 装配期断言验证 requires_grad 全关）。"""
         return self.policy.unet
+
+    @property
+    def device(self) -> torch.device:
+        """装配期单点选定的训练设备（续训状态恢复的迁入目标）。"""
+        return self._amp.device
 
     def seed_base_partition(self) -> None:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
@@ -249,16 +275,24 @@ class GranularGrpoTrainer:
             ),
         )
 
-    def run(self) -> int:
-        """训练主循环：base 分区自动生成 → 逐 iteration 执行序 → checkpoint。
-        返回完成的 iteration 数。"""
+    def run(self, *, resume: bool = False) -> int:
+        """训练主循环：base 分区自动生成 → 逐 iteration 执行序 → checkpoint
+        与续训状态落盘。``resume=True`` 时从 run 目录最新续训状态恢复
+        （全清单覆写，resume 模块），回退指标流中恢复点之后的半截事件后
+        从恢复点继续——base 分区种子生成随之跳过（buffer 随状态整体回归）。
+        返回完成的 iteration 数（config 口径的累计完成数）。"""
+        start_iteration = 0
+        if resume:
+            start_iteration = resume_latest(self)
+            self.artifacts.rewind_events(start_iteration, self.stage_tag.stage)
         self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
-        self.seed_base_partition()
+        if not resume:
+            self.seed_base_partition()
         pairs: list[TrainingLogProbPair] = []
-        last_checkpoint = 0
+        last_checkpoint = start_iteration
         update_interval = self.config.reward.disc_update_interval_n_d
-        for iteration in range(self.config.schedule.max_iterations):
+        for iteration in range(start_iteration, self.config.schedule.max_iterations):
             started = time.monotonic()
             self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
             record = self.rollout.run_iteration()
@@ -309,9 +343,13 @@ class GranularGrpoTrainer:
                 # checkpoint 周期之外，每个里程碑也强制落盘（config 契约：
                 # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须产出）
                 self._write_checkpoint(iteration + 1)
+                save_resume_state(self, iteration + 1)
                 last_checkpoint = iteration + 1
-        if last_checkpoint != self.config.schedule.max_iterations:
+        if last_checkpoint < self.config.schedule.max_iterations:
+            # 收尾兜底只允许前向推进：恢复点已在目标之后（收缩 max_iterations
+            # 的续训 = 无操作）时不得把更后的训练态改写成更小的 iteration 标签
             self._write_checkpoint(self.config.schedule.max_iterations)
+            save_resume_state(self, self.config.schedule.max_iterations)
         if pairs:
             self.artifacts.paths.training_diagnostic.write_text(
                 TrainingDiagnostic(logprob_pairs=pairs).model_dump_json(indent=2),
@@ -355,7 +393,6 @@ class GranularGrpoTrainer:
                 ChannelStats.load(config.reward.channel_stats_json),
             )
         scorer.to(self._amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
-        seed = config.schedule.seed
         update = OnlineUpdate(
             scorer=scorer,
             buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
@@ -363,23 +400,21 @@ class GranularGrpoTrainer:
                 LatentManifest.load(
                     config.reward.real_pool_manifest, kind="real_pool",
                 ),
-                torch.Generator().manual_seed(seed + 1),
+                self.generators["real_pool"],
                 self._amp.device,
             ),
             config=config.reward,
-            generator=torch.Generator().manual_seed(seed + 2),
+            generator=self.generators["disc_update"],
         )
         auc = HeldOutAuc(
             heldout_manifest=LatentManifest.load(
                 config.reward.heldout_real_manifest, kind="heldout_real",
             ),
             scorer=scorer,
-            generator=torch.Generator().manual_seed(seed + 3),
+            generator=self.generators["heldout_auc"],
             device=self._amp.device,
         )
-        return RewardCoordinator(
-            update, auc, torch.Generator().manual_seed(seed + 4),
-        )
+        return RewardCoordinator(update, auc, self.generators["fake_shuffle"])
 
     def _update_policy(self, record: IterationRollout) -> dict[str, float]:
         """逐 k 独立梯度步（执行序第 2 相）：每 k 一次
@@ -423,11 +458,11 @@ class GranularGrpoTrainer:
         return pairs
 
     def _write_checkpoint(self, iteration: int) -> None:
-        """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict；
-        断点续训全状态（optimizer/RNG/buffer）属 T07）。判别器经
-        loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
-        重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
-        历史布局逐字一致）。"""
+        """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict）。
+        判别器经 loadable_state_dict 固化有效权重（spectral norm 启用时
+        仍可严格重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无
+        前缀 = 历史布局逐字一致）。续训全状态由 resume.save_resume_state
+        同节奏落盘。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
             self.policy.network.state_dict(),

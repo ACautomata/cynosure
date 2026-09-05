@@ -78,8 +78,16 @@ class SequentialTrainer:
         )
         return [self._stage1_plan(), self._stage2_plan(base_prime)]
 
-    def run(self) -> int:
-        """顺序执行全部阶段，返回完成的 iteration 总数（= Σ 各阶段）。"""
+    def run(self, *, resume: bool = False) -> int:
+        """顺序执行全部阶段，返回完成的 iteration 总数（= Σ 各阶段）。
+
+        ``resume=True`` 属 CLI 分派的防御性兜底（序贯续训入口未交付，
+        CLI 层已显式拒绝）；到达此处即分派漏洞。"""
+        if resume:
+            raise ValueError(
+                "组3（sequential）的续训入口未交付：--resume 仅覆盖"
+                "单阶段运行（组1/组2）"
+            )
         completed = 0
         for item in self.plan():
             completed += GranularGrpoTrainer(
