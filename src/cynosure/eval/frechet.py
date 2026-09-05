@@ -1,4 +1,4 @@
-"""像素域定量评测的距离度量（ADR-0004：2.5D FID + KID/bootstrap CI）。
+"""像素域定量评测的距离度量（ADR-0004：2.5D FID + KID 重采样 CI）。
 
 全部以 torch 实现（float64 数值口径）：MONAI 自带的 ``FIDMetric`` 依赖
 scipy 做矩阵平方根——scipy 在 import 白名单之外、且集群侧有 numpy 钉版
@@ -107,13 +107,15 @@ class KernelMmd:
 
 
 class BootstrapKernelMmd:
-    """KID 的重采样置信区间（ADR-0004：KID/bootstrap CI）。
+    """KID 的重采样置信区间（bootstrap 族的无放回 m-out-of-n 口径）。
 
-    每次重复从两侧各**无放回**抽取半数样本算 MMD²，取 2.5/97.5 分位为
-    95% CI，点估计用全量特征集。不用有放回 bootstrap：重复行抬高组内
-    相似度、使重复分布系统性偏离点估计；无放回子采样（subsampling CI）
-    估计的是同一统计量的抽样波动。随机性经注入的 ``torch.Generator``
-    ——置信区间可复现（fixture 确定性契约）。
+    每次重复从两侧各**无放回**抽取半数样本（m = n/2）算 MMD²，取
+    2.5/97.5 分位为 95% CI，点估计用全量特征集。**不是** Efron 有放回
+    bootstrap：重复行抬高组内相似度、使重复分布系统性偏离点估计
+    （无偏 MMD² 在 K≈里程碑样本量的小样本下尤其明显）；无放回半样本
+    子抽样（subsampling CI）估计的是同一统计量的抽样波动、方差行为
+    有明确定义（m-out-of-n bootstrap 文献的标准替代）。随机性经注入的
+    ``torch.Generator``——置信区间可复现（fixture 确定性契约）。
     """
 
     LOWER_QUANTILE = 0.025

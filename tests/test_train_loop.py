@@ -85,13 +85,16 @@ class TrainingLoopScenario:
         data["schedule"].update(values)
         self.config_path.write_text(json.dumps(data), encoding="utf-8")
 
-    def standalone_sampler(self, config) -> RolloutSampler:
+    def standalone_sampler(
+        self, config, device: torch.device | None = None,
+    ) -> RolloutSampler:
         """评测相注入测试用的独立采样封装（与 trainer._assemble_sampler
-        同一组合方式；独立于 trainer 内部装配）。"""
+        同一组合方式；独立于 trainer 内部装配）。网络落 ``device``
+        （缺省 CPU；设备归一测试传加速器设备）。"""
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,
-        ))
+        )).to(device if device is not None else torch.device("cpu"))
         scheduler = NetworkAssembler.rflow_scheduler(
             num_inference_steps=config.policy.num_inference_steps,
             input_img_size_numel=config.policy.input_img_size_numel,

@@ -56,14 +56,34 @@ class RealVolumeStore:
     """真实参照影像库：dataset_root 病例目录布局的装载与缓存。
 
     里程碑评测每个里程碑都取同一批参照体——按 (case, modality) 缓存
-    装载结果，重复评测不重复读盘。
+    装载结果，重复评测不重复读盘。``case_ids`` 白名单把参照病例锁进
+    real pool 的 train split（spec「real 样本库」：real = 病例级 70%
+    train split）——dataset_root 全树含 val/test 分区，不篮就构成
+    参照分布的分割泄漏。
     """
 
-    def __init__(self, dataset_root: Path | str) -> None:
+    def __init__(
+        self,
+        dataset_root: Path | str,
+        case_ids: set[str] | None = None,
+    ) -> None:
         self._layout = BratsSeriesLayout(Path(dataset_root))
-        self._cases: dict[str, CaseSeries] = {
+        cases: dict[str, CaseSeries] = {
             case.case_id: case for case in self._layout.scan()
         }
+        if case_ids is not None:
+            unknown = sorted(set(case_ids) - set(cases))
+            if unknown:
+                raise ValueError(
+                    f"参照病例白名单含 dataset_root 不存在的病例: {unknown}"
+                )
+            cases = {
+                case_id: case for case_id, case in cases.items()
+                if case_id in case_ids
+            }
+            if not cases:
+                raise ValueError("参照病例白名单过滤后无可用病例")
+        self._cases: dict[str, CaseSeries] = cases
         self._cache: dict[tuple[str, Modality], torch.Tensor] = {}
         self._reader = NiftiVolumeReader()
 

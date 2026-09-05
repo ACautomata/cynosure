@@ -169,8 +169,17 @@ class BaselineManifest(BaseModel):
     @staticmethod
     def _stage_conditions(config: CynosureConfig) -> dict[int, list]:
         """group → {阶段号: 条件清单} 的唯一映射（组1 四序列、组2 12 有序对、
-        组3 两阶段各一份；build 与条件词汇表共同消费，单一来源）。"""
+        组3 两阶段各一份；build 与条件词汇表共同消费，单一来源）。
+
+        组3 指定 ``stage1_run_dir``（复用既有 stage-1 产物）时只建
+        stage-2 条目：stage-1 不在本 run 执行，manifest 不留无人填充的
+        null 条目（stage-1 样本对住在源 run 自己的 manifest）。"""
         pairs = [list(pair) for pair in config.experiment.cross_modal_pairs]
+        if (
+            config.experiment.group == "sequential"
+            and config.experiment.stage1_run_dir is not None
+        ):
+            return {2: pairs}
         return {
             "modal-label": {1: list(MODALITIES)},
             "cross-modal": {1: pairs},

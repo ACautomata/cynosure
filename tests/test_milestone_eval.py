@@ -16,17 +16,30 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader
+from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.eval import EvaluationPhase
 from cynosure.eval.decode import LatentDecoder
-from cynosure.eval.milestone import MilestoneMetrics
+from cynosure.eval.features import StubSliceFeatureExtractor
+from cynosure.eval.milestone import MilestoneEvaluator, MilestoneMetrics
+from cynosure.eval.sampling import EntrySample
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.numerics import AmpContext
-from cynosure.train import BaselineManifest, GranularGrpoTrainer, RunArtifacts
-from tests.conftest import CliSession
+from cynosure.reward.artifacts import LatentManifest
+from cynosure.train import (
+    BaselineManifest,
+    GranularGrpoTrainer,
+    ManifestEntry,
+    RunArtifacts,
+)
+from tests.conftest import MINIMAL_CONFIG_DICT, CliSession
 from tests.test_train_loop import TrainingLoopScenario
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "cynosure"
+
+SECOND_DEVICE_AVAILABLE = (
+    torch.cuda.is_available() or torch.backends.mps.is_available()
+)
+"""设备错配复现的前提：CPU 之外存在第二计算设备（MPS/CUDA）。"""
 
 
 @pytest.fixture
@@ -193,6 +206,209 @@ class TestDecodeOnlyInEvaluationPaths:
         ]
 
 
+class TestBoundedVolumeSampling:
+    """Baseline/重采的分块流式解码（显存有界）与落盘独立物化。
+
+    生产 N_baseline = 200–500、解码体 256×256×128 fp32：整 manifest
+    单批解码的峰值分配 OOM 级；view 序列化会携带整批 backing storage，
+    每条目文件膨胀 K 倍。"""
+
+    def _evaluation_with_counter(
+        self, scenario: TrainingLoopScenario, decode_batch_size: int,
+    ) -> tuple[EvaluationPhase, CountingDecoder]:
+        scenario.write_inputs()
+        scenario.set_schedule(decode_batch_size=decode_batch_size)
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        inner = LatentDecoder(
+            NetworkArtifact(
+                config=NetworkAssembler.load_json(
+                    config.artifacts.vae_config_json,
+                ),
+                checkpoint=config.artifacts.vae_ckpt,
+            ),
+            torch.device("cpu"),
+        )
+        counter = CountingDecoder(inner)
+        evaluation = EvaluationPhase.build(
+            config,
+            artifacts,
+            scenario.standalone_sampler(config),
+            stage=1,
+            manifest=BaselineManifest.load(artifacts.paths.manifest),
+            amp=AmpContext(torch.device("cpu"), torch.bfloat16),
+            decoder=counter,
+        )
+        return evaluation, counter
+
+    def test_baseline_decoding_streams_in_bounded_chunks(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """decode_batch_size=2、4 条目：baseline 解码两次调用、每次批
+        ≤ 块大小——峰值显存以块为界；重采同口径。"""
+        evaluation, counter = self._evaluation_with_counter(
+            scenario, decode_batch_size=2,
+        )
+        evaluation.sample_baseline()
+        chunk_latent_shape = (2, 4, 16, 16, 8)  # 计数面 = decode 输入 latent
+        assert counter.calls == [chunk_latent_shape, chunk_latent_shape]
+        counter.calls.clear()
+        evaluation.resample()
+        assert counter.calls == [chunk_latent_shape, chunk_latent_shape]
+
+    def test_saved_volume_owns_its_storage(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """落盘像素体是独立物化张量：条目体是批张量的 view 时序列化
+        携带整批 backing storage（load 回读 storage 必须等于张量自身）。"""
+        evaluation, _ = self._evaluation_with_counter(
+            scenario, decode_batch_size=4,
+        )
+        evaluation.sample_baseline()
+        stored = torch.load(
+            scenario.run_dir / "samples" / "stage1" / "baseline" / "0000.pt",
+        )
+        assert stored.untyped_storage().nbytes() == (
+            stored.numel() * stored.element_size()
+        )
+
+
+class StaticLatentSampler:
+    """测试仪器：恒零 latent 的采样替身（不依赖网络）。"""
+
+    def __init__(self, latent_shape: tuple[int, ...]) -> None:
+        self._latent_shape = latent_shape
+
+    def sample(self, entries) -> list[EntrySample]:
+        return [
+            EntrySample(
+                entry=entry, target="t1n", source_case=None,
+                terminal=torch.zeros(1, *self._latent_shape),
+            )
+            for entry in entries
+        ]
+
+
+class FixedShapeDecoder:
+    """测试仪器：输出固定形状像素体的解码替身。"""
+
+    def __init__(self, volume_shape: tuple[int, int, int]) -> None:
+        self._volume_shape = volume_shape
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        return torch.rand(
+            (latents.shape[0], 1, *self._volume_shape),
+            generator=torch.Generator().manual_seed(0),
+        )
+
+
+class NativeShapeRealStore:
+    """测试仪器：返回原生（未经 prepare 预处理）参照体的替身。"""
+
+    def __init__(self, volume_shape: tuple[int, int, int]) -> None:
+        self._volume_shape = volume_shape
+
+    def case_ids(self) -> list[str]:
+        return ["case-a", "case-b"]
+
+    def volume(self, case_id: str, modality: str) -> torch.Tensor:
+        return torch.rand(self._volume_shape)
+
+
+class TestReferenceSpaceAlignment:
+    """参照/合成影像空间对齐守卫：原生 BraTS NIfTI（240×240×155、原生
+    朝向）直入参照库时，跨域比较在组1 FID 路径是**静默**的（特征提取器
+    对任意切片尺寸都能出特征）——守卫把未对齐参照库变成显式失败，而非
+    无意义的跨域指标（生产参照须经 prepare 预处理到模型影像空间）。"""
+
+    @staticmethod
+    def _evaluator(
+        reference_shape: tuple[int, int, int],
+        synthetic_shape: tuple[int, int, int],
+    ) -> MilestoneEvaluator:
+        config = CynosureConfig.model_validate({
+            **MINIMAL_CONFIG_DICT, "schedule": {"seed": 0},
+        })
+        manifest = BaselineManifest(
+            seed=0, group="modal-label", conditions=["t1n"],
+            entries=[
+                ManifestEntry(index=index, condition="t1n", noise_seed=index)
+                for index in range(4)
+            ],
+        )
+        return MilestoneEvaluator(
+            config,
+            1,
+            StaticLatentSampler((4, 16, 16, 8)),
+            FixedShapeDecoder(synthetic_shape),
+            StubSliceFeatureExtractor(),
+            NativeShapeRealStore(reference_shape),
+            manifest,
+            torch.device("cpu"),
+        )
+
+    def test_mismatched_reference_space_rejected_loudly(self) -> None:
+        evaluator = self._evaluator(
+            reference_shape=(20, 20, 10),   # 原生空间（未经预处理）
+            synthetic_shape=(16, 16, 8),    # 模型影像空间
+        )
+        with pytest.raises(ValueError, match="影像空间"):
+            evaluator.evaluate()
+
+    def test_aligned_reference_space_passes(self) -> None:
+        evaluator = self._evaluator(
+            reference_shape=(16, 16, 8), synthetic_shape=(16, 16, 8),
+        )
+        metrics = evaluator.evaluate()
+        assert math.isfinite(metrics.fid)
+
+
+class AcceleratorStubDecoder:
+    """测试仪器：产出落在加速器上的像素体（模拟生产 LatentDecoder 的
+    设备行为——解码网络在 amp.device；体尺寸与 fixture 场景的
+    dataset 参照体同空间 64×64×32）。"""
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        return torch.rand(
+            (latents.shape[0], 1, 64, 64, 32),
+            generator=torch.Generator().manual_seed(0),
+        ).to(self._device)
+
+
+class TestSingleDeviceMilestoneEvaluation:
+    """里程碑度量两侧单设备归一：GPU 训练下合成侧解码在加速器、
+    参照库装载自 CPU NIfTI、提取器骨干另有装载点——不归一即首个
+    里程碑设备错配崩溃（生产 CUDA run 必炸，CPU fixture 测不出）。"""
+
+    @pytest.mark.skipif(
+        not SECOND_DEVICE_AVAILABLE,
+        reason="需要 CPU 之外的第二计算设备来复现设备错配",
+    )
+    def test_synthetic_and_reference_reach_metrics_on_one_device(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        accelerator = torch.device(
+            "cuda" if torch.cuda.is_available() else "mps",
+        )
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        evaluation = EvaluationPhase.build(
+            config,
+            artifacts,
+            scenario.standalone_sampler(config, accelerator),
+            stage=1,
+            manifest=BaselineManifest.load(artifacts.paths.manifest),
+            amp=AmpContext(accelerator, torch.bfloat16),
+            decoder=AcceleratorStubDecoder(accelerator),
+        )
+        metrics = evaluation.milestone_metrics()
+        assert math.isfinite(metrics.fid)
+
+
 class StubEvaluation:
     """测试仪器：里程碑度量可控的评测相替身（早停接线断言用）。"""
 
@@ -257,6 +473,26 @@ class TestProductionEvaluationContract:
             self._evaluation_phase(
                 scenario, **{"artifacts.vae_config_json": None},
             )
+
+
+class TestReferencePoolRestriction:
+    """组1 参照库也取 real pool train split：_build_reals 装配缝把
+    参照病例白名单锁进 pool manifest（dataset_root 全树轮转会混入
+    val/test 分区，FID 参照分布分裂泄漏）。"""
+
+    def test_reference_store_restricted_to_real_pool_split(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        pool = LatentManifest.load(
+            config.reward.real_pool_manifest, kind="real_pool",
+        )
+        store = EvaluationPhase._build_reals(config, pool)
+        assert store.case_ids() == sorted({
+            entry.case_id for entry in pool.entries
+        })
+        assert len(store.case_ids()) < 20  # dataset 全树 20 例，pool 是其 train 子集
 
 
 class TestEarlyStopWiring:

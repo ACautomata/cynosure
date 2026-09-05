@@ -93,12 +93,14 @@ class ManifestVolumeSampler:
         latent_sampler: ManifestLatentSampler,
         decoder: VolumeDecoder,
         paths: "RunPaths",
+        decode_batch_size: int,
     ) -> None:
         self._stage = stage
         self._manifest = manifest
         self._latent_sampler = latent_sampler
         self._decoder = decoder
         self._paths = paths
+        self._decode_batch_size = decode_batch_size
 
     def sample_baseline(self) -> None:
         """冻结初始 policy 的 Baseline 采样（冻结只采一次；须在首个
@@ -110,21 +112,28 @@ class ManifestVolumeSampler:
         self._sample(PHASE_RESAMPLE)
 
     def _sample(self, phase: str) -> None:
+        """分块「采样→解码→落盘」流式编排：峰值显存以块为界（生产
+        N_baseline 200–500 × 256×256×128 解码体，整 manifest 单批解码
+        是 OOM 级分配），每块解码后即落盘，不物化整 manifest 的解码体。"""
         entries = self._manifest.entries_for_stage(self._stage)
-        volumes = self._volumes(entries)
-        for entry, volume in zip(entries, volumes[:, 0]):
-            relative = f"samples/stage{self._stage}/{phase}/{entry.index:04d}.pt"
-            target = self._paths.root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(volume, target)
-            if phase == PHASE_BASELINE:
-                entry.baseline_sample = relative
-            else:
-                entry.resample_sample = relative
+        for start in range(0, len(entries), self._decode_batch_size):
+            chunk = entries[start:start + self._decode_batch_size]
+            volumes = self._volumes(chunk)
+            for entry, volume in zip(chunk, volumes[:, 0]):
+                relative = f"samples/stage{self._stage}/{phase}/{entry.index:04d}.pt"
+                target = self._paths.root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # clone 物化独立存储：条目体是批张量的 view，view 序列化
+                # 携带整块 backing storage（每文件膨胀 K 倍）
+                torch.save(volume.clone(), target)
+                if phase == PHASE_BASELINE:
+                    entry.baseline_sample = relative
+                else:
+                    entry.resample_sample = relative
         self._manifest.write(self._paths.manifest)
 
     def _volumes(self, entries: list[ManifestEntry]) -> torch.Tensor:
-        """全部条目的解码像素体批 [K, 1, X, Y, Z]（整批一次解码，与
+        """一批条目的解码像素体 [k, 1, X, Y, Z]（块内一次解码，与
         里程碑评测同口径）。"""
         samples = self._latent_sampler.sample(entries)
         terminals = torch.cat([sample.terminal for sample in samples])

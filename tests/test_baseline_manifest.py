@@ -5,15 +5,16 @@ baseline 采样（冻结只采一次）与 RL 后重采（同 seed 同条件）�
 路径写回**同一 manifest**——两侧逐条目配对，差异唯一归因于 RL。
 """
 
+import copy
 import json
 from pathlib import Path
 
 import pytest
 import torch
 
-from cynosure.config import MODALITIES
+from cynosure.config import CynosureConfig, MODALITIES
 from cynosure.train import BaselineManifest
-from tests.conftest import CliSession
+from tests.conftest import MINIMAL_CONFIG_DICT, CliSession
 from tests.test_train_loop import TrainingLoopScenario
 
 
@@ -104,6 +105,39 @@ class TestBaselineManifestGeneration:
             seeds[run_index] = [entry.noise_seed for entry in run.manifest.entries]
         assert seeds[0] == seeds[1]  # 同 seed → 同清单
         assert seeds[0] != seeds[2]  # 不同 seed → 不同噪声种子
+
+
+class TestStageManifestMatchesExecutedStages:
+    """manifest 条目 = 实际执行的阶段：组3 复用既有 stage-1 产物
+    （stage1_run_dir）时本 run 只执行 stage-2——manifest 只建 stage-2
+    条目。无人填充的 stage-1 null 条目破坏「条目 = 生成样本对」的
+    消费契约（stage-1 样本对住在源 run 自己的 manifest）。"""
+
+    @staticmethod
+    def _sequential_config(stage1_run_dir: str | None) -> CynosureConfig:
+        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+        data["experiment"] = {
+            "group": "sequential",
+            "stage1_run_dir": stage1_run_dir,
+        }
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"] = {"seed": 0, "milestone_eval_samples": 12}
+        return CynosureConfig.model_validate(data)
+
+    def test_reused_stage1_leaves_no_null_entries(self, tmp_path) -> None:
+        config = self._sequential_config(str(tmp_path / "stage1-run"))
+        manifest = BaselineManifest.build(config)
+        assert all(entry.stage == 2 for entry in manifest.entries)
+        assert len(manifest.entries) == config.schedule.baseline_samples
+        with pytest.raises(ValueError, match="stage=1"):
+            manifest.entries_for_stage(1)
+
+    def test_in_run_sequential_keeps_both_stages(self) -> None:
+        """stage1_run_dir 缺省（同一次运行内先跑 stage-1）：两阶段条目
+        都在（执行计划与 manifest 一致）。"""
+        manifest = BaselineManifest.build(self._sequential_config(None))
+        assert {entry.stage for entry in manifest.entries} == {1, 2}
 
 
 class TestCrossModalManifest:

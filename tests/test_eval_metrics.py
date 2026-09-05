@@ -150,6 +150,28 @@ class TestRadImageNetFeatureExtractor:
         assert features.shape == (2, extractor.feature_dim)
         assert torch.isfinite(features).all()
 
+    def test_extraction_streams_in_bounded_forward_batches(self, tmp_path) -> None:
+        """生产规模有界前向：一个里程碑上千切片分块进 ResNet50（单批
+        224×224×3 激活分配是 OOM 级），特征按序拼接完整。"""
+        torch.manual_seed(0)
+        backbone = RadImageNetFeatureExtractor.build_backbone()
+        weights = tmp_path / "radimagenet_resnet50.pth"
+        torch.save(backbone.state_dict(), weights)
+        extractor = RadImageNetFeatureExtractor(weights)
+        batches: list[int] = []
+
+        class RecordingBackbone:
+            """前向批大小记录替身（特征维契约同 backbone 出口）。"""
+
+            def __call__(self, batch: torch.Tensor) -> torch.Tensor:
+                batches.append(batch.shape[0])
+                return torch.zeros(batch.shape[0], extractor.feature_dim)
+
+        extractor._backbone = RecordingBackbone()
+        features = extractor.extract(torch.randn(100, 1, 64, 64))
+        assert batches == [32, 32, 32, 4]  # EXTRACT_BATCH 分块
+        assert features.shape == (100, extractor.feature_dim)
+
 
 class TestOrthoPlane:
     VOLUMES_SHAPE = (3, 8, 6, 4)  # [K, X, Y, Z]
@@ -195,6 +217,27 @@ class TestRealVolumeStore:
         store = RealVolumeStore(dataset)
         with pytest.raises(ValueError, match="no-such-case"):
             store.volume("no-such-case", "t1n")
+
+    def test_pool_allowlist_restricts_reference_cases(self, tmp_path) -> None:
+        """病例白名单 = real pool train split：参照分布不越过病例级
+        分割（dataset_root 上的 val/test 病例不进 FID 参照）。"""
+        dataset = SyntheticBratsDataset(
+            tmp_path / "dataset",
+            ["BraTS-GLI-00000-000", "BraTS-GLI-00001-000"],
+            (8, 8, 4), seed=0,
+        ).write()
+        store = RealVolumeStore(
+            dataset, case_ids={"BraTS-GLI-00000-000"},
+        )
+        assert store.case_ids() == ["BraTS-GLI-00000-000"]
+        with pytest.raises(ValueError, match="BraTS-GLI-00001-000"):
+            store.volume("BraTS-GLI-00001-000", "t1n")
+
+    def test_unknown_allowlisted_case_rejected(self, tmp_path) -> None:
+        """白名单含 dataset_root 不存在的病例（typo）显式拒绝。"""
+        dataset = self._single_case_dataset(tmp_path)
+        with pytest.raises(ValueError, match="no-such-case"):
+            RealVolumeStore(dataset, case_ids={"no-such-case"})
 
 
 class TestVolumePairFidelity:

@@ -21,11 +21,15 @@ class SyntheticStream:
 
     def iter_event(
         self, iteration: int, reward: float, auc: float = 0.9,
+        modality: str | None = None,
     ) -> "SyntheticStream":
-        self.events.append({
+        event = {
             "event": "iter", "iteration": iteration,
             "anchor_eval_reward": reward, "heldout_auc": auc,
-        })
+        }
+        if modality is not None:
+            event["modality"] = modality
+        self.events.append(event)
         return self
 
     def milestone_event(self, iteration: int, fid: float) -> "SyntheticStream":
@@ -33,6 +37,14 @@ class SyntheticStream:
             "event": "milestone", "iteration": iteration, "fid": fid,
         })
         return self
+
+    @classmethod
+    def plateau_free(cls) -> "SyntheticStream":
+        """主判据持续改善（plateau 通道关闭）的流背景。"""
+        stream = cls()
+        for index, fid in enumerate((10.0, 8.0, 6.0, 4.0), start=1):
+            stream.milestone_event(50 * index, fid)
+        return stream
 
     def judge(self, current_fid: float | None = None) -> EarlyStopVerdict:
         config = CynosureConfig.model_validate({
@@ -70,11 +82,7 @@ class TestPlateauTrigger:
 
 class TestHackingTrigger:
     def _plateau_free_stream(self) -> SyntheticStream:
-        """主判据持续改善（plateau 通道关闭）的流背景。"""
-        stream = SyntheticStream()
-        for index, fid in enumerate((10.0, 8.0, 6.0, 4.0), start=1):
-            stream.milestone_event(50 * index, fid)
-        return stream
+        return SyntheticStream.plateau_free()
 
     def test_auc_near_chance_with_rising_reward_stops(self) -> None:
         stream = self._plateau_free_stream()
@@ -108,6 +116,58 @@ class TestHackingTrigger:
         stream = self._plateau_free_stream()
         for iteration in range(5):  # < 默认窗口 10
             stream.iter_event(iteration, reward=-1.0 - 0.5 * iteration, auc=0.505)
+        verdict = stream.judge()
+        assert verdict.stop is False
+
+
+class TestPerModalityHacking:
+    """hacking 签名按目标序列分层（spec：各项指标按目标序列分层出）：
+    AUC 证据与 reward 趋势须**同模态配对**——跨模态基线差不制造幻影
+    斜率，坍缩模态不被健康模态的最新事件遮蔽。"""
+
+    def test_collapsed_modality_not_hidden_behind_healthy_latest(self) -> None:
+        """坍缩模态（AUC 近 chance 且自身 reward 升）先于健康模态落流：
+        最新事件属于健康模态（AUC 远 chance）也不得遮蔽坍缩模态的签名。"""
+        stream = SyntheticStream.plateau_free()
+        for iteration in range(12):  # 坍缩模态在前
+            stream.iter_event(
+                iteration, reward=-1.0 + 0.5 * iteration, auc=0.505,
+                modality="t1n",
+            )
+        for iteration in range(12):  # 健康模态殿后（最新事件的模态）
+            stream.iter_event(
+                100 + iteration, reward=-1.0 + 0.1 * iteration, auc=0.9,
+                modality="t2w",
+            )
+        verdict = stream.judge()
+        assert verdict.stop is True
+        assert verdict.reason == "reward_hacking"
+        assert verdict.hacking_signature is True
+
+    def test_cross_modality_baselines_do_not_create_phantom_slope(self) -> None:
+        """reward 窗口按模态分层：不同模态的基线差在混合窗口里制造幻影
+        正斜率——两模态各自 reward 都在降时必须不停。"""
+        stream = SyntheticStream.plateau_free()
+        for step in range(10):
+            stream.iter_event(
+                step, reward=10.0 - step, auc=0.9, modality="t1n",
+            )
+            stream.iter_event(
+                step, reward=110.0 - step, auc=0.505, modality="t2w",
+            )
+        verdict = stream.judge()
+        assert verdict.stop is False
+        assert verdict.hacking_signature is False
+
+    def test_modality_window_filled_by_its_own_events(self) -> None:
+        """窗口按模态各自计满：某模态自身 iter 事件不足窗口 → 证据不足
+        不停（与全流口径同一「宁缓停、不误停」语义）。"""
+        stream = SyntheticStream.plateau_free()
+        for iteration in range(5):  # < 默认窗口 10
+            stream.iter_event(
+                iteration, reward=-1.0 - 0.5 * iteration, auc=0.505,
+                modality="t1n",
+            )
         verdict = stream.judge()
         assert verdict.stop is False
 

@@ -2,10 +2,16 @@
 
 到达里程碑间隔时由 train 循环触发：当前 policy 按 Baseline manifest
 条目（前缀 K 条，同 seed 同条件 → 跨里程碑可比）采出 Anchor 终点
-latent → VAE 解码到像素域 → 三正交面逐面提取特征 → 2.5D FID + KID
-（重采样 95% CI）；跨模态组另加 3D SSIM/MAE/PSNR——合成 target 影像与
-**同一病例 ground-truth 的 target 序列影像**逐例配对（配对数据集，
-非 source 与 target 直接比较）。
+latent → VAE 解码到像素域（``decode_batch_size`` 分块，峰值显存以块
+为界）→ 三正交面逐面提取特征 → 2.5D FID + KID（重采样 95% CI）；
+跨模态组另加 3D SSIM/MAE/PSNR——合成 target 影像与**同一病例
+ground-truth 的 target 序列影像**逐例配对（配对数据集，非 source 与
+target 直接比较）。
+
+设备口径：合成侧（解码输出）与参照侧（CPU NIfTI 装载）统一归一到
+构造注入的 ``device``；float64 度量核（Frechet/MMD）消费 CPU 特征，
+与加速器解耦。影像空间口径：两侧体栈形状必须一致（生产参照须先经
+prepare 预处理到模型影像空间）。
 
 本类只在里程碑路径被构造调用；逐 iteration 训练循环不经解码
 （结构断言见测试面）。
@@ -81,6 +87,7 @@ class MilestoneEvaluator:
         extractor: SliceFeatureExtractor,
         reals: RealVolumeStore,
         manifest: BaselineManifest,
+        device: torch.device,
     ) -> None:
         self._config = config
         self._stage = stage
@@ -89,6 +96,7 @@ class MilestoneEvaluator:
         self._extractor = extractor
         self._reals = reals
         self._manifest = manifest
+        self._device = device
 
     def evaluate(self) -> MilestoneMetrics:
         """当前 policy 的里程碑度量（条目前缀 K 条，与 Baseline 同 seed 同条件）。"""
@@ -96,13 +104,18 @@ class MilestoneEvaluator:
             : self._config.schedule.milestone_eval_samples
         ]
         samples = self._latent_sampler.sample(entries)
-        synthetic = self._decoder.decode(
-            torch.cat([sample.terminal for sample in samples]),
-        )  # [K, 1, X, Y, Z]
+        synthetic = self._decode(samples)  # [K, 1, X, Y, Z]
         reference = torch.stack([
             self._reals.volume(self._reference_case(sample), sample.target)
             for sample in samples
-        ]).unsqueeze(1)  # [K, 1, X, Y, Z]（与合成侧同形，逐例对齐）
+        ]).to(self._device).unsqueeze(1)  # [K, 1, X, Y, Z]（与合成侧同形，逐例对齐）
+        if reference.shape != synthetic.shape:
+            raise ValueError(
+                f"参照体栈 {tuple(reference.shape)} 与合成体栈 "
+                f"{tuple(synthetic.shape)} 形状不一致——两侧必须在同一影像"
+                f"空间（生产参照须经 prepare 预处理到模型影像空间后入参照"
+                f"库；dataset_root 原生 NIfTI 直读不构成对齐参照）"
+            )
 
         planes = self._plane_metrics(synthetic[:, 0], reference[:, 0])
         ssim = mae = psnr = None
@@ -114,6 +127,21 @@ class MilestoneEvaluator:
             plane_fid=planes.plane_fid, plane_kid=planes.plane_kid,
             ssim=ssim, mae=mae, psnr=psnr,
         )
+
+    def _decode(self, samples: list[EntrySample]) -> torch.Tensor:
+        """Anchor 终点 latent 的分块解码（峰值显存以块为界），输出落
+        ``device`` 的 [K, 1, X, Y, Z]——解码设备即度量归一设备（注入
+        替身可能产出别的设备）。"""
+        batch = self._config.schedule.decode_batch_size
+        return torch.cat([
+            self._decoder.decode(
+                torch.cat([
+                    sample.terminal
+                    for sample in samples[start:start + batch]
+                ]),
+            ).to(self._device)
+            for start in range(0, len(samples), batch)
+        ])
 
     @property
     def _is_cross_modal(self) -> bool:
@@ -145,8 +173,14 @@ class MilestoneEvaluator:
         plane_kid: dict[str, float] = {}
         replicate_means: list[torch.Tensor] = []
         for plane in OrthoPlane.all_planes():
-            features_synth = self._extractor.extract(plane.slice(synthetic))
-            features_real = self._extractor.extract(plane.slice(reference))
+            # 度量核（float64）与设备解耦：特征归一 CPU——MPS/CUDA 无
+            # float64（或代价高），而 Frechet/MMD 的计算量毫不足道
+            features_synth = self._extractor.extract(
+                plane.slice(synthetic),
+            ).cpu()
+            features_real = self._extractor.extract(
+                plane.slice(reference),
+            ).cpu()
             name = plane.name
             plane_fid[name] = frechet.score(features_synth, features_real)
             point, replicates = kid.score_and_replicates(features_synth, features_real)

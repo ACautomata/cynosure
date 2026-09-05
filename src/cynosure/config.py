@@ -521,6 +521,13 @@ class ScheduleConfig(BaseModel):
         "使里程碑 FID/KID 跨里程碑可比）",
         default=8, ge=2,
     )
+    decode_batch_size: int = SpecField(
+        "tunable", "本 spec 补钉",
+        "解码像素体的分块批大小（Baseline/重采与里程碑评测共用）：每批解码后"
+        "即落盘/聚合，峰值显存以块为界——生产 200–500 条目的整 manifest "
+        "单批解码是 OOM 级分配",
+        default=8, ge=1,
+    )
     kid_bootstrap_replicates: int = SpecField(
         "tunable", "本 spec 补钉",
         "KID 置信区的无放回重采样重复数（重复越多 CI 越稳，代价线性增长）",
@@ -724,6 +731,17 @@ class CynosureConfig(BaseModel):
             )
         return self
 
+    def stage_condition_vocabulary(self) -> dict[int, list]:
+        """组 → {阶段号: 条件词汇表} 的唯一映射（组1 四序列、组2 12 有序对、
+        组3 两阶段各一份）——Baseline manifest 条目生成与本 validator 共同
+        消费（词汇表单一来源，组矩阵一变只改此处）。"""
+        pairs = [list(pair) for pair in self.experiment.cross_modal_pairs]
+        return {
+            "modal-label": {1: list(MODALITIES)},
+            "cross-modal": {1: pairs},
+            "sequential": {1: list(MODALITIES), 2: pairs},
+        }[self.experiment.group]
+
     @model_validator(mode="after")
     def _resize_base_matches_mode(self) -> "CynosureConfig":
         """缩小预处理链参数的通道显式化：fixture_mode=false 时 resize_base 钉
@@ -734,6 +752,28 @@ class CynosureConfig(BaseModel):
                 f"定死上游基数 {UPSTREAM_RESIZE_BASE}（ADR-0006），得到 "
                 f"{self.preprocessing.resize_base}；注入小基数属 fixture，"
                 "须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _milestone_samples_cover_condition_support(self) -> "CynosureConfig":
+        """里程碑评测须覆盖本组条件词汇表：manifest 条目按条件轮转，
+        前缀取样 K < 词汇表即**永久**漏掉尾部方向——早停判据对那些方向
+        失明（12 有序对只评前 K 个）。fixture 豁免（条目数随 fixture
+        缩小，覆盖以盘上条目为准）。"""
+        if self.fixture_mode:
+            return self
+        vocabulary = max(
+            len(conditions)
+            for conditions in self.stage_condition_vocabulary().values()
+        )
+        if self.schedule.milestone_eval_samples < vocabulary:
+            raise ValueError(
+                f"生产 config 下 schedule.milestone_eval_samples 须覆盖本组"
+                f"条件词汇表（{vocabulary} 个条件；manifest 条件轮转下 K "
+                f"不足即永久漏方向），得到 "
+                f"{self.schedule.milestone_eval_samples}；"
+                "缩小评测面属 fixture，须经顶层 fixture_mode=true 显式声明"
             )
         return self
 

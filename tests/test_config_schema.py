@@ -267,6 +267,50 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert ("schedule", "milestone_eval_samples") in self._locations(exc_info.value)
 
+    def test_milestone_samples_cover_condition_support(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config 下里程碑评测样本数须覆盖本组条件词汇表：manifest
+        条目按条件轮转，K < 词汇表即永久漏掉尾部方向（12 有序对只评
+        前 K 个，早停判据对其余方向失明）。fixture 豁免（条目数随
+        fixture 缩小）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8 < 12 对
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
+        data["schedule"]["milestone_eval_samples"] = 12
+        CynosureConfig.model_validate(data)  # 覆盖 12 有序对 → 合法
+        data["fixture_mode"] = True
+        data["schedule"]["milestone_eval_samples"] = 4
+        CynosureConfig.model_validate(data)  # fixture 豁免
+
+    def test_milestone_samples_cover_modal_label_vocabulary(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """组1 词汇表 = 四序列：生产 K < 4 拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"]["milestone_eval_samples"] = 3
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
+
+    def test_milestone_samples_cover_sequential_stage2_vocabulary(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """组3 stage-2 词汇表 = 12 有序对（取两阶段词汇表最大值）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "sequential"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
+        data["schedule"]["milestone_eval_samples"] = 12
+        CynosureConfig.model_validate(data)
+
     def test_auc_chance_epsilon_below_half(self, valid_config_dict: dict) -> None:
         """AUC 近 chance 判定带半径 ≥0.5 即恒真：hacking 签名失去判别力，拒绝。"""
         data = copy.deepcopy(valid_config_dict)
@@ -307,6 +351,7 @@ class TestRejection:
 
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 12 有序对
         config = CynosureConfig.model_validate(data)
         assert config.experiment.group == "cross-modal"
 
@@ -332,6 +377,7 @@ class TestRejection:
         data["experiment"]["group"] = "sequential"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
         config = CynosureConfig.model_validate(data)
         assert config.experiment.group == "sequential"
         assert config.experiment.stage1_run_dir is None
@@ -351,6 +397,7 @@ class TestRejection:
         data["experiment"]["group"] = "sequential"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
         config = CynosureConfig.model_validate(data)
         assert config.experiment.stage1_run_dir == Path("runs/stage1")
 
@@ -361,6 +408,7 @@ class TestRejection:
         data["experiment"]["group"] = "cross-modal"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 12 有序对
         config = CynosureConfig.model_validate(data)
         assert config.policy.source_latent_scale_factor == pytest.approx(1.0)
 

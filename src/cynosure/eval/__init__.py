@@ -89,7 +89,8 @@ class EvaluationPhase:
             config, amp.device,
         )
         resolved_extractor = (
-            extractor if extractor is not None else cls._build_extractor(config)
+            extractor if extractor is not None
+            else cls._build_extractor(config, amp.device)
         )
         evaluator = MilestoneEvaluator(
             config,
@@ -97,8 +98,9 @@ class EvaluationPhase:
             latent_sampler,
             resolved_decoder,
             resolved_extractor,
-            RealVolumeStore(config.artifacts.dataset_root),
+            cls._build_reals(config, pool),
             manifest,
+            amp.device,
         )
         volume_sampler = ManifestVolumeSampler(
             stage,
@@ -106,6 +108,7 @@ class EvaluationPhase:
             latent_sampler,
             resolved_decoder,
             artifacts.paths,
+            decode_batch_size=config.schedule.decode_batch_size,
         )
         return cls(evaluator, volume_sampler)
 
@@ -122,12 +125,22 @@ class EvaluationPhase:
         return self._evaluator.evaluate()
 
     @staticmethod
-    def _load_pool(config: CynosureConfig) -> LatentManifest | None:
-        """组2 源影像病例池（组1 无需装载——condition 条目无源病例语义）。"""
-        if config.experiment.group == "modal-label":
-            return None
+    def _load_pool(config: CynosureConfig) -> LatentManifest:
+        """Real sample pool（病例级 70% train split 的 latent 索引）：组2
+        条目的源病例与**全部组**的里程碑参照病例库都取自它——参照分布
+        不越过病例级分割（experiment-design「real 样本库」）。"""
         return LatentManifest.load(
             config.reward.real_pool_manifest, kind="real_pool",
+        )
+
+    @staticmethod
+    def _build_reals(
+        config: CynosureConfig, pool: LatentManifest,
+    ) -> RealVolumeStore:
+        """参照影像库：病例白名单 = pool train split 的病例集。"""
+        return RealVolumeStore(
+            config.artifacts.dataset_root,
+            case_ids={entry.case_id for entry in pool.entries},
         )
 
     @staticmethod
@@ -146,7 +159,11 @@ class EvaluationPhase:
         )
 
     @staticmethod
-    def _build_extractor(config: CynosureConfig) -> SliceFeatureExtractor:
+    def _build_extractor(
+        config: CynosureConfig, device: torch.device,
+    ) -> SliceFeatureExtractor:
+        """特征提取器装配（fixture stub / 生产 RadImageNet）。生产骨干落
+        ``device``——里程碑度量的归一设备与训练数值口径一致。"""
         if config.fixture_mode:
             return StubSliceFeatureExtractor()
         if config.artifacts.radimagenet_weights is None:
@@ -155,4 +172,6 @@ class EvaluationPhase:
                 "（config artifacts.radimagenet_weights；公开发布权重的下载"
                 "属施工），fixture 经 fixture_mode=true 走 stub 注入"
             )
-        return RadImageNetFeatureExtractor(config.artifacts.radimagenet_weights)
+        return RadImageNetFeatureExtractor(
+            config.artifacts.radimagenet_weights, device,
+        )

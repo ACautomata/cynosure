@@ -15,8 +15,10 @@
 - **hacking 签名**（reward-model 章）：最新 held-out AUC 落在 chance
   ± ``auc_chance_epsilon`` 带内 **且** 最近 ``reward_trend_window`` 个
   iter 的 anchor eval reward 线性斜率 > 0——判别器已无 out-of-sample
-  判别力而 reward 曲线仍在升 = reward hacking 的典型签名。证据不足
-  （iter 事件不足窗口）按未触发处理，不猜。
+  判别力而 reward 曲线仍在升 = reward hacking 的典型签名。**按目标
+  序列分层**（experiment-design）：AUC 证据与 reward 趋势同模态配对，
+  任一模态签名齐备即触发。证据不足（该模态 iter 事件不足窗口）按未
+  触发处理，不猜。
 """
 
 from dataclasses import dataclass
@@ -93,13 +95,29 @@ class EarlyStopJudge:
         return stalled >= self._n_plateau
 
     def _hacking_signature(self, iterations: list[dict]) -> bool:
-        """AUC 近 chance 且 eval reward 仍升（两要素齐备才成立）。"""
-        if not iterations:
+        """AUC 近 chance 且 eval reward 仍升——两要素齐备、按目标序列分层。
+
+        iter 事件携带 ``modality``（指标流契约：reward/AUC 按目标序列
+        归因，experiment-design「各项指标按目标序列分层出」）：按模态
+        分组，各组用**自身**的最近窗口配对**自身**的最新 AUC 判定，任一
+        模态签名齐备即触发——跨模态基线差不制造幻影斜率，坍缩模态不被
+        健康模态的最新事件遮蔽。无 ``modality`` 键的事件（合成测试流）
+        同落单组，判定退化为全流口径。"""
+        groups: dict[object, list[dict]] = {}
+        for event in iterations:
+            groups.setdefault(event.get("modality"), []).append(event)
+        return any(
+            self._signature_of_group(events) for events in groups.values()
+        )
+
+    def _signature_of_group(self, events: list[dict]) -> bool:
+        """单模态两要素：最新 AUC 落 chance 带 且 最近窗口 reward 斜率 > 0。"""
+        if not events:
             return False
-        latest_auc = float(iterations[-1]["heldout_auc"])
+        latest_auc = float(events[-1]["heldout_auc"])
         if abs(latest_auc - 0.5) > self._auc_chance_epsilon:
             return False
-        window = iterations[-self._reward_trend_window:]
+        window = events[-self._reward_trend_window:]
         if len(window) < self._reward_trend_window:
             return False  # 趋势证据不足：不猜（宁缓停、不误停）
         rewards = torch.tensor(

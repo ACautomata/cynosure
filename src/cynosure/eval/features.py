@@ -48,7 +48,7 @@ class StubSliceFeatureExtractor:
             )
         weight = torch.tensor([
             [[[0.0, 0.25, 0.0], [0.25, 1.0, 0.25], [0.0, 0.25, 0.0]]],
-        ], dtype=slices.dtype)
+        ], dtype=slices.dtype, device=slices.device)
         smoothed = torch.nn.functional.conv2d(slices, weight, padding=1)
         flattened = smoothed.reshape(smoothed.shape[0], -1)
         mean = flattened.mean(dim=1)
@@ -68,9 +68,17 @@ class RadImageNetFeatureExtractor:
     权重文件须与 ``build_backbone`` 的 MONAI 拓扑同构（``state_dict`` 严格
     装载）——RadImageNet 公开发布为 torchvision 命名格式，键名重映射随
     施工 ticket 落地；缺文件 / 键不匹配都是显式失败，不静默随机权重。
+    骨干落 ``device``（与里程碑评测的归一设备一致）；前向按
+    ``EXTRACT_BATCH`` 分块——生产一个里程碑上千切片，单批前向的激活
+    分配是 OOM 级。
     """
 
-    def __init__(self, weights: Path | str) -> None:
+    EXTRACT_BATCH = 32
+    """单次前向的切片批上限（2.5D 切片量 = K 体 × 法轴长，上千量级）。"""
+
+    def __init__(
+        self, weights: Path | str, device: torch.device | None = None,
+    ) -> None:
         weights_path = Path(weights)
         if not weights_path.is_file():
             raise FileNotFoundError(
@@ -78,7 +86,8 @@ class RadImageNetFeatureExtractor:
                 "（config artifacts.radimagenet_weights；公开发布权重的"
                 "下载脚本属施工）"
             )
-        self._backbone = self.build_backbone()
+        self._device = device if device is not None else torch.device("cpu")
+        self._backbone = self.build_backbone().to(self._device)
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
         try:
             self._backbone.load_state_dict(state, strict=True)
@@ -89,7 +98,10 @@ class RadImageNetFeatureExtractor:
                 "重映射随施工 ticket 落地；不静默随机初始化）"
             ) from exc
         self._backbone.eval()
-        self.feature_dim = self._backbone(torch.zeros(1, _RADIMAGENET_CHANNELS, 64, 64)).shape[1]
+        probe = torch.zeros(
+            1, _RADIMAGENET_CHANNELS, 64, 64, device=self._device,
+        )
+        self.feature_dim = self._backbone(probe).shape[1]
 
     @staticmethod
     def build_backbone() -> MonaiResNet:
@@ -106,8 +118,16 @@ class RadImageNetFeatureExtractor:
             raise ValueError(
                 f"切片批须为 [N, 1, H, W]，得到 {tuple(slices.shape)}"
             )
+        features = [
+            self._forward_chunk(slices[start:start + self.EXTRACT_BATCH])
+            for start in range(0, slices.shape[0], self.EXTRACT_BATCH)
+        ]
+        return torch.cat(features, dim=0)
+
+    def _forward_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        """单块切片 → 特征（缩放 → 3 通道复制 → 骨干前向）。"""
         resized = torch.nn.functional.interpolate(
-            slices, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
+            chunk, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
             mode="bilinear", align_corners=False,
         )
         channels = resized.repeat(1, _RADIMAGENET_CHANNELS, 1, 1)
