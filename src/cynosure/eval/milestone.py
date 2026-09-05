@@ -3,7 +3,10 @@
 到达里程碑间隔时由 train 循环触发：当前 policy 按 Baseline manifest
 条目（前缀 K 条，同 seed 同条件 → 跨里程碑可比）采出 Anchor 终点
 latent → VAE 解码到像素域（``decode_batch_size`` 分块，峰值显存以块
-为界）→ 三正交面逐面提取特征 → 2.5D FID + KID（重采样 95% CI）；
+为界）→ 三正交面逐面提取特征 → 2.5D FID + KID（重采样 95% CI）。
+距离**按目标序列分层计算再宏平均**（fid/kid = 各 target 距离均值）：
+条件坍缩（忽略/交换模态标签、保持总体混合）在全池聚合下不可见，分层
+宏平均使其在主判据上直接显形；分层值随 ``criteria_summary`` 落盘。
 跨模态组另加 3D SSIM/MAE/PSNR——合成 target 影像与**同一病例
 ground-truth 的 target 序列影像**逐例配对（配对数据集，非 source 与
 target 直接比较）。
@@ -19,7 +22,7 @@ prepare 预处理到模型影像空间）。
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,6 +48,9 @@ class PlaneMetrics:
     plane_kid: dict[str, float]
     kid_ci_low: float
     kid_ci_high: float
+    replicates: torch.Tensor
+    """KID 重采样重复值 [R]（跨面均值后的自助分布原料——上层宏平均
+    构造汇总 CI 的消费面）。"""
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,10 @@ class MilestoneMetrics:
     kid_ci_high: float
     plane_fid: dict[str, float]
     plane_kid: dict[str, float]
+    target_fid: dict[str, float] = field(default_factory=dict)
+    """按目标序列分层的 FID（宏平均的组分——条件坍缩的观测面）。"""
+    target_kid: dict[str, float] = field(default_factory=dict)
+    """按目标序列分层的 KID（同上）。"""
     ssim: float | None = None
     """跨模态组另加：合成 target vs 同病例 ground-truth target 的 3D SSIM。"""
     mae: float | None = None
@@ -65,12 +75,21 @@ class MilestoneMetrics:
     """跨模态组另加：同上配对的 PSNR（dB，封顶 100）。"""
 
     def summary(self) -> dict[str, float]:
-        """criteria_summary 的度量侧条目（逐面 FID/KID + CI 界）。"""
+        """criteria_summary 的度量侧条目（逐面 FID/KID + CI 界 + 按目标
+        序列分层的距离——分层是宏平均的组分，随事件落盘供坍缩归因）。"""
         summary = {
             **{f"fid_{name.lower()}": value for name, value in self.plane_fid.items()},
             **{f"kid_{name.lower()}": value for name, value in self.plane_kid.items()},
             "kid_ci_low": self.kid_ci_low,
             "kid_ci_high": self.kid_ci_high,
+            **{
+                f"fid_target_{name.lower()}": value
+                for name, value in self.target_fid.items()
+            },
+            **{
+                f"kid_target_{name.lower()}": value
+                for name, value in self.target_kid.items()
+            },
         }
         return summary
 
@@ -105,7 +124,14 @@ class MilestoneEvaluator:
         self._device = device
 
     def evaluate(self) -> MilestoneMetrics:
-        """当前 policy 的里程碑度量（条目前缀 K 条，与 Baseline 同 seed 同条件）。"""
+        """当前 policy 的里程碑度量（条目前缀 K 条，与 Baseline 同 seed 同条件）。
+
+        距离按**目标序列分层**计算再宏平均（fid/kid = 各 target 距离的
+        算术均值）：条件模型若忽略/交换模态标签而保持总体混合比例，
+        全池聚合距离下 FID/KID 可以依旧好看——分层后每个 target 的合成
+        分布对该 **target 自己**的参照分布计距，坍缩在主判据上直接
+        可见；分层值本身随 ``criteria_summary`` 落盘（``fid_target_``
+        / ``kid_target_`` 前缀）。"""
         entries = self._manifest.entries_for_stage(self._stage)[
             : self._config.schedule.milestone_eval_samples
         ]
@@ -123,15 +149,65 @@ class MilestoneEvaluator:
                 f"库；dataset_root 原生 NIfTI 直读不构成对齐参照）"
             )
 
-        planes = self._plane_metrics(synthetic[:, 0], reference[:, 0])
+        positions: dict[str, list[int]] = {}
+        for position, sample in enumerate(samples):
+            positions.setdefault(sample.target, []).append(position)
+        per_target = {
+            target: self._plane_metrics(
+                synthetic[indices, 0], reference[indices, 0],
+            )
+            for target, indices in sorted(positions.items())
+        }
+        macro = self._macro_average(per_target)
         ssim = mae = psnr = None
         if self._is_cross_modal:
             ssim, mae, psnr = VolumePairFidelity().score(synthetic, reference)
         return MilestoneMetrics(
-            fid=planes.fid, kid=planes.kid,
-            kid_ci_low=planes.kid_ci_low, kid_ci_high=planes.kid_ci_high,
-            plane_fid=planes.plane_fid, plane_kid=planes.plane_kid,
+            fid=macro.fid, kid=macro.kid,
+            kid_ci_low=macro.kid_ci_low, kid_ci_high=macro.kid_ci_high,
+            plane_fid=macro.plane_fid, plane_kid=macro.plane_kid,
+            target_fid={
+                target: metrics.fid for target, metrics in per_target.items()
+            },
+            target_kid={
+                target: metrics.kid for target, metrics in per_target.items()
+            },
             ssim=ssim, mae=mae, psnr=psnr,
+        )
+
+    @staticmethod
+    def _macro_average(per_target: dict[str, PlaneMetrics]) -> PlaneMetrics:
+        """跨目标序列的宏平均：标量与逐面字段取组分均值；汇总 KID 的
+        重采样 CI 对**宏平均统计量本身**构造（组分重复值逐 replicate
+        跨 target 均值后取分位，与点估计同口径）。单一 target 时恒等于
+        该组自身（宏平均退化为原口径）。"""
+        components = list(per_target.values())
+        replicate_pool = torch.stack(
+            [metrics.replicates for metrics in components],
+        ).mean(dim=0)
+        plane_names = list(components[0].plane_fid)
+        return PlaneMetrics(
+            fid=sum(metrics.fid for metrics in components) / len(components),
+            kid=sum(metrics.kid for metrics in components) / len(components),
+            plane_fid={
+                name: sum(
+                    metrics.plane_fid[name] for metrics in components
+                ) / len(components)
+                for name in plane_names
+            },
+            plane_kid={
+                name: sum(
+                    metrics.plane_kid[name] for metrics in components
+                ) / len(components)
+                for name in plane_names
+            },
+            kid_ci_low=float(
+                replicate_pool.quantile(BootstrapKernelMmd.LOWER_QUANTILE)
+            ),
+            kid_ci_high=float(
+                replicate_pool.quantile(BootstrapKernelMmd.UPPER_QUANTILE)
+            ),
+            replicates=replicate_pool,
         )
 
     def _decode(self, samples: list[EntrySample]) -> torch.Tensor:
@@ -200,4 +276,5 @@ class MilestoneEvaluator:
             plane_kid=plane_kid,
             kid_ci_low=float(pooled.quantile(kid.LOWER_QUANTILE)),
             kid_ci_high=float(pooled.quantile(kid.UPPER_QUANTILE)),
+            replicates=pooled,
         )

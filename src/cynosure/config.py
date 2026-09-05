@@ -279,6 +279,15 @@ class PolicyConfig(BaseModel):
         "config 核对，fixture 取中性 1.0）",
         default=1.0, gt=0.0,
     )
+    latent_scale_factor: float = SpecField(
+        "运行时", "policy-modeling",
+        "主流 latent 的 checkpoint 域缩放因子（基座 diffusion UNet checkpoint "
+        "的 scale_factor = 1/std(z)）：官方权重在 scaled 域训练/采样，prepared "
+        "latents 按存储契约是 encode 原始输出（未乘）——policy 侧装载点乘入、"
+        "评测解码前除回（本字段消费点）。生产值随基座 checkpoint 核对，"
+        "fixture 取中性 1.0",
+        default=1.0, gt=0.0,
+    )
 
     @field_validator("ratio_clip")
     @classmethod
@@ -530,6 +539,23 @@ class ScheduleConfig(BaseModel):
         "单批解码是 OOM 级分配",
         default=8, ge=1,
     )
+    decode_roi_size: list[int] = SpecField(
+        "tunable", "本 spec 补钉",
+        "VAE 解码滑动窗口的 latent 空间 roi（三轴；官方 NV-Generate-CTMR "
+        "config_infer 的 autoencoder_sliding_window_infer_size = [48,48,48]）"
+        "——生产大体积（256³ 级）整前向解码是 OOM 级分配；单样本元素数 "
+        "≤ roi 元素数时整前向（官方 dynamic_infer 小体豁免语义，fixture "
+        "恒走此路）",
+        default=[48, 48, 48],
+    )
+    decode_overlap: float = SpecField(
+        "tunable", "本 spec 补钉",
+        "VAE 解码滑动窗口的重叠比（官方 autoencoder_sliding_window_infer_"
+        "overlap 字面 0.6666 = 2/3 的四位截断；此处取满精度 2/3——MONAI "
+        "要求 overlap×roi×zoom_scale 逐维为整数，VAE 4× 上采样下 "
+        "48×2/3×4=128 整除成立）。mode 定死 gaussian（官方口径）",
+        default=0.6666666666666666, ge=0.0, lt=1.0,
+    )
     kid_bootstrap_replicates: int = SpecField(
         "tunable", "本 spec 补钉",
         "KID 置信区的无放回重采样重复数（重复越多 CI 越稳，代价线性增长）",
@@ -758,11 +784,16 @@ class CynosureConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _milestone_samples_cover_condition_support(self) -> "CynosureConfig":
-        """里程碑评测须覆盖本组条件词汇表：manifest 条目按条件轮转，
-        前缀取样 K < 词汇表即**永久**漏掉尾部方向——早停判据对那些方向
-        失明（12 有序对只评前 K 个）。fixture 豁免（条目数随 fixture
-        缩小，覆盖以盘上条目为准）。"""
+    def _milestone_samples_match_manifest_support(self) -> "CynosureConfig":
+        """里程碑评测样本面与 manifest 支撑面一致（两个方向都显式拒绝）：
+
+        - **下界**：manifest 条目按条件轮转，前缀取样 K < 词汇表即
+          **永久**漏掉尾部方向——早停判据对那些方向失明（12 有序对只
+          评前 K 个）；
+        - **上界**：评测条目取 manifest 前缀，K > N_baseline 即静默
+          缩水到盘上条目数——配置声明的评测样本量与实际评测面失真。
+
+        fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。"""
         if self.fixture_mode:
             return self
         vocabulary = max(
@@ -776,6 +807,15 @@ class CynosureConfig(BaseModel):
                 f"不足即永久漏方向），得到 "
                 f"{self.schedule.milestone_eval_samples}；"
                 "缩小评测面属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        if self.schedule.milestone_eval_samples > self.schedule.baseline_samples:
+            raise ValueError(
+                f"生产 config 下 schedule.milestone_eval_samples 不得超过 "
+                f"schedule.baseline_samples（评测条目取 manifest 前缀，"
+                f"超出即静默缩水到盘上条目数、评测面与配置声明失真），"
+                f"得到 {self.schedule.milestone_eval_samples} > "
+                f"{self.schedule.baseline_samples}；全量对照评估直接用 "
+                f"N_baseline 口径"
             )
         return self
 

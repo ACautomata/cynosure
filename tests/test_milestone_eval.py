@@ -12,6 +12,7 @@ import ast
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,8 +21,10 @@ from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.eval import EvaluationPhase, ManifestEvaluation
 from cynosure.eval.decode import LatentDecoder
 from cynosure.eval.features import StubSliceFeatureExtractor
+from cynosure.eval.frechet import FrechetDistance
 from cynosure.eval.milestone import MilestoneEvaluator, MilestoneMetrics
 from cynosure.eval.sampling import EntrySample
+from cynosure.eval.volumes import OrthoPlane
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.numerics import AmpContext
 from cynosure.reward.artifacts import LatentManifest
@@ -122,6 +125,84 @@ class CountingDecoder:
         return self._inner.decode(latents)
 
 
+class PatchRecordingVae(torch.nn.Module):
+    """测试仪器：4× 上采样替身 VAE，记录每次前向的输入形状——滑窗
+    分块与小体豁免的运行时观测面（MONAI 滑窗经 ``network`` 前向）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.patch_shapes: list[tuple[int, ...]] = []
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        self.patch_shapes.append(tuple(latents.shape))
+        upsampled = torch.nn.functional.interpolate(
+            latents, scale_factor=4.0, mode="nearest",
+        )
+        return upsampled[:, :1]  # [B, 1, 4D, 4H, 4W]
+
+
+class TestLatentDomainAndSlidingWindow:
+    """生产解码器的两域归位与滑窗编排（官方 NV-Generate-CTMR 同策略）。"""
+
+    def _decoder(
+        self,
+        scenario: TrainingLoopScenario,
+        scale: float,
+        roi: tuple[int, int, int],
+    ) -> LatentDecoder:
+        config = ConfigLoader.load(scenario.config_path)
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
+            checkpoint=config.artifacts.vae_ckpt,
+        )
+        return LatentDecoder(artifact, torch.device("cpu"), scale, roi, 0.5)
+
+    def test_decoder_unscales_policy_domain_latents(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """解码前除 scale factor：scale=2 的 decode(x) ≡ scale=1 的
+        decode(x/2)——policy 域到 encoder 域的归位是纯域缩放。"""
+        scenario.write_inputs()
+        latents = torch.randn(1, 4, 16, 16, 8)
+        neutral = self._decoder(scenario, 1.0, (48, 48, 48)).decode(latents)
+        scaled = self._decoder(scenario, 2.0, (48, 48, 48)).decode(latents)
+        reference = self._decoder(scenario, 2.0, (48, 48, 48)).decode(latents * 2.0)
+        assert torch.allclose(neutral, reference)
+        assert not torch.allclose(scaled, neutral)
+
+    def test_large_latents_slide_window_small_ones_go_whole(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> None:
+        """官方 dynamic_infer 小体豁免语义：单样本元素数 ≤ roi 元素数
+        → 整前向（fixture 夹具尺寸恒走此路）；超出 → SlidingWindowInferer
+        按 roi 分块前向（sw_batch_size=1 高斯聚合）。"""
+        scenario.write_inputs()
+        vae = PatchRecordingVae()
+        config = ConfigLoader.load(scenario.config_path)
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
+            checkpoint=config.artifacts.vae_ckpt,
+        )
+
+        def assembled(unused_artifact):
+            # 装配缝替换：真 VAE → 记录替身（滑窗行为的运行时观测面）
+            return vae
+
+        monkeypatch.setattr(
+            "cynosure.eval.decode.NetworkAssembler", SimpleNamespace(vae=assembled),
+        )
+        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048
+        LatentDecoder(artifact, torch.device("cpu"), 1.0, (48, 48, 48), 0.5).decode(latents)
+        assert vae.patch_shapes == [(1, 4, 16, 16, 8)]  # 豁免：一次整前向
+
+        sliding = LatentDecoder(artifact, torch.device("cpu"), 1.0, (8, 8, 8), 0.5).decode(latents)
+        assert len(vae.patch_shapes) > 1  # 分块发生
+        assert all(
+            max(shape[2:]) <= 8 for shape in vae.patch_shapes[1:]
+        )  # 每个窗口的空间维 ≤ roi（豁免前向不计）
+        assert tuple(sliding.shape) == (1, 1, 64, 64, 32)  # 4× 上采样拼合完整
+
+
 class TestDecodeOnlyInEvaluationPaths:
     """AC（结构断言）：解码只发生在里程碑路径，不进逐 iteration 循环。"""
 
@@ -186,6 +267,9 @@ class TestDecodeOnlyInEvaluationPaths:
                 checkpoint=config.artifacts.vae_ckpt,
             ),
             torch.device("cpu"),
+            1.0,
+            (48, 48, 48),
+            0.5,
         )
         counter = CountingDecoder(inner)
         evaluation = ManifestEvaluation.build(
@@ -228,6 +312,9 @@ class TestBoundedVolumeSampling:
                 checkpoint=config.artifacts.vae_ckpt,
             ),
             torch.device("cpu"),
+            1.0,
+            (48, 48, 48),
+            0.5,
         )
         counter = CountingDecoder(inner)
         evaluation = ManifestEvaluation.build(
@@ -363,6 +450,122 @@ class TestReferenceSpaceAlignment:
         assert math.isfinite(metrics.fid)
 
 
+class TwoTargetLatentSampler:
+    """测试仪器：按条目序号交错目标序列的采样替身（K=4 → 各 target
+    2 条），terminal 首元素携带「坍缩 policy」的输出强度（标签交换）。"""
+
+    def sample(self, entries) -> list[EntrySample]:
+        return [
+            EntrySample(
+                entry=entry,
+                target="t1n" if entry.index % 2 == 0 else "t2w",
+                source_case=None,
+                terminal=self._terminal(entry.index),
+            )
+            for entry in entries
+        ]
+
+    @staticmethod
+    def _terminal(index: int) -> torch.Tensor:
+        latent = torch.zeros(1, 4, 16, 16, 8)
+        # 标签交换：t1n 条目产出 t2w 的强度（0.8），t2w 条目产出 t1n 的（0.2）
+        latent[0, 0, 0, 0, 0] = 0.8 if index % 2 == 0 else 0.2
+        return latent
+
+
+class LatentValueDecoder:
+    """测试仪器：latent 首元素 → 恒定强度像素体（合成强度完全由
+    terminal 编码——坍缩行为的载体，体积与条件无关）。"""
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        return torch.stack([
+            torch.full((1, 16, 16, 8), float(value))
+            for value in latents[:, 0, 0, 0, 0]
+        ])
+
+
+class MeanFeatureExtractor:
+    """测试仪器：切片均值 → 1 维特征（FID 退化为强度均值/方差——
+    坍缩可见性的最小可断言面）。"""
+
+    def extract(self, slices: torch.Tensor) -> torch.Tensor:
+        return slices.mean(dim=(1, 2, 3)).unsqueeze(1)
+
+
+class TwoStrengthRealStore:
+    """测试仪器：参照强度随目标序列分级（t1n=0.2、t2w=0.8）。"""
+
+    STRENGTHS = {"t1n": 0.2, "t2w": 0.8}
+
+    def case_ids(self) -> list[str]:
+        return ["case-a"]
+
+    def volume(self, case_id: str, modality: str) -> torch.Tensor:
+        return torch.full((16, 16, 8), self.STRENGTHS[modality])
+
+
+class TestConditionalCollapseVisibility:
+    """距离按目标序列分层（宏平均）后的条件坍缩可见性：policy 忽略/
+    交换模态标签但保持总体混合（t1n 条目产出 0.8、t2w 条目产出 0.2）
+    时，全池聚合距离 = 0（合成池与参照池的混合分布完全相同——盲区）；
+    宏平均下每个 target 的合成对**自己的**参照计距，坍缩显形。"""
+
+    def _evaluator(self) -> MilestoneEvaluator:
+        config = CynosureConfig.model_validate({
+            **MINIMAL_CONFIG_DICT, "schedule": {"seed": 0},
+        })
+        manifest = BaselineManifest(
+            seed=0, group="modal-label", conditions=["t1n", "t2w"],
+            entries=[
+                ManifestEntry(index=index, condition="t1n", noise_seed=index)
+                for index in range(4)
+            ],
+        )
+        return MilestoneEvaluator(
+            config,
+            1,
+            TwoTargetLatentSampler(),
+            LatentValueDecoder(),
+            MeanFeatureExtractor(),
+            TwoStrengthRealStore(),
+            manifest,
+            torch.device("cpu"),
+        )
+
+    def test_swapped_labels_hidden_in_pooled_distance(self) -> None:
+        """反事实锚点：同场景的全池聚合距离 ≈ 0（总体混合不变 = 盲区）
+        ——分层宏平均是必要的，不是等价的形式变换。"""
+        synthetic = torch.stack([
+            torch.full((1, 16, 16, 8), value) for value in (0.8, 0.8, 0.2, 0.2)
+        ]).squeeze(1)  # [K, X, Y, Z]
+        reference = torch.stack([
+            torch.full((1, 16, 16, 8), value) for value in (0.2, 0.2, 0.8, 0.8)
+        ]).squeeze(1)
+        extractor = MeanFeatureExtractor()
+        pooled_fid = FrechetDistance().score(
+            extractor.extract(OrthoPlane.XY.slice(synthetic)),
+            extractor.extract(OrthoPlane.XY.slice(reference)),
+        )
+        assert pooled_fid == pytest.approx(0.0, abs=1e-9)
+
+    def test_swapped_labels_visible_in_macro_average(self) -> None:
+        """宏平均主判据显形：两组各 (0.8-0.2)² = 0.36，fid = 宏平均
+        0.36；分层值与 summary 键随指标落盘（坍缩可归因）。"""
+        metrics = self._evaluator().evaluate()
+        assert metrics.target_fid["t1n"] == pytest.approx(0.36, abs=1e-6)
+        assert metrics.target_fid["t2w"] == pytest.approx(0.36, abs=1e-6)
+        assert metrics.fid == pytest.approx(0.36, abs=1e-6)
+        summary = metrics.summary()
+        assert summary["fid_target_t1n"] == pytest.approx(0.36, abs=1e-6)
+        # KID 同显形：两组常数强度不同 → 无偏 MMD² 显著为正，且两组
+        # 同值（交换对称）→ 宏平均 = 组值
+        assert summary["kid_target_t1n"] > 0.0
+        assert metrics.kid == pytest.approx(summary["kid_target_t1n"], abs=1e-9)
+        # 常数特征下重复值恒同 → CI 界 = 点估计（浮点尾数级差异）
+        assert metrics.kid_ci_low == pytest.approx(metrics.kid, abs=1e-6)
+        assert metrics.kid_ci_high == pytest.approx(metrics.kid, abs=1e-6)
+
+
 class AcceleratorStubDecoder:
     """测试仪器：产出落在加速器上的像素体（模拟生产 LatentDecoder 的
     设备行为——解码网络在 amp.device；体尺寸与 fixture 场景的
@@ -440,6 +643,9 @@ class TestBaselineSamplingIdempotence:
                 checkpoint=config.artifacts.vae_ckpt,
             ),
             torch.device("cpu"),
+            1.0,
+            (48, 48, 48),
+            0.5,
         ))
         evaluation = ManifestEvaluation.build(
             config,

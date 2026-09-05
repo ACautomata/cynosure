@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from cynosure.config import ConfigLoader
+from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import GranularGrpoTrainer, IterationLoop, RunArtifacts
 from tests.test_train_loop import TrainingLoopScenario
@@ -273,6 +274,55 @@ class TestCheckpointCadence:
             with pytest.raises(KeyboardInterrupt):
                 scenario.train()
         assert _load_state(scenario)["iteration"] == 2
+
+
+class TestNoopResumeIntegrity:
+    """恢复点已达标的续训 = 完整无操作（第四轮 review 反馈）。
+
+    「半截执行史由重执行重写」的边界 = checkpoint 覆盖面：恢复点 N 的
+    checkpoint 已覆盖 iter 0..N-1 与完成数 ≤ N 的里程碑评测——它们是
+    已完成执行史，rewind 不得删除（早停 verdict 与 FID 历史都在事件
+    里）；milestone 事件以完成数记账，rewind 保留边界对 milestone 用
+    ≤、对 iter 用 <。同理，零训练迭代的续训不重执行收官重采、完成数
+    报告恢复点本身。"""
+
+    def test_preserves_checkpoint_milestone_events(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """no-op 续训不删 checkpoint 已覆盖的 milestone 事件：恢复点 2
+        与 milestone@2 同批落盘，rewind(2) 的 iter 边界（<2）不得波及
+        完成数口径的 milestone（≤2）。"""
+        scenario.write_inputs()
+        scenario.set_schedule(max_iterations=2, milestone_interval=2)
+        assert scenario.train().code == 0
+        assert [
+            event["iteration"] for event in scenario.events()
+            if event.get("event") == "milestone"
+        ] == [2]
+        events_before = scenario.events()
+        assert _resume_run(scenario).code == 0
+        assert scenario.events() == events_before
+
+    def test_skips_resample_and_reports_restored_count(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> None:
+        """零训练迭代的续训不重执行收官重采（policy 未变、重采产物不因
+        RNG 流位置漂移被静默改写），完成数报告恢复点而非 0。"""
+        scenario.write_inputs()
+        scenario.set_schedule(max_iterations=2)
+        assert scenario.train().code == 0
+        calls = {"resample": 0}
+        original = ManifestEvaluation.resample
+
+        def counting(evaluation):
+            calls["resample"] += 1
+            return original(evaluation)
+
+        monkeypatch.setattr(ManifestEvaluation, "resample", counting)
+        result = _resume_run(scenario)
+        assert result.code == 0
+        assert calls["resample"] == 0
+        assert "2 iteration" in result.stdout
 
 
 class TestResumeGuards:

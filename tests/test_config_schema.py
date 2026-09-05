@@ -311,6 +311,22 @@ class TestRejection:
         data["schedule"]["milestone_eval_samples"] = 12
         CynosureConfig.model_validate(data)
 
+    def test_milestone_samples_within_baseline_manifest(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config 下 K 不得超过 N_baseline：评测条目取 manifest 前缀，
+        超出即静默缩水到盘上条目数、评测面与配置声明失真。fixture 豁免。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["schedule"].update({"milestone_eval_samples": 201})
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
+        data["schedule"]["milestone_eval_samples"] = 200
+        CynosureConfig.model_validate(data)  # = N_baseline → 合法
+        data["fixture_mode"] = True
+        data["schedule"]["milestone_eval_samples"] = 500
+        CynosureConfig.model_validate(data)  # fixture 豁免
+
     def test_auc_chance_epsilon_below_half(self, valid_config_dict: dict) -> None:
         """AUC 近 chance 判定带半径 ≥0.5 即恒真：hacking 签名失去判别力，拒绝。"""
         data = copy.deepcopy(valid_config_dict)

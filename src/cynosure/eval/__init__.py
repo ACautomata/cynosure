@@ -181,6 +181,9 @@ class ManifestEvaluation:
                 checkpoint=config.artifacts.vae_ckpt,
             ),
             device,
+            config.policy.latent_scale_factor,
+            tuple(config.schedule.decode_roi_size),
+            config.schedule.decode_overlap,
         )
 
     @staticmethod

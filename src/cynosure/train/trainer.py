@@ -360,8 +360,10 @@ class GranularGrpoTrainer:
         run 目录最新续训状态恢复（全清单覆写，resume 模块），回退指标流
         中恢复点之后的半截事件后从恢复点继续——base 分区种子生成与
         Baseline 采样随之跳过（buffer 随状态整体回归；Baseline 冻结只采
-        一次，恢复点 policy 已非初始权重）。返回完成的 iteration 数
-        （config 口径的累计完成数；早停时小于 max_iterations）。"""
+        一次，恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）
+        的续训是完整无操作：不重执行收官重采、不改写任何工件。返回完成
+        的 iteration 数（config 口径的累计完成数；早停时小于
+        max_iterations；零训练迭代时 = 恢复点）。"""
         start_iteration = 0
         if resume:
             start_iteration = resume_latest(self)
@@ -373,7 +375,7 @@ class GranularGrpoTrainer:
             self.evaluation.sample_baseline()  # 冻结只采一次：更新开始前的当前权重即初始 policy
         pairs: list[TrainingLogProbPair] = []
         last_checkpoint = start_iteration
-        completed = 0
+        completed = start_iteration  # 零训练迭代的续训（恢复点已达标）报告恢复点本身
         update_interval = self.config.reward.disc_update_interval_n_d
         for iteration in range(start_iteration, self.config.schedule.max_iterations):
             started = time.monotonic()
@@ -442,7 +444,10 @@ class GranularGrpoTrainer:
             self._write_checkpoint(completed)
             save_resume_state(self, completed)
         self.policy.eval_phase()  # 重采与 baseline 同为 eval 相（差异唯一归因于 RL）
-        self.evaluation.resample()  # RL 后同 seed 同条件重采（共用同一 manifest）
+        if completed > start_iteration:
+            # 本次调用执行了训练才收官重采：恢复点已达标的无操作续训不重采
+            # （policy 未变，重采只因 RNG 流位置不同而静默改写产物）
+            self.evaluation.resample()  # RL 后同 seed 同条件重采（共用同一 manifest）
         if pairs:
             self.artifacts.paths.training_diagnostic.write_text(
                 TrainingDiagnostic(logprob_pairs=pairs).model_dump_json(indent=2),

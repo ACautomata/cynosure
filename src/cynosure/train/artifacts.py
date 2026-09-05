@@ -316,17 +316,27 @@ class RunArtifacts:
         return [json.loads(line) for line in lines if line.strip()]
 
     def rewind_events(self, iteration: int, stage: int) -> int:
-        """续训回退指标流：删除恢复点之后本 stage 的事件（iteration ≥
-        恢复点且 stage 匹配，iter 与 milestone 事件均带 stage 字段）——
-        被中断的半截执行史由恢复后的重执行重写，保住「每 iteration 每
-        stage 一条事件」的流不变量（重复事件会污染早停判定等下游消费
-        者）。返回删除的事件数。"""
+        """续训回退指标流：删除恢复点之后本 stage 的**半截**事件——
+        checkpoint 覆盖面之外的执行史由恢复后的重执行重写，保住「每
+        iteration 每 stage 一条事件」的流不变量（重复事件会污染早停判定
+        等下游消费者）。
+
+        保留边界按事件记账口径取：iter 事件以 0-based iteration 号记账
+        （保留号 < 恢复点）；milestone 事件以完成数记账、与恢复点
+        checkpoint 同批产出（保留完成数 ≤ 恢复点——若按 iter 边界删，
+        每次从里程碑 checkpoint 续训都会抹掉该里程碑的评测历史：FID
+        序列断点、早停 verdict 消失且不再重放）。stage 不匹配的事件
+        （其他阶段的历史）不动。返回删除的事件数。"""
         events = self.read_events()
-        kept = [
-            event for event in events
-            if event.get("iteration", 0) < iteration
-            or event.get("stage", 1) != stage
-        ]
+        kept: list[dict] = []
+        for event in events:
+            if event.get("stage", 1) != stage:
+                kept.append(event)
+                continue
+            number = event.get("iteration", 0)
+            milestone = event.get("event") == "milestone"
+            if number < iteration or (milestone and number <= iteration):
+                kept.append(event)
         removed = len(events) - len(kept)
         if removed:
             tmp = self.paths.metrics.with_name(
