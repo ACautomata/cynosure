@@ -317,11 +317,10 @@ class RunArtifacts:
 
     def rewind_events(self, iteration: int, stage: int) -> int:
         """续训回退指标流：删除恢复点之后本 stage 的事件（iteration ≥
-        恢复点且 stage 匹配）——被中断的半截执行史由恢复后的重执行重写，
-        保住「每 iteration 每 stage 一条事件」的流不变量（重复事件会污染
-        早停判定等下游消费者）。milestone 事件暂不带 stage 字段、按 stage 1
-        归属（组3 两阶段的 milestone 归属待 eval ticket 随事件 schema 补
-        stage）。返回删除的事件数。"""
+        恢复点且 stage 匹配，iter 与 milestone 事件均带 stage 字段）——
+        被中断的半截执行史由恢复后的重执行重写，保住「每 iteration 每
+        stage 一条事件」的流不变量（重复事件会污染早停判定等下游消费
+        者）。返回删除的事件数。"""
         events = self.read_events()
         kept = [
             event for event in events

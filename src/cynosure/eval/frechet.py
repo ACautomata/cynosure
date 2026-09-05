@@ -134,15 +134,16 @@ class BootstrapKernelMmd:
         """(全量点估计, 重复值向量)：点估计与自助分布原料一次产出。
         单面区间可直接对重复值取分位；多面汇总统计量的 CI 由上层对
         重复值聚合后取分位（见 MilestoneEvaluator._plane_metrics）。"""
-        return self._kernel.score(features_a, features_b), self.replicate_scores(
+        return self._kernel.score(features_a, features_b), self._replicate_scores(
             features_a, features_b,
         )
 
-    def replicate_scores(
+    def _replicate_scores(
         self, features_a: torch.Tensor, features_b: torch.Tensor,
     ) -> torch.Tensor:
         """每次重复从两侧各无放回抽取半数样本算 MMD² 的重复值向量
-        [replicates]——多面汇总统计量的自助分布原料（上层自行聚合）。"""
+        [replicates]——多面汇总统计量的自助分布原料（经
+        ``score_and_replicates`` 产出）。"""
         size = max(2, min(features_a.shape[0], features_b.shape[0]) // 2)
         return torch.tensor([
             self._kernel.score(
