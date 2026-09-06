@@ -21,7 +21,7 @@ class SyntheticStream:
 
     def iter_event(
         self, iteration: int, reward: float, auc: float = 0.9,
-        modality: str | None = None,
+        modality: str | None = None, rank: int = 0,
     ) -> "SyntheticStream":
         event = {
             "event": "iter", "iteration": iteration,
@@ -29,6 +29,8 @@ class SyntheticStream:
         }
         if modality is not None:
             event["modality"] = modality
+        if rank:
+            event["rank"] = rank
         self.events.append(event)
         return self
 
@@ -170,6 +172,43 @@ class TestPerModalityHacking:
             )
         verdict = stream.judge()
         assert verdict.stop is False
+
+
+class TestPerRankStreams:
+    """多 rank 指标流的窗口语义：归并流里同一逻辑 iteration 有 world_size
+    条事件（每 rank 一条，(iteration, rank) 稳定序）——hacking 窗口必须
+    按 (modality, rank) 取**每 rank 自身**的时间序列。跨 rank 混采会把
+    窗口缩短成 N/world 个 iteration，且 rank 间稳定的 reward 偏移（各
+    rank 数据流差异的稳态）在 rank 序交错下被最小二乘误读成时间趋势。"""
+
+    def test_rank_offset_interleaving_is_not_a_temporal_trend(self) -> None:
+        """伪触发：两 rank 真实序列都平稳（斜率 0）、仅隔恒定偏移，AUC
+        近 chance——交错窗口的锯齿不得被读成上升趋势（每 rank 各 6 条
+        < 默认窗口 10，本就证据不足）。"""
+        stream = SyntheticStream.plateau_free()
+        for iteration in range(6):
+            stream.iter_event(iteration, reward=1.0, auc=0.505, modality="t1n")
+            stream.iter_event(
+                iteration, reward=1.4, auc=0.505, modality="t1n", rank=1,
+            )
+        verdict = stream.judge()
+        assert verdict.stop is False
+        assert verdict.hacking_signature is False
+
+    def test_single_rank_rising_series_still_triggers(self) -> None:
+        """防过修：每 rank 各自的序列确实上升且窗口按 rank 计满 → 照常触发。"""
+        stream = SyntheticStream.plateau_free()
+        for iteration in range(12):
+            rising = -1.0 + 0.5 * iteration
+            stream.iter_event(
+                iteration, reward=rising, auc=0.505, modality="t1n",
+            )
+            stream.iter_event(
+                iteration, reward=rising, auc=0.505, modality="t1n", rank=1,
+            )
+        verdict = stream.judge()
+        assert verdict.stop is True
+        assert verdict.reason == "reward_hacking"
 
 
 class TestNoFalseTrigger:

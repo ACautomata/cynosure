@@ -2,8 +2,8 @@
 
 fixture 下 CLI train 端到端的三条验收：
 1. 训练 N iteration → 中断 → 恢复 → 与不中断续跑的轨迹/指标一致
-   （iter 事件逐条相等（除 wall-clock elapsed_s）+ 收官 policy/判别器
-   checkpoint 逐位一致）；
+   （iter 事件逐条相等（除 wall-clock elapsed_s，RunTrajectory）+ 收官
+   policy/判别器 checkpoint 逐位一致）；
 2. 续训状态清单完整覆盖：两模型权重与 optimizer、buffer 两区、RNG
    （torch/CUDA/numpy/python + 六条命名 generator 流）、iteration 计数、
    LR scheduler 状态槽、EMA 条件项槽；
@@ -13,8 +13,9 @@ fixture 下 CLI train 端到端的三条验收：
 
 「中断」的两条路径都覆盖：
 - 干净截断（max_iterations 截短训练后延长续训，收尾兜底落盘）；
-- 模拟崩溃（训练循环协作方法中途 KeyboardInterrupt——真实作业边界的
-  杀进程在 CLI seam 内无入口，经 monkeypatch 注入；断言面仍是外部工件）。
+- 模拟崩溃（MidRunCrash：训练循环协作方法中途 KeyboardInterrupt——
+  真实作业边界的杀进程在 CLI seam 内无入口，经 monkeypatch 注入；
+  断言面仍是外部工件）。
 """
 
 import json
@@ -26,74 +27,50 @@ import torch
 from cynosure.config import ConfigLoader
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.train import GranularGrpoTrainer, IterationLoop, RunArtifacts
+from cynosure.train import IterationLoop, RunArtifacts
+from cynosure.train.policy import GroupPolicy
+from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
 
 RESUME_STATE = "checkpoints/resume_state.pt"
 
 
+class MidRunCrash:
+    """模拟作业边界崩溃（上下文管理器界定注入范围）：第 ``iteration + 1``
+    次 ``update_policy`` 调用替换为 KeyboardInterrupt——该迭代不产出事件，
+    训练停在最近周期/里程碑落盘点。"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, iteration: int) -> None:
+        self._monkeypatch = monkeypatch
+        self._iteration = iteration
+        self._patch = None
+
+    def __enter__(self) -> "MidRunCrash":
+        original = IterationLoop.update_policy
+        crash_on_call = self._iteration + 1
+        calls = {"count": 0}
+
+        def crashing(loop, record):
+            calls["count"] += 1
+            if calls["count"] == crash_on_call:
+                raise KeyboardInterrupt(
+                    f"模拟作业边界崩溃（iteration {self._iteration}）"
+                )
+            return original(loop, record)
+
+        self._patch = self._monkeypatch.context()
+        self._patch.__enter__().setattr(
+            IterationLoop, "update_policy", crashing,
+        )
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._patch.__exit__(*exc_info)
+
+
 @pytest.fixture
 def scenario(cli, tmp_path: Path) -> TrainingLoopScenario:
     return TrainingLoopScenario(cli, tmp_path)
-
-
-def _patch_config(scenario: TrainingLoopScenario, **sections: dict) -> None:
-    """按 section 覆写训练 config（既有测试的 JSON 补丁惯例）。"""
-    data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-    for section, values in sections.items():
-        data[section].update(values)
-    scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-
-
-def _resume_run(scenario: TrainingLoopScenario):
-    return scenario.cli.run(
-        "train", "--config", str(scenario.config_path),
-        "--run-dir", str(scenario.run_dir), "--resume",
-    )
-
-
-def _load_state(scenario: TrainingLoopScenario) -> dict:
-    return torch.load(
-        scenario.run_dir / RESUME_STATE, map_location="cpu", weights_only=True,
-    )
-
-
-def _trajectory(events: list[dict]) -> list[dict]:
-    """iter 事件的轨迹可比面（wall-clock elapsed_s 除外）。"""
-    return [
-        {key: value for key, value in event.items() if key != "elapsed_s"}
-        for event in events
-    ]
-
-
-def _assert_checkpoints_identical(
-    left: Path, right: Path, names: list[str],
-) -> None:
-    for name in names:
-        first = torch.load(
-            left / "checkpoints" / name, map_location="cpu", weights_only=True,
-        )
-        second = torch.load(
-            right / "checkpoints" / name, map_location="cpu", weights_only=True,
-        )
-        assert set(first) == set(second)
-        for key in first:
-            assert torch.equal(first[key], second[key]), f"{name}:{key}"
-
-
-def _crash_during_iteration(monkeypatch, iteration: int) -> None:
-    """把第 ``iteration + 1`` 次 update_policy 调用替换为 KeyboardInterrupt
-    （iteration 为 0 起数的崩溃所在迭代；该迭代不产出事件）。"""
-    original = IterationLoop.update_policy
-    calls = {"count": 0}
-
-    def crashing(self, record):
-        calls["count"] += 1
-        if calls["count"] == iteration + 1:
-            raise KeyboardInterrupt(f"模拟作业边界崩溃（iteration {iteration}）")
-        return original(self, record)
-
-    monkeypatch.setattr(IterationLoop, "update_policy", crashing)
 
 
 class TestRoundtripEquivalence:
@@ -106,12 +83,12 @@ class TestRoundtripEquivalence:
         config 到 4 并 --resume → 事件流与收官 checkpoint 和不中断的
         4-iteration run 逐条/逐位一致。"""
         scenario.write_inputs()
-        _patch_config(scenario, schedule={"max_iterations": 2})
+        scenario.patch_config(schedule={"max_iterations": 2})
         assert scenario.train().code == 0
         assert [event["iteration"] for event in scenario.events()] == [0, 1]
 
-        _patch_config(scenario, schedule={"max_iterations": 4})
-        result = _resume_run(scenario)
+        scenario.patch_config(schedule={"max_iterations": 4})
+        result = scenario.resume()
         assert result.code == 0, result.stderr
         resumed_events = scenario.events()
         assert [event["iteration"] for event in resumed_events] == [0, 1, 2, 3]
@@ -123,12 +100,11 @@ class TestRoundtripEquivalence:
         baseline_events = RunArtifacts(
             RunArtifacts.layout(baseline_dir),
         ).read_events()
-        assert _trajectory(resumed_events) == _trajectory(baseline_events)
-        _assert_checkpoints_identical(
-            scenario.run_dir, baseline_dir,
-            ["policy_iter4.pt", "discriminator_iter4.pt"],
+        assert RunTrajectory(resumed_events) == RunTrajectory(baseline_events)
+        scenario.checkpoints_identical(
+            baseline_dir, ["policy_iter4.pt", "discriminator_iter4.pt"],
         )
-        assert _load_state(scenario)["iteration"] == 4
+        assert scenario.resume_state()["iteration"] == 4
 
     def test_mid_run_crash_resumes_from_last_periodic_state(
         self, scenario: TrainingLoopScenario, monkeypatch,
@@ -137,19 +113,17 @@ class TestRoundtripEquivalence:
         = 最近周期落盘 iteration 2；恢复回退指标流中半截事件（iteration 2
         的事件被重执行重写），最终轨迹与不中断 run 一致。"""
         scenario.write_inputs()
-        _patch_config(
-            scenario,
+        scenario.patch_config(
             schedule={"max_iterations": 4, "checkpoint_interval": 2},
         )
-        with monkeypatch.context() as patch:
-            _crash_during_iteration(patch, iteration=3)
+        with MidRunCrash(monkeypatch, iteration=3):
             with pytest.raises(KeyboardInterrupt):
                 scenario.train()
         # 崩溃前完整 iteration 0/1/2 已追加事件；状态停在周期点 2
-        assert _load_state(scenario)["iteration"] == 2
+        assert scenario.resume_state()["iteration"] == 2
         assert [event["iteration"] for event in scenario.events()] == [0, 1, 2]
 
-        assert _resume_run(scenario).code == 0
+        assert scenario.resume().code == 0
         resumed_events = scenario.events()
         assert [event["iteration"] for event in resumed_events] == [0, 1, 2, 3]
 
@@ -160,10 +134,9 @@ class TestRoundtripEquivalence:
         baseline_events = RunArtifacts(
             RunArtifacts.layout(baseline_dir),
         ).read_events()
-        assert _trajectory(resumed_events) == _trajectory(baseline_events)
-        _assert_checkpoints_identical(
-            scenario.run_dir, baseline_dir,
-            ["policy_iter4.pt", "discriminator_iter4.pt"],
+        assert RunTrajectory(resumed_events) == RunTrajectory(baseline_events)
+        scenario.checkpoints_identical(
+            baseline_dir, ["policy_iter4.pt", "discriminator_iter4.pt"],
         )
 
 
@@ -173,11 +146,12 @@ class TestResumeStateChecklist:
     def test_state_covers_full_checklist(self, scenario: TrainingLoopScenario) -> None:
         scenario.write_inputs()
         assert scenario.train().code == 0
-        state = _load_state(scenario)
+        state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 1
+        assert state["format_version"] == 2
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
+        assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
         # 两模型权重：键形与全新装配的网络一致（组1 policy = UNet 本体）
         unet = NetworkAssembler.unet(NetworkArtifact(
@@ -228,7 +202,7 @@ class TestResumeStateChecklist:
         """ema_anchor_enabled=true 属升级项（ADR-0001）：静默忽略会让续训
         状态清单缺 EMA 权重（条件项失真），装配期显式拒绝。"""
         scenario.write_inputs()
-        _patch_config(scenario, grpo={"ema_anchor_enabled": True})
+        scenario.patch_config(grpo={"ema_anchor_enabled": True})
         result = scenario.train()
         assert result.code == 2
         assert "EMA" in result.stderr
@@ -244,13 +218,12 @@ class TestCheckpointCadence:
         （周期未到、无收尾兜底）不产出续训状态；恢复入口对缺失状态显式
         拒绝（退出码 2 + 清晰消息），不裸 traceback。"""
         scenario.write_inputs()  # checkpoint_interval 缺省 = 10
-        _patch_config(scenario, schedule={"max_iterations": 4})
-        with monkeypatch.context() as patch:
-            _crash_during_iteration(patch, iteration=3)
+        scenario.patch_config(schedule={"max_iterations": 4})
+        with MidRunCrash(monkeypatch, iteration=3):
             with pytest.raises(KeyboardInterrupt):
                 scenario.train()
         assert not (scenario.run_dir / RESUME_STATE).is_file()
-        result = _resume_run(scenario)
+        result = scenario.resume()
         assert result.code == 2
         assert "续训状态" in result.stderr
 
@@ -261,19 +234,17 @@ class TestCheckpointCadence:
         checkpoint_interval=5，iteration 3 中途崩溃——状态@2 仅由里程碑
         节奏产出（2 % 5 != 0）。"""
         scenario.write_inputs()
-        _patch_config(
-            scenario,
+        scenario.patch_config(
             schedule={
                 "max_iterations": 4,
                 "milestone_interval": 2,
                 "checkpoint_interval": 5,
             },
         )
-        with monkeypatch.context() as patch:
-            _crash_during_iteration(patch, iteration=3)
+        with MidRunCrash(monkeypatch, iteration=3):
             with pytest.raises(KeyboardInterrupt):
                 scenario.train()
-        assert _load_state(scenario)["iteration"] == 2
+        assert scenario.resume_state()["iteration"] == 2
 
 
 class TestNoopResumeIntegrity:
@@ -293,14 +264,14 @@ class TestNoopResumeIntegrity:
         与 milestone@2 同批落盘，rewind(2) 的 iter 边界（<2）不得波及
         完成数口径的 milestone（≤2）。"""
         scenario.write_inputs()
-        scenario.set_schedule(max_iterations=2, milestone_interval=2)
+        scenario.patch_config(schedule={"max_iterations": 2, "milestone_interval": 2})
         assert scenario.train().code == 0
         assert [
             event["iteration"] for event in scenario.events()
             if event.get("event") == "milestone"
         ] == [2]
         events_before = scenario.events()
-        assert _resume_run(scenario).code == 0
+        assert scenario.resume().code == 0
         assert scenario.events() == events_before
 
     def test_skips_resample_and_reports_restored_count(
@@ -309,7 +280,7 @@ class TestNoopResumeIntegrity:
         """零训练迭代的续训不重执行收官重采（policy 未变、重采产物不因
         RNG 流位置漂移被静默改写），完成数报告恢复点而非 0。"""
         scenario.write_inputs()
-        scenario.set_schedule(max_iterations=2)
+        scenario.patch_config(schedule={"max_iterations": 2})
         assert scenario.train().code == 0
         calls = {"resample": 0}
         original = ManifestEvaluation.resample
@@ -319,10 +290,67 @@ class TestNoopResumeIntegrity:
             return original(evaluation)
 
         monkeypatch.setattr(ManifestEvaluation, "resample", counting)
-        result = _resume_run(scenario)
+        result = scenario.resume()
         assert result.code == 0
         assert calls["resample"] == 0
         assert "2 iteration" in result.stdout
+
+    def test_noop_resume_preserves_existing_diagnostic(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """零训练迭代的续训（--dump-trajectory）不得用空 log-prob 对清单
+        覆盖既有 training.json——那会把「文档化的 no-op resume」变成对
+        一致性证据的破坏。"""
+        scenario.write_inputs()
+        assert scenario.train(dump=True).code == 0
+        diagnostic_path = scenario.run_dir / "training.json"
+        original = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        assert original["logprob_pairs"]  # 首轮确有真实采集
+
+        assert scenario.resume(dump=True).code == 0
+        after = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        assert after == original
+
+
+class TestLegacyDirCompatibility:
+    """代际标记引入后的 world-1 兼容：单分片自身原子替换已保证一致性，
+    历史无标记的 run 目录照常恢复（缺标记的拒绝只在多 rank——分片与
+    标记必须同代际对账）。"""
+
+    def test_world1_resume_tolerates_dir_without_marker(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.patch_config(schedule={"max_iterations": 2})
+        assert scenario.train().code == 0
+        marker = scenario.run_dir / "checkpoints" / "resume_generation.json"
+        assert marker.is_file()  # 当前节奏照常产出标记
+        marker.unlink()  # 抹掉标记 = 历史 run 目录形态
+        scenario.patch_config(schedule={"max_iterations": 4})
+        assert scenario.resume().code == 0
+        assert scenario.resume_state()["iteration"] == 4
+
+
+class TestCheckpointCost:
+    """checkpoint 的 full-state 导出成本（一次导出、两处共享）：产物
+    checkpoint 写盘与续训分片快照消费同一份导出——第二次导出会让每
+    rank 在 checkpoint 期同时驻留两份完整 CPU 权重副本（FSDP full state
+    是 offload 到 host 的全量），生产规模下是 host 内存尖峰/OOM 源。"""
+
+    def test_checkpoint_exports_policy_state_once(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> None:
+        scenario.write_inputs()
+        calls = {"count": 0}
+        original = GroupPolicy.full_state
+
+        def counting(policy):
+            calls["count"] += 1
+            return original(policy)
+
+        monkeypatch.setattr(GroupPolicy, "full_state", counting)
+        assert scenario.train().code == 0
+        assert calls["count"] == 1
 
 
 class TestResumeGuards:
@@ -355,10 +383,10 @@ class TestResumeGuards:
         """seed 漂移的续训不可复现（RNG 流与恢复状态失配）：除
         max_iterations（延长训练规模的正当地址）外逐字段一致被守卫拒绝。"""
         scenario.write_inputs()
-        _patch_config(scenario, schedule={"max_iterations": 2})
+        scenario.patch_config(schedule={"max_iterations": 2})
         assert scenario.train().code == 0
-        _patch_config(scenario, schedule={"seed": 1})
-        result = _resume_run(scenario)
+        scenario.patch_config(schedule={"seed": 1})
+        result = scenario.resume()
         assert result.code == 2
         assert "schedule.seed" in result.stderr
 
@@ -379,10 +407,10 @@ class TestResumeGuards:
         """恢复点已等于目标 iteration 数：零重执行、零重复事件、退出 0
         （跨实例重置后的重复提交不产生半截执行史）。"""
         scenario.write_inputs()
-        _patch_config(scenario, schedule={"max_iterations": 2})
+        scenario.patch_config(schedule={"max_iterations": 2})
         assert scenario.train().code == 0
         events_before = scenario.events()
-        assert _resume_run(scenario).code == 0
+        assert scenario.resume().code == 0
         assert scenario.events() == events_before
 
     def test_resume_past_shrunk_target_rewrites_nothing(
@@ -393,12 +421,14 @@ class TestResumeGuards:
         同一 run 目录的下次续训会从 iter-4 权重按 iteration 2 起步（轨迹
         分支）。"""
         scenario.write_inputs()
-        _patch_config(scenario, schedule={"max_iterations": 4, "checkpoint_interval": 4})
+        scenario.patch_config(
+            schedule={"max_iterations": 4, "checkpoint_interval": 4},
+        )
         assert scenario.train().code == 0
         events_before = scenario.events()
-        _patch_config(scenario, schedule={"max_iterations": 2})
-        assert _resume_run(scenario).code == 0
-        assert _load_state(scenario)["iteration"] == 4  # 状态未被改写
+        scenario.patch_config(schedule={"max_iterations": 2})
+        assert scenario.resume().code == 0
+        assert scenario.resume_state()["iteration"] == 4  # 状态未被改写
         assert scenario.events() == events_before  # 事件流未被改写
         assert not (scenario.run_dir / "checkpoints" / "policy_iter2.pt").is_file()
 
@@ -409,9 +439,9 @@ class TestResumeGuards:
         轨迹静默漂移，显式拒绝（CPU fixture 环境恒无 CUDA，可构造该方向）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
-        state = _load_state(scenario)
+        state = scenario.resume_state()
         state["rng"]["cuda"] = [torch.zeros(1, dtype=torch.uint8)]
         torch.save(state, scenario.run_dir / RESUME_STATE)
-        result = _resume_run(scenario)
+        result = scenario.resume()
         assert result.code == 2
         assert "CUDA" in result.stderr

@@ -5,7 +5,6 @@ run 目录与工件契约最小版（config 快照 + metrics.jsonl + manifest + 
 
 import copy
 import json
-import threading
 from pathlib import Path
 
 import pytest
@@ -136,27 +135,28 @@ class TestTrainCommand:
         assert "nope.json" in result.stderr
 
 
-class TestSingleProcessGuard:
-    """单进程训练循环（#21 tracer bullet）的 rank 守卫：FSDP 梯度聚合与
-    rank 0 归并落盘由 orchestration ticket 交付前，非 0 rank 显式拒绝——
-    否则每个 rank 各自跑完整循环，重复追加 iter 事件、覆写同一 checkpoint
-    文件名（RunArtifacts 的 rank 0 写盘契约被静默破坏）。"""
+class TestDistributedEntryGuard:
+    """torchrun 环境的 CLI 守卫（T09 分布式交付后）：非 0 rank 不再被
+    rank 守卫拦截——全部 rank 走同一训练循环（FSDP/DDP 梯度聚合、rank 0
+    归并落盘在 TrainingRuntime 装配），仅默认 run 目录仍被拒绝（按进程
+    时间戳生成，多 rank 下无法对齐、会静默分裂 run）。"""
 
-    def test_nonzero_rank_rejected_even_when_run_dir_ready(
+    def test_nonzero_rank_enters_training_assembly(
         self, cli: CliSession, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """run 目录已就绪（rank 0 已创建）也不进训练循环：显式拒绝、
-        消息指明单进程版边界——而非沿用「等待 rank 0」的 barrier 语义
-        （barrier 之后各 rank 重复训练才是要防的故障）。"""
-        monkeypatch.setenv("RANK", "3")
-        run_root = tmp_path / "run"
-        run_root.mkdir()
-        (run_root / "config.json").write_text("{}", encoding="utf-8")
-        result = cli.train(cli.write_config(tmp_path), run_dir=run_root)
-        assert result.code == 2
-        assert "单进程" in result.stderr
-        assert "训练输入契约违反" not in result.stderr  # 未进训练循环
+        """torchrun 环境进入训练装配（无 rank 守卫）：world=1 形态（
+        ``torchrun --nproc_per_node=1`` 的真实 env）下进程组自洽初始化，
+        生产 config 在装配期因工件缺失得到训练契约错误——走到该错误证明
+        CLI 未按 rank 拦截。多 rank 全 rank 同构执行由 test_distributed
+        的 spawn 契约真实验证（单测无跨进程 rendezvous）。"""
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", "29781")
+        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
+        assert "训练输入契约违反" in result.stderr
 
     def test_rank0_passes_guard_into_training(
         self, cli: CliSession, tmp_path: Path,
@@ -235,63 +235,33 @@ class TestTrajectoryDiagnosticFlag:
 
 
 class TestDistributedRunDir:
-    """torchrun 多 rank（RANK env）下的 run 目录初始化：rank 0 创建、
-    其余 rank 轮询等待采用（spec：多 rank 下指标由 rank 0 归并写出）。"""
+    """run 目录初始化的协调契约：``RunArtifacts.init`` 是无 env 感知的
+    单次创建（拒绝预存目录），多 rank 的「rank 0 创建 + 广播裁决」在
+    CLI 协调层（挂死/一致退出的进程级行为由 test_distributed 的
+    spawned usage 契约测试覆盖——文件轮询握手无法区分「本轮新建」与
+    「上轮遗留」，已删除）。"""
 
     @pytest.fixture
     def config(self) -> CynosureConfig:
         return CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
 
-    def test_rank0_creates_run_dir(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("RANK", "0")
-        monkeypatch.setenv("WORLD_SIZE", "8")
+    def test_init_creates_run_dir(self, config: CynosureConfig, tmp_path: Path) -> None:
         artifacts = RunArtifacts.init(config, tmp_path / "run")
         assert artifacts.paths.config_snapshot.is_file()
 
-    def test_nonzero_rank_adopts_dir_created_by_rank0(
+    def test_init_rejects_preexisting_dir_regardless_of_env(
         self, config: CynosureConfig, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """非 0 rank 不创建：rank 0 先行建好目录时，等待方直接采用、不再报 FileExistsError。"""
+        """预存目录（含 torchrun 环境变量下的非 0 rank 视角）一律拒绝：
+        「采用既有目录」的裁决属 CLI 广播层，不在本方法。"""
         monkeypatch.setenv("RANK", "3")
+        monkeypatch.setenv("WORLD_SIZE", "8")
         run_root = tmp_path / "run"
         run_root.mkdir()
-        (run_root / "config.json").write_text("{}", encoding="utf-8")  # rank 0 已创建
-        artifacts = RunArtifacts.init(config, run_root)
-        assert artifacts.paths.config_snapshot.is_file()
-
-    def test_nonzero_rank_times_out_when_rank0_never_creates(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """rank 0 迟迟不建目录 → 等待超时显式失败，而非各 rank 静默自建、分裂 run。"""
-        monkeypatch.setenv("RANK", "3")
-        with pytest.raises(TimeoutError):
-            RunArtifacts.init(config, tmp_path / "never", wait_timeout_s=0.1)
-
-    def test_nonzero_rank_waits_then_adopts(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """rank 0 稍后创建：等待方阻塞至目录出现后采用，且自身不落盘。"""
-        monkeypatch.setenv("RANK", "3")
-        run_root = tmp_path / "run"
-
-        def _create_as_rank0() -> None:
-            run_root.mkdir()
-            (run_root / "config.json").write_text("{}", encoding="utf-8")
-
-        timer = threading.Timer(0.2, _create_as_rank0)
-        timer.start()
-        try:
-            artifacts = RunArtifacts.init(config, run_root, wait_timeout_s=5.0)
-        finally:
-            timer.join()
-        assert artifacts.paths.root == run_root
-        assert artifacts.paths.config_snapshot.is_file()
+        (run_root / "config.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(FileExistsError):
+            RunArtifacts.init(config, run_root)
 
     def test_train_under_torchrun_requires_explicit_run_dir(
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

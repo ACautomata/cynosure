@@ -1,29 +1,30 @@
-"""单进程 Granular-GRPO 训练循环（ticket #21 tracer bullet，#23 扩展到
-组2；组3 的两阶段序贯由 SequentialTrainer 编排本类）。
+"""Granular-GRPO 训练循环（ticket #21 tracer bullet 起；#24 分布式化）。
 
-spec #15 执行序的单进程版（分布式 allreduce/barrier 留 T09）：
+spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 恒等）：
 
-    每 iteration：
+    每 iteration（每 rank，同卡交替）：
       1. eval() + no_grad —— Rollout 与打分（RolloutPhase）
-      2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次）；
-         判别器 Online update（50% 当前 fake + 50% 回放，单进程直通）
-      3. iter 事件落盘（Anchor eval reward / 组内 reward std / held-out
-         AUC / loss 组件 / buffer 占比 / lr / 耗时；组3 stage-2 带 stage=2）
-    定期：续训状态全清单落盘（resume 模块，T07）——与产物 checkpoint 同
-    节奏（checkpoint_interval 周期 + 每里程碑强制 + 收尾兜底）
-    train 启动时：用冻结初始 policy 自动生成 buffer base 分区（续训恢复
-    时跳过——buffer 两区内容随状态整体回归），并对 Baseline manifest 条目
-    采样落盘（冻结只采一次，续训恢复时同样跳过——恢复点 policy 已非初始
-    权重）；到达里程碑间隔时触发评测相的解码评测 → ``milestone`` 事件
-    写入同一指标流 → train 进程内早停判定消费该流（plateau / hacking
-    签名命中即停）；训练结束后对同 manifest 条目 RL 后重采。**解码只在
-    Baseline/里程碑/重采三条评测路径**（ADR-0004，结构断言见测试面）。
+      2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次，
+         FSDP 梯度 allreduce）；判别器 Online update（本 rank fake +
+         pool 切片 + 回放混采，DDP 梯度 allreduce）
+      3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
+    定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
+    （rank 0 独写，契约文件名不变）
+    train 启动时：per-rank buffer 的 base 分区由冻结初始 policy 生成
+    （续训恢复时跳过——buffer 两区内容随状态整体回归）；Baseline manifest
+    条目采样落盘只在 rank 0（冻结只采一次，续训恢复时同样跳过——恢复点
+    policy 已非初始权重）；到达里程碑间隔时触发评测相的解码评测 →
+    ``milestone`` 事件写入同一指标流（rank 0 独写）→ train 进程内早停
+    判定消费该流（plateau / hacking 签名命中即停，verdict 广播各 rank
+    一致 break）；训练结束后对同 manifest 条目 RL 后重采（rank 0）。
+    **解码只在 Baseline/里程碑/重采三条评测路径**（ADR-0004，结构断言
+    见测试面）。
 
-可训练对象按组装配（GroupPolicy）：组1 = UNet 全参、组2 = ControlNet
-（base UNet 冻结经装配期断言验证）。每组一次装配 → 判别器与 Replay
-buffer 随训练实例天然隔离（跨组/跨阶段不复用）。
-
-（dist.barrier() 属 T09。）
+装配（含分布式包装：FSDP full-shard + 梯度检查点、判别器 DDP、pool
+切片、seed 的 rank 派生、指标归并器）收敛在 TrainingRuntime——循环
+代码对部署形态无分支。可训练对象按组装配（GroupPolicy）；每组一次
+装配 → 判别器与 Replay buffer 随训练实例天然隔离（per-rank buffer，
+跨组/跨阶段不复用）。
 """
 
 import time
@@ -32,21 +33,12 @@ from dataclasses import dataclass
 import torch
 from pydantic import BaseModel, ConfigDict
 
-from cynosure.config import CynosureConfig, Modality
+from cynosure.config import CynosureConfig
+from cynosure.distributed import DistributedContext
 from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
-from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
-from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.policy.cursor import TrajectoryCursor
-from cynosure.policy.field import VelocityField
-from cynosure.policy.kernel import SdeKernel
-from cynosure.policy.numerics import AMP_DTYPES, AmpContext
-from cynosure.policy.sampler import RolloutSampler
-from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.buffer import ReplayBuffer, ReplayStore
-from cynosure.reward.sampler import RealPoolSampler
-from cynosure.reward.scorer import RewardScorer
-from cynosure.reward.update import OnlineUpdate, UpdateReport
+from cynosure.grpo import MgaiAdvantage, StepwisePolicyUpdate
+from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.numerics import AmpContext
 from cynosure.train.artifacts import (
     BaselineManifest,
     IterEvent,
@@ -56,9 +48,11 @@ from cynosure.train.artifacts import (
 )
 from cynosure.train.earlystop import EarlyStopJudge
 from cynosure.train.policy import GroupPolicy
+from cynosure.train.resume import ResumeStore
+from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import IterationRollout, RolloutPhase
-from cynosure.train.resume import resume_latest, save_resume_state
 from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.runtime import TrainingRuntime
 
 
 @dataclass(frozen=True)
@@ -93,67 +87,12 @@ class TrainingDiagnostic(BaseModel):
     logprob_pairs: list[TrainingLogProbPair]
 
 
-class RewardCoordinator:
-    """判别器侧协作者组（Facade）：聚合两区缓冲、Online update 与
-    held-out AUC——trainer 只面对「种植/更新/AUC」三个动作与判别器引用。
-
-    fake 供给与判别器相位约定：更新批的当前半区从全批 fake 随机抽取
-    （rollout 产出按 (k, λ) 有序堆叠，确定性取头部会使 K=4 的当前半区
-    永远只见最小 step、λ=1 的头部方向）；判别器默认保持 eval 相（打分
-    与监控前向不得推进 spectral norm power iteration），仅更新一步
-    期间短暂 train。"""
-
-    def __init__(
-        self, update: OnlineUpdate, auc: HeldOutAuc,
-        generator: torch.Generator,
-    ) -> None:
-        self.update = update
-        self.auc = auc
-        self._generator = generator
-
-    @property
-    def buffer(self) -> ReplayStore:
-        """两区回放缓冲（Online update 的混采源，单点持有）。"""
-        return self.update.buffer
-
-    @property
-    def discriminator(self) -> torch.nn.Module:
-        """底层判别器（checkpoint 落盘用）。"""
-        return self.update.scorer.discriminator
-
-    def seed_base(self, samples: torch.Tensor) -> None:
-        """冻结初始 policy 的产出填充 base 分区（train 启动期一次）。"""
-        self.buffer.fill_base(samples)
-
-    def update_step(self, current_fakes: torch.Tensor) -> UpdateReport:
-        """判别器 Online update 一步：全批 fake 随机置换后交更新
-        （50% 当前 / 50% 回放的混采由 update 消费置换批的头部），更新
-        期间判别器 train 相、结束后恢复 eval 相。置换过的整批照常入
-        近期分区（近期分布记录是集合语义，次序无关）。"""
-        order = torch.randperm(current_fakes.shape[0], generator=self._generator)
-        shuffled = current_fakes[order]
-        self.discriminator.train()
-        try:
-            return self.update.step(shuffled)
-        finally:
-            self.discriminator.eval()
-
-    def heldout_auc(
-        self, current_fakes: torch.Tensor, modality: Modality,
-    ) -> float:
-        """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。
-
-        real 侧按本 iteration 采样的目标序列过滤——iter 事件按序列归因
-        reward/loss/AUC，混采会让其他序列的判别器分数偏移伪装成本序列
-        realism 变化（per-target-sequence 健康监控）。"""
-        return self.auc.compute(current_fakes, modality=modality)
-
-
 class IterationLoop:
     """单 iteration 执行序的策略侧两相（判别器侧见 RewardCoordinator）：
     eval 相 rollout（Anchor → 单步 SDE 扰动 → 各 λ ODE 续跑 → 打分）→
-    train 相逐 k 独立梯度步——两相共享采样场，由 trainer 逐 iteration
-    驱动；log-prob 一致性诊断（π_old 记录 vs 同权重重算）同属本循环面。"""
+    train 相逐 k 独立梯度步（分布式下 FSDP 梯度 allreduce 同步权重）——
+    两相共享采样场，由 trainer 逐 iteration 驱动；log-prob 一致性诊断
+    （π_old 记录 vs 同权重重算）同属本循环面。"""
 
     def __init__(
         self,
@@ -177,7 +116,8 @@ class IterationLoop:
 
     def update_policy(self, record: IterationRollout) -> dict[str, float]:
         """执行序第 2 相：逐 k 独立梯度步——每 k 一次
-        forward→backward→optimizer.step，返回逐 k loss 组件。"""
+        forward→backward→optimizer.step（MGAI advantage 融合后交
+        updater），返回逐 k loss 组件。"""
         advantage = MgaiAdvantage(clamp=self._config.grpo.advantage_clamp)
         loss_terms: dict[str, float] = {}
         for step in record.steps:
@@ -219,8 +159,9 @@ class IterationLoop:
 
 
 class GranularGrpoTrainer:
-    """单进程 Granular-GRPO 训练循环编排（config 驱动装配；一次装配 =
-    一个组的一个阶段）。"""
+    """Granular-GRPO 训练循环编排（config 驱动装配；一次装配 = 一个组
+    的一个阶段）。分布式拓扑（ADR-0003）下各同构 rank 执行同一循环，
+    权重同步经 FSDP/DDP 梯度 allreduce 自然生效，指标由 rank 0 归并。"""
 
     def __init__(
         self,
@@ -230,6 +171,7 @@ class GranularGrpoTrainer:
         dump_trajectory: bool = False,
         device: torch.device | None = None,
         stage: StageTag | None = None,
+        dist_context: DistributedContext | None = None,
         evaluation: EvaluationPhase | None = None,
     ) -> None:
         if config.experiment.group == "sequential":
@@ -272,66 +214,40 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
         self.stage_tag = stage if stage is not None else StageTag()
-        # 装配期单点选设备（local rank 0 的加速器）；分布式 sharding 属 T09。
-        # 所有模型与 rollout/打分张量随该设备放置——autocast(device_type)
-        # 只影响前向 dtype，不移动任何张量
-        self._amp = AmpContext(
-            device=(
-                device if device is not None
-                else torch.device(
-                    "cuda" if torch.cuda.is_available() else "cpu",
-                )
-            ),
-            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        self.runtime = TrainingRuntime.build(
+            config, run_artifacts, device=device, dist_context=dist_context,
         )
-        # 全循环的六条命名 RNG 流（TrainingRngStreams 注册表，resume 按名
-        # 保存/恢复）：rollout 相与条件分布共享主流；real 采样 / 判别器
-        # 更新 / AUC / fake 置换 / base 分区生成各自独立派生流（互不漂移）
-        self.rng = TrainingRngStreams(config.schedule.seed)
-        self.policy = GroupPolicy.build(
-            config, self.rng.rollout, self._amp.device,
-        )
-        sampler = self._assemble_sampler(self.policy.field)
-        self.rewards = self._assemble_rewards()
         # 策略侧执行序两相（eval 相 rollout → train 相逐 k 更新）合成
         # 单 iteration 循环体（判别器侧协作者见 self.rewards）
         self.loop = IterationLoop(
             config=config,
-            rollout=RolloutPhase(
-                config,
-                sampler,
-                self.rewards.update.scorer,
-                self.rng.rollout,
-                condition_sampler=self.policy.conditions,
-                device_type=self._amp.device_type,
-                autocast_dtype=self._amp.dtype,
-                device=self._amp.device,
-                # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
-                # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
-                base_generator=self.rng.base_partition,
-            ),
-            updater=StepwisePolicyUpdate(
-                sampler=sampler,
-                optimizer=self.policy.optimizer,
-                loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
-                device_type=self._amp.device_type,
-                amp_dtype=self._amp.dtype,
-            ),
-            amp=self._amp,
+            rollout=self.runtime.rollout,
+            updater=self.runtime.updater,
+            amp=self.runtime.amp,
+        )
+        # 续训状态分片存取（per-rank 落盘/恢复的单点，checkpoint 同节奏）
+        self.resume_store = ResumeStore(
+            run_artifacts.paths.checkpoints,
+            self.stage_tag.checkpoint_prefix,
+            self.runtime.dist,
         )
         # 评测相（Baseline 采样 / 里程碑解码评测 / RL 后重采）；测试可注入替身。
         # manifest 由本侧从 run 目录装载注入（eval 不反向依赖 train 契约模块）：
-        # 组3 stage-2 各自重读盘上 manifest，天然含 stage-1 已回写的样本路径
+        # 组3 stage-2 各自重读盘上 manifest，天然含 stage-1 已回写的样本路径。
+        # 评测执行全 rank 参与（FSDP 集合前向），样本写盘闸门只开在 rank 0
         self.evaluation = evaluation if evaluation is not None else (
             ManifestEvaluation.build(
                 config,
                 run_artifacts,
-                sampler,
+                self.runtime.updater.sampler,
                 self.stage_tag.stage,
                 BaselineManifest.load(run_artifacts.paths.manifest),
-                amp=self._amp,
+                amp=self.runtime.amp,
+                write_enabled=self.runtime.dist.rank == 0,
             )
         )
+
+    # —— 既有公开访问面（tests 与 resume 模块消费；组件归 runtime 持有）——
 
     @property
     def unet(self) -> torch.nn.Module:
@@ -340,13 +256,44 @@ class GranularGrpoTrainer:
         return self.policy.unet
 
     @property
+    def policy(self) -> GroupPolicy:
+        """本组 policy 侧装配（可训练网络 + 采样场 + 条件分布 + 优化器）。"""
+        return self.runtime.policy
+
+    @property
+    def rewards(self) -> RewardCoordinator:
+        """判别器侧协作者组（种植/更新/AUC）。"""
+        return self.runtime.rewards
+
+    @property
+    def updater(self) -> StepwisePolicyUpdate:
+        """逐 k 更新编排（log π 重算 → clipped loss → 优化器步）。"""
+        return self.runtime.updater
+
+    @property
+    def rollout(self) -> RolloutPhase:
+        """rollout 相编排（eval + no_grad 的执行序第 1 相）。"""
+        return self.runtime.rollout
+
+    @property
+    def rng(self) -> TrainingRngStreams:
+        """六条命名 RNG 流注册表（续训状态机按名保存/恢复的枚举面）。"""
+        return self.runtime.rng
+
+    @property
     def device(self) -> torch.device:
         """装配期单点选定的训练设备（续训状态恢复的迁入目标）。"""
-        return self._amp.device
+        return self.runtime.amp.device
+
+    @property
+    def amp(self) -> AmpContext:
+        """数值口径（device + autocast dtype）。"""
+        return self.runtime.amp
 
     def seed_base_partition(self) -> None:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
-        （未参与任何梯度步）rollout 产出填满 base 分区（spec 补钉）。"""
+        （未参与任何梯度步）rollout 产出填满 per-rank base 分区（spec
+        补钉；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。"""
         self.rewards.seed_base(
             self.loop.base_partition_samples(
                 self.rewards.buffer.base_capacity,
@@ -354,25 +301,37 @@ class GranularGrpoTrainer:
         )
 
     def run(self, *, resume: bool = False) -> int:
-        """训练主循环：base 分区自动生成 → Baseline 采样（冻结初始
-        policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停判定）
-        → RL 后重采 → checkpoint 与续训状态落盘。``resume=True`` 时从
-        run 目录最新续训状态恢复（全清单覆写，resume 模块），回退指标流
-        中恢复点之后的半截事件后从恢复点继续——base 分区种子生成与
-        Baseline 采样随之跳过（buffer 随状态整体回归；Baseline 冻结只采
-        一次，恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）
-        的续训是完整无操作：不重执行收官重采、不改写任何工件。返回完成
-        的 iteration 数（config 口径的累计完成数；早停时小于
-        max_iterations；零训练迭代时 = 恢复点）。"""
+        """训练主循环：base 分区自动生成 → Baseline 采样（rank 0，冻结
+        初始 policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停
+        判定）→ RL 后重采（rank 0）→ checkpoint 与续训状态落盘。
+        ``resume=True`` 时从 run 目录各 rank 的最新续训状态恢复（全清单
+        覆写，resume 模块），rank 0 回退指标流中恢复点之后的半截事件后
+        从恢复点继续——base 分区种子生成与 Baseline 采样随之跳过（buffer
+        随状态整体回归；Baseline 冻结只采一次，恢复点 policy 已非初始
+        权重）。恢复点已达标（无训练迭代）的续训是完整无操作：不重执行
+        收官重采、不改写任何工件。返回完成的 iteration 数（config 口径
+        的累计完成数；早停时小于 max_iterations；零训练迭代时 = 恢复
+        点）。"""
+        dist = self.runtime.dist
         start_iteration = 0
         if resume:
-            start_iteration = resume_latest(self)
-            self.artifacts.rewind_events(start_iteration, self.stage_tag.stage)
+            start_iteration = self.resume_store.restore(self)
+            if dist.rank == 0:
+                # 指标流回退只在 rank 0（RunArtifacts 的 rank 0 写盘契约）；
+                # barrier 保证回退先于任何 rank 的下一事件追加
+                self.artifacts.rewind_events(
+                    start_iteration, self.stage_tag.stage,
+                )
+            dist.barrier()
         self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         if not resume:
             self.seed_base_partition()
-            self.evaluation.sample_baseline()  # 冻结只采一次：更新开始前的当前权重即初始 policy
+            # Baseline 采样（冻结只采一次：更新开始前的当前权重即初始
+            # policy）。policy 采样前向是 FSDP 集合操作，全 rank 对称
+            # 参与；样本落盘与 manifest 回写是 rank 0 独写产物契约
+            # （eval 侧 write_enabled 闸门）
+            self.evaluation.sample_baseline()
         pairs: list[TrainingLogProbPair] = []
         last_checkpoint = start_iteration
         completed = start_iteration  # 零训练迭代的续训（恢复点已达标）报告恢复点本身
@@ -402,9 +361,10 @@ class GranularGrpoTrainer:
                 loss_terms["discriminator"] = report.loss_discriminator
             batch_size_k = self.config.reward.disc_batch_size_k
             zone_sizes = self.rewards.buffer.zone_sizes()
-            self.artifacts.append_event(IterEvent(
+            self.runtime.merger.emit(IterEvent(
                 iteration=iteration,
                 stage=self.stage_tag.stage,
+                rank=dist.rank,
                 modality=record.modality,
                 anchor_eval_reward=record.anchor_eval_reward,
                 intra_group_reward_std=record.intra_group_reward_std,
@@ -429,8 +389,7 @@ class GranularGrpoTrainer:
             ):
                 # checkpoint 周期之外，每个里程碑也强制落盘（config 契约：
                 # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须产出）
-                self._write_checkpoint(completed)
-                save_resume_state(self, completed)
+                self._checkpoint_at(completed)
                 last_checkpoint = completed
             if milestone_due:
                 # 里程碑评测相与 rollout/baseline 同为 eval（相位敏感层的
@@ -438,121 +397,105 @@ class GranularGrpoTrainer:
                 self.policy.eval_phase()
                 if self._run_milestone(completed):
                     break  # 早停：早停签名命中，最终 policy 状态已随里程碑 checkpoint 落盘
+            dist.barrier()  # 执行序第 3 步：iteration 节奏的集合点
         if last_checkpoint < completed:
             # 收尾兜底只允许前向推进：恢复点已在目标之后（收缩 max_iterations
-            # 的续训 = 无操作）时不得把更后的训练态改写成更小的 iteration 标签
-            self._write_checkpoint(completed)
-            save_resume_state(self, completed)
+            # 的续训 = 无操作）时不得把更后的训练态改写成更小的 iteration
+            # 标签；早停时 completed < max_iterations，收尾落实际完成数
+            self._checkpoint_at(completed)
         self.policy.eval_phase()  # 重采与 baseline 同为 eval 相（差异唯一归因于 RL）
         if completed > start_iteration:
             # 本次调用执行了训练才收官重采：恢复点已达标的无操作续训不重采
-            # （policy 未变，重采只因 RNG 流位置不同而静默改写产物）
-            self.evaluation.resample()  # RL 后同 seed 同条件重采（共用同一 manifest）
-        if pairs:
-            self.artifacts.paths.training_diagnostic.write_text(
-                TrainingDiagnostic(logprob_pairs=pairs).model_dump_json(indent=2),
-                encoding="utf-8",
-            )
+            # （policy 未变，重采只因 RNG 流位置不同而静默改写产物）。
+            # 同 Baseline：采样全 rank 集合参与、落盘 rank 0 独写（eval 侧
+            # write_enabled 闸门）
+            self.evaluation.resample()
+        self._write_diagnostic(pairs)
         return completed
 
     def _run_milestone(self, iteration: int) -> bool:
         """里程碑解码评测 → ``milestone`` 事件写入训练指标流 → 早停判定
         消费该流。返回是否早停（解码评测只发生在本路径，不进逐 iteration
         循环；本阶段的早停判定只消费本阶段的流前缀——组3 两阶段事件同流
-        存放，按 stage 过滤防跨阶段串扰）。"""
+        存放，按 stage 过滤防跨阶段串扰）。评测（policy 采样是 FSDP 集合
+        前向）全 rank 对称参与；事件写出与早停 verdict 判定只在 rank 0
+        （RunArtifacts 的 rank 0 写盘契约），verdict 经广播同步——早停是
+        全局决定，各 rank 必须一致 break（分歧会让 iteration 节奏的
+        barrier 互等死锁）。"""
+        dist = self.runtime.dist
         metrics: MilestoneMetrics = self.evaluation.milestone_metrics()
-        stage_events = [
-            event for event in self.artifacts.read_events()
-            if event.get("stage", 1) == self.stage_tag.stage
-        ]
-        verdict = EarlyStopJudge(self.config).judge(
-            stage_events, current_fid=metrics.fid,
-        )
-        criteria = dict(metrics.summary())
-        criteria["plateau_stalled"] = float(verdict.plateau_stalled)
-        criteria["hacking_signature"] = float(verdict.hacking_signature)
-        self.artifacts.append_event(MilestoneEvent(
-            iteration=iteration,
-            stage=self.stage_tag.stage,
-            fid=metrics.fid,
-            kid=metrics.kid,
-            ssim=metrics.ssim,
-            mae=metrics.mae,
-            psnr=metrics.psnr,
-            criteria_summary=criteria,
-            early_stop=verdict.stop,
-            early_stop_reason=verdict.reason,
-        ))
-        return verdict.stop
-
-    def _assemble_sampler(self, field: VelocityField) -> RolloutSampler:
-        """policy 采样封装装配（netbuild 日程 + 本组采样场 + SDE 核）。"""
-        policy = self.config.policy
-        scheduler = NetworkAssembler.rflow_scheduler(
-            num_inference_steps=policy.num_inference_steps,
-            input_img_size_numel=policy.input_img_size_numel,
-        )
-        kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
-        return RolloutSampler(field, kernel, TrajectoryCursor(scheduler))
-
-    def _assemble_rewards(self) -> RewardCoordinator:
-        """判别器侧装配（T05 管线的同一组合方式）。"""
-        config = self.config
-        if config.artifacts.discriminator_config_json is None:
-            raise ValueError(
-                "训练循环需要判别器网络配置（discriminator_config_json）："
-                "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
-                "随机初始化起步的在线训练，冷启动工作流）"
+        if dist.rank == 0:
+            stage_events = [
+                event for event in self.artifacts.read_events()
+                if event.get("stage", 1) == self.stage_tag.stage
+            ]
+            verdict = EarlyStopJudge(self.config).judge(
+                stage_events, current_fid=metrics.fid,
             )
-        # 网络构建（含冷启动随机初始化）在 schedule.seed 的派生流下进行，
-        # 并 fork 隔离全局 RNG——同 config 的两次冷启动判别器权重逐位
-        # 可复现，且不扰动进程全局 RNG 状态（sampling generators 独立
-        # 对象本就不受影响）
-        with torch.random.fork_rng():
-            torch.manual_seed(config.schedule.seed + 6)
-            scorer = RewardScorer(
-                NetworkArtifact(
-                    config=NetworkAssembler.load_json(
-                        config.artifacts.discriminator_config_json,
-                    ),
-                    checkpoint=config.artifacts.discriminator_ckpt,
-                ),
-                config.reward,
-                ChannelStats.load(config.reward.channel_stats_json),
-            )
-        scorer.to(self._amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
-        update = OnlineUpdate(
-            scorer=scorer,
-            buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
-            real_sampler=RealPoolSampler(
-                LatentManifest.load(
-                    config.reward.real_pool_manifest, kind="real_pool",
-                ),
-                self.rng.real_pool,
-                self._amp.device,
-            ),
-            config=config.reward,
-            generator=self.rng.disc_update,
-        )
-        auc = HeldOutAuc(
-            heldout_manifest=LatentManifest.load(
-                config.reward.heldout_real_manifest, kind="heldout_real",
-            ),
-            scorer=scorer,
-            generator=self.rng.heldout_auc,
-            device=self._amp.device,
-        )
-        return RewardCoordinator(update, auc, self.rng.fake_shuffle)
+            criteria = dict(metrics.summary())
+            criteria["plateau_stalled"] = float(verdict.plateau_stalled)
+            criteria["hacking_signature"] = float(verdict.hacking_signature)
+            self.artifacts.append_event(MilestoneEvent(
+                iteration=iteration,
+                stage=self.stage_tag.stage,
+                fid=metrics.fid,
+                kid=metrics.kid,
+                ssim=metrics.ssim,
+                mae=metrics.mae,
+                psnr=metrics.psnr,
+                criteria_summary=criteria,
+                early_stop=verdict.stop,
+                early_stop_reason=verdict.reason,
+            ))
+            return dist.broadcast_flag(verdict.stop)
+        return dist.broadcast_flag(False)  # 返回值被 rank 0 的广播覆盖
 
-    def _write_checkpoint(self, iteration: int) -> None:
-        """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict）。
-        判别器经 loadable_state_dict 固化有效权重（spectral norm 启用时
-        仍可严格重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无
-        前缀 = 历史布局逐字一致）。续训全状态由 resume.save_resume_state
-        同节奏落盘。"""
+    def _write_diagnostic(self, pairs: list[TrainingLogProbPair]) -> None:
+        """训练侧 log-prob 对落盘（--dump-trajectory）：多 rank 下归并到
+        rank 0（按 rank 升序拼接，per-rank 记录全量保留）；单进程直写。
+        本次运行未产出新对（零训练迭代的续训 = 恢复点已达标）不写——
+        空清单会覆盖既有诊断工件，把文档化的 no-op resume 变成对一致性
+        证据的破坏。"""
+        if not self._dump or not pairs:
+            return
+        dist = self.runtime.dist
+        gathered = dist.gather(pairs)
+        if dist.rank != 0:
+            return
+        merged = [pair for source in gathered for pair in source]
+        self.artifacts.paths.training_diagnostic.write_text(
+            TrainingDiagnostic(logprob_pairs=merged).model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+
+    def _checkpoint_at(self, iteration: int) -> None:
+        """指定 iteration 的 checkpoint 节奏（全 rank 的单一入口）：full
+        state 导出是 FSDP 集合操作（FULL_STATE_DICT），必须全 rank 调用本
+        方法，且**只导出一次**——产物 checkpoint 写盘（rank 0）与续训状态
+        分片共享同一份（二次导出会让每 rank 同时驻留两份完整 CPU 权重，
+        checkpoint 期 host 内存翻倍）；产物 checkpoint 只 rank 0 独写
+        （契约文件名不变），续训状态每 rank 写自己的分片文件。"""
+        full_state = self.policy.full_state()
+        if self.runtime.dist.rank == 0:
+            self._write_checkpoint(iteration, full_state)
+        self.resume_store.save(self, iteration, full_state)
+
+    def _write_checkpoint(
+        self, iteration: int, full_state: dict,
+    ) -> None:
+        """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict，
+        rank 0 独写——多 rank 下仅 rank 0 产出契约工件）。
+        policy 经 GroupPolicy.full_state 固化 full state（FSDP 装配下由
+        PolicySharding 导出、键形与裸网络一致；导出本身是集合操作，
+        ``full_state`` 必传——由调用方全 rank 完成导出后传入，本方法内部
+        不按需导出（rank0-only 导出会互等死锁））；判别器经
+        loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
+        重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
+        历史布局逐字一致）。续训全状态由 ResumeStore.save 同节奏
+        落盘（per-rank 分片文件）。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
-            self.policy.network.state_dict(),
+            full_state,
             self.artifacts.paths.checkpoints / (
                 f"{prefix}{POLICY_CHECKPOINT_TEMPLATE.format(iteration=iteration)}"
             ),

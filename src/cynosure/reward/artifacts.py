@@ -89,6 +89,20 @@ class LatentManifest(BaseModel):
         manifest._path = path
         return manifest
 
+    def with_entries(self, entries: list[PoolEntry]) -> "LatentManifest":
+        """同源 manifest 的条目子集视图：modalities 分层计数重派生、
+        装载路径基准保留——条带切片（分布式 real 侧）等消费方的装配入口。"""
+        sliced = LatentManifest(
+            kind=self.kind,
+            encoder=self.encoder,
+            latent_shape=self.latent_shape,
+            split_seed=self.split_seed,
+            split_sizes=self.split_sizes,
+            entries=entries,
+        )
+        sliced._path = self._path
+        return sliced
+
     def load_latent(self, entry: PoolEntry) -> torch.Tensor:
         """装载单条 latent（按条目懒加载，供判别器 real 切片采样）。"""
         if self._path is None:

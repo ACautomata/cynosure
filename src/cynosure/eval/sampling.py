@@ -94,6 +94,7 @@ class ManifestVolumeSampler:
         decoder: VolumeDecoder,
         paths: "RunPaths",
         decode_batch_size: int,
+        write_enabled: bool = True,
     ) -> None:
         self._stage = stage
         self._manifest = manifest
@@ -101,6 +102,10 @@ class ManifestVolumeSampler:
         self._decoder = decoder
         self._paths = paths
         self._decode_batch_size = decode_batch_size
+        # 产物写盘闸门（分布式）：policy 采样前向是 FSDP 集合操作，评测
+        # 执行必须全 rank 参与；样本落盘与 manifest 回写是 rank 0 独写
+        # 产物契约——非 writer rank 冗余产出一致样本但不落盘
+        self._write_enabled = write_enabled
 
     def sample_baseline(self) -> None:
         """冻结初始 policy 的 Baseline 采样（冻结只采一次；须在首个
@@ -118,7 +123,9 @@ class ManifestVolumeSampler:
 
         baseline 相位跳过 ``baseline_sample`` 已填充的条目——「冻结只采
         一次」的工件级幂等：续训恢复点 policy 已非冻结初始权重，重采会
-        把训练后样本污染进基线（experiment-design「对照基线」）。"""
+        把训练后样本污染进基线（experiment-design「对照基线」）。
+        ``write_enabled=False``（分布式非 0 rank）照常采样与解码（集合
+        安全），只跳过写盘与 manifest 回写。"""
         entries = self._manifest.entries_for_stage(self._stage)
         if phase == PHASE_BASELINE:
             entries = [
@@ -127,6 +134,8 @@ class ManifestVolumeSampler:
         for start in range(0, len(entries), self._decode_batch_size):
             chunk = entries[start:start + self._decode_batch_size]
             volumes = self._volumes(chunk)
+            if not self._write_enabled:
+                continue
             for entry, volume in zip(chunk, volumes[:, 0]):
                 relative = f"samples/stage{self._stage}/{phase}/{entry.index:04d}.pt"
                 target = self._paths.root / relative
@@ -138,7 +147,8 @@ class ManifestVolumeSampler:
                     entry.baseline_sample = relative
                 else:
                     entry.resample_sample = relative
-        self._manifest.write(self._paths.manifest)
+        if self._write_enabled:
+            self._manifest.write(self._paths.manifest)
 
     def _volumes(self, entries: list[ManifestEntry]) -> torch.Tensor:
         """一批条目的解码像素体 [k, 1, X, Y, Z]（块内一次解码，与

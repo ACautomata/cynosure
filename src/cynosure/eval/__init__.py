@@ -96,6 +96,7 @@ class ManifestEvaluation:
         amp: AmpContext,
         decoder: VolumeDecoder | None = None,
         extractor: SliceFeatureExtractor | None = None,
+        write_enabled: bool = True,
     ) -> "ManifestEvaluation":
         """按 config 装配评测相（manifest 由调用方从 run 目录装载注入；
         数值口径随训练循环的 AmpContext 单点传入；decoder/extractor 可
@@ -131,6 +132,7 @@ class ManifestEvaluation:
             resolved_decoder,
             artifacts.paths,
             decode_batch_size=config.schedule.decode_batch_size,
+            write_enabled=write_enabled,
         )
         return cls(evaluator, volume_sampler)
 

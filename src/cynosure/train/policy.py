@@ -14,6 +14,7 @@ base 冻结经断言验证（issue #23 验收）：组2 装配期显式关闭 UN
 import torch
 
 from cynosure.config import CynosureConfig
+from cynosure.distributed.shard import PolicySharding
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
 from cynosure.policy.field import BareConditionField, CfgCombinedField, VelocityField
@@ -50,9 +51,14 @@ class GroupPolicy:
         config: CynosureConfig,
         generator: torch.Generator,
         device: torch.device,
+        sharding: PolicySharding | None = None,
     ) -> "GroupPolicy":
         """按组装配（三组实验矩阵的唯一分派点）：网络工件经 netbuild 装载、
-        可训练对象与采样场/条件分布按 experiment.group 落位。"""
+        可训练对象与采样场/条件分布按 experiment.group 落位。
+
+        ``sharding``（FSDP 封装）在 optimizer 构建之前应用——优化器状态
+        活在分片后参数上；单进程为 None（网络原样透传）。
+        """
         group = config.experiment.group
         if group == "sequential":
             raise ValueError(
@@ -64,14 +70,10 @@ class GroupPolicy:
             checkpoint=config.artifacts.unet_ckpt,
         )).to(device)
         mapping = ModalityMapping.load(config.artifacts.modality_mapping_json)
+        conditions: ConditionSampler
         if group == "cross-modal":
             network = cls._assemble_cross_modal(unet, config, device)
-            field: VelocityField = BareConditionField(
-                unet,
-                network,
-                config.policy.source_latent_scale_factor,
-            )
-            conditions: ConditionSampler = CrossModalConditionSampler(
+            conditions = CrossModalConditionSampler(
                 mapping,
                 [tuple(pair) for pair in config.experiment.cross_modal_pairs],
                 SourceLatentPool(
@@ -85,14 +87,36 @@ class GroupPolicy:
             )
         else:
             network = unet
-            field = CfgCombinedField(unet)
             conditions = ModalLabelConditionSampler(mapping, generator, device)
+        if sharding is not None:
+            # 分片先于采样场构建：field 必须引用 FSDP wrapper（裸网络的
+            # 前向不进分片的梯度聚合路径）；optimizer 最后构建（状态活在
+            # 分片后参数上）
+            network = sharding.wrap(network)
+        if group == "cross-modal":
+            field: VelocityField = BareConditionField(
+                unet,
+                network,
+                config.policy.source_latent_scale_factor,
+            )
+        else:
+            field = CfgCombinedField(network)
         optimizer = torch.optim.AdamW(
             network.parameters(),
             lr=config.policy.policy_lr,
             weight_decay=config.policy.policy_weight_decay,
         )
-        return cls(unet, network, field, conditions, optimizer)
+        return cls(unet if group == "cross-modal" else network,
+                   network, field, conditions, optimizer)
+
+    def full_state(self) -> dict:
+        """可训练网络权重的 full state dict（裸网络键形，checkpoint 落盘
+        与续训状态的保存形态；FSDP 装配下由 PolicySharding 导出）。"""
+        return PolicySharding.full_state_dict(self._network)
+
+    def load_full_state(self, state: dict) -> None:
+        """full state dict 整体装载（续训恢复路径；FSDP 内部分片分发）。"""
+        PolicySharding.load_full_state_dict(self._network, state)
 
     @staticmethod
     def _assemble_cross_modal(

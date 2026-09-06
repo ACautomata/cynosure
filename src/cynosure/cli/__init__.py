@@ -1,18 +1,21 @@
 """cynosure 命令行：train / eval / prepare 三子命令与 config schema 校验
 ——全库唯一测试 seam（spec「Testing Decisions」）。
 
-三子命令共享同一 config schema；dispatch 前统一校验。train 自 #21 起
-执行单进程 Granular-GRPO 训练循环（MGAI → 逐 k 梯度步 → 判别器 Online
-update → iter 事件流 + checkpoint）；``--dump-trajectory`` 额外产出
-fixture 诊断工件（轨迹双列/log-prob 对）；``--resume`` 从既有 run 目录
-的最新续训状态恢复训练（T07 状态机，仅单阶段组、须显式 --run-dir）。
-分布式 torchrun 入口（FSDP 初始化等）属 orchestration ticket（T09）；
-分布式启动须经显式 --run-dir（跨 rank 的 run 目录 barrier 见 train）。
+三子命令共享同一 config schema；dispatch 前统一校验。train 执行
+Granular-GRPO 训练循环（MGAI → 逐 k 梯度步 → 判别器 Online update →
+iter 事件流 + checkpoint），单进程与 torchrun 多进程同一条代码路径
+（分布式装配点在 TrainingRuntime：FSDP 分片、判别器 DDP、rank 0 指标
+归并、per-rank 续训状态；进程组经 CLI 装配一次、注入 trainer）；``--dump-trajectory``
+额外产出 fixture 诊断工件（轨迹双列/log-prob 对）；``--resume`` 从既有
+run 目录的最新续训状态恢复训练（仅单阶段组、须显式 --run-dir）。
+分布式启动（检测到 RANK env）必须显式 --run-dir——默认目录按进程
+时间戳生成，无法跨 rank 对齐。
 """
 
 import argparse
 import json
 import os
+import pickle
 import shutil
 import sys
 from pathlib import Path
@@ -21,6 +24,7 @@ from typing import TextIO
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.distributed import DistributedContext
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
@@ -121,24 +125,22 @@ class CynosureCli:
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
-        if os.environ.get("RANK") not in (None, "0"):
-            # 单进程训练循环（#21 tracer bullet）：FSDP 梯度聚合与 rank 0
-            # 归并落盘由 orchestration ticket（T09）交付。非 0 rank 放行会
-            # 各自跑完整循环——重复追加 iter 事件、覆写同一 checkpoint 文件
-            # 名（RunArtifacts 的 rank 0 写盘契约被静默破坏），故显式拒绝
-            print(
-                f"检测到 torchrun 非 0 rank（RANK={os.environ['RANK']}）："
-                "训练循环当前为单进程实现（FSDP 梯度聚合与 rank 0 归并落盘"
-                "由 orchestration ticket 交付），非 0 rank 显式拒绝",
-                file=self._stderr,
-            )
-            return _EXIT_USAGE_ERROR
         if args.dump_trajectory and not config.fixture_mode:
             # 诊断工件属 fixture 诊断模式（spec「产物工件契约」）：生产采样
             # 诊断随训练循环 ticket 交付，当前显式拒绝、不建 run 目录
             print(
                 "轨迹诊断当前仅支持 fixture（fixture_mode=true）：生产 config "
                 "须先经 fixture_mode=true 显式声明",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        env_rank = DistributedContext.env_rank()
+        if args.run_dir is None and env_rank is not None:
+            # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
+            print(
+                "检测到 torchrun 环境（RANK="
+                f"{env_rank}）：默认 run 目录按进程时间戳生成、"
+                "无法跨 rank 对齐，分布式启动必须显式指定 --run-dir",
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
@@ -163,15 +165,6 @@ class CynosureCli:
                     "（training.json）照常产出",
                     file=self._stderr,
                 )
-        if args.run_dir is None and "RANK" in os.environ:
-            # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
-            print(
-                "检测到 torchrun 环境（RANK="
-                f"{os.environ['RANK']}）：默认 run 目录按进程时间戳生成、"
-                "无法跨 rank 对齐，分布式启动必须显式指定 --run-dir",
-                file=self._stderr,
-            )
-            return _EXIT_USAGE_ERROR
         run_root = (
             Path(args.run_dir) if args.run_dir
             else RunArtifacts.default_root(config)
@@ -187,24 +180,11 @@ class CynosureCli:
             artifacts = RunArtifacts(paths)
             print(f"续训目标 run 目录: {artifacts.paths.root}", file=self._stdout)
         else:
-            try:
-                artifacts = RunArtifacts.init(config, run_root)
-            except FileExistsError:
-                print(
-                    f"run 目录已存在（不静默覆盖；续训请走 --resume 入口）: "
-                    f"{run_root}",
-                    file=self._stderr,
-                )
-                return _EXIT_USAGE_ERROR
-            except TimeoutError:
-                print(f"等待 rank 0 创建 run 目录超时: {run_root}", file=self._stderr)
-                return _EXIT_USAGE_ERROR
-            print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
-        if run_trajectory_diagnostic:
-            code = self._dump_trajectory(config, artifacts)
-            if code != 0:
-                return code
-        return self._run_training(config, artifacts, args.dump_trajectory, resume=resume)
+            artifacts = None  # 新 run 的创建在进程组 rendezvous 之后（广播裁决）
+        return self._run_training(
+            config, artifacts, args.dump_trajectory,
+            resume=resume, run_root=run_root,
+        )
 
     def _rollback_untouched_run(self, artifacts: RunArtifacts) -> None:
         """训练装配/启动失败且回滚 run 目录：目录若除 init 契约最小集外
@@ -223,44 +203,103 @@ class CynosureCli:
             shutil.rmtree(paths.root)
 
     def _run_training(
-        self, config: CynosureConfig, artifacts: RunArtifacts,
+        self, config: CynosureConfig, artifacts: RunArtifacts | None,
         dump_trajectory: bool, resume: bool = False,
+        run_root: Path | None = None,
     ) -> int:
-        """训练循环（ticket #21 tracer bullet，#23 扩展三组）：MGAI →
+        """训练循环（ticket #21 tracer bullet 起，#24 分布式化）：MGAI →
         逐 k 梯度步 → 判别器 Online update → iter 事件流 + checkpoint
-        落盘；组3 经 SequentialTrainer 序贯两阶段（单 run 目录）；
-        ``--dump-trajectory`` 额外产出训练侧 log-prob 对（training.json）；
-        ``--resume`` 从 run 目录最新续训状态恢复（T07 状态机，仅单阶段）。
-        续训失败不回滚 run 目录（既有产物非本次预占）。"""
-        # 构造期 = 装配/输入契约（网络与 manifest 工件装载、跨字段守卫）：
-        # checkpoint 键/shape 不匹配的严格装载失败（RuntimeError）同属
-        # 输入契约违反，得到干净消息 + 未产出工件的 run 目录回滚
+        落盘；进程组在此装配一次（单进程 = world-1 恒等退化）并注入
+        trainer（组3 两阶段共享）；组3 经 SequentialTrainer 序贯两阶段
+        （单 run 目录）；``--dump-trajectory`` 额外产出训练侧 log-prob 对
+        （training.json）；``--resume`` 从 run 目录各 rank 的最新续训状态
+        恢复（仅单阶段）。续训失败不回滚 run 目录（既有产物非本次预占）。
+
+        rank 非对称的 pre-flight 动作（新 run 目录创建、``--dump-trajectory``
+        轨迹诊断）一律 rank 0 执行 + ``broadcast_flag`` 广播裁决：文件
+        存在性无法携带「本轮新建 vs 上轮遗留」的裁决，任何 rank 单方面
+        的失败退出都会让其余 rank 停在 rendezvous（挂死）——usage 错误
+        必须全 rank 一致返回。训练装配失败的 run 目录回滚同样只由
+        rank 0 执行（多 rank 各自 rmtree 同一共享目录是 stat/rmtree 竞态）。"""
+        dist = DistributedContext.bootstrap()
         try:
-            trainer: GranularGrpoTrainer | SequentialTrainer
-            if config.experiment.group == "sequential":
-                trainer = SequentialTrainer(config, artifacts)
-            else:
-                trainer = GranularGrpoTrainer(
-                    config, artifacts, dump_trajectory=dump_trajectory,
+            if artifacts is None:
+                artifacts = self._init_new_run(config, run_root, dist)
+                if artifacts is None:
+                    return _EXIT_USAGE_ERROR
+            if dump_trajectory and config.experiment.group == "modal-label":
+                # 轨迹诊断是独立单进程路径：分布式下只 rank 0 产出，
+                # 失败经广播让全 rank 一致返回（其余 rank 不得进入训练）
+                ok = (
+                    dist.rank == 0
+                    and self._dump_trajectory(config, artifacts) == 0
                 )
-        except (ValueError, FileNotFoundError, RuntimeError) as exc:
-            print(f"训练输入契约违反: {exc}", file=self._stderr)
-            self._rollback_untouched_run(artifacts)
-            return _EXIT_USAGE_ERROR
-        try:
-            completed = trainer.run(resume=resume)
-        except (ValueError, FileNotFoundError) as exc:
-            print(f"训练输入契约违反: {exc}", file=self._stderr)
-            if not resume:
-                self._rollback_untouched_run(artifacts)
-            return _EXIT_USAGE_ERROR
-        if os.environ.get("RANK") in (None, "0"):
+                if not dist.broadcast_flag(ok):
+                    return _EXIT_USAGE_ERROR
+            # 构造期 = 装配/输入契约（网络与 manifest 工件装载、跨字段守卫）：
+            # checkpoint 键/shape 不匹配的严格装载失败（RuntimeError）与
+            # 损坏文件的反序列化失败（UnpicklingError）同属输入契约违反，
+            # 得到干净消息 + 未产出工件的 run 目录回滚
+            try:
+                trainer: GranularGrpoTrainer | SequentialTrainer
+                if config.experiment.group == "sequential":
+                    trainer = SequentialTrainer(
+                        config, artifacts, dist_context=dist,
+                    )
+                else:
+                    trainer = GranularGrpoTrainer(
+                        config, artifacts, dump_trajectory=dump_trajectory,
+                        dist_context=dist,
+                    )
+            except (
+                ValueError, FileNotFoundError, RuntimeError,
+                pickle.UnpicklingError,
+            ) as exc:
+                print(f"训练输入契约违反: {exc}", file=self._stderr)
+                if dist.rank == 0:
+                    self._rollback_untouched_run(artifacts)
+                return _EXIT_USAGE_ERROR
+            try:
+                completed = trainer.run(resume=resume)
+            except (ValueError, FileNotFoundError) as exc:
+                print(f"训练输入契约违反: {exc}", file=self._stderr)
+                if not resume and dist.rank == 0:
+                    self._rollback_untouched_run(artifacts)
+                return _EXIT_USAGE_ERROR
+        finally:
+            dist.destroy()
+        if dist.rank == 0:
             print(
                 f"训练完成（{completed} iteration）：iter 事件流 "
                 f"{artifacts.paths.metrics}、checkpoint {artifacts.paths.checkpoints}",
                 file=self._stdout,
             )
         return 0
+
+    def _init_new_run(
+        self, config: CynosureConfig, run_root: Path | None,
+        dist: DistributedContext,
+    ) -> RunArtifacts | None:
+        """新 run 目录的装配：rank 0 创建（拒绝预存目录），成败经广播
+        裁决——非 0 rank 等裁决而非轮询文件系统，预存目录下全体一致
+        返回 usage error。"""
+        artifacts: RunArtifacts | None = None
+        if dist.rank == 0:
+            try:
+                artifacts = RunArtifacts.init(config, run_root)
+            except FileExistsError:
+                print(
+                    f"run 目录已存在（不静默覆盖；续训请走 --resume 入口）: "
+                    f"{run_root}",
+                    file=self._stderr,
+                )
+            else:
+                print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
+        if not dist.broadcast_flag(artifacts is not None):
+            return None
+        if artifacts is None:
+            artifacts = RunArtifacts(RunArtifacts.layout(run_root))
+        return artifacts
 
     def _dump_trajectory(
         self, config: CynosureConfig, artifacts: RunArtifacts,

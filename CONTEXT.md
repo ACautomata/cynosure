@@ -96,6 +96,38 @@ GRPO 中共享同一初始噪声的 G 条 rollout 为一组；advantage 是该�
 Granular-GRPO 里续跑采样所用的时间步间隔 λ；多粒度（multi-granularity）指多个 λ 的 reward 融合。
 _Avoid_: 分辨率、尺度（尺度另有所指，见单/多尺度判别器）
 
+### 分布式执行
+
+**Rank（进程秩）**:
+torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。
+_Avoid_: 进程号、节点（node 是机器，rank 是进程）
+
+**World size（进程组规模）**:
+参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。
+
+**FSDP full-shard（全分片）**:
+可训练网络的参数/梯度/优化器状态按 rank 切分、前向按需重组的数据并行方式；梯度 allreduce 保证各 rank 权重同步（ADR-0003：同构 rank、无角色划分）。
+
+**DDP replica（判别器完整副本）**:
+判别器不参与分片的分布式口径：每 rank 完整副本 + 标准 DDP 梯度 allreduce；各 rank 用本 rank fake + Real sample pool 切片更新。
+_Avoid_: 判别器分片
+
+**Rank-sliced pool（真实样本库切片）**:
+Real sample pool 按序列分层的条带切片（每序列 entries[rank::world]），各 rank 判别器 real 侧只见本切片；held-out real 不切（out-of-sample 监控保持全量）。
+
+**Per-rank replay buffer（每 rank 回放缓冲）**:
+每 rank 独立的 fake 回放缓冲（rollout 数据各 rank 独立演化）；续训状态同样按 rank 分片落盘（resume_state_rank{R}.pt），恢复时对号取回。
+
+**Resume generation marker（续训代际标记）**:
+全部 rank 分片均已持久化到同一 iteration 的提交记录（resume_generation.json，save 的 barrier 之后由 rank 0 写出）；恢复对账标记代际、混代际分片（保存中途崩溃现场）显式拒绝——各 rank 必须从同一 iteration 继续。
+
+**Metric merge（指标归并）**:
+iter 事件由各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出的合并写出——无重复、无丢失。
+
+**World-1 degeneration（world-1 恒等退化）**:
+单进程 = world size 1 的退化实现：不初始化进程组、集合通信原语恒等（barrier/gather 直接返回），训练循环对单进程/分布式走同一条执行序。
+_Avoid_: 单机模式（单机也可多进程）
+
 ### 实验设计与验收
 
 **Baseline（无 RL 基线）**:

@@ -19,6 +19,7 @@ from typing import Protocol
 
 import torch
 from monai.networks.nets import PatchDiscriminator
+from torch.nn.parallel import DistributedDataParallel
 
 from cynosure.config import RewardConfig
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
@@ -137,8 +138,25 @@ class RewardScorer(torch.nn.Module):
 
     @property
     def discriminator(self) -> PatchDiscriminator:
-        """底层的 MONAI 判别器（Online update 取参数/优化器用）。"""
-        return self._discriminator
+        """底层的 MONAI 判别器（Online update 取参数/优化器用）。
+
+        分布式装配（ADR-0003 判别器不分片）下内部是 DDP wrapper：
+        checkpoint/state_dict 语义面向裸网络，这里解包返回——键形与
+        单进程逐字一致；打分前向（``patch_logits``）仍走 DDP wrapper
+        （更新 backward 的梯度 hook 挂在 wrapper 上）。"""
+        inner = self._discriminator
+        if isinstance(inner, DistributedDataParallel):
+            return inner.module
+        return inner
+
+    def adopt_distributed(
+        self, wrapped: DistributedDataParallel,
+    ) -> None:
+        """把判别器替换为 DDP wrapper（分布式装配入口，ReplicatedDiscriminator 调用）。
+
+        前向与梯度路径整体切换到 wrapper（参数对象不变——DDP 不复制
+        参数，既有 optimizer 引用保持有效）。"""
+        self._discriminator = wrapped
 
     def patch_logits(self, latents: torch.Tensor) -> torch.Tensor:
         """[B,4,D,H,W] → patch logit 图 [B,1,D',H',W']（raw，不过 sigmoid）。"""

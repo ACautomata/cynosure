@@ -24,6 +24,28 @@ class CliResult:
     stderr: str
 
 
+class RunTrajectory:
+    """iter 事件流的轨迹可比面（值对象）：wall-clock ``elapsed_s`` 不参与
+    相等性——跨作业对比的语义轴是事件序下的其余字段。同路径重放（续训
+    roundtrip）在此逐位断言；跨路径（分布式 vs 单进程）的重算噪声容差
+    判定见 test_distributed.CrossPathEquivalence。"""
+
+    def __init__(self, events: list[dict]) -> None:
+        self._events = [
+            {key: value for key, value in event.items() if key != "elapsed_s"}
+            for event in events
+        ]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RunTrajectory) and self._events == other._events
+
+    def __repr__(self) -> str:
+        return (
+            "RunTrajectory(iterations="
+            f"{[event.get('iteration') for event in self._events]})"
+        )
+
+
 class CliSession:
     """CLI 会话：向 cynosure 命令行提交 argv 并捕获输出。"""
 
