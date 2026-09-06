@@ -127,27 +127,28 @@ class TestTrainCommand:
         assert "nope.json" in result.stderr
 
 
-class TestSingleProcessGuard:
-    """单进程训练循环（#21 tracer bullet）的 rank 守卫：FSDP 梯度聚合与
-    rank 0 归并落盘由 orchestration ticket 交付前，非 0 rank 显式拒绝——
-    否则每个 rank 各自跑完整循环，重复追加 iter 事件、覆写同一 checkpoint
-    文件名（RunArtifacts 的 rank 0 写盘契约被静默破坏）。"""
+class TestDistributedEntryGuard:
+    """torchrun 环境的 CLI 守卫（T09 分布式交付后）：非 0 rank 不再被
+    rank 守卫拦截——全部 rank 走同一训练循环（FSDP/DDP 梯度聚合、rank 0
+    归并落盘在 TrainingRuntime 装配），仅默认 run 目录仍被拒绝（按进程
+    时间戳生成，多 rank 下无法对齐、会静默分裂 run）。"""
 
-    def test_nonzero_rank_rejected_even_when_run_dir_ready(
+    def test_nonzero_rank_enters_training_assembly(
         self, cli: CliSession, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """run 目录已就绪（rank 0 已创建）也不进训练循环：显式拒绝、
-        消息指明单进程版边界——而非沿用「等待 rank 0」的 barrier 语义
-        （barrier 之后各 rank 重复训练才是要防的故障）。"""
-        monkeypatch.setenv("RANK", "3")
-        run_root = tmp_path / "run"
-        run_root.mkdir()
-        (run_root / "config.json").write_text("{}", encoding="utf-8")
-        result = cli.train(cli.write_config(tmp_path), run_dir=run_root)
-        assert result.code == 2
-        assert "单进程" in result.stderr
-        assert "训练输入契约违反" not in result.stderr  # 未进训练循环
+        """torchrun 环境进入训练装配（无 rank 守卫）：world=1 形态（
+        ``torchrun --nproc_per_node=1`` 的真实 env）下进程组自洽初始化，
+        生产 config 在装配期因工件缺失得到训练契约错误——走到该错误证明
+        CLI 未按 rank 拦截。多 rank 全 rank 同构执行由 test_distributed
+        的 spawn 契约真实验证（单测无跨进程 rendezvous）。"""
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", "29781")
+        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
+        assert "训练输入契约违反" in result.stderr
 
     def test_rank0_passes_guard_into_training(
         self, cli: CliSession, tmp_path: Path,

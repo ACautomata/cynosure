@@ -48,6 +48,10 @@ class IterEvent(BaseModel):
     """组内阶段号（序贯两阶段的归因轴）：单阶段组（组1/组2）恒 1，
     组3 stage-2 事件 = 2——「每组判别器与 buffer 独立」在指标流上的
     观测面（各阶段事件互不混淆）。"""
+    rank: int = 0
+    """产出本事件的 rank（分布式归并的排序轴：同一 iteration 的 N 条
+    事件按 rank 升序连续排列——无重复/无丢失的观测面；单进程恒 0，
+    与历史布局逐字一致）。"""
     modality: str
     """本 iteration 采样的目标序列（条件分布四序列均匀采样）——reward/
     loss/AUC 按目标序列归因的轴（per-sequence 健康监控，experiment-design）。"""

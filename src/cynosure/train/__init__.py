@@ -22,6 +22,7 @@ from cynosure.train.artifacts import (
     RunArtifacts,
     RunPaths,
 )
+from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import (
     ConditionSampler,
     CrossModalConditionSampler,
@@ -31,15 +32,16 @@ from cynosure.train.rollout import (
     SourceLatentPool,
     StepRollout,
 )
+from cynosure.train.runtime import AmpContext, TrainingRuntime
 from cynosure.train.sequential import SequentialTrainer, StagePlan
 from cynosure.train.trainer import (
     GranularGrpoTrainer,
-    RewardCoordinator,
     TrainingDiagnostic,
     TrainingLogProbPair,
 )
 
 __all__ = [
+    "AmpContext",
     "ConditionSampler",
     "CrossModalConditionSampler",
     "GranularGrpoTrainer",
@@ -57,4 +59,5 @@ __all__ = [
     "StepRollout",
     "TrainingDiagnostic",
     "TrainingLogProbPair",
+    "TrainingRuntime",
 ]

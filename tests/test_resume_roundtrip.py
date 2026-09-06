@@ -175,8 +175,9 @@ class TestResumeStateChecklist:
         state = _load_state(scenario)
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 1
+        assert state["format_version"] == 2
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
+        assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
         # 两模型权重：键形与全新装配的网络一致（组1 policy = UNet 本体）
         unet = NetworkAssembler.unet(NetworkArtifact(

@@ -5,17 +5,23 @@ state、Replay buffer 两区内容、RNG 状态（torch/CUDA/numpy/python）、
 iteration 计数、LR scheduler 状态、（若启用）EMA 权重——目标是跨作业
 边界恢复后训练轨迹与指标可复现。
 
-形态：单文件滚动 checkpoint（``checkpoints/<前缀>resume_state.pt``，原子
-写 tmp + ``os.replace``）——崩溃恢复只消费最新状态，按周期覆写（周期 =
-``schedule.checkpoint_interval``，默认每 10 iteration + 每里程碑强制 +
-收尾兜底，与产物 checkpoint 同节奏、由 trainer 消费 config 契约驱动）。
+形态：单文件滚动 checkpoint——**per-rank 分片**（单进程/world-1 =
+``checkpoints/<前缀>resume_state.pt``；多 rank = ``..._rank{R}.pt``，
+原子写 tmp + ``os.replace``）——崩溃恢复只消费各 rank 自己的最新状态，
+按周期覆写（周期 = ``schedule.checkpoint_interval``，默认每 10
+iteration + 每里程碑强制 + 收尾兜底，与产物 checkpoint 同节奏、由
+trainer 消费 config 契约驱动）。per-rank 分片的原因：Replay buffer
+（per-rank 两区内容）、六条命名 RNG 流（rank 派生 seed 下各 rank 独立
+演化）与 FSDP 优化器状态（分片动量）本就是 rank 本地状态；policy 与
+判别器权重在各 rank 间经梯度 allreduce 保持逐位一致，随每个分片冗余
+保存（同时是「同步生效」的外部观测面）。
 
-与产物 checkpoint（``policy_iter*.pt`` / ``discriminator_iter*.pt``）的
-分工：后者是**契约工件**（评测 / milestone / 组3 stage-1 复用消费的可
-装载有效权重）；本文件是**训练机内部状态**，判定目标是恢复后逐位续跑
-——判别器以原始 ``state_dict`` 落盘（spectral norm 启用时含 power
-iteration buffer ``_u``/``_v``；有效权重语义的可装载形式见
-``netbuild.loadable_state_dict``）。
+与产物 checkpoint（``policy_iter*.pt`` / ``discriminator_iter*.pt``，
+rank 0 独写）的分工：后者是**契约工件**（评测 / milestone / 组3
+stage-1 复用消费的可装载有效权重）；本文件是**训练机内部状态**，判定
+目标是恢复后逐位续跑——判别器以原始 ``state_dict`` 落盘（spectral
+norm 启用时含 power iteration buffer ``_u``/``_v``；有效权重语义的
+可装载形式见 ``netbuild.loadable_state_dict``）。
 
 清单各项的落地面：
 
@@ -50,14 +56,17 @@ if TYPE_CHECKING:
     from cynosure.train.trainer import GranularGrpoTrainer
 
 RESUME_STATE_FILENAME = "resume_state.pt"
-"""续训状态文件名（checkpoints 目录内、组3 stage 前缀隔离）。"""
+"""续训状态文件名（checkpoints 目录内、组3 stage 前缀隔离；多 rank 下
+每 rank 追加 ``_rank{R}`` 后缀形成分片文件）。"""
 
-RESUME_STATE_FORMAT_VERSION = 1
-"""payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。"""
+RESUME_STATE_FORMAT_VERSION = 2
+"""payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
+v2：+ world_size（多 rank 续训的拓扑对账）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
     "iteration",
+    "world_size",
     "policy_network",
     "policy_optimizer",
     "discriminator_network",
@@ -78,18 +87,26 @@ buffer 内容与 optimizer 状态语义失配，一律拒绝。"""
 
 
 def resume_state_path(
-    checkpoints_dir: Path, prefix: str = "",
+    checkpoints_dir: Path, prefix: str = "", *,
+    world_size: int = 1, rank: int = 0,
 ) -> Path:
-    """续训状态文件路径（checkpoints 目录 + stage 前缀）。"""
-    return checkpoints_dir / f"{prefix}{RESUME_STATE_FILENAME}"
+    """续训状态文件路径（checkpoints 目录 + stage 前缀；多 rank 追加
+    rank 后缀形成 per-rank 分片文件）。"""
+    name = RESUME_STATE_FILENAME if world_size <= 1 else (
+        f"resume_state_rank{rank}.pt"
+    )
+    return checkpoints_dir / f"{prefix}{name}"
 
 
 def save_resume_state(trainer: "GranularGrpoTrainer", iteration: int) -> None:
-    """全清单快照原子落盘（trainer 在周期/里程碑/收尾点调用）。"""
+    """全清单快照原子落盘（trainer 在周期/里程碑/收尾点调用；每 rank
+    写自己的分片文件）。"""
     payload = capture_state(trainer, iteration)
+    dist = trainer.runtime.dist
     path = resume_state_path(
         trainer.artifacts.paths.checkpoints,
         trainer.stage_tag.checkpoint_prefix,
+        world_size=dist.world_size, rank=dist.rank,
     )
     tmp = path.with_name(f"{path.name}.tmp")
     torch.save(payload, tmp)
@@ -97,16 +114,18 @@ def save_resume_state(trainer: "GranularGrpoTrainer", iteration: int) -> None:
 
 
 def resume_latest(trainer: "GranularGrpoTrainer") -> int:
-    """从 run 目录最新续训状态整体恢复，返回恢复点 iteration。
+    """从 run 目录本 rank 的最新续训状态整体恢复，返回恢复点 iteration。
 
-    先对账 config（除白名单漂移字段外逐字段一致），再按序恢复：两模型
-    权重与 optimizer → lr 槽位对账 → buffer 两区 → 命名 RNG 流 → 全局
-    RNG。装配期随机性（冷启动判别器初始化）被整体覆写，恢复即落盘时刻
-    的训练机状态。
+    先对账 config（除白名单漂移字段外逐字段一致）与拓扑（world_size
+    分片数一致），再按序恢复：两模型权重与 optimizer → lr 槽位对账 →
+    buffer 两区 → 命名 RNG 流 → 全局 RNG。装配期随机性（冷启动判别器
+    初始化）被整体覆写，恢复即落盘时刻的训练机状态。
     """
+    dist = trainer.runtime.dist
     path = resume_state_path(
         trainer.artifacts.paths.checkpoints,
         trainer.stage_tag.checkpoint_prefix,
+        world_size=dist.world_size, rank=dist.rank,
     )
     if not path.is_file():
         raise FileNotFoundError(
@@ -119,11 +138,17 @@ def resume_latest(trainer: "GranularGrpoTrainer") -> int:
     except Exception as exc:  # 损坏/半截文件 → 干净的输入契约错误（非裸 traceback）
         raise ValueError(f"续训状态文件不可读（{path}）: {exc}") from exc
     _validate_payload(state)
+    if state["world_size"] != dist.world_size:
+        raise ValueError(
+            f"续训状态 world_size（{state['world_size']}）与当前拓扑"
+            f"（{dist.world_size}）不符：FSDP 分片与 optimizer 状态是"
+            "按 world 切分的，跨拓扑续训不受支持"
+        )
     assert_resumable_config(
         ConfigLoader.load(trainer.artifacts.paths.config_snapshot),
         trainer.config,
     )
-    trainer.policy.network.load_state_dict(state["policy_network"], strict=True)
+    trainer.policy.load_full_state(state["policy_network"])
     trainer.policy.optimizer.load_state_dict(state["policy_optimizer"])
     trainer.rewards.discriminator.load_state_dict(
         state["discriminator_network"], strict=True,
@@ -147,7 +172,10 @@ def capture_state(trainer: "GranularGrpoTrainer", iteration: int) -> dict[str, A
     return {
         "format_version": RESUME_STATE_FORMAT_VERSION,
         "iteration": int(iteration),
-        "policy_network": policy.network.state_dict(),
+        "world_size": trainer.runtime.dist.world_size,
+        # full state（裸网络键形）：FSDP 装配下由 PolicySharding 导出，
+        # 每 rank 冗余保存全量（同步生效的外部观测面 + 恢复入口简单）
+        "policy_network": policy.full_state(),
         "policy_optimizer": policy.optimizer.state_dict(),
         # 判别器原始 state_dict（非 loadable 有效权重形式）：训练态续跑
         # 要求 spectral norm 的 power iteration buffer 逐位回归

@@ -23,6 +23,7 @@ from pathlib import Path
 import torch
 
 from cynosure.config import CynosureConfig
+from cynosure.distributed import DistributedContext
 from cynosure.train.artifacts import RunArtifacts
 from cynosure.train.trainer import GranularGrpoTrainer, StageTag
 
@@ -57,6 +58,7 @@ class SequentialTrainer:
         run_artifacts: RunArtifacts,
         *,
         device: torch.device | None = None,
+        dist_context: DistributedContext | None = None,
     ) -> None:
         if config.experiment.group != "sequential":
             raise ValueError(
@@ -66,6 +68,8 @@ class SequentialTrainer:
         self._config = config
         self._artifacts = run_artifacts
         self._device = device
+        # 两阶段共享同一进程组（进程级单例，CLI 层装配一次注入）
+        self._dist_context = dist_context
 
     def plan(self) -> list[StagePlan]:
         """两阶段执行计划（stage-1 产物路径在执行前即可解析，计划的
@@ -95,6 +99,7 @@ class SequentialTrainer:
                 self._artifacts,
                 device=self._device,
                 stage=StageTag(item.stage, item.checkpoint_prefix),
+                dist_context=self._dist_context,
             ).run()
         return completed
 
