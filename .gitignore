@@ -10,3 +10,9 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# T11 集群执行的本地工作副本（正式产物在实例 run 目录与 scripts/ 入仓件）
+.remote/
+
+# 实例执行脚本不入仓（CLAUDE.md 纪律：执行/临时脚本只落 run 目录 scripts/）
+scripts/

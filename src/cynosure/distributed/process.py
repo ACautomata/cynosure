@@ -14,6 +14,7 @@ seed 派生含 rank 偏移：各 rank 的六条命名 RNG 流独立演化（roll
 初始权重，见 trainer 装配）。
 """
 
+import datetime
 import os
 
 import torch
@@ -21,6 +22,13 @@ import torch.distributed as dist
 
 _RANK_SEED_STRIDE = 1_000_000
 """rank 间 seed 派生的间隔步长（远大于流内偏移 +0..+6，防流间碰撞）。"""
+
+_PG_TIMEOUT_MINUTES_ENV = "CYNOSURE_PG_TIMEOUT_MIN"
+"""进程组 watchdog 超时的环境变量（分钟；未设置 = torch 默认 10 分钟）。
+
+SothisAI DCU 平台适配（T11/#26）：同实例其他任务的间歇计算会让 RCCL
+端点被饿死数分钟，默认 10 分钟 watchdog 会让长跑训练在抖动期整组中止——
+部署侧设大值（如 40）让集合在负载窗口后恢复。"""
 
 
 class DistributedContext:
@@ -50,7 +58,13 @@ class DistributedContext:
             return cls(0, 1, False)
         if dist.is_initialized():
             return cls(dist.get_rank(), dist.get_world_size(), True)
-        dist.init_process_group(backend=cls._select_backend())
+        timeout = cls._pg_timeout()
+        if timeout is None:
+            dist.init_process_group(backend=cls._select_backend())
+        else:
+            dist.init_process_group(
+                backend=cls._select_backend(), timeout=timeout,
+            )
         context = cls(dist.get_rank(), dist.get_world_size(), True)
         # torchrun 只注入 LOCAL_RANK、不替进程选择 CUDA 设备：显式绑定
         # 本 rank 卡，使「未索引 cuda / current device」语义与 object
@@ -65,6 +79,20 @@ class DistributedContext:
     def _select_backend() -> str:
         """加速器可集合通信的 backend：DCU/CUDA = nccl（RCCL 同接口）、CPU = gloo。"""
         return "nccl" if torch.cuda.is_available() else "gloo"
+
+    @staticmethod
+    def _pg_timeout() -> datetime.timedelta | None:
+        """进程组 watchdog 超时（``_PG_TIMEOUT_MINUTES_ENV`` 分钟数；未设置
+        返回 None = init_process_group 不传参、保持 torch 默认）。"""
+        raw = os.environ.get(_PG_TIMEOUT_MINUTES_ENV)
+        if raw is None:
+            return None
+        minutes = int(raw)
+        if minutes <= 0:
+            raise ValueError(
+                f"{_PG_TIMEOUT_MINUTES_ENV} 须为正整数分钟，得到 {raw!r}"
+            )
+        return datetime.timedelta(minutes=minutes)
 
     @property
     def rank(self) -> int:

@@ -291,6 +291,23 @@ class TestDistributedContextUnit:
         )
         context.destroy()
 
+    def test_pg_timeout_env_parsing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """watchdog 超时环境变量：未设置 = None（不传参、torch 默认）、
+        正整数 = timedelta 分钟、非法值显式拒绝（部署侧拼写错误静默回落
+        默认会让 SothisAI 平台的长 watchdog 预期失效）。"""
+        from datetime import timedelta
+
+        monkeypatch.delenv("CYNOSURE_PG_TIMEOUT_MIN", raising=False)
+        assert DistributedContext._pg_timeout() is None
+        monkeypatch.setenv("CYNOSURE_PG_TIMEOUT_MIN", "40")
+        assert DistributedContext._pg_timeout() == timedelta(minutes=40)
+        monkeypatch.setenv("CYNOSURE_PG_TIMEOUT_MIN", "0")
+        with pytest.raises(ValueError, match="CYNOSURE_PG_TIMEOUT_MIN"):
+            DistributedContext._pg_timeout()
+        monkeypatch.setenv("CYNOSURE_PG_TIMEOUT_MIN", "abc")
+        with pytest.raises(ValueError):
+            DistributedContext._pg_timeout()
+
 
 class TestPoolSliceUnit:
     """Real sample pool 的 rank 切片语义（条带切片 + 分层保持）。"""
