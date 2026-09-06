@@ -21,7 +21,6 @@ from dataclasses import dataclass
 import torch
 
 from cynosure.config import CynosureConfig
-from cynosure.config import CynosureConfig
 from cynosure.distributed import (
     DistributedContext,
     EventMerger,

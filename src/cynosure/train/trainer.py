@@ -262,26 +262,14 @@ class GranularGrpoTrainer:
                 or (iteration + 1) % self.config.schedule.milestone_interval == 0
             ):
                 # checkpoint 周期之外，每个里程碑也强制落盘（config 契约：
-                # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须产出）。
-                # full state 导出全 rank 参与（FSDP FULL_STATE_DICT 是集合
-                # 操作——rank0-only 调用会互等死锁）；产物 checkpoint 只
-                # rank 0 独写（契约文件名不变）；续训状态每 rank 写自己的
-                # 分片文件（per-rank RNG/buffer/optimizer）
-                full_state = self.policy.full_state()
-                if dist.rank == 0:
-                    self._write_checkpoint(iteration + 1, full_state)
-                save_resume_state(self, iteration + 1)
+                # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须产出）
+                self._checkpoint_at(iteration + 1)
                 last_checkpoint = iteration + 1
             dist.barrier()  # 执行序第 3 步：iteration 节奏的集合点
         if last_checkpoint < self.config.schedule.max_iterations:
             # 收尾兜底只允许前向推进：恢复点已在目标之后（收缩 max_iterations
             # 的续训 = 无操作）时不得把更后的训练态改写成更小的 iteration 标签
-            full_state = self.policy.full_state()
-            if dist.rank == 0:
-                self._write_checkpoint(
-                    self.config.schedule.max_iterations, full_state,
-                )
-            save_resume_state(self, self.config.schedule.max_iterations)
+            self._checkpoint_at(self.config.schedule.max_iterations)
         self._write_diagnostic(pairs)
         return self.config.schedule.max_iterations
 
@@ -342,20 +330,29 @@ class GranularGrpoTrainer:
             encoding="utf-8",
         )
 
+    def _checkpoint_at(self, iteration: int) -> None:
+        """指定 iteration 的 checkpoint 节奏（全 rank 的单一入口）：full
+        state 导出是 FSDP 集合操作（FULL_STATE_DICT），必须全 rank 调用本
+        方法；产物 checkpoint 只 rank 0 独写（契约文件名不变），续训状态
+        每 rank 写自己的分片文件（per-rank RNG/buffer/optimizer）。"""
+        full_state = self.policy.full_state()
+        if self.runtime.dist.rank == 0:
+            self._write_checkpoint(iteration, full_state)
+        save_resume_state(self, iteration)
+
     def _write_checkpoint(
-        self, iteration: int, full_state: dict | None = None,
+        self, iteration: int, full_state: dict,
     ) -> None:
         """policy（本组可训练网络）与判别器权重落盘（可装载 state_dict，
         rank 0 独写——多 rank 下仅 rank 0 产出契约工件）。
         policy 经 GroupPolicy.full_state 固化 full state（FSDP 装配下由
-        PolicySharding 导出、键形与裸网络一致；导出本身是集合操作，调用
-        方须全 rank 参与后传入，本方法只在 rank 0 执行写盘）；判别器经
+        PolicySharding 导出、键形与裸网络一致；导出本身是集合操作，
+        ``full_state`` 必传——由调用方全 rank 完成导出后传入，本方法内部
+        不按需导出（rank0-only 导出会互等死锁））；判别器经
         loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
         重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
         历史布局逐字一致）。续训全状态由 resume.save_resume_state 同节奏
         落盘（per-rank 分片文件）。"""
-        if full_state is None:
-            full_state = self.policy.full_state()
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
             full_state,

@@ -31,6 +31,14 @@ class DistributedContext:
         self._world_size = world_size
         self._distributed = distributed
 
+    @staticmethod
+    def env_rank() -> int | None:
+        """torchrun 注入的 ``RANK`` 环境变量解析（rendezvous 之前的 rank
+        判定单点：cli 守卫与产物装配的 rank 0 独写语义消费它；无环境变量
+        = None = 单进程）。"""
+        raw = os.environ.get("RANK")
+        return None if raw is None else int(raw)
+
     @classmethod
     def bootstrap(cls) -> "DistributedContext":
         """从 torchrun 环境变量装配进程组；无环境变量 = 单进程退化。
@@ -38,7 +46,7 @@ class DistributedContext:
         已初始化的进程组（重复 bootstrap）复用现有语义——进程组是进程级
         单例，CLI 层装配一次后注入 trainer（组3 两阶段共享）。
         """
-        if os.environ.get("RANK") is None or os.environ.get("WORLD_SIZE") is None:
+        if cls.env_rank() is None or os.environ.get("WORLD_SIZE") is None:
             return cls(0, 1, False)
         if dist.is_initialized():
             return cls(dist.get_rank(), dist.get_world_size(), True)

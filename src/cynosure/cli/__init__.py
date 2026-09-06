@@ -133,11 +133,12 @@ class CynosureCli:
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
-        if args.run_dir is None and os.environ.get("RANK") is not None:
+        env_rank = DistributedContext.env_rank()
+        if args.run_dir is None and env_rank is not None:
             # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
             print(
                 "检测到 torchrun 环境（RANK="
-                f"{os.environ['RANK']}）：默认 run 目录按进程时间戳生成、"
+                f"{env_rank}）：默认 run 目录按进程时间戳生成、"
                 "无法跨 rank 对齐，分布式启动必须显式指定 --run-dir",
                 file=self._stderr,
             )
@@ -163,15 +164,6 @@ class CynosureCli:
                     "（training.json）照常产出",
                     file=self._stderr,
                 )
-        if args.run_dir is None and "RANK" in os.environ:
-            # 默认 run 目录按进程时间戳生成：多 rank 下无法对齐、会静默分裂 run
-            print(
-                "检测到 torchrun 环境（RANK="
-                f"{os.environ['RANK']}）：默认 run 目录按进程时间戳生成、"
-                "无法跨 rank 对齐，分布式启动必须显式指定 --run-dir",
-                file=self._stderr,
-            )
-            return _EXIT_USAGE_ERROR
         run_root = (
             Path(args.run_dir) if args.run_dir
             else RunArtifacts.default_root(config)
@@ -202,7 +194,7 @@ class CynosureCli:
             print(f"run 目录已就绪: {artifacts.paths.root}", file=self._stdout)
         if (
             run_trajectory_diagnostic
-            and os.environ.get("RANK", "0") == "0"
+            and DistributedContext.env_rank() in (None, 0)
         ):
             # 轨迹诊断是独立单进程路径：分布式启动下只 rank 0 产出
             # （其余 rank 直接进入训练，进程组 rendezvous 自然会合）

@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.distributed import DistributedContext
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
@@ -121,8 +122,8 @@ class RunArtifacts:
         等待超时抛 ``TimeoutError``，防各 rank 静默分裂 run。
         """
         paths = cls.layout(root)
-        rank = os.environ.get("RANK")
-        if rank is None or rank == "0":
+        env_rank = DistributedContext.env_rank()
+        if env_rank is None or env_rank == 0:
             if paths.config_snapshot.exists():
                 raise FileExistsError(f"run 目录已存在（不静默覆盖）: {root}")
             cls._create_minimal_set(config, paths)
