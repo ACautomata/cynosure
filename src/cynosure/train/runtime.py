@@ -3,8 +3,10 @@
 
 config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 （RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、六条命名 RNG 流、数值口径（AmpContext）与分布式
-运行时（DistributedContext + EventMerger）。trainer 只面对本 Facade
+（RolloutPhase）、六条命名 RNG 流（TrainingRngStreams 注册表）、数值
+口径（AmpContext，定义在 policy/numerics——train 与 eval 共用的 import
+环安全位，此处 re-export 保持既有消费面）与分布式运行时
+（DistributedContext + EventMerger）。trainer 只面对本 Facade
 编排 iteration 循环，装配细节（含分布式包装）不进循环代码路径。
 
 分布式装配点（ADR-0003，仅 torchrun 多进程下生效、单进程恒等）：
@@ -15,8 +17,6 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
   （RankSlicedPool；held-out 不切）；
 - 指标归并器（EventMerger，rank 0 顺序写出）。
 """
-
-from dataclasses import dataclass
 
 import torch
 
@@ -33,6 +33,7 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
@@ -44,35 +45,9 @@ from cynosure.train.artifacts import RunArtifacts
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import RolloutPhase
+from cynosure.train.rng import TrainingRngStreams
 
-AMP_DTYPES: dict[str, torch.dtype] = {"bf16": torch.bfloat16}
-"""config amp_dtype（Literal["bf16"] 定死）→ torch autocast dtype。"""
-
-_STREAM_SEED_OFFSETS: dict[str, int] = {
-    "rollout": 0,
-    "real_pool": 1,
-    "disc_update": 2,
-    "heldout_auc": 3,
-    "fake_shuffle": 4,
-    "base_partition": 5,
-}
-"""全循环的六条命名 RNG 流（续训状态机按名保存/恢复的注册表）：rollout
-相与条件分布共享主流；real 采样 / 判别器更新 / AUC / fake 置换 / base
-分区生成各自独立派生流（互不漂移）。seed 派生含 rank 偏移（分布式）。"""
-
-
-@dataclass(frozen=True)
-class AmpContext:
-    """装配期单点选定的数值口径：设备 + autocast dtype（bf16 autocast +
-    fp32 master weights）。所有模型与 rollout/打分张量随 device 放置——
-    autocast(device_type) 只影响前向 dtype，不移动张量。"""
-
-    device: torch.device
-    dtype: torch.dtype
-
-    @property
-    def device_type(self) -> str:
-        return self.device.type
+__all__ = ["AMP_DTYPES", "AmpContext", "TrainingRuntime"]
 
 
 class TrainingRuntime:
@@ -85,6 +60,7 @@ class TrainingRuntime:
         rewards: RewardCoordinator,
         updater: StepwisePolicyUpdate,
         rollout: RolloutPhase,
+        rng: TrainingRngStreams,
         generators: dict[str, torch.Generator],
         amp: AmpContext,
         dist: DistributedContext,
@@ -95,6 +71,7 @@ class TrainingRuntime:
         self.rewards = rewards
         self.updater = updater
         self.rollout = rollout
+        self.rng = rng
         self.generators = generators
         self.amp = amp
         self.dist = dist
@@ -115,11 +92,10 @@ class TrainingRuntime:
         # seed 的 rank 派生：六条流的演化各 rank 独立（rollout 数据多样性
         # 来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性前提。
         # 判别器冷启动初始化不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
-        seed = dist.derive_seed(config.schedule.seed)
-        generators = {
-            name: torch.Generator().manual_seed(seed + offset)
-            for name, offset in _STREAM_SEED_OFFSETS.items()
-        }
+        # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；named() 的
+        # dict 视图是装配期按名取流的消费面。
+        streams = TrainingRngStreams(dist.derive_seed(config.schedule.seed))
+        generators = streams.named()
         amp = AmpContext(
             device=(
                 device if device is not None
@@ -162,6 +138,7 @@ class TrainingRuntime:
             rewards=rewards,
             updater=updater,
             rollout=rollout,
+            rng=streams,
             generators=generators,
             amp=amp,
             dist=dist,

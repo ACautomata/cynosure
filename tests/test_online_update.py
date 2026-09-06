@@ -53,6 +53,7 @@ class WrittenPool:
                 case_id=case_id,
                 modality=modality,
                 latent=f"real_pool_latents/{index}.pt",
+                spacing=(100.0, 100.0, 100.0),
             ))
         manifest = LatentManifest(
             kind="real_pool",

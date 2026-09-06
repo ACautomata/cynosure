@@ -31,14 +31,28 @@ out-of-sample 监控侧），装载时以 kind 守卫互换使用。"""
 
 
 class PoolEntry(BaseModel):
-    """manifest 条目：一病例一序列的一枚预编码 latent。"""
+    """manifest 条目：一病例一序列的一枚预编码 latent + spacing 侧车。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     case_id: str
     modality: Modality
     latent: str
     """latent 文件路径，相对 manifest 文件所在目录。"""
+    spacing: tuple[float, float, float]
+    """per-case spacing 侧车（issue #46）：raw NIfTI header zooms ×1e2——
+    prepare 从 header 读出、随条目可审计；rollout 组2 源影像条件的
+    spacing tensor 按条目取值（BraTS 1mm iso → (100.0, 100.0, 100.0)，
+    值来自数据而非写死常量）。"""
+
+    @field_validator("spacing")
+    @classmethod
+    def _spacing_positive(
+        cls, value: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        if any(component <= 0 for component in value):
+            raise ValueError(f"spacing 须为正（raw header zooms ×1e2）: {value}")
+        return value
 
 
 class LatentManifest(BaseModel):

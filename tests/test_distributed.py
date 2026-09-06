@@ -27,6 +27,7 @@ import multiprocessing
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty as _QueueEmpty
 
 import pytest
 import torch
@@ -127,7 +128,23 @@ class SpawnedTrainWorld:
             process.start()
         collected: dict[int, dict] = {}
         for _ in range(self.world):
-            payload = queue.get()
+            # get 的超时是 join 兜底的前置（worker 崩溃未回传时主进程不能
+            # 无限等）：超时把已收集的 stderr 带进失败信息，死锁可诊断
+            try:
+                payload = queue.get(timeout=_WORKER_JOIN_TIMEOUT_S)
+            except _QueueEmpty:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5.0)
+                stuck = ", ".join(
+                    f"rank {rank}: {collected[rank]['stderr']}"
+                    for rank in sorted(collected)
+                ) or "（无任何 worker 回传）"
+                raise AssertionError(
+                    f"worker 回传超时（{_WORKER_JOIN_TIMEOUT_S}s，"
+                    f"疑似某 rank 在集合操作互等后崩溃）: {stuck}"
+                )
             collected[payload["rank"]] = payload
         for process in processes:
             process.join(timeout=_WORKER_JOIN_TIMEOUT_S)
@@ -270,6 +287,9 @@ class TestPoolSliceUnit:
                 "case_id": f"case-{index}",
                 "modality": ["t1n", "t1c", "t2w", "t2f"][index % 4],
                 "latent": f"latent-{index}.pt",
+                # spacing 侧车（issue #46 契约必填）：BraTS 1mm iso 的
+                # header zooms ×1e2（切片语义不消费取值，仅须通过装载校验）
+                "spacing": [100.0, 100.0, 100.0],
             }
             for index in range(8)
         ]

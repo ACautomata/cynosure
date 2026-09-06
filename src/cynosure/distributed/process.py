@@ -103,6 +103,17 @@ class DistributedContext:
         )
         return received
 
+    def broadcast_flag(self, value: bool) -> bool:
+        """rank 0 的布尔决定广播到所有 rank（早停 verdict 的全局一致性
+        消费：训练循环的 break 必须各 rank 一致，分歧会让 barrier 互等
+        死锁）。所有 rank 都须调用本方法（集合操作）；rank 0 的 ``value``
+        生效，其余 rank 的传入值被覆盖。单进程恒等返回传入值。"""
+        if not self._distributed:
+            return value
+        flag = torch.tensor(1.0 if value else 0.0)
+        dist.broadcast(flag, src=0)
+        return bool(flag.item())
+
     def destroy(self) -> None:
         """进程组销毁（CLI 层 finally 调用；单进程恒等）。"""
         if self._distributed and dist.is_initialized():

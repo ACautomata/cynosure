@@ -25,6 +25,10 @@ from cynosure.config import ConfigLoader, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
+from cynosure.policy.cursor import TrajectoryCursor
+from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import ChannelNormalizer
@@ -74,6 +78,32 @@ class TrainingLoopScenario:
         if dump:
             argv.append("--dump-trajectory")
         return self.cli.run(*argv)
+
+    def set_schedule(self, **values) -> None:
+        """改写 config 的 schedule 字段并重落盘（里程碑/早停参数变体）。"""
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        data["schedule"].update(values)
+        self.config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def standalone_sampler(
+        self, config, device: torch.device | None = None,
+    ) -> RolloutSampler:
+        """评测相注入测试用的独立采样封装（与 trainer._assemble_sampler
+        同一组合方式；独立于 trainer 内部装配）。网络落 ``device``
+        （缺省 CPU；设备归一测试传加速器设备）。"""
+        unet = NetworkAssembler.unet(NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.net_config_json),
+            checkpoint=config.artifacts.unet_ckpt,
+        )).to(device if device is not None else torch.device("cpu"))
+        scheduler = NetworkAssembler.rflow_scheduler(
+            num_inference_steps=config.policy.num_inference_steps,
+            input_img_size_numel=config.policy.input_img_size_numel,
+        )
+        return RolloutSampler(
+            CfgCombinedField(unet),
+            SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max),
+            TrajectoryCursor(scheduler),
+        )
 
     def artifacts(self) -> RunArtifacts:
         return RunArtifacts(RunArtifacts.layout(self.run_dir))
@@ -174,7 +204,8 @@ class TestSingleIterationLoop:
         data["schedule"]["max_iterations"] = 2
         data["reward"]["disc_update_interval_n_d"] = 2
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         first, second = scenario.events()
         assert "discriminator" in first["loss"]
         assert first["buffer_current_fraction"] == pytest.approx(0.5)
@@ -279,7 +310,8 @@ class TestSingleIterationLoop:
         data["schedule"]["milestone_interval"] = 2
         data["schedule"]["checkpoint_interval"] = 5
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         checkpoints = scenario.run_dir / "checkpoints"
         assert (checkpoints / "policy_iter2.pt").is_file()
         assert (checkpoints / "discriminator_iter2.pt").is_file()
@@ -339,7 +371,8 @@ class TestSingleIterationLoop:
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["artifacts"]["discriminator_ckpt"] = None
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        assert scenario.train().code == 0, scenario.stderr
+        result = scenario.train()
+        assert result.code == 0, result.stderr
         assert (scenario.run_dir / "checkpoints" / "discriminator_iter1.pt").is_file()
 
     def test_replay_capacity_guard_rejects_undersized_combinations(
@@ -422,7 +455,7 @@ class TestPolicyOptimizerConfig:
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         trainer = GranularGrpoTrainer(config, artifacts)
-        (group,) = trainer.updater.optimizer.param_groups
+        (group,) = trainer.loop.updater.optimizer.param_groups
         assert group["weight_decay"] == pytest.approx(
             config.policy.policy_weight_decay,
         )
@@ -517,10 +550,20 @@ class TestCrossModalPairSampling:
 
     LATENT_SHAPE = (4, 16, 16, 8)
 
+    # 各序列条目的 spacing 侧车值各不相同（issue #46）：消费端接线可从
+    # 条件 spacing 反查源条目（float32 精确值，断言可精确相等）
+    SPACING_BY_MODALITY: dict[str, tuple[float, float, float]] = {
+        "t1n": (50.0, 100.0, 200.0),
+        "t1c": (110.0, 120.0, 130.0),
+        "t2w": (140.0, 150.0, 160.0),
+        "t2f": (70.0, 80.0, 90.0),
+    }
+
     @staticmethod
     def _write_identifiable_pool(root: Path) -> Path:
         """每序列恰一枚、以序列序号填充的 latent（源序列可从张量内容
-        识别，使 12 对的完整计数可观测）。"""
+        识别，使 12 对的完整计数可观测）；spacing 侧车按序列取不同值
+        （issue #46 消费端接线的观测面）。"""
         shape = (4, 16, 16, 8)
         latents_dir = root / "latents"
         latents_dir.mkdir(parents=True)
@@ -535,6 +578,9 @@ class TestCrossModalPairSampling:
                 "case_id": f"case-{modality}",
                 "modality": modality,
                 "latent": f"latents/{name}",
+                "spacing": list(
+                    TestCrossModalPairSampling.SPACING_BY_MODALITY[modality]
+                ),
             })
         manifest = {
             "kind": "real_pool",
@@ -601,6 +647,27 @@ class TestCrossModalPairSampling:
         targets = {sampler.sample()[1] for _ in range(48)}
         assert targets <= set(MODALITIES)
         assert len(targets) == 4
+
+    def test_condition_spacing_comes_from_source_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        """组2 消费端接线（issue #46）：条件的 spacing tensor = 源影像条目
+        的 manifest 侧车值（per-case 来自数据，替换写死常量）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        seen: set[str] = set()
+        for _ in range(48):
+            condition, _ = sampler.sample()
+            source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+            seen.add(source)
+            assert tuple(condition.spacing[0].tolist()) == (
+                self.SPACING_BY_MODALITY[source]
+            )
+        assert seen == set(MODALITIES)  # 各源序列的接线都被真实走到
 
     def test_pool_missing_modality_rejected(self, tmp_path: Path) -> None:
         """源影像库缺任一序列 = 组2 条件分布不可用：显式拒绝。"""
@@ -863,7 +930,7 @@ class TestBaseSeedingIsolation:
                 config, artifacts, device=torch.device("cpu"),
             )
             trainer.seed_base_partition()
-            record = trainer.rollout.run_iteration()
+            record = trainer.loop.run_iteration()
             streams[capacity] = (
                 record.modality,
                 record.steps[0].anchor_latent,

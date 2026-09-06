@@ -31,7 +31,7 @@ from cynosure.reward.dataset import (
     SplitPart,
 )
 from cynosure.reward.encoder import LatentEncoder
-from cynosure.reward.preprocessing import UpstreamPreprocessChain
+from cynosure.reward.preprocessing import SpacingSidecar, UpstreamPreprocessChain
 
 
 @dataclass
@@ -99,6 +99,8 @@ class PreparePipeline:
         self._preprocess = UpstreamPreprocessChain(
             resize_base=config.preprocessing.resize_base,
         )
+        # spacing 侧车（issue #46）：per-case raw header zooms ×1e2 随条目落盘
+        self._spacing = SpacingSidecar()
 
     def run(self) -> PrepareReport:
         cases = self._layout.scan()
@@ -161,7 +163,9 @@ class PreparePipeline:
         entries: list[PoolEntry] = []
         for modality in MODALITIES:
             for case_id in sorted(case_ids):
-                latent = self._encode_one(series_by_case[case_id].series[modality])
+                latent, spacing = self._encode_one(
+                    series_by_case[case_id].series[modality],
+                )
                 latent_dir = summary.latent_root / modality
                 latent_dir.mkdir(parents=True, exist_ok=True)
                 latent_path = latent_dir / f"{case_id}.pt"
@@ -172,17 +176,24 @@ class PreparePipeline:
                     latent=latent_path.relative_to(
                         summary.manifest_path.parent,
                     ).as_posix(),
+                    spacing=spacing,
                 ))
                 if stats is not None:
                     stats.update(latent)
         return entries
 
-    def _encode_one(self, series_path: Path) -> torch.Tensor:
+    def _encode_one(
+        self, series_path: Path,
+    ) -> tuple[torch.Tensor, tuple[float, float, float]]:
+        """单（病例, 序列）的编码产物：(latent, per-case spacing 侧车)。"""
         # 宽捕获有据：第三方读取栈（MONAI reader、nibabel ImageFileError、压缩层）
         # 的异常类面不可枚举，nibabel 异常又不在 import 白名单内无法按类型接；
         # 保留异常链（from exc）不吞根因，原始类名入消息供分诊。
         try:
             image = self._preprocess(series_path)
+            # 侧车读链末端 meta 的 raw header zooms（×1e2），与影像同次读取、
+            # 同一失败契约（issue #46）
+            spacing = self._spacing.read(image)
         except Exception as exc:
             raise ValueError(
                 f"影像读取失败: {series_path}"
@@ -199,7 +210,7 @@ class PreparePipeline:
                 f"预编码输出形状 {tuple(latent.shape)} 与 latent_shape 契约"
                 f" {self._config.latent_shape} 不符（输入 {tuple(tensor.shape)}）"
             )
-        return latent
+        return latent, spacing
 
     def _write_manifest(
         self, summary: LatentSummary, entries: list[PoolEntry], split: CaseSplit,

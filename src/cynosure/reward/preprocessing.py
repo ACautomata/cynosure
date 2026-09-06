@@ -17,13 +17,15 @@
 链中明确不存在的步骤同样是对齐结论（ADR-0006）：spacing 重采样、foreground
 crop、z-score 归一化——补上任何一步都等于换基座训练分布，须先重论证。
 
-末端保留 ``MetaTensor``（affine 随 RAS 重定向更新），供方向断言与后续
-spacing 侧车（issue #46）读取；工件落盘前由管线剥离元数据。
+末端保留 ``MetaTensor``（affine 随 RAS 重定向更新），供方向断言与
+spacing 侧车（``SpacingSidecar``，issue #46）读取；工件落盘前由管线
+剥离元数据。
 """
 
 from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
 import torch
 from monai.data import MetaTensor
 from monai.transforms import (
@@ -35,8 +37,13 @@ from monai.transforms import (
     Resize,
     ScaleIntensityRangePercentiles,
 )
+from monai.utils import MetaKeys
 
 from cynosure.config import UPSTREAM_RESIZE_BASE
+
+SPACING_CONDITION_SCALE: float = 1e2
+"""header zooms（mm）→ spacing 条件张量单位的换算因子（×1e2）：policy-modeling
+章「体素间距 ×1e2」与 data-preparation spec「spacing 侧车」的单一来源。"""
 
 
 class UpstreamPreprocessChain:
@@ -75,3 +82,30 @@ class UpstreamPreprocessChain:
         # resize 目标在运行时从 RAS 重定向后的形状计算（第 6 步依赖第 3 步结果）
         target = self.resize_target(tuple(image.shape[1:]), self._resize_base)
         return Resize(spatial_size=target, mode="trilinear")(image)
+
+
+class SpacingSidecar:
+    """per-case spacing 侧车读取器（data-preparation spec「spacing 侧车」+ issue #46）。
+
+    从链末端 ``MetaTensor`` 的 meta 读 **raw NIfTI header zooms**（``LoadImage``
+    原样保留的 ``original_pixdim``，nibabel ``get_zooms()[:3]`` 同值）——RAS
+    重定向只改 affine、不动 raw zooms（BraTS flip-only 下顺序也不变），与上游
+    「sidecar raw zooms、loader 端 ×1e2」的语义一致。"""
+
+    def read(self, image: MetaTensor) -> tuple[float, float, float]:
+        """单序列的 per-case spacing（manifest 条目值，×1e2 条件单位）。
+
+        ``pixdim[1:4]`` 即三个存储轴的 zooms；meta 缺 raw zooms（非 NIfTI
+        输入、读图契约破坏）显式失败。"""
+        if MetaKeys.ORIGINAL_PIXDIM not in image.meta:
+            raise ValueError(
+                "链末端 meta 缺少 raw header zooms（original_pixdim）："
+                "spacing 侧车要求 NIfTI 读图链（dataset 契约）",
+            )
+        zooms = np.asarray(image.meta[MetaKeys.ORIGINAL_PIXDIM], dtype=float)[1:4]
+        i, j, k = (float(zoom) for zoom in zooms)
+        return (
+            i * SPACING_CONDITION_SCALE,
+            j * SPACING_CONDITION_SCALE,
+            k * SPACING_CONDITION_SCALE,
+        )

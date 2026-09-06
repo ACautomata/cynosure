@@ -7,13 +7,20 @@
 from pathlib import Path
 
 import nibabel as nib
+import numpy as np
 import pytest
 import torch
 
 from cynosure.config import MODALITIES, ConfigLoader
 from cynosure.fixtures import Fixture
 from cynosure.reward import ChannelStats, LatentManifest
-from tests.conftest import CliSession, CliResult, SyntheticBratsDataset
+from cynosure.reward.preprocessing import SPACING_CONDITION_SCALE
+from tests.conftest import (
+    ANISOTROPIC_AFFINE,
+    CliSession,
+    CliResult,
+    SyntheticBratsDataset,
+)
 
 # fixture 影像体：fixture latent [4,16,16,8] 的 4× 空间上采样
 FIXTURE_SERIES_SHAPE = (64, 64, 32)
@@ -279,6 +286,63 @@ class TestPrepareIdempotency:
         assert not config.reward.real_pool_manifest.exists()
         assert not config.reward.heldout_real_manifest.exists()
         assert not config.reward.channel_stats_json.exists()
+
+
+class TestPrepareSpacingSidecar:
+    """spacing 侧车全链（issue #46）：prepare 逐 case 读 header zooms ×1e2
+    写入 manifest 条目——夹具 NIfTI 的 header zooms 与 manifest 侧车值一致
+    （×1e2 后），值是读出来的、不是写死常量。"""
+
+    @staticmethod
+    def header_zooms_x1e2(dataset_root: Path, entry) -> tuple[float, ...]:
+        """条目对应 NIfTI 的 raw header zooms ×1e2（审计基准，独立于 prepare）。"""
+        nifti = (
+            dataset_root / entry.case_id
+            / f"{entry.case_id}-{entry.modality}.nii.gz"
+        )
+        zooms = nib.load(nifti).header.get_zooms()[:3]
+        return tuple(float(zoom) * SPACING_CONDITION_SCALE for zoom in zooms)
+
+    def test_entries_carry_header_zooms_x1e2(
+        self, scenario: PrepareScenario,
+    ) -> None:
+        """pool 与 held-out 的每条 manifest 条目携带该（病例, 序列）的
+        header zooms ×1e2（可装载、可审计）。"""
+        assert scenario.run().code == 0
+        dataset_root = scenario.config().artifacts.dataset_root
+        for manifest in (scenario.load_pool(), scenario.load_heldout()):
+            assert len(manifest.entries) > 0
+            for entry in manifest.entries:
+                assert entry.spacing == self.header_zooms_x1e2(dataset_root, entry)
+
+    def test_spacing_is_per_case_data_not_constant(
+        self, scenario: PrepareScenario, cli: CliSession,
+    ) -> None:
+        """「来自数据」的判别性断言：把一个 t1n 换成各向异性 zooms 后重跑，
+        该条目的 spacing 随数据变化、其余条目不受影响（写死常量必假绿）。"""
+        assert scenario.run().code == 0
+        config = scenario.config()
+        target = next(
+            entry for entry in scenario.load_pool().entries
+            if entry.modality == "t1n"
+        )
+        nifti = (
+            config.artifacts.dataset_root / target.case_id
+            / f"{target.case_id}-t1n.nii.gz"
+        )
+        volume = np.random.default_rng(0).standard_normal(
+            FIXTURE_SERIES_SHAPE,
+        ).astype(np.float32)
+        nib.save(nib.Nifti1Image(volume, ANISOTROPIC_AFFINE), nifti)
+        assert cli.run("prepare", "--config", str(scenario.config_path)).code == 0
+        for manifest in (scenario.load_pool(), scenario.load_heldout()):
+            for entry in manifest.entries:
+                expected = self.header_zooms_x1e2(
+                    config.artifacts.dataset_root, entry,
+                )
+                assert entry.spacing == expected
+                if (entry.case_id, entry.modality) == (target.case_id, "t1n"):
+                    assert entry.spacing == (50.0, 100.0, 200.0)
 
 
 class TestPrepareChainSemantics:
