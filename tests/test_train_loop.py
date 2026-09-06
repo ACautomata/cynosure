@@ -81,6 +81,44 @@ class TrainingLoopScenario:
     def events(self) -> list[dict]:
         return self.artifacts().read_events()
 
+    def patch_config(self, **sections: dict) -> None:
+        """按 section 覆写已写出的训练 config（JSON 补丁，写回原路径）。"""
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        for section, values in sections.items():
+            data[section].update(values)
+        self.config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def resume(self):
+        """--resume 入口：同 run 目录的续训提交（跨作业边界的恢复场景）。"""
+        return self.cli.run(
+            "train", "--config", str(self.config_path),
+            "--run-dir", str(self.run_dir), "--resume",
+        )
+
+    def resume_state(self) -> dict:
+        """单进程续训状态分片的外部读取面（契约文件名字面：world-1 无
+        rank 后缀；多 rank 分片对账见 test_distributed.RankResumeShards）。"""
+        return torch.load(
+            self.run_dir / "checkpoints" / "resume_state.pt",
+            map_location="cpu", weights_only=True,
+        )
+
+    def checkpoints_identical(self, other_run_dir: Path, names: list[str]) -> None:
+        """收官 checkpoint 工件与另一 run 的同名 state_dict 逐位对账
+        （同路径重放的逐位语义）。"""
+        for name in names:
+            first = torch.load(
+                self.run_dir / "checkpoints" / name,
+                map_location="cpu", weights_only=True,
+            )
+            second = torch.load(
+                other_run_dir / "checkpoints" / name,
+                map_location="cpu", weights_only=True,
+            )
+            assert set(first) == set(second)
+            for key in first:
+                assert torch.equal(first[key], second[key]), f"{name}:{key}"
+
 
 @pytest.fixture
 def scenario(cli: CliSession, tmp_path: Path) -> TrainingLoopScenario:

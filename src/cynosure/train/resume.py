@@ -35,10 +35,11 @@ norm 启用时含 power iteration buffer ``_u``/``_v``；有效权重语义的
   反序列化的原语（张量 / int / float / None）：numpy 的 MT19937 键数组
   转 uint32 张量，python random 状态转 int 列表。
 
-恢复语义：trainer 装配（网络构建、冷启动判别器初始化）完成后整体覆写
-——权重 / optimizer / buffer / 全部 RNG 流 / 全局 RNG 逐一回到落盘时刻，
-从 ``iteration`` 计数继续；恢复调用方还须回退指标流（RunArtifacts.
-``rewind_events``）删除恢复点之后的半截事件。
+恢复语义：trainer 装配（网络构建、冷启动判别器初始化）完成后
+``ResumeStore.restore`` 整体覆写——权重 / optimizer / buffer / 全部 RNG
+流 / 全局 RNG 逐一回到落盘时刻，从 ``iteration`` 计数继续；恢复调用方
+还须回退指标流（RunArtifacts.``rewind_events``）删除恢复点之后的半截
+事件。
 """
 
 import os
@@ -50,6 +51,7 @@ import numpy as np
 import torch
 
 from cynosure.config import ConfigLoader
+from cynosure.distributed import DistributedContext
 
 if TYPE_CHECKING:
     from cynosure.config import CynosureConfig
@@ -86,273 +88,275 @@ _ALLOWED_CONFIG_DRIFT: frozenset[tuple[str, ...]] = frozenset(
 buffer 内容与 optimizer 状态语义失配，一律拒绝。"""
 
 
-def resume_state_path(
-    checkpoints_dir: Path, prefix: str = "", *,
-    world_size: int = 1, rank: int = 0,
-) -> Path:
-    """续训状态文件路径（checkpoints 目录 + stage 前缀；多 rank 追加
-    rank 后缀形成 per-rank 分片文件）。"""
-    name = RESUME_STATE_FILENAME if world_size <= 1 else (
-        f"resume_state_rank{rank}.pt"
-    )
-    return checkpoints_dir / f"{prefix}{name}"
+class ResumeStore:
+    """续训状态分片存取（断点续训状态机的落盘/恢复单点，per-rank）。
 
-
-def save_resume_state(trainer: "GranularGrpoTrainer", iteration: int) -> None:
-    """全清单快照原子落盘（trainer 在周期/里程碑/收尾点调用；每 rank
-    写自己的分片文件）。"""
-    payload = capture_state(trainer, iteration)
-    dist = trainer.runtime.dist
-    path = resume_state_path(
-        trainer.artifacts.paths.checkpoints,
-        trainer.stage_tag.checkpoint_prefix,
-        world_size=dist.world_size, rank=dist.rank,
-    )
-    tmp = path.with_name(f"{path.name}.tmp")
-    torch.save(payload, tmp)
-    os.replace(tmp, path)  # 崩溃下的原子替换：恢复面只见完整旧文件或完整新文件
-
-
-def resume_latest(trainer: "GranularGrpoTrainer") -> int:
-    """从 run 目录本 rank 的最新续训状态整体恢复，返回恢复点 iteration。
-
-    先对账 config（除白名单漂移字段外逐字段一致）与拓扑（world_size
-    分片数一致），再按序恢复：两模型权重与 optimizer → lr 槽位对账 →
-    buffer 两区 → 命名 RNG 流 → 全局 RNG。装配期随机性（冷启动判别器
-    初始化）被整体覆写，恢复即落盘时刻的训练机状态。
+    落盘：全清单快照（``_capture``）原子写本 rank 分片文件（tmp +
+    ``os.replace``）。恢复（``restore``）：payload 契约校验（版本/字段/
+    计数）→ 拓扑对账（world_size 一致，跨拓扑拒绝）→ config 一致性守卫
+    （除白名单漂移字段外逐字段一致）→ 两模型权重与 optimizer → lr 槽位
+    对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG——装配期随机性（冷启动
+    判别器初始化）被整体覆写，恢复即落盘时刻的训练机状态。
     """
-    dist = trainer.runtime.dist
-    path = resume_state_path(
-        trainer.artifacts.paths.checkpoints,
-        trainer.stage_tag.checkpoint_prefix,
-        world_size=dist.world_size, rank=dist.rank,
-    )
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"无续训状态可恢复（期望 {path}）：周期落盘"
-            "（schedule.checkpoint_interval）尚未产出，或 run 目录不是"
-            "训练中断现场"
+
+    def __init__(
+        self, checkpoints_dir: Path, prefix: str, dist: DistributedContext,
+    ) -> None:
+        self._checkpoints_dir = checkpoints_dir
+        self._prefix = prefix
+        self._dist = dist
+
+    def shard_path(self) -> Path:
+        """本 rank 的续训状态文件路径（checkpoints 目录 + stage 前缀；
+        多 rank 追加 rank 后缀形成 per-rank 分片文件）。"""
+        name = RESUME_STATE_FILENAME if self._dist.world_size <= 1 else (
+            f"resume_state_rank{self._dist.rank}.pt"
         )
-    try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:  # 损坏/半截文件 → 干净的输入契约错误（非裸 traceback）
-        raise ValueError(f"续训状态文件不可读（{path}）: {exc}") from exc
-    _validate_payload(state)
-    if state["world_size"] != dist.world_size:
-        raise ValueError(
-            f"续训状态 world_size（{state['world_size']}）与当前拓扑"
-            f"（{dist.world_size}）不符：FSDP 分片与 optimizer 状态是"
-            "按 world 切分的，跨拓扑续训不受支持"
-        )
-    assert_resumable_config(
-        ConfigLoader.load(trainer.artifacts.paths.config_snapshot),
-        trainer.config,
-    )
-    trainer.policy.load_full_state(state["policy_network"])
-    trainer.policy.optimizer.load_state_dict(state["policy_optimizer"])
-    trainer.rewards.discriminator.load_state_dict(
-        state["discriminator_network"], strict=True,
-    )
-    trainer.rewards.update.optimizer.load_state_dict(
-        state["discriminator_optimizer"],
-    )
-    _restore_lr(trainer, state["lr"])
-    _restore_buffer(trainer, state["replay_buffer"])
-    _restore_generators(trainer, state["generators"])
-    _restore_global_rng(state["rng"])
-    return state["iteration"]
+        return self._checkpoints_dir / f"{self._prefix}{name}"
 
+    def save(self, trainer: "GranularGrpoTrainer", iteration: int) -> None:
+        """全清单快照原子落盘（trainer 在周期/里程碑/收尾点调用；每 rank
+        写自己的分片文件）。"""
+        payload = self._capture(trainer, iteration)
+        path = self.shard_path()
+        tmp = path.with_name(f"{path.name}.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, path)  # 崩溃下的原子替换：恢复面只见完整旧文件或完整新文件
 
-def capture_state(trainer: "GranularGrpoTrainer", iteration: int) -> dict[str, Any]:
-    """续训状态全清单快照（T07 验收清单的落盘形态）。"""
-    policy = trainer.policy
-    rewards = trainer.rewards
-    base = rewards.buffer.base_samples()
-    recent = rewards.buffer.recent_samples()
-    return {
-        "format_version": RESUME_STATE_FORMAT_VERSION,
-        "iteration": int(iteration),
-        "world_size": trainer.runtime.dist.world_size,
-        # full state（裸网络键形）：FSDP 装配下由 PolicySharding 导出，
-        # 每 rank 冗余保存全量（同步生效的外部观测面 + 恢复入口简单）
-        "policy_network": policy.full_state(),
-        "policy_optimizer": policy.optimizer.state_dict(),
-        # 判别器原始 state_dict（非 loadable 有效权重形式）：训练态续跑
-        # 要求 spectral norm 的 power iteration buffer 逐位回归
-        "discriminator_network": rewards.discriminator.state_dict(),
-        "discriminator_optimizer": rewards.update.optimizer.state_dict(),
-        "replay_buffer": {
-            "base": torch.stack(base) if base else None,
-            "recent": torch.stack(recent) if recent else None,
-        },
-        "generators": {
-            name: generator.get_state()
-            for name, generator in trainer.generators.items()
-        },
-        "rng": _global_rng_state(),
-        "lr": {
-            "policy": policy.optimizer.param_groups[0]["lr"],
-            "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
-        },
-        "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）
-    }
+    def restore(self, trainer: "GranularGrpoTrainer") -> int:
+        """从 run 目录本 rank 的最新续训状态整体恢复，返回恢复点 iteration。
 
-
-def assert_resumable_config(
-    saved: "CynosureConfig", current: "CynosureConfig",
-) -> None:
-    """续训 config 与原 run 快照的一致性守卫（漂移白名单见模块常量）。"""
-    if saved == current:
-        return
-    drift = _config_drift(saved.model_dump(), current.model_dump())
-    unallowed = sorted(
-        ".".join(path) for path in drift if tuple(path) not in _ALLOWED_CONFIG_DRIFT
-    )
-    if unallowed:
-        raise ValueError(
-            "续训 config 与原 run 快照不一致（除 schedule.max_iterations 外"
-            f"须逐字段一致，漂移字段会让恢复状态语义失配）: {', '.join(unallowed)}"
-        )
-
-
-def _config_drift(
-    left: Any, right: Any, prefix: tuple[str, ...] = (),
-) -> list[tuple[str, ...]]:
-    if isinstance(left, dict) and isinstance(right, dict):
-        drift: list[tuple[str, ...]] = []
-        for key in sorted(set(left) | set(right)):
-            if key not in left or key not in right:
-                drift.append((*prefix, key))
-            else:
-                drift.extend(_config_drift(left[key], right[key], (*prefix, key)))
-        return drift
-    return [] if left == right else [prefix]
-
-
-def _validate_payload(state: dict) -> None:
-    version = state.get("format_version")
-    if version != RESUME_STATE_FORMAT_VERSION:
-        raise ValueError(
-            f"续训状态契约版本不符：期望 {RESUME_STATE_FORMAT_VERSION}，"
-            f"得到 {version}"
-        )
-    missing = [key for key in _REQUIRED_KEYS if key not in state]
-    if missing:
-        raise ValueError(f"续训状态缺字段: {missing}")
-    iteration = state["iteration"]
-    if not isinstance(iteration, int) or iteration < 0:
-        raise ValueError(f"续训状态 iteration 计数非法: {iteration!r}")
-
-
-def _restore_lr(trainer: "GranularGrpoTrainer", slot: dict) -> None:
-    """LR scheduler 状态对账：常数 LR 实现的 scheduler 状态 = 两 optimizer
-    ``param_groups`` 的 lr（load_state_dict 已随 param_groups 回归）——
-    槽位与其实测值显式对账，不一致 = 文件损坏/篡改；scheduler 对象落地
-    后此处扩展为其 state_dict 装载。"""
-    optimizers = {
-        "policy": trainer.policy.optimizer,
-        "discriminator": trainer.rewards.update.optimizer,
-    }
-    if set(slot) != set(optimizers):
-        raise ValueError(f"续训状态 lr 槽位字段不符: {sorted(slot)}")
-    for name, optimizer in optimizers.items():
-        saved_lr = float(slot[name])
-        for group in optimizer.param_groups:
-            if group["lr"] != saved_lr:
-                raise ValueError(
-                    f"续训状态 lr 槽位与 optimizer state 不一致（{name}: "
-                    f"{saved_lr} vs {group['lr']}）"
-                )
-
-
-def _restore_buffer(trainer: "GranularGrpoTrainer", saved: dict) -> None:
-    """buffer 两区内容恢复：base 按固定容量严格对账后整体回填，recent
-    按 FIFO 插入序重放；恢复后两区占用必须与落盘一致（容量漂移在显式
-    错误处暴露，不静默截断）。"""
-    buffer = trainer.rewards.buffer
-    base = saved["base"]
-    recent = saved["recent"]
-    expected_shape = tuple(trainer.config.latent_shape)
-    if (
-        base is None
-        or base.shape[0] != buffer.base_capacity
-        or tuple(base.shape[1:]) != expected_shape
-    ):
-        raise ValueError(
-            f"续训状态 base 分区（{None if base is None else tuple(base.shape)}）"
-            f"与 buffer 容量 {buffer.base_capacity} × latent {expected_shape} 不符"
-        )
-    buffer.fill_base(base.to(trainer.device))
-    if recent is not None:
-        if tuple(recent.shape[1:]) != expected_shape:
-            raise ValueError(
-                f"续训状态 recent 分区形状 {tuple(recent.shape)} 与 latent "
-                f"{expected_shape} 不符"
+        先对账 config（除白名单漂移字段外逐字段一致）与拓扑（world_size
+        分片数一致），再按序恢复：两模型权重与 optimizer → lr 槽位对账 →
+        buffer 两区 → 命名 RNG 流 → 全局 RNG。
+        """
+        path = self.shard_path()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"无续训状态可恢复（期望 {path}）：周期落盘"
+                "（schedule.checkpoint_interval）尚未产出，或 run 目录不是"
+                "训练中断现场"
             )
-        buffer.push(recent.to(trainer.device))
-    sizes = buffer.zone_sizes()
-    if (sizes.base, sizes.recent) != (
-        buffer.base_capacity,
-        0 if recent is None else recent.shape[0],
-    ):
-        raise ValueError("续训状态 buffer 恢复后两区占用与落盘不一致")
-
-
-def _restore_generators(trainer: "GranularGrpoTrainer", saved: dict) -> None:
-    if set(saved) != set(trainer.generators):
-        raise ValueError(
-            f"续训状态 generator 清单与当前装配不一致: "
-            f"{sorted(saved)} vs {sorted(trainer.generators)}"
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as exc:  # 损坏/半截文件 → 干净的输入契约错误（非裸 traceback）
+            raise ValueError(f"续训状态文件不可读（{path}）: {exc}") from exc
+        self._validate_payload(state)
+        if state["world_size"] != self._dist.world_size:
+            raise ValueError(
+                f"续训状态 world_size（{state['world_size']}）与当前拓扑"
+                f"（{self._dist.world_size}）不符：FSDP 分片与 optimizer 状态是"
+                "按 world 切分的，跨拓扑续训不受支持"
+            )
+        self._assert_resumable_config(
+            ConfigLoader.load(trainer.artifacts.paths.config_snapshot),
+            trainer.config,
         )
-    for name, generator_state in saved.items():
-        trainer.generators[name].set_state(generator_state)
-
-
-def _global_rng_state() -> dict[str, Any]:
-    kind, keys, pos, has_gauss, cached = np.random.get_state()
-    version, state, gauss = random.getstate()
-    return {
-        "torch": torch.get_rng_state(),
-        "cuda": (
-            torch.cuda.get_rng_state_all()
-            if torch.cuda.is_available() else None
-        ),
-        "numpy": {
-            "keys": torch.from_numpy(np.asarray(keys, dtype=np.uint32)),
-            "pos": int(pos),
-            "has_gauss": int(has_gauss),
-            "cached": float(cached),
-        },
-        "python": {"version": version, "state": list(state), "gauss": gauss},
-    }
-
-
-def _restore_global_rng(saved: dict[str, Any]) -> None:
-    torch.set_rng_state(saved["torch"])
-    cuda = saved["cuda"]
-    cuda_available = torch.cuda.is_available()
-    if (cuda is not None) != cuda_available:
-        # CUDA 可用性在落盘与恢复两侧不一致（跨设备续训）：静默丢弃
-        # CUDA RNG = 恢复后轨迹静默漂移，显式拒绝
-        raise ValueError(
-            "续训状态的 CUDA RNG 侧与当前环境不一致"
-            f"（落盘 {'含' if cuda is not None else '不含'} CUDA 状态，"
-            f"当前 {'有' if cuda_available else '无'} CUDA）："
-            "跨设备续训不受支持"
+        trainer.policy.load_full_state(state["policy_network"])
+        trainer.policy.optimizer.load_state_dict(state["policy_optimizer"])
+        trainer.rewards.discriminator.load_state_dict(
+            state["discriminator_network"], strict=True,
         )
-    if cuda is not None:
-        torch.cuda.set_rng_state_all(cuda)
-    numpy_state = saved["numpy"]
-    np.random.set_state((
-        "MT19937",
-        numpy_state["keys"].numpy(),
-        int(numpy_state["pos"]),
-        int(numpy_state["has_gauss"]),
-        float(numpy_state["cached"]),
-    ))
-    python_state = saved["python"]
-    random.setstate((
-        int(python_state["version"]),
-        tuple(int(value) for value in python_state["state"]),
-        python_state["gauss"],
-    ))
+        trainer.rewards.update.optimizer.load_state_dict(
+            state["discriminator_optimizer"],
+        )
+        self._restore_lr(trainer, state["lr"])
+        self._restore_buffer(trainer, state["replay_buffer"])
+        self._restore_generators(trainer, state["generators"])
+        self._restore_global_rng(state["rng"])
+        return state["iteration"]
+
+    def _capture(
+        self, trainer: "GranularGrpoTrainer", iteration: int,
+    ) -> dict[str, Any]:
+        """续训状态全清单快照（T07 验收清单的落盘形态）。"""
+        policy = trainer.policy
+        rewards = trainer.rewards
+        base = rewards.buffer.base_samples()
+        recent = rewards.buffer.recent_samples()
+        return {
+            "format_version": RESUME_STATE_FORMAT_VERSION,
+            "iteration": int(iteration),
+            "world_size": trainer.runtime.dist.world_size,
+            # full state（裸网络键形）：FSDP 装配下由 PolicySharding 导出，
+            # 每 rank 冗余保存全量（同步生效的外部观测面 + 恢复入口简单）
+            "policy_network": policy.full_state(),
+            "policy_optimizer": policy.optimizer.state_dict(),
+            # 判别器原始 state_dict（非 loadable 有效权重形式）：训练态续跑
+            # 要求 spectral norm 的 power iteration buffer 逐位回归
+            "discriminator_network": rewards.discriminator.state_dict(),
+            "discriminator_optimizer": rewards.update.optimizer.state_dict(),
+            "replay_buffer": {
+                "base": torch.stack(base) if base else None,
+                "recent": torch.stack(recent) if recent else None,
+            },
+            "generators": {
+                name: generator.get_state()
+                for name, generator in trainer.generators.items()
+            },
+            "rng": self._capture_global_rng(),
+            "lr": {
+                "policy": policy.optimizer.param_groups[0]["lr"],
+                "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
+            },
+            "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）
+        }
+
+    def _assert_resumable_config(
+        self, saved: "CynosureConfig", current: "CynosureConfig",
+    ) -> None:
+        """续训 config 与原 run 快照的一致性守卫（漂移白名单见模块常量）。"""
+        if saved == current:
+            return
+        drift = self._config_drift(saved.model_dump(), current.model_dump())
+        unallowed = sorted(
+            ".".join(path)
+            for path in drift if tuple(path) not in _ALLOWED_CONFIG_DRIFT
+        )
+        if unallowed:
+            raise ValueError(
+                "续训 config 与原 run 快照不一致（除 schedule.max_iterations 外"
+                f"须逐字段一致，漂移字段会让恢复状态语义失配）: {', '.join(unallowed)}"
+            )
+
+    def _config_drift(
+        self, left: Any, right: Any, prefix: tuple[str, ...] = (),
+    ) -> list[tuple[str, ...]]:
+        if isinstance(left, dict) and isinstance(right, dict):
+            drift: list[tuple[str, ...]] = []
+            for key in sorted(set(left) | set(right)):
+                if key not in left or key not in right:
+                    drift.append((*prefix, key))
+                else:
+                    drift.extend(
+                        self._config_drift(left[key], right[key], (*prefix, key))
+                    )
+            return drift
+        return [] if left == right else [prefix]
+
+    def _validate_payload(self, state: dict) -> None:
+        version = state.get("format_version")
+        if version != RESUME_STATE_FORMAT_VERSION:
+            raise ValueError(
+                f"续训状态契约版本不符：期望 {RESUME_STATE_FORMAT_VERSION}，"
+                f"得到 {version}"
+            )
+        missing = [key for key in _REQUIRED_KEYS if key not in state]
+        if missing:
+            raise ValueError(f"续训状态缺字段: {missing}")
+        iteration = state["iteration"]
+        if not isinstance(iteration, int) or iteration < 0:
+            raise ValueError(f"续训状态 iteration 计数非法: {iteration!r}")
+
+    def _restore_lr(self, trainer: "GranularGrpoTrainer", slot: dict) -> None:
+        """LR scheduler 状态对账：常数 LR 实现的 scheduler 状态 = 两 optimizer
+        ``param_groups`` 的 lr（load_state_dict 已随 param_groups 回归）——
+        槽位与其实测值显式对账，不一致 = 文件损坏/篡改；scheduler 对象落地
+        后此处扩展为其 state_dict 装载。"""
+        optimizers = {
+            "policy": trainer.policy.optimizer,
+            "discriminator": trainer.rewards.update.optimizer,
+        }
+        if set(slot) != set(optimizers):
+            raise ValueError(f"续训状态 lr 槽位字段不符: {sorted(slot)}")
+        for name, optimizer in optimizers.items():
+            saved_lr = float(slot[name])
+            for group in optimizer.param_groups:
+                if group["lr"] != saved_lr:
+                    raise ValueError(
+                        f"续训状态 lr 槽位与 optimizer state 不一致（{name}: "
+                        f"{saved_lr} vs {group['lr']}）"
+                    )
+
+    def _restore_buffer(
+        self, trainer: "GranularGrpoTrainer", saved: dict,
+    ) -> None:
+        """buffer 两区内容恢复：base 按固定容量严格对账后整体回填，recent
+        按 FIFO 插入序重放；恢复后两区占用必须与落盘一致（容量漂移在显式
+        错误处暴露，不静默截断）。"""
+        buffer = trainer.rewards.buffer
+        base = saved["base"]
+        recent = saved["recent"]
+        expected_shape = tuple(trainer.config.latent_shape)
+        if (
+            base is None
+            or base.shape[0] != buffer.base_capacity
+            or tuple(base.shape[1:]) != expected_shape
+        ):
+            raise ValueError(
+                f"续训状态 base 分区（{None if base is None else tuple(base.shape)}）"
+                f"与 buffer 容量 {buffer.base_capacity} × latent {expected_shape} 不符"
+            )
+        buffer.fill_base(base.to(trainer.device))
+        if recent is not None:
+            if tuple(recent.shape[1:]) != expected_shape:
+                raise ValueError(
+                    f"续训状态 recent 分区形状 {tuple(recent.shape)} 与 latent "
+                    f"{expected_shape} 不符"
+                )
+            buffer.push(recent.to(trainer.device))
+        sizes = buffer.zone_sizes()
+        if (sizes.base, sizes.recent) != (
+            buffer.base_capacity,
+            0 if recent is None else recent.shape[0],
+        ):
+            raise ValueError("续训状态 buffer 恢复后两区占用与落盘不一致")
+
+    def _restore_generators(
+        self, trainer: "GranularGrpoTrainer", saved: dict,
+    ) -> None:
+        if set(saved) != set(trainer.generators):
+            raise ValueError(
+                f"续训状态 generator 清单与当前装配不一致: "
+                f"{sorted(saved)} vs {sorted(trainer.generators)}"
+            )
+        for name, generator_state in saved.items():
+            trainer.generators[name].set_state(generator_state)
+
+    def _capture_global_rng(self) -> dict[str, Any]:
+        kind, keys, pos, has_gauss, cached = np.random.get_state()
+        version, state, gauss = random.getstate()
+        return {
+            "torch": torch.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() else None
+            ),
+            "numpy": {
+                "keys": torch.from_numpy(np.asarray(keys, dtype=np.uint32)),
+                "pos": int(pos),
+                "has_gauss": int(has_gauss),
+                "cached": float(cached),
+            },
+            "python": {"version": version, "state": list(state), "gauss": gauss},
+        }
+
+    def _restore_global_rng(self, saved: dict[str, Any]) -> None:
+        torch.set_rng_state(saved["torch"])
+        cuda = saved["cuda"]
+        cuda_available = torch.cuda.is_available()
+        if (cuda is not None) != cuda_available:
+            # CUDA 可用性在落盘与恢复两侧不一致（跨设备续训）：静默丢弃
+            # CUDA RNG = 恢复后轨迹静默漂移，显式拒绝
+            raise ValueError(
+                "续训状态的 CUDA RNG 侧与当前环境不一致"
+                f"（落盘 {'含' if cuda is not None else '不含'} CUDA 状态，"
+                f"当前 {'有' if cuda_available else '无'} CUDA）："
+                "跨设备续训不受支持"
+            )
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+        numpy_state = saved["numpy"]
+        np.random.set_state((
+            "MT19937",
+            numpy_state["keys"].numpy(),
+            int(numpy_state["pos"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached"]),
+        ))
+        python_state = saved["python"]
+        random.setstate((
+            int(python_state["version"]),
+            tuple(int(value) for value in python_state["state"]),
+            python_state["gauss"],
+        ))

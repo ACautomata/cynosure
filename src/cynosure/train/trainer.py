@@ -36,7 +36,7 @@ from cynosure.train.artifacts import (
     RunArtifacts,
 )
 from cynosure.train.policy import GroupPolicy
-from cynosure.train.resume import resume_latest, save_resume_state
+from cynosure.train.resume import ResumeStore
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import IterationRollout, RolloutPhase
 from cynosure.train.runtime import AmpContext, TrainingRuntime
@@ -133,6 +133,11 @@ class GranularGrpoTrainer:
         self.runtime = TrainingRuntime.build(
             config, run_artifacts, device=device, dist_context=dist_context,
         )
+        self.resume_store = ResumeStore(
+            run_artifacts.paths.checkpoints,
+            self.stage_tag.checkpoint_prefix,
+            self.runtime.dist,
+        )
 
     # —— 既有公开访问面（tests 与 resume 模块消费；组件归 runtime 持有）——
 
@@ -197,7 +202,7 @@ class GranularGrpoTrainer:
         dist = self.runtime.dist
         start_iteration = 0
         if resume:
-            start_iteration = resume_latest(self)
+            start_iteration = self.resume_store.restore(self)
             if dist.rank == 0:
                 # 指标流回退只在 rank 0（RunArtifacts 的 rank 0 写盘契约）；
                 # barrier 保证回退先于任何 rank 的下一事件追加
@@ -338,7 +343,7 @@ class GranularGrpoTrainer:
         full_state = self.policy.full_state()
         if self.runtime.dist.rank == 0:
             self._write_checkpoint(iteration, full_state)
-        save_resume_state(self, iteration)
+        self.resume_store.save(self, iteration)
 
     def _write_checkpoint(
         self, iteration: int, full_state: dict,
@@ -351,7 +356,7 @@ class GranularGrpoTrainer:
         不按需导出（rank0-only 导出会互等死锁））；判别器经
         loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
         重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
-        历史布局逐字一致）。续训全状态由 resume.save_resume_state 同节奏
+        历史布局逐字一致）。续训全状态由 ResumeStore.save 同节奏
         落盘（per-rank 分片文件）。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
