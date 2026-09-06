@@ -51,7 +51,15 @@ class DistributedContext:
         if dist.is_initialized():
             return cls(dist.get_rank(), dist.get_world_size(), True)
         dist.init_process_group(backend=cls._select_backend())
-        return cls(dist.get_rank(), dist.get_world_size(), True)
+        context = cls(dist.get_rank(), dist.get_world_size(), True)
+        # torchrun 只注入 LOCAL_RANK、不替进程选择 CUDA 设备：显式绑定
+        # 本 rank 卡，使「未索引 cuda / current device」语义与 object
+        # collectives 的暂存设备都落在 LOCAL_RANK 卡上——否则各 rank 默认
+        # 都在 GPU 0 上构建网络，与 FSDP/DDP 的 device_id（cuda:LOCAL_RANK）
+        # 错位（DDP 拒绝或 NCCL 对象集合走错卡）。
+        if torch.cuda.is_available():
+            torch.cuda.set_device(context.local_device())
+        return context
 
     @staticmethod
     def _select_backend() -> str:
@@ -103,14 +111,32 @@ class DistributedContext:
         )
         return received
 
+    def all_gather(self, items: list) -> list[list]:
+        """逐 rank 收集对象列表到**所有** rank（恢复代际对账的「全体同
+        见」原语：一致性结论必须各 rank 独立可判定——只有 rank 0 见全貌
+        的 gather 会让通过方单方面继续、拒绝方退出，集合操作互等挂死）。
+
+        返回按源 rank 排列的列表（received[src] = rank src 提交的整段
+        提交物）；单进程返回自身一份。
+        """
+        if not self._distributed:
+            return [items]
+        received: list = [None] * self._world_size
+        dist.all_gather_object(received, items)
+        return received
+
     def broadcast_flag(self, value: bool) -> bool:
         """rank 0 的布尔决定广播到所有 rank（早停 verdict 的全局一致性
         消费：训练循环的 break 必须各 rank 一致，分歧会让 barrier 互等
         死锁）。所有 rank 都须调用本方法（集合操作）；rank 0 的 ``value``
-        生效，其余 rank 的传入值被覆盖。单进程恒等返回传入值。"""
+        生效，其余 rank 的传入值被覆盖。单进程恒等返回传入值。flag 落
+        本 rank 计算设备（NCCL 只支持 CUDA 张量——CPU 张量的广播在
+        torchrun 多卡路径上直接失败；gloo/CPU fixture 下即 cpu）。"""
         if not self._distributed:
             return value
-        flag = torch.tensor(1.0 if value else 0.0)
+        flag = torch.tensor(
+            1.0 if value else 0.0, device=self.local_device(),
+        )
         dist.broadcast(flag, src=0)
         return bool(flag.item())
 

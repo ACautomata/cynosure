@@ -105,7 +105,7 @@ class SpawnedTrainWorld:
 
     def __init__(
         self, config_path: Path, run_dir: Path, world: int,
-        argv: list[str] | None = None,
+        argv: list[str] | None = None, join_timeout_s: float | None = None,
     ) -> None:
         self.config_path = config_path
         self.run_dir = run_dir
@@ -113,6 +113,10 @@ class SpawnedTrainWorld:
         self.argv = argv if argv is not None else [
             "train", "--config", str(config_path), "--run-dir", str(run_dir),
         ]
+        self.join_timeout_s = (
+            join_timeout_s
+            if join_timeout_s is not None else _WORKER_JOIN_TIMEOUT_S
+        )
         type(self)._next_port += 1
         self.port = type(self)._next_port
 
@@ -131,7 +135,7 @@ class SpawnedTrainWorld:
             # get 的超时是 join 兜底的前置（worker 崩溃未回传时主进程不能
             # 无限等）：超时把已收集的 stderr 带进失败信息，死锁可诊断
             try:
-                payload = queue.get(timeout=_WORKER_JOIN_TIMEOUT_S)
+                payload = queue.get(timeout=self.join_timeout_s)
             except _QueueEmpty:
                 for process in processes:
                     if process.is_alive():
@@ -142,12 +146,12 @@ class SpawnedTrainWorld:
                     for rank in sorted(collected)
                 ) or "（无任何 worker 回传）"
                 raise AssertionError(
-                    f"worker 回传超时（{_WORKER_JOIN_TIMEOUT_S}s，"
+                    f"worker 回传超时（{self.join_timeout_s}s，"
                     f"疑似某 rank 在集合操作互等后崩溃）: {stuck}"
                 )
             collected[payload["rank"]] = payload
         for process in processes:
-            process.join(timeout=_WORKER_JOIN_TIMEOUT_S)
+            process.join(timeout=self.join_timeout_s)
             if process.is_alive():
                 process.terminate()
                 collected[process.pid] = {
@@ -274,6 +278,19 @@ class TestDistributedContextUnit:
         assert context.derive_seed(7) == 7  # 等价性前提：rank 0 恒等偏移
         context.destroy()
 
+    def test_broadcast_flag_and_local_device_degenerate_on_single_process(self) -> None:
+        """world-1 恒等：broadcast_flag 原样返回传入值（不构造张量）、
+        local_device 回落 CPU。CUDA 下的 cuda:LOCAL_RANK 绑定与 NCCL 的
+        广播张量设备正确性属集群 torchrun 冒烟门槛（本机 CPU fixture 只
+        锁退化语义与代码路径收敛）。"""
+        context = DistributedContext.bootstrap()
+        assert context.broadcast_flag(True) is True
+        assert context.broadcast_flag(False) is False
+        assert context.local_device().type == (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        context.destroy()
+
 
 class TestPoolSliceUnit:
     """Real sample pool 的 rank 切片语义（条带切片 + 分层保持）。"""
@@ -327,6 +344,20 @@ class TestPoolSliceUnit:
         starved.entries = starved.entries[:2]  # 只剩 t1n/t1c 两序列
         with pytest.raises(ValueError, match="t2w|t2f|序列"):
             RankSlicedPool(starved, context).view()
+
+    def test_insufficient_pool_rejected_consistently_on_every_rank(
+        self, manifest: LatentManifest,
+    ) -> None:
+        """pool 不足的拒绝必须全 rank 一致：校验消费**切片前**的 full
+        manifest（每 rank 对同一全量判定同一结果）。按切片后本地视图校验
+        时 rank 间可见性不同（序列仅 1 条时 rank 0 满额通过、高 rank 条带
+        为空才拒绝）——失败方单方面退出装配、其余 rank 进入集合操作互等
+        （连接错误/挂死），而非全 rank 一致的输入拒绝。"""
+        starved = manifest.model_copy(deep=True)
+        starved.entries = starved.entries[:4]  # 每序列恰好 1 条
+        for rank in range(2):
+            with pytest.raises(ValueError, match="不足"):
+                RankSlicedPool(starved, DistributedContext(rank, 2, True)).view()
 
 
 class TestSingleRankEquivalence:
@@ -407,6 +438,33 @@ class TestTwoRankSharding:
             not torch.equal(initial[name], synced[name]) for name in initial
         )
 
+    def test_two_rank_milestone_eval_and_stop_broadcast(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """里程碑评测相在 world=2 下全 rank 集合参与（policy 采样前向是
+        FSDP 集合操作）、早停 verdict 经广播原语同步（``milestone`` 事件
+        rank 0 独写入流）——早停广播的张量设备语义在多 rank 进程组下的
+        集合路径覆盖（NCCL 多卡的设备正确性由集群 torchrun 冒烟门槛
+        验证，本机 CPU gloo 等价进程语义）。"""
+        scenario.write_inputs()
+        scenario.patch_config(schedule={
+            "max_iterations": 2,
+            "milestone_interval": 1,
+            "checkpoint_interval": 2,
+        })
+        SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch().assert_green()
+
+        events = RunArtifacts(
+            RunArtifacts.layout(scenario.run_dir),
+        ).read_events()
+        milestones = [
+            event for event in events if event.get("event") == "milestone"
+        ]
+        assert [event["iteration"] for event in milestones] == [1, 2]
+        assert all(not event["early_stop"] for event in milestones)
+
     def test_two_rank_gradient_differs_from_single_process(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -437,6 +495,134 @@ class TestTwoRankSharding:
             not torch.equal(dist_policy[key], inproc_policy[key])
             for key in dist_policy
         )
+
+
+class TestResumeGeneration:
+    """续训代际一致性：per-rank 分片各自原子替换（tmp + os.replace），
+    保存中途崩溃可留下**混代际**分片（部分 rank 已到 N、其余还在 N-1）
+    ——各 rank 只对账自己分片的恢复会从不同 iteration 继续训练：集合
+    操作与邻居错配、指标流出现重复事件、allreduce 混入不同逻辑迭代的
+    梯度（权重静默分叉）。恢复入口必须对齐共同代际：全 rank 分片均
+    持久化到同一 iteration 后才发布代际标记（提交点），恢复对账标记、
+    混代际现场显式拒绝。"""
+
+    @pytest.fixture
+    def scenario(self, cli, tmp_path: Path) -> TrainingLoopScenario:
+        return TrainingLoopScenario(cli, tmp_path)
+
+    def test_generation_marker_published_with_shards(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.patch_config(
+            schedule={"max_iterations": 2, "checkpoint_interval": 2},
+        )
+        SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch().assert_green()
+
+        marker = json.loads(
+            (scenario.run_dir / "checkpoints" / "resume_generation.json")
+            .read_text(encoding="utf-8"),
+        )
+        assert marker["iteration"] == 2
+        shards = RankResumeShards(scenario.run_dir, world=2)
+        for rank in range(2):
+            assert shards.state(rank)["iteration"] == marker["iteration"]
+
+    def test_mixed_generation_shards_are_refused(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """混代际现场（rank 1 分片落后一代 = 其保存未及完成的崩溃现场）
+        的续训显式拒绝：分叉续跑不是恢复，是静默损坏。"""
+        scenario.write_inputs()
+        scenario.patch_config(
+            schedule={"max_iterations": 2, "checkpoint_interval": 2},
+        )
+        SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch().assert_green()
+
+        shard = scenario.run_dir / "checkpoints" / "resume_state_rank1.pt"
+        payload = torch.load(shard, map_location="cpu", weights_only=True)
+        payload["iteration"] -= 1  # 回拨一代：混代际注入
+        torch.save(payload, shard)
+
+        scenario.patch_config(schedule={"max_iterations": 4})
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+            argv=[
+                "train", "--config", str(scenario.config_path),
+                "--run-dir", str(scenario.run_dir), "--resume",
+            ],
+        ).launch()
+        assert result.codes == [2, 2], result.errors
+        assert any("代际" in error for error in result.errors)
+
+
+class TestSpawnedUsageContract:
+    """分布式启动的 usage 错误契约：rank 非对称的 pre-flight 失败（run
+    目录预存、轨迹诊断输入错误）必须经广播裁决让**全 rank 一致**返回
+    usage error（exit 2）——rank 0 单方面退出、其余 rank 进 rendezvous
+    的作业是挂死/被 launcher 噪声终止，不是干净的输入拒绝；训练装配
+    失败的 run 目录回滚只由 rank 0 执行（多 rank 各自 rmtree 同一目录
+    是 stat/rmtree 竞态）。
+
+    红/绿信号用短 join 超时（挂死 → 超时红；一致退出 → 秒级绿）。"""
+
+    _JOIN_TIMEOUT_S = 120.0
+
+    @pytest.fixture
+    def scenario(self, cli, tmp_path: Path) -> TrainingLoopScenario:
+        return TrainingLoopScenario(cli, tmp_path)
+
+    def test_preexisting_run_dir_rejected_on_every_rank(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.run_dir.mkdir(parents=True)
+        (scenario.run_dir / "config.json").write_text("{}", encoding="utf-8")
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+            join_timeout_s=self._JOIN_TIMEOUT_S,
+        ).launch()
+        assert result.codes == [2, 2], result.errors
+        assert any("已存在" in error for error in result.errors)
+
+    def test_dump_trajectory_failure_reaches_every_rank(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.patch_config(artifacts={
+            "net_config_json": str(scenario.fixture_dir / "missing.json"),
+        })
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+            argv=[
+                "train", "--config", str(scenario.config_path),
+                "--run-dir", str(scenario.run_dir), "--dump-trajectory",
+            ],
+            join_timeout_s=self._JOIN_TIMEOUT_S,
+        ).launch()
+        assert result.codes == [2, 2], result.errors
+        assert any("轨迹诊断" in error for error in result.errors)
+
+    def test_construction_failure_rollback_is_rank0_only(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        # 损坏判别器 checkpoint → 装配期对 torch.load 的对称 RuntimeError
+        (scenario.fixture_dir / "discriminator.pt").write_bytes(b"corrupt")
+        for _ in range(3):  # 竞态类：重复三次提高捕获率
+            result = SpawnedTrainWorld(
+                scenario.config_path, scenario.run_dir, world=2,
+                join_timeout_s=self._JOIN_TIMEOUT_S,
+            ).launch()
+            assert result.codes == [2, 2], result.errors
+            assert not any(
+                "FileNotFoundError" in error for error in result.errors
+            )
+            assert not scenario.run_dir.exists()  # 未产出工件的目录已回滚
 
 
 class TestTwoRankResume:

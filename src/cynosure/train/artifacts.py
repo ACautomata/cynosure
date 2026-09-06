@@ -9,7 +9,6 @@ checkpoint 目录。
 
 import json
 import os
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,16 +17,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cynosure.config import CynosureConfig
-from cynosure.distributed import DistributedContext
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
-
-_RANK_WAIT_TIMEOUT_S: float = 60.0
-"""非 0 rank 等待 rank 0 创建 run 目录的超时（秒）。"""
-
-_RANK_POLL_INTERVAL_S: float = 0.05
-"""非 0 rank 轮询 run 目录出现的间隔（秒）。"""
 
 POLICY_CHECKPOINT_TEMPLATE = "policy_iter{iteration}.pt"
 """policy checkpoint 文件名模板（契约布局的一部分：组3 stage-1 的复用
@@ -236,25 +228,21 @@ class RunArtifacts:
         self.paths = paths
 
     @classmethod
-    def init(
-        cls, config: CynosureConfig, root: Path, *,
-        wait_timeout_s: float = _RANK_WAIT_TIMEOUT_S,
-    ) -> "RunArtifacts":
+    def init(cls, config: CynosureConfig, root: Path) -> "RunArtifacts":
         """创建 run 目录并落盘契约最小集工件；run 目录已存在则拒绝
         （每次运行一个 run 目录的隔离契约，续训须显式复用并经续训入口）。
 
-        torchrun 环境（``RANK`` env）下 rank 0 创建、其余 rank 轮询等待目录
-        出现后原样采用（自身不写盘——多 rank 下指标由 rank 0 归并写出）；
-        等待超时抛 ``TimeoutError``，防各 rank 静默分裂 run。
+        只应由协调方（CLI：进程组 rendezvous 之后的 rank 0）在新 run
+        启动时调用一次，成败经广播裁决同步各 rank——文件存在性无法区分
+        「rank 0 本轮新建」与「上轮遗留」，历史上「非 0 rank 轮询等待
+        config 快照出现」的握手在预存目录下会让非 0 rank 误判 rank 0
+        成功、径自进入 rendezvous 挂死。
         """
         paths = cls.layout(root)
-        env_rank = DistributedContext.env_rank()
-        if env_rank is None or env_rank == 0:
-            if paths.config_snapshot.exists():
-                raise FileExistsError(f"run 目录已存在（不静默覆盖）: {root}")
-            cls._create_minimal_set(config, paths)
-            return cls(paths)
-        return cls._await_rank0(paths, wait_timeout_s)
+        if paths.config_snapshot.exists():
+            raise FileExistsError(f"run 目录已存在（不静默覆盖）: {root}")
+        cls._create_minimal_set(config, paths)
+        return cls(paths)
 
     @classmethod
     def _create_minimal_set(cls, config: CynosureConfig, paths: RunPaths) -> None:
@@ -265,19 +253,6 @@ class RunArtifacts:
         )
         paths.metrics.touch()
         cls.manifest(config).write(paths.manifest)
-
-    @classmethod
-    def _await_rank0(cls, paths: RunPaths, wait_timeout_s: float) -> "RunArtifacts":
-        """轻量文件系统 barrier：轮询等待 rank 0 写出 config 快照
-        （不引入 torch.distributed 初始化——那属 orchestration ticket）。"""
-        deadline = time.monotonic() + wait_timeout_s
-        while not paths.config_snapshot.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"等待 rank 0 创建 run 目录超时（{wait_timeout_s}s）: {paths.root}"
-                )
-            time.sleep(_RANK_POLL_INTERVAL_S)
-        return cls(paths)
 
     @classmethod
     def layout(cls, root: Path) -> RunPaths:

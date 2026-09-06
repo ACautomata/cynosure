@@ -35,7 +35,7 @@ from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
-from tests.conftest import CliSession, FixturePrepareScenario
+from tests.conftest import CliResult, CliSession, FixturePrepareScenario
 
 
 class TrainingLoopScenario:
@@ -118,12 +118,15 @@ class TrainingLoopScenario:
             data[section].update(values)
         self.config_path.write_text(json.dumps(data), encoding="utf-8")
 
-    def resume(self):
+    def resume(self, *, dump: bool = False) -> CliResult:
         """--resume 入口：同 run 目录的续训提交（跨作业边界的恢复场景）。"""
-        return self.cli.run(
+        argv = [
             "train", "--config", str(self.config_path),
             "--run-dir", str(self.run_dir), "--resume",
-        )
+        ]
+        if dump:
+            argv.append("--dump-trajectory")
+        return self.cli.run(*argv)
 
     def resume_state(self) -> dict:
         """单进程续训状态分片的外部读取面（契约文件名字面：world-1 无

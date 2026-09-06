@@ -96,12 +96,12 @@ class TrainingRuntime:
         # dict 视图是装配期按名取流的消费面。
         streams = TrainingRngStreams(dist.derive_seed(config.schedule.seed))
         generators = streams.named()
+        # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
+        # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
+        # （cuda:LOCAL_RANK）错位；CPU fixture 下即 cpu
         amp = AmpContext(
             device=(
-                device if device is not None
-                else torch.device(
-                    "cuda" if torch.cuda.is_available() else "cpu",
-                )
+                device if device is not None else dist.local_device()
             ),
             dtype=AMP_DTYPES[config.policy.amp_dtype],
         )

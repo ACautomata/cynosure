@@ -118,6 +118,9 @@ Real sample pool 按序列分层的条带切片（每序列 entries[rank::world]
 **Per-rank replay buffer（每 rank 回放缓冲）**:
 每 rank 独立的 fake 回放缓冲（rollout 数据各 rank 独立演化）；续训状态同样按 rank 分片落盘（resume_state_rank{R}.pt），恢复时对号取回。
 
+**Resume generation marker（续训代际标记）**:
+全部 rank 分片均已持久化到同一 iteration 的提交记录（resume_generation.json，save 的 barrier 之后由 rank 0 写出）；恢复对账标记代际、混代际分片（保存中途崩溃现场）显式拒绝——各 rank 必须从同一 iteration 继续。
+
 **Metric merge（指标归并）**:
 iter 事件由各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出的合并写出——无重复、无丢失。
 

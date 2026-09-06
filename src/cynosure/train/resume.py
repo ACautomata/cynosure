@@ -42,6 +42,7 @@ norm 启用时含 power iteration buffer ``_u``/``_v``；有效权重语义的
 事件。
 """
 
+import json
 import os
 import random
 from pathlib import Path
@@ -60,6 +61,15 @@ if TYPE_CHECKING:
 RESUME_STATE_FILENAME = "resume_state.pt"
 """续训状态文件名（checkpoints 目录内、组3 stage 前缀隔离；多 rank 下
 每 rank 追加 ``_rank{R}`` 后缀形成分片文件）。"""
+
+RESUME_GENERATION_FILENAME = "resume_generation.json"
+"""续训代际标记（checkpoints 目录内、stage 前缀隔离）：全部 rank 分片
+均已持久化到同一 iteration 的提交记录——save 在分片落盘后的 barrier 之
+后才由 rank 0 写出。多 rank 恢复必须对齐标记代际：per-rank 分片各自
+原子替换，保存中途崩溃可留下混代际现场（部分 rank 已到 N、其余还在
+N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操作错配、
+指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
+原子替换已保证一致性），对账跳过。"""
 
 RESUME_STATE_FORMAT_VERSION = 2
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
@@ -114,22 +124,69 @@ class ResumeStore:
         )
         return self._checkpoints_dir / f"{self._prefix}{name}"
 
-    def save(self, trainer: "GranularGrpoTrainer", iteration: int) -> None:
+    def generation_marker_path(self) -> Path:
+        """续训代际标记路径（与分片同前缀隔离；提交点语义见模块常量）。"""
+        return self._checkpoints_dir / f"{self._prefix}{RESUME_GENERATION_FILENAME}"
+
+    def save(
+        self, trainer: "GranularGrpoTrainer", iteration: int,
+        policy_state: dict,
+    ) -> None:
         """全清单快照原子落盘（trainer 在周期/里程碑/收尾点调用；每 rank
-        写自己的分片文件）。"""
-        payload = self._capture(trainer, iteration)
+        写自己的分片文件）。``policy_state`` 是调用方已导出的 policy full
+        state（产物 checkpoint 写盘与续训分片共享同一份导出——本方法内部
+        不再二次导出，那会让每 rank 在 checkpoint 期同时驻留两份完整 CPU
+        权重副本）。落盘后的 barrier 是代际提交的前置：标记（rank 0 写）
+        承诺**全部**分片已持久化到同一 iteration。"""
+        payload = self._capture(trainer, iteration, policy_state)
         path = self.shard_path()
         tmp = path.with_name(f"{path.name}.tmp")
         torch.save(payload, tmp)
         os.replace(tmp, path)  # 崩溃下的原子替换：恢复面只见完整旧文件或完整新文件
+        self._dist.barrier()
+        if self._dist.rank == 0:
+            self._write_generation_marker(iteration)
+
+    def _write_generation_marker(self, iteration: int) -> None:
+        marker = self.generation_marker_path()
+        tmp = marker.with_name(f"{marker.name}.tmp")
+        tmp.write_text(json.dumps({
+            "iteration": int(iteration),
+            "world_size": self._dist.world_size,
+        }), encoding="utf-8")
+        os.replace(tmp, marker)
+
+    def _read_generation_marker(self) -> int | None:
+        """代际标记读取（缺失返回 None：world-1 的历史 run 目录无标记，
+        单分片自身原子替换已保证一致性）。"""
+        marker = self.generation_marker_path()
+        if not marker.is_file():
+            return None
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            return int(payload["iteration"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"续训代际标记不可读（{marker}）: {exc}"
+            ) from exc
 
     def restore(self, trainer: "GranularGrpoTrainer") -> int:
         """从 run 目录本 rank 的最新续训状态整体恢复，返回恢复点 iteration。
 
-        先对账 config（除白名单漂移字段外逐字段一致）与拓扑（world_size
-        分片数一致），再按序恢复：两模型权重与 optimizer → lr 槽位对账 →
-        buffer 两区 → 命名 RNG 流 → 全局 RNG。
+        先对账代际（多 rank：分片 iteration 必须等于提交标记——混代际
+        分片是保存中途崩溃的现场，滚动覆写不保留历史分片，只能拒绝不
+        能猜测），再对账 config（除白名单漂移字段外逐字段一致）与拓扑
+        （world_size 分片数一致），最后按序恢复：两模型权重与 optimizer
+        → lr 槽位对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG。
         """
+        marker_iteration = self._read_generation_marker()
+        if marker_iteration is None and self._dist.world_size > 1:
+            raise ValueError(
+                f"多 rank 续训缺代际标记"
+                f"（{self.generation_marker_path().name}）：run 目录不是"
+                "完整的多 rank 训练现场（分片与标记由同一 checkpoint 节奏"
+                "产出），拒绝猜测各 rank 的共同恢复点"
+            )
         path = self.shard_path()
         if not path.is_file():
             raise FileNotFoundError(
@@ -147,6 +204,34 @@ class ResumeStore:
                 f"续训状态 world_size（{state['world_size']}）与当前拓扑"
                 f"（{self._dist.world_size}）不符：FSDP 分片与 optimizer 状态是"
                 "按 world 切分的，跨拓扑续训不受支持"
+            )
+        # 代际的集合性对账（全体同见才放行）：对账结论必须各 rank 独立
+        # 可判定——单 rank 本地判断（标记或分片不一致即抛）会让通过方
+        # 单方面恢复训练、拒绝方退出，集合操作互等挂死。各 rank 报告
+        # （分片代际、标记、拓扑），任何不一致全体拒绝。
+        report = {
+            "rank": self._dist.rank,
+            "iteration": int(state["iteration"]),
+            "marker": marker_iteration,
+            "world_size": int(state["world_size"]),
+        }
+        peers = [
+            entry[0] for entry in self._dist.all_gather([report])
+        ]
+        mismatched = [
+            peer for peer in peers
+            if (peer["iteration"], peer["marker"], peer["world_size"])
+            != (report["iteration"], report["marker"], report["world_size"])
+        ]
+        if mismatched:
+            peer = mismatched[0]
+            raise ValueError(
+                "各 rank 续训分片代际不一致"
+                f"（rank {peer['rank']} 分片 {peer['iteration']} / 标记 "
+                f"{peer['marker']} vs 本 rank（{report['rank']}）分片 "
+                f"{report['iteration']} / 标记 {report['marker']}）：保存"
+                "中途崩溃留下的混代际分片不可恢复（滚动覆写不保留历史"
+                "分片），请从更早的完整 checkpoint 现场恢复"
             )
         self._assert_resumable_config(
             ConfigLoader.load(trainer.artifacts.paths.config_snapshot),
@@ -168,9 +253,9 @@ class ResumeStore:
 
     def _capture(
         self, trainer: "GranularGrpoTrainer", iteration: int,
+        policy_state: dict,
     ) -> dict[str, Any]:
         """续训状态全清单快照（T07 验收清单的落盘形态）。"""
-        policy = trainer.policy
         rewards = trainer.rewards
         base = rewards.buffer.base_samples()
         recent = rewards.buffer.recent_samples()
@@ -179,9 +264,10 @@ class ResumeStore:
             "iteration": int(iteration),
             "world_size": trainer.runtime.dist.world_size,
             # full state（裸网络键形）：FSDP 装配下由 PolicySharding 导出，
-            # 每 rank 冗余保存全量（同步生效的外部观测面 + 恢复入口简单）
-            "policy_network": policy.full_state(),
-            "policy_optimizer": policy.optimizer.state_dict(),
+            # 每 rank 冗余保存全量（同步生效的外部观测面 + 恢复入口简单）；
+            # 调用方传入的同一份导出（不在此二次导出）
+            "policy_network": policy_state,
+            "policy_optimizer": trainer.policy.optimizer.state_dict(),
             # 判别器原始 state_dict（非 loadable 有效权重形式）：训练态续跑
             # 要求 spectral norm 的 power iteration buffer 逐位回归
             "discriminator_network": rewards.discriminator.state_dict(),
@@ -196,7 +282,7 @@ class ResumeStore:
             },
             "rng": self._capture_global_rng(),
             "lr": {
-                "policy": policy.optimizer.param_groups[0]["lr"],
+                "policy": trainer.policy.optimizer.param_groups[0]["lr"],
                 "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
             },
             "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）

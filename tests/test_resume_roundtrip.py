@@ -18,6 +18,7 @@ fixture 下 CLI train 端到端的三条验收：
   断言面仍是外部工件）。
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from cynosure.config import ConfigLoader
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import IterationLoop, RunArtifacts
+from cynosure.train.policy import GroupPolicy
 from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
 
@@ -292,6 +294,63 @@ class TestNoopResumeIntegrity:
         assert result.code == 0
         assert calls["resample"] == 0
         assert "2 iteration" in result.stdout
+
+    def test_noop_resume_preserves_existing_diagnostic(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """零训练迭代的续训（--dump-trajectory）不得用空 log-prob 对清单
+        覆盖既有 training.json——那会把「文档化的 no-op resume」变成对
+        一致性证据的破坏。"""
+        scenario.write_inputs()
+        assert scenario.train(dump=True).code == 0
+        diagnostic_path = scenario.run_dir / "training.json"
+        original = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        assert original["logprob_pairs"]  # 首轮确有真实采集
+
+        assert scenario.resume(dump=True).code == 0
+        after = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        assert after == original
+
+
+class TestLegacyDirCompatibility:
+    """代际标记引入后的 world-1 兼容：单分片自身原子替换已保证一致性，
+    历史无标记的 run 目录照常恢复（缺标记的拒绝只在多 rank——分片与
+    标记必须同代际对账）。"""
+
+    def test_world1_resume_tolerates_dir_without_marker(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.patch_config(schedule={"max_iterations": 2})
+        assert scenario.train().code == 0
+        marker = scenario.run_dir / "checkpoints" / "resume_generation.json"
+        assert marker.is_file()  # 当前节奏照常产出标记
+        marker.unlink()  # 抹掉标记 = 历史 run 目录形态
+        scenario.patch_config(schedule={"max_iterations": 4})
+        assert scenario.resume().code == 0
+        assert scenario.resume_state()["iteration"] == 4
+
+
+class TestCheckpointCost:
+    """checkpoint 的 full-state 导出成本（一次导出、两处共享）：产物
+    checkpoint 写盘与续训分片快照消费同一份导出——第二次导出会让每
+    rank 在 checkpoint 期同时驻留两份完整 CPU 权重副本（FSDP full state
+    是 offload 到 host 的全量），生产规模下是 host 内存尖峰/OOM 源。"""
+
+    def test_checkpoint_exports_policy_state_once(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> None:
+        scenario.write_inputs()
+        calls = {"count": 0}
+        original = GroupPolicy.full_state
+
+        def counting(policy):
+            calls["count"] += 1
+            return original(policy)
+
+        monkeypatch.setattr(GroupPolicy, "full_state", counting)
+        assert scenario.train().code == 0
+        assert calls["count"] == 1
 
 
 class TestResumeGuards:

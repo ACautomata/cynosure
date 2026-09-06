@@ -452,8 +452,11 @@ class GranularGrpoTrainer:
 
     def _write_diagnostic(self, pairs: list[TrainingLogProbPair]) -> None:
         """训练侧 log-prob 对落盘（--dump-trajectory）：多 rank 下归并到
-        rank 0（按 rank 升序拼接，per-rank 记录全量保留）；单进程直写。"""
-        if not self._dump:
+        rank 0（按 rank 升序拼接，per-rank 记录全量保留）；单进程直写。
+        本次运行未产出新对（零训练迭代的续训 = 恢复点已达标）不写——
+        空清单会覆盖既有诊断工件，把文档化的 no-op resume 变成对一致性
+        证据的破坏。"""
+        if not self._dump or not pairs:
             return
         dist = self.runtime.dist
         gathered = dist.gather(pairs)
@@ -468,12 +471,14 @@ class GranularGrpoTrainer:
     def _checkpoint_at(self, iteration: int) -> None:
         """指定 iteration 的 checkpoint 节奏（全 rank 的单一入口）：full
         state 导出是 FSDP 集合操作（FULL_STATE_DICT），必须全 rank 调用本
-        方法；产物 checkpoint 只 rank 0 独写（契约文件名不变），续训状态
-        每 rank 写自己的分片文件（per-rank RNG/buffer/optimizer）。"""
+        方法，且**只导出一次**——产物 checkpoint 写盘（rank 0）与续训状态
+        分片共享同一份（二次导出会让每 rank 同时驻留两份完整 CPU 权重，
+        checkpoint 期 host 内存翻倍）；产物 checkpoint 只 rank 0 独写
+        （契约文件名不变），续训状态每 rank 写自己的分片文件。"""
         full_state = self.policy.full_state()
         if self.runtime.dist.rank == 0:
             self._write_checkpoint(iteration, full_state)
-        self.resume_store.save(self, iteration)
+        self.resume_store.save(self, iteration, full_state)
 
     def _write_checkpoint(
         self, iteration: int, full_state: dict,

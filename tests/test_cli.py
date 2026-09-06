@@ -5,7 +5,6 @@ run 目录与工件契约最小版（config 快照 + metrics.jsonl + manifest + 
 
 import copy
 import json
-import threading
 from pathlib import Path
 
 import pytest
@@ -236,63 +235,33 @@ class TestTrajectoryDiagnosticFlag:
 
 
 class TestDistributedRunDir:
-    """torchrun 多 rank（RANK env）下的 run 目录初始化：rank 0 创建、
-    其余 rank 轮询等待采用（spec：多 rank 下指标由 rank 0 归并写出）。"""
+    """run 目录初始化的协调契约：``RunArtifacts.init`` 是无 env 感知的
+    单次创建（拒绝预存目录），多 rank 的「rank 0 创建 + 广播裁决」在
+    CLI 协调层（挂死/一致退出的进程级行为由 test_distributed 的
+    spawned usage 契约测试覆盖——文件轮询握手无法区分「本轮新建」与
+    「上轮遗留」，已删除）。"""
 
     @pytest.fixture
     def config(self) -> CynosureConfig:
         return CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
 
-    def test_rank0_creates_run_dir(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("RANK", "0")
-        monkeypatch.setenv("WORLD_SIZE", "8")
+    def test_init_creates_run_dir(self, config: CynosureConfig, tmp_path: Path) -> None:
         artifacts = RunArtifacts.init(config, tmp_path / "run")
         assert artifacts.paths.config_snapshot.is_file()
 
-    def test_nonzero_rank_adopts_dir_created_by_rank0(
+    def test_init_rejects_preexisting_dir_regardless_of_env(
         self, config: CynosureConfig, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """非 0 rank 不创建：rank 0 先行建好目录时，等待方直接采用、不再报 FileExistsError。"""
+        """预存目录（含 torchrun 环境变量下的非 0 rank 视角）一律拒绝：
+        「采用既有目录」的裁决属 CLI 广播层，不在本方法。"""
         monkeypatch.setenv("RANK", "3")
+        monkeypatch.setenv("WORLD_SIZE", "8")
         run_root = tmp_path / "run"
         run_root.mkdir()
-        (run_root / "config.json").write_text("{}", encoding="utf-8")  # rank 0 已创建
-        artifacts = RunArtifacts.init(config, run_root)
-        assert artifacts.paths.config_snapshot.is_file()
-
-    def test_nonzero_rank_times_out_when_rank0_never_creates(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """rank 0 迟迟不建目录 → 等待超时显式失败，而非各 rank 静默自建、分裂 run。"""
-        monkeypatch.setenv("RANK", "3")
-        with pytest.raises(TimeoutError):
-            RunArtifacts.init(config, tmp_path / "never", wait_timeout_s=0.1)
-
-    def test_nonzero_rank_waits_then_adopts(
-        self, config: CynosureConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """rank 0 稍后创建：等待方阻塞至目录出现后采用，且自身不落盘。"""
-        monkeypatch.setenv("RANK", "3")
-        run_root = tmp_path / "run"
-
-        def _create_as_rank0() -> None:
-            run_root.mkdir()
-            (run_root / "config.json").write_text("{}", encoding="utf-8")
-
-        timer = threading.Timer(0.2, _create_as_rank0)
-        timer.start()
-        try:
-            artifacts = RunArtifacts.init(config, run_root, wait_timeout_s=5.0)
-        finally:
-            timer.join()
-        assert artifacts.paths.root == run_root
-        assert artifacts.paths.config_snapshot.is_file()
+        (run_root / "config.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(FileExistsError):
+            RunArtifacts.init(config, run_root)
 
     def test_train_under_torchrun_requires_explicit_run_dir(
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
