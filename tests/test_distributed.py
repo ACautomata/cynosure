@@ -560,6 +560,50 @@ class TestResumeGeneration:
         assert any("代际" in error for error in result.errors)
 
 
+class TestResumeShardFailureRefusal:
+    """单 rank 分片装载/校验失败的集体拒绝：restore 的本地前置（代际
+    标记读取、分片装载、payload 契约/拓扑校验）在**任一 rank** 失败时，
+    拒绝必须作为报告数据进对账 collective、全体一致返回输入契约错误
+    ——本地先抛会让通过校验的邻居停在 all_gather 永等（拒绝方退出、
+    通过方挂死），那是作业假死而非干净的输入拒绝。
+
+    红/绿信号用短 join 超时（挂死 → 回传超时红；一致退出 → 秒级绿）。"""
+
+    _JOIN_TIMEOUT_S = 120.0
+
+    @pytest.fixture
+    def scenario(self, cli, tmp_path: Path) -> TrainingLoopScenario:
+        return TrainingLoopScenario(cli, tmp_path)
+
+    def test_single_rank_topology_mismatch_refused_on_every_rank(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        scenario.patch_config(
+            schedule={"max_iterations": 2, "checkpoint_interval": 2},
+        )
+        SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch().assert_green()
+
+        shard = scenario.run_dir / "checkpoints" / "resume_state_rank1.pt"
+        payload = torch.load(shard, map_location="cpu", weights_only=True)
+        payload["world_size"] = 1  # 单 rank 拓扑篡改：仅 rank 1 分片自称 world-1
+        torch.save(payload, shard)
+
+        scenario.patch_config(schedule={"max_iterations": 4})
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+            argv=[
+                "train", "--config", str(scenario.config_path),
+                "--run-dir", str(scenario.run_dir), "--resume",
+            ],
+            join_timeout_s=self._JOIN_TIMEOUT_S,
+        ).launch()
+        assert result.codes == [2, 2], result.errors
+        assert any("world_size" in error for error in result.errors)
+
+
 class TestSpawnedUsageContract:
     """分布式启动的 usage 错误契约：rank 非对称的 pre-flight 失败（run
     目录预存、轨迹诊断输入错误）必须经广播裁决让**全 rank 一致**返回

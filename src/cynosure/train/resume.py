@@ -102,11 +102,13 @@ class ResumeStore:
     """续训状态分片存取（断点续训状态机的落盘/恢复单点，per-rank）。
 
     落盘：全清单快照（``_capture``）原子写本 rank 分片文件（tmp +
-    ``os.replace``）。恢复（``restore``）：payload 契约校验（版本/字段/
-    计数）→ 拓扑对账（world_size 一致，跨拓扑拒绝）→ config 一致性守卫
-    （除白名单漂移字段外逐字段一致）→ 两模型权重与 optimizer → lr 槽位
-    对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG——装配期随机性（冷启动
-    判别器初始化）被整体覆写，恢复即落盘时刻的训练机状态。
+    ``os.replace``）。恢复（``restore``）的校验与应用分两段集合裁决：
+    本地前置（payload 契约、拓扑、代际标记）的结果作为报告数据进对账
+    collective——装载失败与代际不一致全体一致拒绝；应用段（config
+    一致性守卫 → 两模型权重与 optimizer → lr 槽位对账 → buffer 两区 →
+    命名 RNG 流 → 全局 RNG）的失败经第二段 collective 全体拒绝——
+    装配期随机性（冷启动判别器初始化）被整体覆写，恢复即落盘时刻的
+    训练机状态。
     """
 
     def __init__(
@@ -173,12 +175,70 @@ class ResumeStore:
     def restore(self, trainer: "GranularGrpoTrainer") -> int:
         """从 run 目录本 rank 的最新续训状态整体恢复，返回恢复点 iteration。
 
-        先对账代际（多 rank：分片 iteration 必须等于提交标记——混代际
-        分片是保存中途崩溃的现场，滚动覆写不保留历史分片，只能拒绝不
-        能猜测），再对账 config（除白名单漂移字段外逐字段一致）与拓扑
-        （world_size 分片数一致），最后按序恢复：两模型权重与 optimizer
-        → lr 槽位对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG。
+        恢复的失败拒绝全部集合化：本地前置（标记读取、分片装载、
+        payload/拓扑校验）的结果作为报告数据进对账 collective——任何
+        rank 的本地先抛都会让通过校验的邻居停在 all_gather 永等（拒绝
+        方退出、通过方挂死）。第一段裁决装载失败与代际不一致，第二段
+        裁决恢复应用失败；两段全绿才回到训练循环。
         """
+        try:
+            fields, state = self._prepare_local_state()
+        except (ValueError, FileNotFoundError) as exc:
+            fields, state = {"error": str(exc)}, None
+        peers = [
+            entry[0] for entry in self._dist.all_gather(
+                [{"rank": self._dist.rank, **fields}],
+            )
+        ]
+        failed = [peer for peer in peers if "error" in peer]
+        if failed:
+            peer = failed[0]
+            raise ValueError(
+                f"rank {peer['rank']} 续训状态装载失败: {peer['error']}"
+                "——任一 rank 分片损坏/缺失都是保存中途崩溃的现场，恢复"
+                "入口集体拒绝（部分 rank 单方面恢复会让其余 rank 停在"
+                "集合操作）"
+            )
+        mismatched = [
+            peer for peer in peers
+            if (peer["iteration"], peer["marker"], peer["world_size"])
+            != (fields["iteration"], fields["marker"], fields["world_size"])
+        ]
+        if mismatched:
+            peer = mismatched[0]
+            raise ValueError(
+                "各 rank 续训分片代际不一致"
+                f"（rank {peer['rank']} 分片 {peer['iteration']} / 标记 "
+                f"{peer['marker']} vs 本 rank（{self._dist.rank}）分片 "
+                f"{fields['iteration']} / 标记 {fields['marker']}）：保存"
+                "中途崩溃留下的混代际分片不可恢复（滚动覆写不保留历史"
+                "分片），请从更早的完整 checkpoint 现场恢复"
+            )
+        try:
+            iteration = self._apply(trainer, state)
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            verdict: dict[str, Any] = {"error": str(exc)}
+        else:
+            verdict = {"iteration": iteration}
+        outcomes = [
+            entry[0] for entry in self._dist.all_gather(
+                [{"rank": self._dist.rank, **verdict}],
+            )
+        ]
+        failed_apply = [peer for peer in outcomes if "error" in peer]
+        if failed_apply:
+            peer = failed_apply[0]
+            raise ValueError(
+                f"rank {peer['rank']} 续训状态回填失败: {peer['error']}"
+                "——全体拒绝（部分 rank 带半恢复状态继续训练是权重分叉）"
+            )
+        return iteration
+
+    def _prepare_local_state(self) -> tuple[dict[str, Any], dict]:
+        """restore 的本地前置：代际标记读取、分片装载、payload 契约与
+        拓扑校验。返回 (对账报告字段, 落盘 payload)；失败即抛——调用方
+        把异常转为 collective 报告数据（任何 rank 的本地拒绝不得先于
+        集合对账发生，否则通过校验的邻居停在 all_gather 永等）。"""
         marker_iteration = self._read_generation_marker()
         if marker_iteration is None and self._dist.world_size > 1:
             raise ValueError(
@@ -205,34 +265,18 @@ class ResumeStore:
                 f"（{self._dist.world_size}）不符：FSDP 分片与 optimizer 状态是"
                 "按 world 切分的，跨拓扑续训不受支持"
             )
-        # 代际的集合性对账（全体同见才放行）：对账结论必须各 rank 独立
-        # 可判定——单 rank 本地判断（标记或分片不一致即抛）会让通过方
-        # 单方面恢复训练、拒绝方退出，集合操作互等挂死。各 rank 报告
-        # （分片代际、标记、拓扑），任何不一致全体拒绝。
-        report = {
-            "rank": self._dist.rank,
+        return {
             "iteration": int(state["iteration"]),
             "marker": marker_iteration,
             "world_size": int(state["world_size"]),
-        }
-        peers = [
-            entry[0] for entry in self._dist.all_gather([report])
-        ]
-        mismatched = [
-            peer for peer in peers
-            if (peer["iteration"], peer["marker"], peer["world_size"])
-            != (report["iteration"], report["marker"], report["world_size"])
-        ]
-        if mismatched:
-            peer = mismatched[0]
-            raise ValueError(
-                "各 rank 续训分片代际不一致"
-                f"（rank {peer['rank']} 分片 {peer['iteration']} / 标记 "
-                f"{peer['marker']} vs 本 rank（{report['rank']}）分片 "
-                f"{report['iteration']} / 标记 {report['marker']}）：保存"
-                "中途崩溃留下的混代际分片不可恢复（滚动覆写不保留历史"
-                "分片），请从更早的完整 checkpoint 现场恢复"
-            )
+        }, state
+
+    def _apply(self, trainer: "GranularGrpoTrainer", state: dict) -> int:
+        """代际对齐通过后的恢复应用：config 守卫 → 两模型权重与
+        optimizer → lr 槽位对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG
+        ——装配期随机性（冷启动判别器初始化）被整体覆写；返回恢复点
+        iteration。失败即抛，由调用方的第二段 collective 裁决同步给
+        全体（半恢复状态不进训练循环）。"""
         self._assert_resumable_config(
             ConfigLoader.load(trainer.artifacts.paths.config_snapshot),
             trainer.config,
