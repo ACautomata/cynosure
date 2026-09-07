@@ -31,7 +31,7 @@ Ray 不进入主路径：它的三项独有能力（actor 级容错、placement 
 
 - **单实例 4 卡（默认且唯一主路径）**：`torchrun --nproc_per_node=4`。4×64GiB=256GiB 对 ~1e8 参数量富余。
 - **双 source 是一切计算与网络的前提**：`source /opt/dtk/env.sh`（DTK，算——不 source 则 `import torch` 直接 `ImportError`）+ `source /root/private_data/.ai_user_info/ai_proxy`（平台 squid 代理，网——不 source 则 pip/curl/git 全部超时）。幂等注入 `~/.bashrc` 最顶部后非交互 shell 自动生效；bashrc 在易失盘上，实例重置后需重注入。
-- **文件系统纪律**：实例系统盘 `/` 易失（重置即丢），checkpoint/中间产物/run 目录一律落持久分区 `/root/private_data`（**绝不落易失系统盘**，也不落 `/tmp`）；实例重置后用实例冒烟脚本一键重建与验证（门槛⑥，`scripts/sothisai_smoke.sh`）。
+- **文件系统纪律**：实例系统盘 `/` 易失（重置即丢），checkpoint/中间产物/run 目录一律落持久分区 `/root/private_data`（**绝不落易失系统盘**，也不落 `/tmp`）；实例重置后用实例冒烟脚本一键重建与验证（门槛⑥，`run 目录 scripts/ 下的实例冒烟脚本`）。
 - **生产与调试统一**：SSH + tmux/nohup + torchrun（无作业调度器可区分生产/调试通道；长跑任务挂 tmux/nohup 防断连）。
 - 长训需**断点续训**（policy + 判别器 + 回放缓冲 + optimizer state 定期落盘，跨实例重启/重置恢复）。
 - **跨实例多节点 = 未验证远期选项**：RCCL 跨实例组网未验证，不作路径承诺、不进验证清单（rollout 吞吐不够时先议缩 iteration，见 ADR-0005 wall-clock ×2 决策）。
@@ -67,7 +67,7 @@ PatchDiscriminator 几层 3D conv、算力可忽略，**不参与 FSDP 分片**�
 3. 单实例 4 卡 RCCL allreduce 正常（FSDP 分片 + 梯度同步）。
 4. G=12 × 30 步轨迹 + MGAI 终点的实际显存（64GiB/卡）实测；不够则降 G 或逐 k 释放。
 5. **rollout 吞吐 profile**（真正绑定项）：单实例 4 rank 的每 iter wall-clock，对照 200–500 iteration 预算（wall-clock ×2 已接受，ADR-0005）。
-6. **实例冒烟脚本一键跑通**（`scripts/sothisai_smoke.sh`：双 source + hy-smi + torchrun 4 卡 RCCL allreduce + `import torch` 回验，幂等可重复）；实例重置后的环境重建亦用它一键完成。
+6. **实例冒烟脚本一键跑通**（`run 目录 scripts/ 下的实例冒烟脚本`：双 source + hy-smi + torchrun 4 卡 RCCL allreduce + `import torch` 回验，幂等可重复）；实例重置后的环境重建亦用它一键完成。
 
 ## 待定 / 移交
 
