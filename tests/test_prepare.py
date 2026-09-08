@@ -24,6 +24,7 @@ from cynosure.reward import (
     PreparePipeline,
     SyntheticLatentEncoder,
 )
+from cynosure.reward.dataset import CaseSplitter
 from cynosure.reward.preprocessing import SPACING_CONDITION_SCALE
 from tests.conftest import (
     ANISOTROPIC_AFFINE,
@@ -597,3 +598,47 @@ class TestPrepareEncoderDispatch:
         assert base != PreparePipeline.noise_seed(1, "BraTS-GLI-00000-000", "t1n")
         assert base != PreparePipeline.noise_seed(0, "BraTS-GLI-00000-000", "t2f")
         assert 0 <= base < 2 ** 31  # torch.Generator().manual_seed 的非负域
+
+
+class SeedRecordingEncoder:
+    """记录 encode 收到的噪声种子的替身（生产编码器的种子穿透观测面：
+    fixture 合成编码器忽略种子，CLI 端到端测不到这条接线）。"""
+
+    name = "seed_recorder"
+
+    def __init__(self, latent_shape: tuple[int, ...]) -> None:
+        self._latent_shape = latent_shape
+        self.seeds: list[int] = []
+
+    def encode(self, image: torch.Tensor, noise_seed: int = 0) -> torch.Tensor:
+        self.seeds.append(noise_seed)
+        return torch.zeros(self._latent_shape)
+
+
+class TestPrepareSeedPlumbing:
+    """内容寻址种子穿透管线到编码器的接线（spec (a)2 覆盖缺口）：
+    ``_encode_cases`` 对每个（病例, 序列）传 ``noise_seed`` 的派生值，
+    顺序为（序列, 病例排序）双键定序——pool 段后接 held-out 段。"""
+
+    def test_encode_receives_content_addressed_seed_per_case_modality(
+        self, tmp_path: Path,
+    ) -> None:
+        seed = 3
+        config = Fixture().config(tmp_path / "fixtures")
+        config.schedule.seed = seed
+        case_ids = [f"BraTS-GLI-{index:05d}-000" for index in range(NUM_CASES)]
+        SyntheticBratsDataset(
+            config.artifacts.dataset_root, case_ids, FIXTURE_SERIES_SHAPE, seed,
+        ).write()
+        encoder = SeedRecordingEncoder(tuple(config.latent_shape))
+        PreparePipeline(config, encoder).run()
+        split = CaseSplitter(seed).split(case_ids)
+        expected = [
+            PreparePipeline.noise_seed(seed, case_id, modality)
+            for part in (split.train, split.val)
+            for modality in MODALITIES
+            for case_id in sorted(part)
+        ]
+        # 只编码 train（pool）+ val（held-out）；test split 不参与预编码
+        assert len(encoder.seeds) == (TRAIN_CASES + VAL_CASES) * len(MODALITIES)
+        assert encoder.seeds == expected

@@ -69,7 +69,13 @@ class RadImageNetFeatureExtractor:
     RadImageNet 官方发布（Keras 转换，conv 全带 bias）在拓扑外多 49 个
     conv bias 键——装载前按拓扑键过滤（多余键丢弃，键名不重写）；拓扑键
     缺失（命名格式不同，如 ``_orig_mod.`` 前缀污染）显式失败，不静默
-    随机初始化。骨架落 ``device``（与里程碑评测的归一设备一致）；前向按
+    随机初始化。bias 丢弃的等价性（T12 集群探针量化）：Keras BN 的
+    running_mean 吸收了 conv bias 的常数贡献，丢弃后前向残留
+    γb/σ 的 per-channel 偏移——实测池化特征相对差异 1.2%（8 样本
+    max 1.3%），对跨里程碑 FID/KID 的相对比较无实质影响（同一提取器
+    全程一致）；若未来需绝对对齐 RadImageNet 前向，按 γb/σ 修正对应
+    BN running_mean 而非保留 bias 键（MONAI 拓扑无此参数位）。
+    骨架落 ``device``（与里程碑评测的归一设备一致）；前向按
     ``EXTRACT_BATCH`` 分块——生产一个里程碑上千切片，单批前向的激活
     分配是 OOM 级。
     """

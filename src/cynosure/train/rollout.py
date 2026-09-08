@@ -35,7 +35,13 @@ _BASE_BATCH = 8
 
 @dataclass(frozen=True)
 class StepRollout:
-    """一个被优化训练步 k 的 rollout 记录（MGAI advantage 与逐 k 更新的输入）。"""
+    """一个被优化训练步 k 的 rollout 记录（MGAI advantage 与逐 k 更新的输入）。
+
+    域契约：``anchor_latent``/``directions`` 保持 policy（scaled 采样）
+    域——更新相 log-prob 重算在此域消费；``rewards`` 已归位 real pool
+    存储域（``RolloutPhase._to_pool_domain``），与 ``IterationRollout.
+    new_fakes`` 同域。
+    """
 
     step_index: int
     anchor_latent: torch.Tensor
@@ -45,7 +51,8 @@ class StepRollout:
     old_log_probs: torch.Tensor
     """rollout 时记录的 π_old（各自采样场口径，更新相逐位重算的对照）。"""
     rewards: dict[int, torch.Tensor]
-    """Granularity λ → 组内 G 方向的 terminal reward（raw real-logit）。"""
+    """Granularity λ → 组内 G 方向的 terminal reward（raw real-logit，
+    pool 存储域）。"""
 
 
 @dataclass(frozen=True)
@@ -267,15 +274,13 @@ class RolloutPhase:
         std_count = 0
         # fake 域归一（T12 探针定谳）：rollout 终点在 checkpoint scaled
         # 采样域，real pool 按 data-preparation 契约存 encode 原始输出
-        # （seeded 后验采样）——打分与入 buffer 前除 latent_scale_factor
-        # 归位 pool 域（LatentDecoder 解码前除回同构），判别器比较两侧
-        # 同域。打分输入与 new_fakes 的消费面（Online update / 回放 /
-        # AUC fake 侧）因此域一致。
-        scale = self._config.policy.latent_scale_factor
+        # （seeded 后验采样）——打分与入 buffer 前归位 pool 域（见
+        # _to_pool_domain），判别器比较两侧同域。打分输入与 new_fakes
+        # 的消费面（Online update / 回放 / AUC fake 侧）因此域一致。
         with torch.no_grad():  # 打分是 inference（autocast 外、fp32、无图）
             for step_index, x_k, directions, old_log_probs, terminals in sampled:
                 rewards = {
-                    lam: self._scorer.reward(latents / scale)
+                    lam: self._scorer.reward(self._to_pool_domain(latents))
                     for lam, latents in terminals.items()
                 }
                 steps.append(StepRollout(
@@ -285,13 +290,13 @@ class RolloutPhase:
                     old_log_probs=old_log_probs,
                     rewards=rewards,
                 ))
-                fakes.extend(latents / scale for latents in terminals.values())
+                fakes.extend(self._to_pool_domain(latents) for latents in terminals.values())
                 std_sum += sum(rewards.std().item() for rewards in rewards.values())
                 std_count += len(rewards)
             anchor_eval_reward = float(
-                self._scorer.reward(anchor_terminal / scale)[0]
+                self._scorer.reward(self._to_pool_domain(anchor_terminal))[0]
             )
-        fakes.append(anchor_terminal / scale)
+        fakes.append(self._to_pool_domain(anchor_terminal))
         return IterationRollout(
             condition=condition,
             modality=modality,
@@ -325,7 +330,13 @@ class RolloutPhase:
                 terminals.append(anchor[-1])
                 produced += count
         # base 分区与近期分区同一 reward 域（real pool 存储域）
-        return torch.cat(terminals) / self._config.policy.latent_scale_factor
+        return self._to_pool_domain(torch.cat(terminals))
+
+    def _to_pool_domain(self, latent: torch.Tensor) -> torch.Tensor:
+        """rollout 终点（policy scaled 采样域）→ real pool 存储域：
+        除 ``policy.latent_scale_factor``（``LatentDecoder`` 解码前除回
+        同构）——判别器比较与 buffer 存取的单一归一点。"""
+        return latent / self._config.policy.latent_scale_factor
 
     def _perturb(
         self,

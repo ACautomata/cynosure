@@ -26,7 +26,10 @@ class LatentEncoder(Protocol):
         """[1, D, H, W] 影像体 → [4, D/4, H/4, W/4] latent（4× 空间压缩）。
 
         ``noise_seed``：后验采样噪声的内容寻址种子（生产语义，见
-        ``MaisiLatentEncoder``）；合成实现忽略（自身无随机）。"""
+        ``MaisiLatentEncoder``）；合成实现忽略（自身无随机）。生产
+        调用点恒显式传种子（``PreparePipeline.noise_seed``）——缺省 0
+        仅为无随机实现的签名兼容，生产路径漏传会让全语料静默共享
+        一条 eps 流。"""
         ...
 
 
@@ -88,7 +91,9 @@ class MaisiLatentEncoder:
     与本地测试路径）。
 
     编排：**恒整前向**——单样本元素数 ≤ roi 元素数才编码（上游
-    ``dynamic_infer`` 小体豁免同语义，``roi_size`` 即豁免阈值）。
+    ``dynamic_infer`` 小体豁免同语义，``roi_size`` 即豁免阈值；
+    判定按元素总数而非逐维窗口——BraTS 形状下两者等价（单窗），
+    非 BraTS 形状先被 latent_shape 契约拦截，语义分叉无实际观测面）。
     BraTS [1,1,256,256,128] = 8.39M ≤ 影像空间阈值 [320,320,160] 的
     16.38M，生产全语料恒整前向（VAE 无注意力层、fp16 峰值 GB 级）。
     超过阈值的体积显式拒绝而非滑窗：MONAI ``SlidingWindowInferer`` 的
