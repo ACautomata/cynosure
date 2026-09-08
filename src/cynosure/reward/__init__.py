@@ -21,7 +21,11 @@ from cynosure.reward.dataset import (
     CaseSplit,
     CaseSplitter,
 )
-from cynosure.reward.encoder import LatentEncoder, SyntheticLatentEncoder
+from cynosure.reward.encoder import (
+    LatentEncoder,
+    MaisiLatentEncoder,
+    SyntheticLatentEncoder,
+)
 from cynosure.reward.pipeline import PreparePipeline, PrepareReport
 from cynosure.reward.preprocessing import UpstreamPreprocessChain
 from cynosure.reward.sampler import RealPoolSampler, RealSampling
@@ -45,6 +49,7 @@ __all__ = [
     "LatentManifest",
     "LatentScorer",
     "LsganTerms",
+    "MaisiLatentEncoder",
     "OnlineUpdate",
     "PoolEntry",
     "PreparePipeline",

@@ -21,12 +21,13 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
+import torch
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.distributed import DistributedContext
 from cynosure.policy import TrajectoryDiagnosticRunner
-from cynosure.reward import PreparePipeline, SyntheticLatentEncoder
+from cynosure.reward import PreparePipeline
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
 
 _EXIT_USAGE_ERROR = 2
@@ -344,21 +345,27 @@ class CynosureCli:
         )
         return 0
 
+    @staticmethod
+    def _prepare_device() -> torch.device:
+        """prepare 编码设备（单进程、不起进程组）：有 DCU/CUDA 用 0 号卡。"""
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     def _prepare(
         self, args: argparse.Namespace, config: CynosureConfig,
     ) -> int:
-        if not config.fixture_mode:
-            # 生产预编码（MONAI AutoencoderKlMaisi 装载 vae_ckpt）待基座
-            # checkpoint 落地后的 ticket 校准交付，当前显式拒绝、不静默产出
-            print(
-                "prepare 当前仅支持 fixture 合成数据端到端：生产 config 须"
-                "经 fixture_mode=true 显式声明（MONAI VAE 预编码由后续 "
-                "ticket 交付）",
-                file=self._stderr,
-            )
+        # 装载期（同 train 构造期口径）：网络工件严格装载失败
+        # （RuntimeError）与损坏 checkpoint 反序列化失败（UnpicklingError）
+        # 同属输入契约违反；执行期窄面在下方（OOM 等运行时故障不混入归因）
+        try:
+            encoder = PreparePipeline.build_encoder(config, self._prepare_device())
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"prepare 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         try:
-            report = PreparePipeline(config, SyntheticLatentEncoder()).run()
+            report = PreparePipeline(config, encoder).run()
         except (ValueError, FileNotFoundError) as exc:
             print(f"prepare 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR

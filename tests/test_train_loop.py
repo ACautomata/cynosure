@@ -980,3 +980,62 @@ class TestLogProbConsistency:
         assert {pair["step_index"] for pair in pairs} == {1, 2}
         for pair in pairs:
             assert pair["recorded"] == pair["recomputed"]
+
+
+class TestRewardDomainNormalization:
+    """rollout（policy 域）→ reward/replay（real pool 存储域）的归位
+    （T12 探针定谳）：fake 在打分与入 buffer 前除 latent_scale_factor——
+    real 按 data-preparation 契约存 encode 原始输出、policy 输出在
+    checkpoint scaled 域，判别器比较要求两侧同域。"""
+
+    @staticmethod
+    def _rollout_with_scale(
+        scenario: TrainingLoopScenario, scale: float, tag: str,
+    ) -> tuple:
+        # fixture 权重由 write_inputs 内的 manual_seed(7) 固定；两次构造的
+        # rollout 流可比性来自 TrainingRngStreams 全显式 CPU generator——
+        # scale 不进任何 RNG 消耗路径（reward 打分后置、无反馈分支）
+        scenario.write_inputs()
+        data = json.loads(
+            scenario.config_path.read_text(encoding="utf-8"),
+        )
+        data["policy"]["latent_scale_factor"] = scale
+        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.tmp_path / f"run_{tag}")
+        trainer = GranularGrpoTrainer(config, artifacts, device=torch.device("cpu"))
+        scored: list[torch.Tensor] = []
+        scorer = trainer.rewards.update.scorer
+        original_reward = scorer.reward
+
+        def recording_reward(latents: torch.Tensor) -> torch.Tensor:
+            scored.append(latents)
+            return original_reward(latents)
+
+        scorer.reward = recording_reward  # 打分输入记录（实例属性遮蔽 bound method）
+        trainer.seed_base_partition()
+        record = trainer.loop.run_iteration()
+        return record, scored
+
+    def test_scored_fakes_match_replay_domain(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """打分输入与 new_fakes 同值同序（同一归一域）：打分、回放入区、
+        AUC fake 侧消费同一批归一后 latent，不出现「打分用 A 域、
+        回放用 B 域」的错配。"""
+        record, scored = self._rollout_with_scale(scenario, 2.0, "replay")
+        assert scored, "打分记录为空"
+        assert torch.equal(torch.cat(scored), record.new_fakes)
+
+    def test_scale_only_affects_reward_side_not_rollout(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """scale 只作用在 reward 侧归一：rollout 采样流（条件/噪声/方向）
+        与 scale 无关——scale=2 的 new_fakes 恰为 scale=1 的 ÷2
+        （policy 域产出同、归一除法真实发生在 fake 上）。"""
+        neutral_record, _ = self._rollout_with_scale(scenario, 1.0, "neutral")
+        scaled_record, _ = self._rollout_with_scale(scenario, 2.0, "scaled")
+        assert neutral_record.modality == scaled_record.modality
+        assert torch.equal(
+            neutral_record.new_fakes, scaled_record.new_fakes * 2.0,
+        )
