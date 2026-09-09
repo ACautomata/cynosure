@@ -8,6 +8,7 @@ manifest 随每次运行整体重建：先失效旧件、编码成功才落盘�
 """
 
 import shutil
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import (
     ChannelStats,
     LatentManifest,
@@ -30,7 +32,11 @@ from cynosure.reward.dataset import (
     CaseSplitter,
     SplitPart,
 )
-from cynosure.reward.encoder import LatentEncoder
+from cynosure.reward.encoder import (
+    LatentEncoder,
+    MaisiLatentEncoder,
+    SyntheticLatentEncoder,
+)
 from cynosure.reward.preprocessing import SpacingSidecar, UpstreamPreprocessChain
 
 
@@ -102,6 +108,28 @@ class PreparePipeline:
         # spacing 侧车（issue #46）：per-case raw header zooms ×1e2 随条目落盘
         self._spacing = SpacingSidecar()
 
+    @staticmethod
+    def build_encoder(
+        config: CynosureConfig, device: torch.device,
+    ) -> LatentEncoder:
+        """编码器策略分派（Factory Method，CLI 与单测共用的装配缝）：
+        fixture 合成（device 无关）/ 生产 VAE 预编码（``vae_config_json``
+        + ``vae_ckpt`` 工件对经 netbuild 严格装载）。生产 config 缺
+        VAE 网络配置工件显式拒绝（工件存在性属运行时契约，schema 不拦）。"""
+        if config.fixture_mode:
+            return SyntheticLatentEncoder()
+        if config.artifacts.vae_config_json is None:
+            raise ValueError(
+                "生产 prepare 须 VAE 网络配置工件（artifacts.vae_config_json，"
+                "与 vae_ckpt 成对经 netbuild 装载 AutoencoderKlMaisi），"
+                "当前为 None"
+            )
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
+            checkpoint=config.artifacts.vae_ckpt,
+        )
+        return MaisiLatentEncoder(artifact, device)
+
     def run(self) -> PrepareReport:
         cases = self._layout.scan()
         split = self._splitter.split([case.case_id for case in cases])
@@ -151,6 +179,18 @@ class PreparePipeline:
             latent_root=manifest_path.parent / f"{manifest_path.stem}_latents",
         )
 
+    @staticmethod
+    def noise_seed(schedule_seed: int, case_id: str, modality: str) -> int:
+        """后验采样噪声的内容寻址种子（crc32 稳定派生，非负域内）：
+        同（schedule seed, 病例, 序列）键恒同种子——重跑零漂移；换键
+        换种子——各（病例, 序列）的后验样本互异。31 位域在全语料
+        ~5e3 键下的生日碰撞概率约 0.6%，后果仅是两个样本共享同一
+        eps 序列（z_mu 基底各异，统计影响可忽略）。"""
+        digest = zlib.crc32(
+            f"{schedule_seed}|{case_id}|{modality}".encode("utf-8"),
+        )
+        return digest & 0x7FFFFFFF
+
     def _encode_cases(
         self,
         case_ids: list[str],
@@ -165,6 +205,7 @@ class PreparePipeline:
             for case_id in sorted(case_ids):
                 latent, spacing = self._encode_one(
                     series_by_case[case_id].series[modality],
+                    self.noise_seed(self._config.schedule.seed, case_id, modality),
                 )
                 latent_dir = summary.latent_root / modality
                 latent_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +224,7 @@ class PreparePipeline:
         return entries
 
     def _encode_one(
-        self, series_path: Path,
+        self, series_path: Path, noise_seed: int,
     ) -> tuple[torch.Tensor, tuple[float, float, float]]:
         """单（病例, 序列）的编码产物：(latent, per-case spacing 侧车)。"""
         # 宽捕获有据：第三方读取栈（MONAI reader、nibabel ImageFileError、压缩层）
@@ -204,7 +245,7 @@ class PreparePipeline:
         tensor = torch.as_tensor(
             image.as_tensor() if isinstance(image, MetaTensor) else image,
         )
-        latent = self._encoder.encode(tensor)
+        latent = self._encoder.encode(tensor, noise_seed)
         if tuple(latent.shape) != self._config.latent_shape:
             raise ValueError(
                 f"预编码输出形状 {tuple(latent.shape)} 与 latent_shape 契约"

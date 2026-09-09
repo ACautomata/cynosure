@@ -197,14 +197,15 @@ class TestEvalCommand:
 
 
 class TestPrepareCommand:
-    def test_production_mode_rejected_until_vae_ticket(
+    def test_production_without_vae_artifacts_rejected(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
-        """fixture_mode=false 的生产 prepare 须 MONAI VAE 预编码（后续 ticket
-        交付），当前显式拒绝而非静默产出。"""
+        """fixture_mode=false 且 VAE 网络配置工件缺失（vae_config_json=None）
+        的生产 prepare 显式拒绝：AutoencoderKlMaisi 装配源是生产预编码的
+        必需工件。"""
         result = cli.run("prepare", "--config", str(cli.write_config(tmp_path)))
         assert result.code == 2
-        assert "fixture_mode" in result.stderr
+        assert "vae_config_json" in result.stderr
 
     def test_invalid_config_rejected(
         self, cli: CliSession, tmp_path: Path,

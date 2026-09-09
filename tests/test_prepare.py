@@ -1,24 +1,36 @@
 """prepare 数据工件管线测试：Real sample pool / Held-out real / per-channel
-统计量三工件（ticket #18）。
+统计量三工件（ticket #18）；生产 VAE 预编码策略与其分派点（T12）。
 
 测试原则（spec「Testing Decisions」）：经唯一 CLI seam 驱动 fixture 合成数据
-端到端，只断言工件契约的外部行为——序列分层、病例级不相交、可装载、幂等。"""
+端到端，只断言工件契约的外部行为——序列分层、病例级不相交、可装载、幂等；
+生产编码器单测用 fixture 微型 VAE 走同一 netbuild 严格装载契约。"""
 
+import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import nibabel as nib
 import numpy as np
 import pytest
 import torch
 
-from cynosure.config import MODALITIES, ConfigLoader
+from cynosure.config import CynosureConfig, MODALITIES, ConfigLoader
 from cynosure.fixtures import Fixture
-from cynosure.reward import ChannelStats, LatentManifest
+from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.reward import (
+    ChannelStats,
+    LatentManifest,
+    MaisiLatentEncoder,
+    PreparePipeline,
+    SyntheticLatentEncoder,
+)
+from cynosure.reward.dataset import CaseSplitter
 from cynosure.reward.preprocessing import SPACING_CONDITION_SCALE
 from tests.conftest import (
     ANISOTROPIC_AFFINE,
     CliSession,
     CliResult,
+    MINIMAL_CONFIG_DICT,
     SyntheticBratsDataset,
 )
 
@@ -403,3 +415,230 @@ class TestPrepareInputGuard:
         result = scenario.run(num_cases=5)
         assert result.code == 2
         assert "val" in result.stderr
+
+
+class MeanPoolEncoderTwin:
+    """AutoencoderKlMaisi.encode 的均值池化替身（4× 空间压缩语义）：记录每次
+    encode 调用的输入形状（整前向豁免的运行时观测面），返回 (z_mu, z_sigma)
+    二元组与真实 encode 同构。"""
+
+    def __init__(self) -> None:
+        self.encode_shapes: list[tuple[int, ...]] = []
+
+    def to(self, device: torch.device) -> "MeanPoolEncoderTwin":
+        return self
+
+    def eval(self) -> "MeanPoolEncoderTwin":
+        return self
+
+    def encode(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.encode_shapes.append(tuple(batch.shape))
+        latent = torch.nn.functional.avg_pool3d(
+            batch.repeat(1, 4, 1, 1, 1), kernel_size=4, stride=4,
+        )  # 单通道 → 4 latent 通道（VAE latent_channels=4 同构）
+        return latent, torch.zeros_like(latent)
+
+
+class TestMaisiLatentEncoder:
+    """生产预编码器（fixture 微型 VAE 走同一 netbuild 严格装载契约）：
+    z_mu 确定性与 raw 存储域是 prepare 幂等/缩放契约的根基。"""
+
+    ENCODE_INPUT_SHAPE = (1, 64, 64, 32)
+    LATENT_SHAPE = (4, 16, 16, 8)
+
+    def artifact(self, tmp_path: Path) -> NetworkArtifact:
+        directory = tmp_path / "fixture_artifacts"
+        Fixture().write_artifacts(directory)
+        return NetworkArtifact(
+            config=NetworkAssembler.load_json(directory / "vae_config.json"),
+            checkpoint=directory / "vae.pt",
+        )
+
+    def encoder(self, artifact: NetworkArtifact, **overrides) -> MaisiLatentEncoder:
+        return MaisiLatentEncoder(artifact, torch.device("cpu"), **overrides)
+
+    def test_shape_dtype_device_contract(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        encoder = self.encoder(self.artifact(tmp_path))
+        latent = encoder.encode(torch.randn(self.ENCODE_INPUT_SHAPE))
+        assert tuple(latent.shape) == self.LATENT_SHAPE
+        assert latent.dtype == torch.float32
+        assert latent.device == torch.device("cpu")
+
+    def test_encode_is_bitwise_deterministic(self, tmp_path: Path) -> None:
+        """seeded sampling z（内容寻址噪声种子）是 prepare 幂等的前提：
+        同 checkpoint、同 noise_seed 三次编码逐位相等——无种子 RNG 或
+        GPU 流的采样都会破坏重跑零漂移。"""
+        torch.manual_seed(0)
+        artifact = self.artifact(tmp_path)  # 工件只写一次：权重不随测试内 RNG 漂移
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+        first = self.encoder(artifact).encode(image, noise_seed=42)
+        second = self.encoder(artifact).encode(image, noise_seed=42)
+        assert torch.equal(first, second)
+        third = self.encoder(artifact).encode(image, noise_seed=42)
+        assert torch.equal(first, third)  # 新实例、同一 checkpoint 重载
+
+    def test_encode_stores_seeded_posterior_sample(self, tmp_path: Path) -> None:
+        """存储域语义 = seeded sampling z（上游 create_training_data 同
+        语义）：encoder 输出与裸网络 z_mu + eps(noise_seed)·z_sigma 逐位
+        相等——z_mu 与 policy rollout 域是分布级错配（探针实测 raw z_mu
+        std≈0.48 vs rollout≈0.94），判别器比较要求 real/fake 同为后验
+        采样分布。"""
+        torch.manual_seed(0)
+        artifact = self.artifact(tmp_path)
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+        latent = self.encoder(artifact).encode(image, noise_seed=7)
+        # 对照面与被测面同 eval 相（廉价保险：未来 fixture 配置若引入
+        # 相位敏感层，两侧仍同口径）
+        raw_vae = NetworkAssembler.vae(artifact).eval()
+        with torch.no_grad():
+            z_mu, z_sigma = raw_vae.encode(image.unsqueeze(0))
+            eps = torch.randn(
+                z_mu.shape, generator=torch.Generator().manual_seed(7),
+            )
+            expected = (z_mu + eps * z_sigma).squeeze(0)
+        assert torch.equal(latent, expected)
+        # 内容寻址：不同噪声种子给不同后验样本（同 z_mu 基底）
+        other = self.encoder(artifact).encode(image, noise_seed=8)
+        assert not torch.equal(latent, other)
+
+    def test_name_records_provenance(self, tmp_path: Path) -> None:
+        encoder = self.encoder(self.artifact(tmp_path))
+        assert encoder.name == "autoencoderkl_maisi"
+
+    def test_output_detached_no_grad(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        encoder = self.encoder(self.artifact(tmp_path))
+        latent = encoder.encode(torch.randn(self.ENCODE_INPUT_SHAPE))
+        assert latent.requires_grad is False
+
+    def test_input_contract_rejected(self, tmp_path: Path) -> None:
+        encoder = self.encoder(self.artifact(tmp_path))
+        with pytest.raises(ValueError, match="影像体须为"):
+            encoder.encode(torch.randn(64, 64, 32))  # 缺通道维
+        with pytest.raises(ValueError, match="影像体须为"):
+            encoder.encode(torch.randn(2, 1, 64, 64, 32))  # 带 batch 维
+
+    def test_whole_forward_within_threshold_large_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """官方 dynamic_infer 小体豁免语义：单样本元素数 ≤ 阈值元素数
+        → 整前向（BraTS [1,1,256,256,128]=8.39M ≤ 影像空间阈值
+        [320,320,160]，生产恒走此路）；超过 → 显式拒绝而非滑窗
+        （MONAI SlidingWindowInferer 对下采样 encoder 拼合通道错乱，
+        静默错误比显式失败危险）。"""
+        artifact = self.artifact(tmp_path)
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+
+        twin = MeanPoolEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+        latent = self.encoder(artifact).encode(image)
+        assert twin.encode_shapes == [(1, 1, 64, 64, 32)]  # 豁免：一次整前向
+        assert tuple(latent.shape) == self.LATENT_SHAPE
+
+        small_threshold = self.encoder(artifact, roi_size=(32, 32, 32))
+        with pytest.raises(ValueError, match="整前向豁免阈值"):
+            small_threshold.encode(image)
+        assert len(twin.encode_shapes) == 1  # 拒绝路径不产生前向
+
+    def test_invalid_roi_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="roi"):
+            self.encoder(self.artifact(tmp_path), roi_size=(0, 320, 160))
+
+    def test_checkpoint_mismatch_rejected(self, tmp_path: Path) -> None:
+        """工件错配（VAE 网络配置对 UNet checkpoint）：严格装载契约在
+        构造期显式失败，不静默产出错误编码。"""
+        directory = tmp_path / "fixture_artifacts"
+        Fixture().write_artifacts(directory)
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(directory / "vae_config.json"),
+            checkpoint=directory / "unet.pt",
+        )
+        with pytest.raises(RuntimeError):
+            MaisiLatentEncoder(artifact, torch.device("cpu"))
+
+
+class TestPrepareEncoderDispatch:
+    """编码器策略分派（PreparePipeline.build_encoder，Factory Method）：
+    fixture 合成 vs 生产 VAE 预编码——CLI 保持薄，分派点直接可单测。"""
+
+    def test_fixture_config_builds_synthetic(self, tmp_path: Path) -> None:
+        config = Fixture().config(tmp_path / "fixtures")
+        encoder = PreparePipeline.build_encoder(config, torch.device("cpu"))
+        assert isinstance(encoder, SyntheticLatentEncoder)
+
+    def test_production_config_builds_maisi(self, tmp_path: Path) -> None:
+        """合法生产 config（fixture_mode=false）+ VAE 工件对 → 生产编码器
+        （只装配验证分派与装载契约，不跑全量生产编码）。"""
+        artifacts = Fixture().write_artifacts(tmp_path / "fixtures")
+        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+        data["artifacts"]["vae_ckpt"] = str(artifacts.vae_ckpt)
+        data["artifacts"]["vae_config_json"] = str(artifacts.vae_config_json)
+        config = CynosureConfig.model_validate(data)
+        encoder = PreparePipeline.build_encoder(config, torch.device("cpu"))
+        assert isinstance(encoder, MaisiLatentEncoder)
+        assert encoder.name == "autoencoderkl_maisi"
+
+    def test_production_without_vae_config_rejected(self, tmp_path: Path) -> None:
+        """vae_config_json 缺失（None）的生产 config：装配源不存在的
+        预编码显式拒绝（schema 不拦、分派点拦——工件存在性属运行时契约）。"""
+        config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
+        with pytest.raises(ValueError, match="vae_config_json"):
+            PreparePipeline.build_encoder(config, torch.device("cpu"))
+
+    def test_noise_seed_is_content_addressed(self) -> None:
+        """后验采样噪声种子按（schedule seed, 病例, 序列）稳定派生：
+        同键同种子（重跑幂等的前提）、换键换种子（后验样本互异）。"""
+        base = PreparePipeline.noise_seed(0, "BraTS-GLI-00000-000", "t1n")
+        assert base == PreparePipeline.noise_seed(0, "BraTS-GLI-00000-000", "t1n")
+        assert base != PreparePipeline.noise_seed(0, "BraTS-GLI-00001-000", "t1n")
+        assert base != PreparePipeline.noise_seed(1, "BraTS-GLI-00000-000", "t1n")
+        assert base != PreparePipeline.noise_seed(0, "BraTS-GLI-00000-000", "t2f")
+        assert 0 <= base < 2 ** 31  # torch.Generator().manual_seed 的非负域
+
+
+class SeedRecordingEncoder:
+    """记录 encode 收到的噪声种子的替身（生产编码器的种子穿透观测面：
+    fixture 合成编码器忽略种子，CLI 端到端测不到这条接线）。"""
+
+    name = "seed_recorder"
+
+    def __init__(self, latent_shape: tuple[int, ...]) -> None:
+        self._latent_shape = latent_shape
+        self.seeds: list[int] = []
+
+    def encode(self, image: torch.Tensor, noise_seed: int = 0) -> torch.Tensor:
+        self.seeds.append(noise_seed)
+        return torch.zeros(self._latent_shape)
+
+
+class TestPrepareSeedPlumbing:
+    """内容寻址种子穿透管线到编码器的接线（spec (a)2 覆盖缺口）：
+    ``_encode_cases`` 对每个（病例, 序列）传 ``noise_seed`` 的派生值，
+    顺序为（序列, 病例排序）双键定序——pool 段后接 held-out 段。"""
+
+    def test_encode_receives_content_addressed_seed_per_case_modality(
+        self, tmp_path: Path,
+    ) -> None:
+        seed = 3
+        config = Fixture().config(tmp_path / "fixtures")
+        config.schedule.seed = seed
+        case_ids = [f"BraTS-GLI-{index:05d}-000" for index in range(NUM_CASES)]
+        SyntheticBratsDataset(
+            config.artifacts.dataset_root, case_ids, FIXTURE_SERIES_SHAPE, seed,
+        ).write()
+        encoder = SeedRecordingEncoder(tuple(config.latent_shape))
+        PreparePipeline(config, encoder).run()
+        split = CaseSplitter(seed).split(case_ids)
+        expected = [
+            PreparePipeline.noise_seed(seed, case_id, modality)
+            for part in (split.train, split.val)
+            for modality in MODALITIES
+            for case_id in sorted(part)
+        ]
+        # 只编码 train（pool）+ val（held-out）；test split 不参与预编码
+        assert len(encoder.seeds) == (TRAIN_CASES + VAL_CASES) * len(MODALITIES)
+        assert encoder.seeds == expected

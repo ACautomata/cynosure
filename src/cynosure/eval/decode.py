@@ -30,7 +30,8 @@ class LatentDecoder:
 
     域语义：policy（官方基座权重）工作在 **scaled** latent 域
     （checkpoint scale_factor = 1/std(z)），prepared latents 按存储契约
-    是 encode 原始输出（未乘，data-preparation「latent 存储域」）——
+    是 seeded 后验采样 z（未乘 scale_factor，data-preparation「latent
+    存储域」）——
     解码前除回 scale factor 把 policy 域 latent 归位到 VAE 期望的
     encoder 域（官方 ``ReconModel.decode_stage_2_outputs(z/scale)``
     同一语义）。生产因子随基座 checkpoint 核对（config

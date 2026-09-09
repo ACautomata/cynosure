@@ -65,10 +65,17 @@ class StubSliceFeatureExtractor:
 class RadImageNetFeatureExtractor:
     """生产特征器：MONAI ResNet50（2D、2048 维池化特征）+ RadImageNet 权重。
 
-    权重文件须与 ``build_backbone`` 的 MONAI 拓扑同构（``state_dict`` 严格
-    装载）——RadImageNet 公开发布为 torchvision 命名格式，键名重映射随
-    施工 ticket 落地；缺文件 / 键不匹配都是显式失败，不静默随机权重。
-    骨干落 ``device``（与里程碑评测的归一设备一致）；前向按
+    权重装载：MONAI 拓扑键名与 torchvision 同风格（conv1/bn1/layer1-4），
+    RadImageNet 官方发布（Keras 转换，conv 全带 bias）在拓扑外多 49 个
+    conv bias 键——装载前按拓扑键过滤（多余键丢弃，键名不重写）；拓扑键
+    缺失（命名格式不同，如 ``_orig_mod.`` 前缀污染）显式失败，不静默
+    随机初始化。bias 丢弃的等价性（T12 集群探针量化）：Keras BN 的
+    running_mean 吸收了 conv bias 的常数贡献，丢弃后前向残留
+    γb/σ 的 per-channel 偏移——实测池化特征相对差异 1.2%（8 样本
+    max 1.3%），对跨里程碑 FID/KID 的相对比较无实质影响（同一提取器
+    全程一致）；若未来需绝对对齐 RadImageNet 前向，按 γb/σ 修正对应
+    BN running_mean 而非保留 bias 键（MONAI 拓扑无此参数位）。
+    骨架落 ``device``（与里程碑评测的归一设备一致）；前向按
     ``EXTRACT_BATCH`` 分块——生产一个里程碑上千切片，单批前向的激活
     分配是 OOM 级。
     """
@@ -88,15 +95,25 @@ class RadImageNetFeatureExtractor:
             )
         self._device = device if device is not None else torch.device("cpu")
         self._backbone = self.build_backbone().to(self._device)
+        topology = self._backbone.state_dict()
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
-        try:
-            self._backbone.load_state_dict(state, strict=True)
-        except RuntimeError as exc:
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"RadImageNet 权重须为 state_dict（键 → 张量），得到 "
+                f"{type(state).__name__}: {weights_path}"
+            )
+        filtered = {
+            key: value for key, value in state.items() if key in topology
+        }
+        missing = topology.keys() - filtered.keys()
+        if missing:
             raise ValueError(
                 f"RadImageNet 权重与 MONAI resnet50 拓扑键名不匹配: "
-                f"{weights_path}（公开发布为 torchvision 命名格式，键名"
-                "重映射随施工 ticket 落地；不静默随机初始化）"
-            ) from exc
+                f"{weights_path}（拓扑键缺失 {len(missing)} 个，如 "
+                f"{sorted(missing)[:2]}；公开发布的命名格式不一，不静默"
+                "随机初始化）"
+            )
+        self._backbone.load_state_dict(filtered, strict=True)
         self._backbone.eval()
         probe = torch.zeros(
             1, _RADIMAGENET_CHANNELS, 64, 64, device=self._device,

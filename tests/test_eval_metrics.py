@@ -158,6 +158,41 @@ class TestRadImageNetFeatureExtractor:
         assert features.shape == (2, extractor.feature_dim)
         assert torch.isfinite(features).all()
 
+    def test_loads_keras_converted_weights_with_extra_conv_bias(self, tmp_path) -> None:
+        """RadImageNet 官方发布（Keras 转换）：MONAI 拓扑外多 49 个 conv
+        bias 键（Keras conv 默认带 bias）——装载时丢弃拓扑外多余键、
+        特征与纯拓扑权重逐位一致；缺键仍显式失败。"""
+        torch.manual_seed(0)
+        backbone = RadImageNetFeatureExtractor.build_backbone()
+        topology = backbone.state_dict()
+        keras_style = {key: value.clone() for key, value in topology.items()}
+        keras_style["conv1.bias"] = torch.randn(64)
+        keras_style["layer1.0.conv1.bias"] = torch.randn(64)
+        weights = tmp_path / "radimagenet_keras.pth"
+        torch.save(keras_style, weights)
+        extractor = RadImageNetFeatureExtractor(weights)
+        pure_weights = tmp_path / "radimagenet_pure.pth"
+        torch.save(topology, pure_weights)
+        reference = RadImageNetFeatureExtractor(pure_weights)
+        slices = torch.randn(2, 1, 64, 64)
+        assert torch.equal(
+            extractor.extract(slices), reference.extract(slices),
+        )
+
+    def test_foreign_key_prefix_rejected(self, tmp_path) -> None:
+        """键名污染（torch.compile 的 _orig_mod. 前缀 = 拓扑键全缺）：
+        显式失败而非静默随机初始化。"""
+        torch.manual_seed(0)
+        backbone = RadImageNetFeatureExtractor.build_backbone()
+        polluted = {
+            f"_orig_mod.{key}": value
+            for key, value in backbone.state_dict().items()
+        }
+        weights = tmp_path / "polluted.pth"
+        torch.save(polluted, weights)
+        with pytest.raises(ValueError, match="键名不匹配"):
+            RadImageNetFeatureExtractor(weights)
+
     def test_extraction_streams_in_bounded_forward_batches(self, tmp_path) -> None:
         """生产规模有界前向：一个里程碑上千切片分块进 ResNet50（单批
         224×224×3 激活分配是 OOM 级），特征按序拼接完整。"""
