@@ -21,6 +21,7 @@ from cynosure.train.artifacts import (
     IterEvent,
     ManifestEntry,
     MilestoneEvent,
+    PretrainEvent,
     RunArtifacts,
     RunPaths,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "ManifestEntry",
     "MilestoneEvent",
     "ModalLabelConditionSampler",
+    "PretrainEvent",
     "RewardCoordinator",
     "RolloutPhase",
     "RunArtifacts",

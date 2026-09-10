@@ -88,7 +88,7 @@ class TrainingLoopScenario:
     def standalone_sampler(
         self, config, device: torch.device | None = None,
     ) -> RolloutSampler:
-        """评测相注入测试用的独立采样封装（与 trainer._assemble_sampler
+        """评测相注入测试用的独立采样封装（与 TrainingRuntime.assemble_sampler
         同一组合方式；独立于 trainer 内部装配）。网络落 ``device``
         （缺省 CPU；设备归一测试传加速器设备）。"""
         unet = NetworkAssembler.unet(NetworkArtifact(

@@ -31,8 +31,22 @@
 
 ## 在线更新机制
 
-- **节奏**：`N=1`（每个 RL iteration 都更新判别器），每批 `K` 小，**D:G 更新比 ≈ 1:1**；优化器 AdamW，LR 1e-5~1e-4（与 policy 同量级）。判别器是几层 3D conv，相对 UNet rollout（30 步 ODE × G 方向）算力可忽略，故「每 iter 更新」几乎免费；真正的约束是 rollout 吞吐（见 ticket #7 编排）。`N/K/LR` 标为 **tunable**，待 profile 后定。
+> RL 启动前先经 **Warm-start 预训练**（ADR-0007，见下节）——本节的在线节奏适用于 RL 期间：预训练后的判别器继续随每个 iteration 在线更新（ADR-0001 核心保留，仅「在线从零」被修订）。
+
+- **节奏**：`N=1`（每个 RL iteration 都更新判别器），每批 `K` 小，**D:G 更新比 ≈ 1:1**；优化器 AdamW，LR 1e-5~1e-4（与 policy 同量级）。判别器是几层 3D conv，相对 UNet rollout（30 步 ODE × G 方向）算力可忽略，故「每 iter 更新」几乎免费；真正的约束是 rollout 吞吐（见 ticket #7 编排）。`N/K/LR` 标为 **tunable**，待 profile 后定。`weight_decay` 显式落位（`disc_weight_decay`，与 policy 侧同值口径 1e-4）——此前隐式取 PyTorch 默认 0.01 的不对称已消除（ADR-0007 卫生项）。
 - **fake 缓冲**：封顶 **FIFO 回放缓冲** = base 时期样本（初始冻结 policy 产出）+ 近期 policy 样本，按 **50% 当前 / 50% 回放** 混合采样。real 侧固定训练集 latent，不漂。理由：防止判别器随 policy 变好而**灾难性遗忘**「明显假」长什么样，稳定在线训练、抗漂移（GAN-RL 标准做法；代价仅是显存里存数百~数千个小 latent）。
+
+## Warm-start 预训练与 RM readiness gate（ADR-0007）
+
+T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不足——100 iter 全程徘徊 chance 带，advantage 信号近噪声。ADR-0007 修订 ADR-0001 的「在线从零」：RL 启动前新增判别器**密集预训练**，产物作为在线更新的初始权重。
+
+- **入口**：`pretrain` 子命令（与 train / eval / prepare 共享同一 config schema 与 dispatch 前校验）。单进程执行（World-1 退化路径），产物全局唯一——判别器是 DDP 完整副本口径，多 rank 各自预训练会分叉（torchrun 启动显式拒绝）。
+- **数据**：real = Real sample pool manifest（kind 守卫装载）；fake = base policy 冻结 rollout 量产，复用回放缓冲的 base 分区采样入口（批量分块、独立随机流、输出归一到 pool 存储域）。组1 / 组2 各自预训练 run（fake 分布不同）：采样场与条件分布经 `GroupPolicy` 按 config 分派——**同一条代码路径，仅 config 不同**。
+- **训练循环**：复用在线期同款判别器单步更新原语（`OnlineUpdate.step`：混采 + LSGAN + AdamW）密集步进，**无第二套判别器训练逻辑**。预训练期无「当前 policy」，混采语义退化为 base fake 库内采样；real 侧口径与在线期一致。终止条件 = held-out AUC ≥ 门槛（`pretrain_gate_auc`，暂定 **0.65**、chance 带外，用预训练曲线校准后定版）或步数上限（`pretrain_max_steps`），两者皆配置化；最终 held-out AUC 与落盘 checkpoint 同快照。
+- **产物契约**：判别器 checkpoint（可装载 state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（`kind="pretrain_report"`：组别、最终 held-out AUC、门槛与达标与否、数据口径指纹——ChannelStats / Real sample pool manifest / held-out manifest / 判别器网络配置的内容 sha256）。装载走守卫入口（`PretrainReport.load` → `load_discriminator`）：**缺报告 / kind 不符 / 形态指纹不符即拒绝**。
+- **指标事件**：`pretrain` 事件类型（步号 + loss + held-out AUC + buffer 占用）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；预训练事件**不参与**续训回退（rewind）记账。
+- **RM readiness gate**：train 入口的硬前置（加载预训练产物、按当前 run 数据口径**重算** held-out AUC、不过线拒绝启动并回滚 run 目录）由后续 ticket 交付；本实现先行落位 schema 字段（`pretrain_report_json`，生产配置**必填无默认**）——RL 不带 warm-start 工件在 schema 层就无法启动。门槛是启动期机制，与「防 reward hacking」节的训练期监控（AUC 掉回 chance 带）互不替代。
+
 
 ## KL / 稳定性锚定
 
@@ -65,7 +79,10 @@
 ## 待定 / 移交
 
 - 精确 `N/K`、判别器 LR、replay buffer 容量 → rollout 吞吐 profile 后定（ticket #7 编排、ticket #9 终稿）。
+- **RM readiness gate 的 train 接入**（preflight 门槛硬检查：按当前 run 数据口径重算 held-out AUC、不过线拒绝启动并回滚 run 目录）→ 后续 ticket；`pretrain` 子命令与产物契约已交付（本 PR）。
+- **门槛阈值 0.65 定版** → DCU 预训练曲线校准（ADR-0007；chance 带 ≈ 0.5±0.02 来自 T13 实测）。
 - hacking 监控阈值、早停准则 → ticket #8 + 对应 fog（依赖经验数据）。
+- **预案 A（冻结判别器 + EMA 锚）**：hacking 签名（`anchor_eval_reward` 升 + milestone FID 同步恶化）触发时切换——实现另开 ticket（ADR-0007 Considered Options A）。
 - 若将来加第二 reward（重建 loss / 分割指标）→ 各自组内标准化后 advantage 相加（Granular-GRPO 双 reward 做法）。
 
 ## 依据

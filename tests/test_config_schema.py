@@ -38,6 +38,13 @@ class TestValidConfigs:
         assert config.reward.disc_update_interval_n_d == 1
         assert config.reward.disc_lr == pytest.approx(5e-5)
         assert config.reward.replay_current_fraction == pytest.approx(0.5)
+        # 预训练与 RM readiness gate（ADR-0007）：阈值暂定 0.65、卫生项同
+        # policy 侧口径（1e-4）
+        assert config.reward.disc_weight_decay == pytest.approx(1e-4)
+        assert config.reward.disc_weight_decay == config.policy.policy_weight_decay
+        assert config.reward.pretrain_gate_auc == pytest.approx(0.65)
+        assert config.reward.pretrain_max_steps >= 1
+        assert config.reward.pretrain_fake_batch >= 1
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
@@ -93,6 +100,15 @@ class TestRejection:
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
         assert ("experiment", "group") in self._locations(exc_info.value)
+
+    def test_missing_pretrain_report_path_is_field_level_error(self) -> None:
+        """预训练产物路径必填无默认（ADR-0007：RL 不带 warm-start 工件在
+        schema 层就无法启动）。"""
+        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+        del data["reward"]["pretrain_report_json"]
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward", "pretrain_report_json") in self._locations(exc_info.value)
 
     def test_unknown_field_rejected(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)

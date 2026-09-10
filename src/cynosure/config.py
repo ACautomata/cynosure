@@ -434,6 +434,13 @@ class RewardConfig(BaseModel):
         "判别器学习率（AdamW），5e-5 = 区间 1e-5~1e-4 中点（profile 后定）",
         default=5e-5, gt=0.0,
     )
+    disc_weight_decay: float = SpecField(
+        "起步值", "ADR-0007",
+        "判别器 AdamW 的 weight decay：显式落位并与 policy 侧同值口径"
+        "（1e-4，policy_weight_decay 同源）；此前隐式取 PyTorch 默认 0.01，"
+        "与 policy 侧的 1e-4 不对称（ADR-0007 卫生项）",
+        default=1e-4, ge=0.0,
+    )
     replay_buffer_capacity: int = SpecField(
         "tunable", "reward-model",
         "Replay buffer 容量（固定 base 分区 + FIFO 近期分区；base 分区由初始 policy "
@@ -456,6 +463,31 @@ class RewardConfig(BaseModel):
     channel_stats_json: Path = SpecField(
         "运行时", "reward-model",
         "判别器输入 per-channel 标准化统计量（来自 Real sample pool 所用训练集；prepare 产出）",
+    )
+    pretrain_gate_auc: float = SpecField(
+        "tunable", "ADR-0007",
+        "RM readiness gate 门槛阈值：预训练 held-out AUC 达标即终止、train 上岗"
+        "硬检查同源（暂定 0.65，T13 实测 chance 带 ≈ 0.5±0.02；用预训练曲线"
+        "校准后定版）",
+        default=0.65, gt=0.0, lt=1.0,
+    )
+    pretrain_max_steps: int = SpecField(
+        "tunable", "ADR-0007",
+        "预训练密集步进上限（远超在线期 1 step/iter；AUC 达门槛即提前终止，"
+        "起步值待 DCU 预训练曲线校准）",
+        default=2000, ge=1,
+    )
+    pretrain_fake_batch: int = SpecField(
+        "tunable", "ADR-0007",
+        "预训练每步量产的 fake 批量（base policy 冻结 rollout 的产出量；"
+        "须覆盖判别器更新批的当前半区，装配期守卫）",
+        default=16, ge=1,
+    )
+    pretrain_report_json: Path = SpecField(
+        "运行时", "ADR-0007",
+        "判别器预训练报告路径（kind 标识 + 最终 held-out AUC + 数据口径指纹；"
+        "train 上岗门槛的守卫装载源，预训练 run 目录产物）。必填无默认——"
+        "RL 不带 warm-start 工件在 schema 层就无法启动",
     )
 
     @field_validator("replay_current_fraction")
@@ -649,7 +681,7 @@ class DeploymentConfig(BaseModel):
 
 
 class CynosureConfig(BaseModel):
-    """cynosure 全量运行配置：train / eval / prepare 三子命令共享同一 schema。"""
+    """cynosure 全量运行配置：train / eval / prepare / pretrain 四子命令共享同一 schema。"""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -821,7 +853,7 @@ class CynosureConfig(BaseModel):
 
 
 class ConfigLoader:
-    """config 文件装载：JSON 反序列化 + schema 校验（三子命令共用）。"""
+    """config 文件装载：JSON 反序列化 + schema 校验（四子命令共用）。"""
 
     @classmethod
     def load(cls, path: str | Path) -> CynosureConfig:

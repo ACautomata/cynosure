@@ -1,5 +1,6 @@
-"""CLI seam 测试：train / eval / prepare 三子命令、config 校验字段级错误、
-run 目录与工件契约最小版（config 快照 + metrics.jsonl + manifest + checkpoints）。
+"""CLI seam 测试：train / eval / prepare / pretrain 四子命令、config 校验
+字段级错误、run 目录与工件契约最小版（config 快照 + metrics.jsonl +
+manifest + checkpoints）。pretrain 的端到端与守卫在 test_pretrain。
 
 测试原则（spec「Testing Decisions」）：只断言经 CLI 边界可观测的外部行为。"""
 

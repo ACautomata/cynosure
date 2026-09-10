@@ -110,8 +110,8 @@ class TrainingRuntime:
         policy = GroupPolicy.build(
             config, generators["rollout"], amp.device, sharding=sharding,
         )
-        rewards = cls._assemble_rewards(config, amp, generators, dist)
-        sampler = cls._assemble_sampler(config, policy.field)
+        rewards = cls.assemble_rewards(config, amp, generators, dist)
+        sampler = cls.assemble_sampler(config, policy.field)
         updater = StepwisePolicyUpdate(
             sampler=sampler,
             optimizer=policy.optimizer,
@@ -146,8 +146,11 @@ class TrainingRuntime:
         )
 
     @classmethod
-    def _assemble_sampler(cls, config: CynosureConfig, field: VelocityField) -> RolloutSampler:
-        """policy 采样封装装配（netbuild 日程 + 本组采样场 + SDE 核）。"""
+    def assemble_sampler(cls, config: CynosureConfig, field: VelocityField) -> RolloutSampler:
+        """policy 采样封装装配（netbuild 日程 + 本组采样场 + SDE 核）。
+
+        公开装配缝：train 运行时与预训练 driver（单进程 world-1 语境）
+        共用同一份装配代码——采样日程/核参数的调整单点生效。"""
         policy = config.policy
         scheduler = NetworkAssembler.rflow_scheduler(
             num_inference_steps=policy.num_inference_steps,
@@ -157,7 +160,7 @@ class TrainingRuntime:
         return RolloutSampler(field, kernel, TrajectoryCursor(scheduler))
 
     @classmethod
-    def _assemble_rewards(
+    def assemble_rewards(
         cls,
         config: CynosureConfig,
         amp: AmpContext,
@@ -165,7 +168,11 @@ class TrainingRuntime:
         dist: DistributedContext,
     ) -> RewardCoordinator:
         """判别器侧装配：网络构建 → DDP 副本升级（分布式）→ pool 切片
-        （real 侧；held-out 不切）→ Online update / AUC 协作者。"""
+        （real 侧；held-out 不切）→ Online update / AUC 协作者。
+
+        公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
+        RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
+        同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。"""
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
                 "训练循环需要判别器网络配置（discriminator_config_json）："

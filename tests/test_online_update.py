@@ -173,6 +173,16 @@ class TestUpdateStep:
         assert type(update.optimizer).__name__ == "AdamW"
         assert update.optimizer.param_groups[0]["lr"] == pytest.approx(5e-5)
 
+    def test_optimizer_weight_decay_is_explicit(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """卫生项（ADR-0007）：判别器 AdamW 的 weight_decay 显式取 config
+        值（与 policy 侧同值口径 1e-4），不再是隐式 PyTorch 默认 0.01。"""
+        update, _ = scenario.update()
+        decay = update.optimizer.param_groups[0]["weight_decay"]
+        assert decay == pytest.approx(1e-4)
+        assert decay == pytest.approx(scenario.config.policy.policy_weight_decay)
+
     def test_step_changes_discriminator_weights(
         self, scenario: UpdateScenario,
     ) -> None:
