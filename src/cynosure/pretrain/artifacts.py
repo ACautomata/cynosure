@@ -17,7 +17,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -26,7 +26,12 @@ from cynosure.config import CynosureConfig
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.scorer import RewardScorer
-from cynosure.train.artifacts import PretrainEvent
+
+if TYPE_CHECKING:
+    # 事件模型在 train.artifacts（指标流事件类型的集中地）；仅作类型标注
+    # 使用——运行时 import 会与 train.runtime 的 PretrainReport 装配依赖
+    # 成环（train 侧 warm-start 装载反向消费本模块）
+    from cynosure.train.artifacts import PretrainEvent
 
 
 class PretrainProvenance(BaseModel):
@@ -98,6 +103,35 @@ class PretrainReport(BaseModel):
         report = cls.model_validate(json.loads(path.read_text(encoding="utf-8")))
         report._path = path
         return report
+
+    def assert_data_provenance(self, config: CynosureConfig) -> None:
+        """当前 config 的数据口径三工件与报告指纹对照：不匹配即拒绝。
+
+        real pool / held-out manifest / channel stats 任一文件内容与
+        预训练时的指纹不符（manifest 重建、统计量换源）都让上岗判别力
+        与预训练报告脱钩——warm-start 装载前显式拒绝，不给静默错位
+        留缝（判别器形态指纹的对照在 ``load_discriminator``）。
+        """
+        checks = (
+            ("real_pool_manifest", config.reward.real_pool_manifest,
+             self.provenance.real_pool_manifest_sha256),
+            ("heldout_real_manifest", config.reward.heldout_real_manifest,
+             self.provenance.heldout_manifest_sha256),
+            ("channel_stats_json", config.reward.channel_stats_json,
+             self.provenance.channel_stats_sha256),
+        )
+        mismatched = []
+        for name, path, recorded in checks:
+            current = PretrainProvenance.digest(path)  # 每工件读盘+哈希一次
+            if current != recorded:
+                mismatched.append(
+                    f"{name}（报告 {recorded[:12]}… ≠ 当前 {current[:12]}…）",
+                )
+        if mismatched:
+            raise ValueError(
+                "预训练数据口径指纹不符（预训练与上岗须同一数据口径）: "
+                + "; ".join(mismatched)
+            )
 
     def load_discriminator(
         self, config: CynosureConfig, device: torch.device | None = None,
@@ -184,7 +218,7 @@ class PretrainRun:
             report=root / "pretrain_report.json",
         )
 
-    def append_event(self, event: PretrainEvent) -> None:
+    def append_event(self, event: "PretrainEvent") -> None:
         """向预训练指标流追加一行 JSON 事件（事件类型与 iter/milestone
         混存同一 metrics.jsonl，event 判别字段区分）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:

@@ -119,6 +119,12 @@ class PretrainDriver:
         """判别器侧协作者组（Online update 原语 / held-out AUC / buffer）。"""
         return self._rewards
 
+    @property
+    def rollout(self) -> RolloutPhase:
+        """rollout 封装（base fake 量产的公开面——RM readiness gate
+        重算口径的消耗序重演消费它）。"""
+        return self._rollout
+
     def run(self) -> PretrainReport:
         """密集步进至 RM readiness gate 达标或步数上限，产出判别器
         checkpoint 与预训练报告（产物全局唯一：单进程唯一写者）。"""

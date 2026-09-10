@@ -45,7 +45,7 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 - **训练循环**：复用在线期同款判别器单步更新原语（`OnlineUpdate.step`：混采 + LSGAN + AdamW）密集步进，**无第二套判别器训练逻辑**。预训练期无「当前 policy」，混采语义退化为 base fake 库内采样；real 侧口径与在线期一致。终止条件 = held-out AUC ≥ 门槛（`pretrain_gate_auc`，暂定 **0.65**、chance 带外，用预训练曲线校准后定版）或步数上限（`pretrain_max_steps`），两者皆配置化；最终 held-out AUC 与落盘 checkpoint 同快照。
 - **产物契约**：判别器 checkpoint（可装载 state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（`kind="pretrain_report"`：组别、最终 held-out AUC、门槛与达标与否、数据口径指纹——ChannelStats / Real sample pool manifest / held-out manifest / 判别器网络配置的内容 sha256）。装载走守卫入口（`PretrainReport.load` → `load_discriminator`）：**缺报告 / kind 不符 / 形态指纹不符即拒绝**。
 - **指标事件**：`pretrain` 事件类型（步号 + loss + held-out AUC + buffer 占用）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；事件类型清单与各型的回退记账口径见下节。
-- **RM readiness gate**：train 入口的硬前置（加载预训练产物、按当前 run 数据口径**重算** held-out AUC、不过线拒绝启动并回滚 run 目录）由后续 ticket 交付；本实现先行落位 schema 字段（`pretrain_report_json`，生产配置**必填无默认**）——RL 不带 warm-start 工件在 schema 层就无法启动。门槛是启动期机制，与「防 reward hacking」节的训练期监控（AUC 掉回 chance 带）互不替代。
+- **RM readiness gate**：train 入口的硬前置（ADR-0007）：判别器装配从预训练报告守卫重载（数据口径三工件指纹对照 → 形态指纹对照 → checkpoint 严格装载——缺报告 / kind 不符 / 工件损坏 / 口径指纹不匹配即拒绝，冷启动训练路径在 train 侧废弃，``discriminator_ckpt`` 不再是 train 装配消费点）；启动期按**当前 run 的数据口径**（held-out real + 本 rank base fake 批）**重算** held-out AUC——不信任预训练报告旧值，重算与预训练 gate 测量同一份 ``HeldOutAuc.compute`` 口径（全池混采），同 scorer 快照 + 同 fake 批下与报告 ``final_heldout_auc`` 逐位可比；重算值低于 ``pretrain_gate_auc`` 即给出含实测值与阈值的可读报错并回滚 run 目录（沿用 preflight 失败语义），达标放行。检查发生在 Baseline 采样等昂贵启动动作之前；分布式下各 rank 以本 rank base fake 独立重算、经集合裁决全体一致拒绝（任一 rank 眼里判别器失明都不得开跑）。**resume 跳过门槛**——续训状态已含判别器全量状态（恢复点判别器已在岗）；``pretrain_report_json`` 字段引入前的旧 run 快照在续训对账装载期被 schema 必填校验拒绝，旧口径 run 不再支持续训。fixture 不设豁免：fixture config 以低阈值（0.51，chance 带上沿之上）+ 自产小产物经同一条代码路径通过门槛。门槛是启动期机制，与「防 reward hacking」节的训练期监控（AUC 掉回 chance 带）互不替代。
 
 
 ## 指标事件流的事件类型清单（metrics.jsonl）
@@ -95,7 +95,6 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 ## 待定 / 移交
 
 - 精确 `N/K`、判别器 LR、replay buffer 容量 → rollout 吞吐 profile 后定（ticket #7 编排、ticket #9 终稿）。
-- **RM readiness gate 的 train 接入**（preflight 门槛硬检查：按当前 run 数据口径重算 held-out AUC、不过线拒绝启动并回滚 run 目录）→ 后续 ticket；`pretrain` 子命令与产物契约已交付（本 PR）。
 - **门槛阈值 0.65 定版** → DCU 预训练曲线校准（ADR-0007；chance 带 ≈ 0.5±0.02 来自 T13 实测）。
 - hacking 监控阈值、早停准则 → ticket #8 + 对应 fog（依赖经验数据）。
 - **预案 A（冻结判别器 + EMA 锚）**：hacking 签名（`anchor_eval_reward` 升 + milestone FID 同步恶化）触发时切换——实现另开 ticket（ADR-0007 Considered Options A）。

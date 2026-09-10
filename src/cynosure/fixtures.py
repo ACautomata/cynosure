@@ -257,6 +257,11 @@ class Fixture:
                 "pretrain_report_json": str(
                     artifacts_dir / "pretrain_run" / "pretrain_report.json"
                 ),
+                # RM readiness gate 的 fixture 低阈值（ADR-0007）：chance 带
+                # 上沿之上、自产小产物可达——门槛判定逻辑的 fixture 专属取值
+                # （fixture 不设豁免：train 门槛硬检查以同一条代码路径放行；
+                # 生产默认 0.65 不受影响）
+                "pretrain_gate_auc": 0.51,
             },
             # N_baseline fixture 缩小（Baseline manifest 条目随全流程走）
             "schedule": {"seed": 0, "baseline_samples": 4},

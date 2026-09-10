@@ -677,8 +677,14 @@ class TestSpawnedUsageContract:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         scenario.write_inputs()
-        # 损坏判别器 checkpoint → 装配期对 torch.load 的对称 RuntimeError
-        (scenario.fixture_dir / "discriminator.pt").write_bytes(b"corrupt")
+        # 损坏 warm-start 产物 checkpoint（train 装配的判别器装载源）→
+        # 装配期对 torch.load 的对称 RuntimeError
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        checkpoint = (
+            Path(data["reward"]["pretrain_report_json"]).parent
+            / "checkpoints" / "pretrain_discriminator.pt"
+        )
+        checkpoint.write_bytes(b"corrupt")
         for _ in range(3):  # 竞态类：重复三次提高捕获率
             result = SpawnedTrainWorld(
                 scenario.config_path, scenario.run_dir, world=2,

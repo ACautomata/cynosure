@@ -35,6 +35,7 @@ from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
+from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
@@ -110,7 +111,10 @@ class TrainingRuntime:
         policy = GroupPolicy.build(
             config, generators["rollout"], amp.device, sharding=sharding,
         )
-        rewards = cls.assemble_rewards(config, amp, generators, dist)
+        rewards = cls.assemble_rewards(
+            config, amp, generators, dist,
+            report=PretrainReport.load(config.reward.pretrain_report_json),
+        )
         sampler = cls.assemble_sampler(config, policy.field)
         updater = StepwisePolicyUpdate(
             sampler=sampler,
@@ -166,36 +170,27 @@ class TrainingRuntime:
         amp: AmpContext,
         generators: dict[str, torch.Generator],
         dist: DistributedContext,
+        report: PretrainReport | None = None,
     ) -> RewardCoordinator:
         """判别器侧装配：网络构建 → DDP 副本升级（分布式）→ pool 切片
         （real 侧；held-out 不切）→ Online update / AUC 协作者。
 
         公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
         RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
-        同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。"""
+        同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
+
+        权重来源按语境二分：``report`` 给定（train 语境）= warm-start
+        守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告 checkpoint
+        严格装载，ADR-0007——RL 不带预训练产物在装配层就无法启动）；
+        ``None``（pretrain driver 语境）= 冷启动路径（checkpoint 工件
+        或随机初始化，预训练本身即产物的生产方）。"""
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
                 "训练循环需要判别器网络配置（discriminator_config_json）："
                 "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
                 "随机初始化起步的在线训练，冷启动工作流）"
             )
-        # 网络构建（含冷启动随机初始化）在 schedule.seed 的派生流下进行，
-        # 并 fork 隔离全局 RNG——同 config 的两次冷启动判别器权重逐位
-        # 可复现，且跨 rank 逐位一致（seed 不含 rank 偏移：DDP 装配要求
-        # 各 rank 初始副本一致）。不扰动进程全局 RNG 状态（sampling
-        # generators 独立对象本就不受影响）
-        with torch.random.fork_rng():
-            torch.manual_seed(config.schedule.seed + 6)
-            scorer = RewardScorer(
-                NetworkArtifact(
-                    config=NetworkAssembler.load_json(
-                        config.artifacts.discriminator_config_json,
-                    ),
-                    checkpoint=config.artifacts.discriminator_ckpt,
-                ),
-                config.reward,
-                ChannelStats.load(config.reward.channel_stats_json),
-            )
+        scorer = cls._assemble_scorer(config, report)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
         update = OnlineUpdate(
@@ -223,3 +218,31 @@ class TrainingRuntime:
             device=amp.device,
         )
         return RewardCoordinator(update, auc, generators["fake_shuffle"])
+
+    @staticmethod
+    def _assemble_scorer(
+        config: CynosureConfig, report: PretrainReport | None,
+    ) -> RewardScorer:
+        """判别器 scorer 的权重来源分派（见 ``assemble_rewards``）。"""
+        if report is not None:
+            # warm-start 守卫链：数据口径指纹 → 形态指纹 → 严格装载
+            # （任一不符在装配期拒绝，CLI 层回滚 run 目录）
+            report.assert_data_provenance(config)
+            return report.load_discriminator(config)
+        # 冷启动：网络构建（随机初始化或 checkpoint 工件装载）在
+        # schedule.seed 的派生流下进行，并 fork 隔离全局 RNG——同 config
+        # 的两次冷启动判别器权重逐位可复现，且跨 rank 逐位一致（seed
+        # 不含 rank 偏移：DDP 装配要求各 rank 初始副本一致）。不扰动
+        # 进程全局 RNG 状态（sampling generators 独立对象本就不受影响）
+        with torch.random.fork_rng():
+            torch.manual_seed(config.schedule.seed + 6)
+            return RewardScorer(
+                NetworkArtifact(
+                    config=NetworkAssembler.load_json(
+                        config.artifacts.discriminator_config_json,
+                    ),
+                    checkpoint=config.artifacts.discriminator_ckpt,
+                ),
+                config.reward,
+                ChannelStats.load(config.reward.channel_stats_json),
+            )

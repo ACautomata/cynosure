@@ -28,6 +28,7 @@ from cynosure.train.artifacts import (
     RunPaths,
 )
 from cynosure.train.earlystop import EarlyStopJudge, EarlyStopVerdict
+from cynosure.train.gate import ReadinessGate
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import (
     ConditionSampler,
@@ -56,6 +57,7 @@ __all__ = [
     "EarlyStopJudge",
     "EarlyStopVerdict",
     "GranularGrpoTrainer",
+    "ReadinessGate",
     "IterationLoop",
     "IterationRollout",
     "IterEvent",

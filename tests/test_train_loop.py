@@ -14,6 +14,7 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 
 import json
 import math
+import shutil
 from collections import Counter
 from itertools import product
 from pathlib import Path
@@ -57,10 +58,18 @@ class TrainingLoopScenario:
         group: str = "modal-label",
     ) -> None:
         """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
-        选实验组：组2/组3 的 config 携带 ControlNet 工件）。"""
+        选实验组：组2/组3 的 config 携带 ControlNet 工件）。
+
+        warm-start 前置（ADR-0007）：RM readiness gate 是 train 入口的
+        硬检查、消费预训练产物——场景先以同一 config 的预训练轻量变体
+        跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
+        再落训练 config。"""
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(self.fixture_dir)
+        # 场景工具的幂等重建（write_inputs 可重复调用——预训练 run 目录
+        # 由本步重建，不静默覆盖语义是 CLI 的、工具面先清后建）
+        shutil.rmtree(self.fixture_dir / "pretrain_run", ignore_errors=True)
         prepare_config = FixturePrepareScenario(
             self.cli, fixture.config(self.fixture_dir, group=group), self.tmp_path,
         ).run(self.tmp_path / "prepare_config.json")
@@ -69,9 +78,33 @@ class TrainingLoopScenario:
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
+        self._pretrain_warm_start(config, group)
         self.config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
+
+    def _pretrain_warm_start(self, config, group: str) -> None:
+        """场景的预训练前置：报告落 config 声明的产物路径（train 装配
+        与门槛检查的装载源）。轻量参数只降低本步执行成本、不进训练
+        config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
+        sequential 组的单次装配）。预训练 gate 抬到 0.60——达标即停
+        让重算值贴着停止阈值，对 train gate（0.51）留出测量噪声的
+        安全 margin。"""
+        pretrain_config = config.model_copy(deep=True)
+        pretrain_config.experiment.group = (
+            "modal-label" if group == "sequential" else group
+        )
+        pretrain_config.reward.pretrain_fake_batch = 4
+        pretrain_config.reward.replay_buffer_capacity = 8
+        pretrain_config.reward.disc_lr = 2e-4
+        pretrain_config.reward.pretrain_gate_auc = 0.60
+        pretrain_config.reward.pretrain_max_steps = 24
+        path = self.tmp_path / "pretrain_config.json"
+        path.write_text(
+            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = self.cli.run("pretrain", "--config", str(path))
+        assert result.code == 0, result.stderr
 
     def train(self, *, dump: bool = False):
         argv = ["train", "--config", str(self.config_path), "--run-dir", str(self.run_dir)]
@@ -366,10 +399,10 @@ class TestSingleIterationLoop:
     def test_discriminator_cold_start_without_checkpoint(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """冷启动在线判别器（schema 语义 ``discriminator_ckpt=None = 随机
-        初始化起步的在线训练``）：网络配置 JSON 必需、checkpoint 可缺省
-        ——训练全链路绿且判别器 checkpoint 正常落盘（冷启动工作流，
-        reward-model 章）。"""
+        """discriminator_ckpt=None 的工件面（随机初始化起步）：预训练
+        侧冷启动（ADR-0007 的 warm-start 产物生产方）不受影响，train
+        侧判别器一律从预训练报告守卫重载——``discriminator_ckpt`` 在
+        train 装配中不再是消费点（warm-start 接入后废弃冷启动训练）。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["artifacts"]["discriminator_ckpt"] = None
@@ -429,16 +462,17 @@ class TestSingleIterationLoop:
     def test_incompatible_checkpoint_rolls_back_run(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """checkpoint 装载失败（键/shape 不匹配 → 严格装载 RuntimeError）
-        同属输入契约违反：构造期得到干净消息 + 未产出工件的 run 目录
-        回滚——RuntimeError 不在捕获集内则裸 traceback 且目录残留，
-        修正 checkpoint 后同 --run-dir 重试被拒。"""
+        """warm-start 产物 checkpoint 装载失败（键/shape 不匹配 → 严格
+        装载 RuntimeError）同属输入契约违反：构造期得到干净消息 + 未
+        产出工件的 run 目录回滚——修正预训练产物后同 --run-dir 重试
+        不被残留目录拒绝。"""
         scenario.write_inputs()
-        bad = scenario.tmp_path / "bad_discriminator.pt"
-        torch.save({"bogus": torch.zeros(1)}, bad)  # 键形与网络不符
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-        data["artifacts"]["discriminator_ckpt"] = str(bad)
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        checkpoint = (
+            Path(data["reward"]["pretrain_report_json"]).parent
+            / "checkpoints" / "pretrain_discriminator.pt"
+        )
+        torch.save({"bogus": torch.zeros(1)}, checkpoint)  # 键形与网络不符
         result = scenario.train()
         assert result.code == 2
         assert "训练输入契约违反" in result.stderr
