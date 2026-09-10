@@ -26,9 +26,10 @@ class CliResult:
 
 class RunTrajectory:
     """iter 事件流的轨迹可比面（值对象）：wall-clock ``elapsed_s`` 不参与
-    相等性——跨作业对比的语义轴是事件序下的其余字段。同路径重放（续训
-    roundtrip）在此逐位断言；跨路径（分布式 vs 单进程）的重算噪声容差
-    判定见 test_distributed.CrossPathEquivalence。"""
+    相等性——跨作业对比的语义轴是事件序下的其余字段。同**进程**重放
+    （单进程续训 roundtrip）在此逐位断言；跨进程世界对的对比（分布式
+    续训 roundtrip 等）的观测前向存在 1-2 ulp 重算噪声，走
+    test_distributed.CrossPathEquivalence 的容差判定。"""
 
     def __init__(self, events: list[dict]) -> None:
         self._events = [

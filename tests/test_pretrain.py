@@ -5,6 +5,10 @@ fixture 合成流：小 pool + 小 fake 集 → 密集步进 → 产物落盘 �
 双分支、组1/组2 同路径、kind 守卫、预训练事件的回退记账口径由专属
 用例覆盖；真实收敛动力学留给 DCU 实跑（spec「Testing Decisions」：
 fixture 只验判定逻辑与数据流）。
+
+事件类型 × 回退记账口径（ticket #59）分两层锁：本文件锁**口径表**本身
+（三型事件的登记与各自的保留边界、未登记类型的不删语义）；resume seam 上
+的真回退（真 `--resume` 不误删预训练事件）见 test_resume_roundtrip。
 """
 
 import copy
@@ -26,9 +30,12 @@ from cynosure.pretrain import (
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train import (
+    REWIND_ACCOUNTING,
     CrossModalConditionSampler,
     IterEvent,
+    MilestoneEvent,
     PretrainEvent,
+    RewindAccounting,
     RunArtifacts,
 )
 from tests.conftest import (
@@ -39,10 +46,11 @@ from tests.conftest import (
 )
 
 
-def iter_event(iteration: int) -> IterEvent:
+def iter_event(iteration: int, stage: int = 1) -> IterEvent:
     """最小合法 iter 事件（rewind 记账口径的对照事件）。"""
     return IterEvent(
         iteration=iteration,
+        stage=stage,
         modality="t1n",
         anchor_eval_reward=0.0,
         intra_group_reward_std=1.0,
@@ -70,11 +78,32 @@ def pretrain_event(step: int) -> PretrainEvent:
     )
 
 
+def milestone_event(iteration: int) -> MilestoneEvent:
+    """最小合法里程碑事件（回退记账的完成数口径对照事件）。"""
+    return MilestoneEvent(iteration=iteration, fid=1.0)
+
+
+def event_type_vocabulary() -> set[str]:
+    """指标流事件类型的判别值词汇表（由事件模型实例的 ``event`` 默认值取
+    真值——判别字段的 Literal 是那一处的单一来源，测试不另抄字面量）。"""
+    return {
+        event.event
+        for event in (
+            iter_event(0), milestone_event(0), pretrain_event(0),
+        )
+    }
+
+
+def fresh_run_artifacts(tmp_path: Path) -> RunArtifacts:
+    """本文件各用例的最小落盘面：全新 run 目录（config 快照 + 空指标流）。"""
+    config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
+    return RunArtifacts.init(config, tmp_path / "run")
+
+
 class TestPretrainEventContract:
     def test_event_type_discriminant_and_roundtrip(self, tmp_path: Path) -> None:
         """事件判别字段区分于 iter/milestone；同流混存读取无损。"""
-        config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
-        artifacts = RunArtifacts.init(config, tmp_path / "run")
+        artifacts = fresh_run_artifacts(tmp_path)
         artifacts.append_event(iter_event(0))
         artifacts.append_event(pretrain_event(0))
         events = artifacts.read_events()
@@ -85,8 +114,7 @@ class TestPretrainEventContract:
     def test_rewind_preserves_pretrain_events(self, tmp_path: Path) -> None:
         """预训练事件不参与续训回退记账（spec「实现警点」）：rewind 只删
         iter/milestone 的半截执行史，混存的 pretrain 事件全量保留。"""
-        config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
-        artifacts = RunArtifacts.init(config, tmp_path / "run")
+        artifacts = fresh_run_artifacts(tmp_path)
         artifacts.append_event(iter_event(0))
         artifacts.append_event(pretrain_event(0))
         artifacts.append_event(pretrain_event(1))
@@ -98,6 +126,81 @@ class TestPretrainEventContract:
             "iter", "pretrain", "pretrain",
         ]
         assert [event.get("step") for event in survivors if event["event"] == "pretrain"] == [0, 1]
+
+
+class TestEventRewindAccounting:
+    """事件类型 × 回退记账口径（ticket #59：「可扩不可改名」的记账面）。
+
+    口径表本身在契约层锁：三型事件各登记一个口径、保留边界按各自记账轴
+    取、未登记类型退化为不删（新增事件类型必须显式声明口径，不得静默
+    继承删除口径）。resume seam 上的真回退见 test_resume_roundtrip。"""
+
+    def test_registry_covers_event_type_vocabulary(self) -> None:
+        """记账口径登记表与事件类型词汇表逐项对齐：每型事件的判别值都有
+        显式登记的口径（新增事件类型必须声明口径，不得静默继承删除口径）。"""
+        assert set(REWIND_ACCOUNTING) == event_type_vocabulary()
+        assert REWIND_ACCOUNTING["iter"] is RewindAccounting.ITERATION
+        assert REWIND_ACCOUNTING["milestone"] is RewindAccounting.COMPLETION
+        assert REWIND_ACCOUNTING["pretrain"] is RewindAccounting.EXEMPT
+
+    def test_recovery_point_covers_by_event_own_accounting(self) -> None:
+        """保留边界按各型自身口径取（恢复点 = 最近 checkpoint 的计数）：
+        iter 以 0-based iteration 号记账（号 < 恢复点 = 已在 checkpoint
+        覆盖面内）；milestone 以完成数记账（完成数 ≤ 恢复点 = 与恢复点
+        checkpoint 同批产出，删即抹掉 FID 历史）；pretrain 不参与记账。"""
+        assert RewindAccounting.ITERATION.covers(1, 2) is True
+        assert RewindAccounting.ITERATION.covers(2, 2) is False  # 半截：待重写
+        assert RewindAccounting.COMPLETION.covers(2, 2) is True  # 同批产出：保留
+        assert RewindAccounting.COMPLETION.covers(3, 2) is False
+        assert RewindAccounting.EXEMPT.covers(0, 0) is True
+        assert RewindAccounting.EXEMPT.covers(999, 0) is True
+
+    def test_rewind_keeps_and_drops_by_event_type(self, tmp_path: Path) -> None:
+        """三型事件混存同一流的回退现场（恢复点 2）：iter 删恢复点及之后的
+        半截执行史（号 ≥ 2）、milestone 按完成数保留同批（≤ 2）、pretrain
+        全量保留且逐字不动；其他 stage 的历史一概不动。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(pretrain_event(0))
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(pretrain_event(1))
+        artifacts.append_event(iter_event(1))
+        artifacts.append_event(milestone_event(2))
+        artifacts.append_event(iter_event(2))
+        artifacts.append_event(iter_event(0, stage=2))  # 组3 stage-1 的历史
+        removed = artifacts.rewind_events(2, stage=1)
+        assert removed == 1  # 只有 stage-1 的 iteration 2 半截事件
+        survivors = artifacts.read_events()
+        assert [(event["event"], event.get("step", event.get("iteration")))
+                for event in survivors] == [
+            ("pretrain", 0), ("iter", 0), ("pretrain", 1), ("iter", 1),
+            ("milestone", 2), ("iter", 0),
+        ]
+
+    def test_rewind_to_origin_keeps_pretrain_events(self, tmp_path: Path) -> None:
+        """恢复点 0（stage 的首个 iteration 都未进 checkpoint 覆盖面）：
+        预训练事件仍须全量保留——按 iter 口径记账时它们的 ``iteration``
+        缺省为 0，恰落在删除边界内，口径隔离是唯一挡得住这次误删的机制。
+        恢复点 0 在 CLI seam 上难以构造（无 checkpoint 即无恢复入口），
+        故在契约层直接锁。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(pretrain_event(0))
+        artifacts.append_event(pretrain_event(1))
+        artifacts.append_event(iter_event(0))
+        assert artifacts.rewind_events(0, stage=1) == 1  # 只删 stage-1 的 iter@0
+        assert [event["event"] for event in artifacts.read_events()] == [
+            "pretrain", "pretrain",
+        ]
+
+    def test_unregistered_event_type_is_never_deleted(self, tmp_path: Path) -> None:
+        """未登记的事件类型一律不参与删除：口径表是删除的准入名单，表外
+        类型退化为全量保留，而非静默继承 iter 口径被当作半截执行史抹掉。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(iter_event(9))  # 恢复点之外的半截事件：该删
+        future = {"event": "future-metric", "iteration": 99}
+        with open(artifacts.paths.metrics, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(future) + "\n")
+        assert artifacts.rewind_events(1, stage=1) == 1
+        assert artifacts.read_events() == [future]
 
 
 class PretrainReportScenario:
@@ -378,6 +481,9 @@ class TestPretrainEndToEnd:
         assert [event["step"] for event in events] == list(range(12))
         assert all(event["event"] == "pretrain" for event in events)
         assert all("loss_discriminator" in event for event in events)
+        # 曲线的操作者可见面：终点报出指标流路径与事件数（离线查看收敛
+        # 曲线、校准门槛阈值的数据源）
+        assert f"{len(events)} 条 pretrain 事件" in result.stdout
         assert report.gate_passed is False
         # 判定与报告值的一致性（走满路径：落盘 checkpoint 的补测值 < 门槛）
         assert report.final_heldout_auc < report.gate_auc

@@ -11,6 +11,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -87,9 +88,10 @@ class MilestoneEvent(BaseModel):
 class PretrainEvent(BaseModel):
     """判别器预训练指标流的逐步事件（ADR-0007 warm-start）。
 
-    ``event`` 判别字段与 iter/milestone 混存同一 metrics.jsonl（预训练
-    run 目录）；预训练事件不参与续训回退（rewind）记账口径——回退只重写
-    RL iteration 的半截执行史，预训练执行史全量保留。
+    ``event`` 判别字段与 iter/milestone 混存同一 metrics.jsonl（事件契约
+    沿「可扩不可改名」口径：新类型加判别值与字段、既有字段名与语义不改）；
+    预训练事件在回退记账中登记为 ``EXEMPT``（见 ``REWIND_ACCOUNTING``）
+    ——续训回退只重写 RL iteration 的半截执行史，预训练执行史全量保留。
     """
 
     model_config = ConfigDict(allow_inf_nan=False)
@@ -107,6 +109,59 @@ class PretrainEvent(BaseModel):
     """Replay buffer 近期分区当前占用（FIFO 滚动观测面）。"""
     lr: float
     elapsed_s: float
+
+
+class RewindAccounting(Enum):
+    """事件类型在续训回退（rewind）中的记账口径（每型事件声明的保留策略）。
+
+    回退 = 删除恢复点之外的**半截**执行史、由恢复后的重执行重写（保住
+    「每 iteration 每 stage 一条事件」的流不变量）。保留边界按各型自身的
+    记账轴取——同一份流里三种轴并存，故口径随事件类型声明而非全局统一：
+
+    - ``ITERATION``：iter 事件以 0-based iteration 号记账，保留号 <
+      恢复点（号 ≥ 恢复点的迭代未进 checkpoint 覆盖面，重执行重写）；
+    - ``COMPLETION``：milestone 事件以完成数记账，保留完成数 ≤ 恢复点
+      ——里程碑评测与 checkpoint 同批产出，按 iter 边界删会抹掉该里程碑
+      的评测历史（FID 序列断点、早停 verdict 消失且不再重放）；
+    - ``EXEMPT``：不参与回退记账，全量保留。warm-start 预训练事件属此类：
+      它没有对应的 checkpoint 可重放，按任何边界删都是永久丢失（收敛
+      曲线断点、RM readiness gate 的阈值校准数据不可复现）；表外事件
+      类型（未登记 / 新增未声明）的兜底同为 ``EXEMPT``——同一条「不参与
+      记账」语义在已登记与未登记两侧共用。
+    """
+
+    ITERATION = "iteration"
+    COMPLETION = "completion"
+    EXEMPT = "exempt"
+
+    def covers(self, number: int, recovery: int) -> bool:
+        """恢复点 ``recovery`` 是否覆盖事件号 ``number``（覆盖 = 保留）。
+
+        ``number`` 按本口径自身的记账轴取：``ITERATION`` 传事件的
+        0-based iteration 号，``COMPLETION`` 传完成数（两者都是事件的
+        ``iteration`` 字段，语义随口径而异——指标流的既有字段不动）。
+        """
+        if self is RewindAccounting.ITERATION:
+            return number < recovery
+        if self is RewindAccounting.COMPLETION:
+            return number <= recovery
+        if self is RewindAccounting.EXEMPT:
+            return True
+        raise ValueError(f"未实现的记账口径（新增口径须实现保留边界）: {self}")
+
+
+REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
+    "iter": RewindAccounting.ITERATION,
+    "milestone": RewindAccounting.COMPLETION,
+    "pretrain": RewindAccounting.EXEMPT,
+}
+"""事件判别值 → 回退记账口径的登记表（契约「可扩不可改名」的记账面）。
+
+登记表是**删除的准入名单**：``rewind_events`` 只对表内口径为删除的轴做
+判定，表外（未登记 / 新增未声明）的事件类型一律保留——宁可留痕不可误删。
+新增事件类型 = 新判别值 + 登记口径 + spec 事件类型清单同步（三者同批），
+既有类型的判别值与字段名不变。
+"""
 
 
 class ManifestEntry(BaseModel):
@@ -326,27 +381,16 @@ class RunArtifacts:
         iteration 每 stage 一条事件」的流不变量（重复事件会污染早停判定
         等下游消费者）。
 
-        保留边界按事件记账口径取：iter 事件以 0-based iteration 号记账
-        （保留号 < 恢复点）；milestone 事件以完成数记账、与恢复点
-        checkpoint 同批产出（保留完成数 ≤ 恢复点——若按 iter 边界删，
-        每次从里程碑 checkpoint 续训都会抹掉该里程碑的评测历史：FID
-        序列断点、早停 verdict 消失且不再重放）。预训练事件（pretrain）
-        不参与回退记账：warm-start 执行史没有对应的 checkpoint 重放，
-        删除即永久丢失（spec「实现警点」）。stage 不匹配的事件
-        （其他阶段的历史）同样不动。返回删除的事件数。"""
+        保留边界按事件类型登记的回退记账口径取（``REWIND_ACCOUNTING``）：
+        预训练事件（pretrain）登记为 ``EXEMPT``，不参与回退记账——warm-start
+        执行史没有对应的 checkpoint 重放，删除即永久丢失（spec「实现
+        警点」）；未登记的事件类型同样不参与删除（宁可留痕不可误删）。
+        stage 不匹配的事件（其他阶段的历史）一概不动。返回删除的事件数。"""
         events = self.read_events()
-        kept: list[dict] = []
-        for event in events:
-            if event.get("event") == "pretrain":
-                kept.append(event)
-                continue
-            if event.get("stage", 1) != stage:
-                kept.append(event)
-                continue
-            number = event.get("iteration", 0)
-            milestone = event.get("event") == "milestone"
-            if number < iteration or (milestone and number <= iteration):
-                kept.append(event)
+        kept = [
+            event for event in events
+            if self._kept_by_rewind(event, iteration, stage)
+        ]
         removed = len(events) - len(kept)
         if removed:
             tmp = self.paths.metrics.with_name(
@@ -361,3 +405,17 @@ class RunArtifacts:
             # 半截重写的指标流
             os.replace(tmp, self.paths.metrics)
         return removed
+
+    @staticmethod
+    def _kept_by_rewind(event: dict, iteration: int, stage: int) -> bool:
+        """单事件在回退后的去留：先按判别值查记账口径，再按该口径的轴
+        取保留边界。口径外类型（含未登记类型）不进 stage 过滤——它们
+        没有本 stage 的执行史语义，过滤即等于按错误的轴判删。"""
+        accounting = REWIND_ACCOUNTING.get(
+            event.get("event"), RewindAccounting.EXEMPT,
+        )
+        if accounting is RewindAccounting.EXEMPT:
+            return True
+        if event.get("stage", 1) != stage:
+            return True
+        return accounting.covers(event.get("iteration", 0), iteration)

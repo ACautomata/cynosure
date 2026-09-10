@@ -470,6 +470,12 @@ class CynosureCli:
             f"  - 预训练报告: {run.paths.report}",
             file=self._stdout,
         )
+        print(
+            f"  - 预训练曲线: {run.paths.metrics}"
+            f"（{len(run.read_events())} 条 pretrain 事件，离线查看收敛"
+            "曲线与校准门槛阈值的数据源）",
+            file=self._stdout,
+        )
         return 0
 
 

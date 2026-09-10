@@ -15,7 +15,9 @@ AC 对应：
    生效）+ world=2 结果 ≠ 单进程对照（梯度混入他 rank rollout 数据）；
 2. 判别器 DDP：各 rank 本 rank fake + pool 切片更新，同步后参数一致；
 3. rank 0 指标归并：无重复、无丢失、顺序稳定（(iteration, rank) 序）；
-4. 多 rank 续训 roundtrip：中断恢复后与一步到位 run 的轨迹/权重一致；
+4. 多 rank 续训 roundtrip：中断恢复后与一步到位 run 一致——权重逐位
+   （RankResumeShards）、事件轨迹在跨路径容差内（独立进程世界的
+   观测前向存在 1-2 ulp 重算噪声）；
 5. torchrun 启动入口：world 全 rank 驱动同一 CLI（--nproc_per_node
    参数化语义由 harness 的 world 参数覆盖）。
 """
@@ -36,7 +38,6 @@ from cynosure.cli import CynosureCli
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.train import RunArtifacts
 from cynosure.distributed import DistributedContext, RankSlicedPool
-from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
 
 _WORKER_JOIN_TIMEOUT_S = 600.0
@@ -46,8 +47,10 @@ _WORKER_JOIN_TIMEOUT_S = 600.0
 _EQUIVALENCE_RTOL = 1e-5
 """跨路径等价性检查的数值容差：分布式路径（FSDP + 梯度检查点重算）
 与单进程路径（直接前向）在 fp32 尾数层存在求和顺序噪声（实测 ~1e-8，
-远低于 bf16 autocast 训练的量化信号）；语义等价以相对容差断言。同路径
-重放（续训 roundtrip、各 rank 权重同步）仍逐位断言。"""
+远低于 bf16 autocast 训练的量化信号）；语义等价以相对容差断言。逐位
+承重轴：各 rank 权重同步（RankResumeShards）、同进程续训 roundtrip
+（RunTrajectory）；跨进程世界对的事件浮点面（含续训 roundtrip 的
+两世界对比）走本容差——独立进程实例的打分前向偶发 1-2 ulp 分叉。"""
 
 
 class TrainWorldWorker:
@@ -164,10 +167,12 @@ class SpawnedTrainWorld:
 
 
 class CrossPathEquivalence:
-    """跨路径（分布式 vs 单进程）等价性判定：结构字段严格一致、浮点
-    字段在重算路径噪声容差内一致；wall-clock elapsed_s 不参与对比。
-    同路径重放（续训 roundtrip、各 rank 权重同步）走逐位断言
-    （RunTrajectory / RankResumeShards），不经本判定。"""
+    """跨路径等价性判定：结构字段严格一致、浮点字段在重算路径噪声容差
+    内一致；wall-clock elapsed_s 不参与对比。适用面 = 任何两个独立执行
+    语境的重算对比（分布式 vs 单进程、跨进程世界对——含多 rank 续训
+    roundtrip 的两世界事件对比）。逐位断言保留给同进程重放（单进程
+    续训 roundtrip，RunTrajectory）与各 rank 权重同步（RankResumeShards）
+    ——后者的输入是落盘状态本身，不含重算面。"""
 
     def __init__(
         self, rtol: float, float_atol: float = 1e-8, tensor_atol: float = 1e-7,
@@ -738,7 +743,12 @@ class TestTwoRankResume:
         baseline_events = RunArtifacts(
             RunArtifacts.layout(baseline_dir),
         ).read_events()
-        assert RunTrajectory(resumed_events) == RunTrajectory(baseline_events)
+        # 事件浮点面走跨路径容差（权重逐位对账在下方分片断言承重）：
+        # 两个独立进程世界的打分前向对相同输入偶发 float32 1-2 ulp 分叉
+        # （macOS/CPU 实测仅 anchor_eval_reward，rel ~2e-7，且可出现在
+        # resume 未触及的段落——训练态全组件逐位一致、噪声纯观测不进
+        # 梯度），逐位断言在此本质脆弱而非恢复逻辑缺陷。
+        _CROSS_PATH.trajectories(resumed_events, baseline_events)
 
         resumed_shards = RankResumeShards(scenario.run_dir, world=2)
         baseline_shards = RankResumeShards(baseline_dir, world=2)
