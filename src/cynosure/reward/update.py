@@ -51,8 +51,12 @@ class OnlineUpdate:
     ) -> None:
         self.scorer = scorer
         self.buffer = buffer
+        # weight_decay 显式落位（ADR-0007 卫生项）：与 policy 侧同值口径
+        # （config.disc_weight_decay，默认 1e-4）——此前隐式取 PyTorch
+        # 默认 0.01，与 policy 侧 1e-4 的事实不对称
         self.optimizer = torch.optim.AdamW(
             scorer.discriminator.parameters(), lr=config.disc_lr,
+            weight_decay=config.disc_weight_decay,
         )
         self._real_sampler = real_sampler
         self._generator = generator

@@ -53,7 +53,9 @@ class HeldOutAuc:
 
         real 侧按 ``modality`` 过滤（本 iteration 采样的目标序列）后无放
         回采样 min(fake 批量, 该序列 held-out 条目数) 条；缺省 None 为
-        全池混采，仅供诊断（生产路径按序列归因）；fake 侧全量参与。
+        全池混采（在线期 iter 事件按序列归因；全池口径的消费方 = 诊断
+        与预训练 RM readiness gate——预训练 fake 批跨条件混合，无单一
+        目标序列可归因）。fake 侧全量参与。
         """
         pool_size = (
             self._manifest.modalities.get(modality, 0)

@@ -84,6 +84,31 @@ class MilestoneEvent(BaseModel):
     """触发早停的签名（"plateau" / "reward_hacking"）；未停为 None。"""
 
 
+class PretrainEvent(BaseModel):
+    """判别器预训练指标流的逐步事件（ADR-0007 warm-start）。
+
+    ``event`` 判别字段与 iter/milestone 混存同一 metrics.jsonl（预训练
+    run 目录）；预训练事件不参与续训回退（rewind）记账口径——回退只重写
+    RL iteration 的半截执行史，预训练执行史全量保留。
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    event: Literal["pretrain"] = "pretrain"
+    step: int
+    """预训练步号（0 起；每步 = 一批 fake 量产 + 一次判别器单步更新）。"""
+    loss_discriminator: float
+    heldout_auc: float
+    """本步更新前测得的 held-out AUC（与在线期 iter 事件同快照口径：
+    更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。"""
+    buffer_base_occupied: int
+    """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
+    buffer_recent_occupied: int
+    """Replay buffer 近期分区当前占用（FIFO 滚动观测面）。"""
+    lr: float
+    elapsed_s: float
+
+
 class ManifestEntry(BaseModel):
     """Baseline 采样清单的单条目：一个采样位（阶段 + 序号）的种子、条件
     与样本路径（契约最小集：seed、条件、样本路径——spec「产物工件契约」）。
@@ -283,7 +308,7 @@ class RunArtifacts:
         """
         return BaselineManifest.build(config)
 
-    def append_event(self, event: IterEvent | MilestoneEvent) -> None:
+    def append_event(self, event: IterEvent | MilestoneEvent | PretrainEvent) -> None:
         """向训练指标流追加一行 JSON 事件（按行追加、rank 0 归并）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(
@@ -305,11 +330,16 @@ class RunArtifacts:
         （保留号 < 恢复点）；milestone 事件以完成数记账、与恢复点
         checkpoint 同批产出（保留完成数 ≤ 恢复点——若按 iter 边界删，
         每次从里程碑 checkpoint 续训都会抹掉该里程碑的评测历史：FID
-        序列断点、早停 verdict 消失且不再重放）。stage 不匹配的事件
-        （其他阶段的历史）不动。返回删除的事件数。"""
+        序列断点、早停 verdict 消失且不再重放）。预训练事件（pretrain）
+        不参与回退记账：warm-start 执行史没有对应的 checkpoint 重放，
+        删除即永久丢失（spec「实现警点」）。stage 不匹配的事件
+        （其他阶段的历史）同样不动。返回删除的事件数。"""
         events = self.read_events()
         kept: list[dict] = []
         for event in events:
+            if event.get("event") == "pretrain":
+                kept.append(event)
+                continue
             if event.get("stage", 1) != stage:
                 kept.append(event)
                 continue

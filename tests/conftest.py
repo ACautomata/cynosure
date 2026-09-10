@@ -121,6 +121,8 @@ MINIMAL_CONFIG_DICT: dict = {
         "real_pool_manifest": "artifacts/real_pool.json",
         "heldout_real_manifest": "artifacts/heldout_real.json",
         "channel_stats_json": "artifacts/channel_stats.json",
+        # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源（必填无默认）
+        "pretrain_report_json": "artifacts/pretrain_report.json",
     },
     "schedule": {"seed": 0},
 }

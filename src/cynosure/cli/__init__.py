@@ -1,7 +1,7 @@
-"""cynosure 命令行：train / eval / prepare 三子命令与 config schema 校验
-——全库唯一测试 seam（spec「Testing Decisions」）。
+"""cynosure 命令行：train / eval / prepare / pretrain 子命令与 config schema
+校验——全库唯一测试 seam（spec「Testing Decisions」）。
 
-三子命令共享同一 config schema；dispatch 前统一校验。train 执行
+四子命令共享同一 config schema；dispatch 前统一校验。train 执行
 Granular-GRPO 训练循环（MGAI → 逐 k 梯度步 → 判别器 Online update →
 iter 事件流 + checkpoint），单进程与 torchrun 多进程同一条代码路径
 （分布式装配点在 TrainingRuntime：FSDP 分片、判别器 DDP、rank 0 指标
@@ -9,7 +9,10 @@ iter 事件流 + checkpoint），单进程与 torchrun 多进程同一条代码�
 额外产出 fixture 诊断工件（轨迹双列/log-prob 对）；``--resume`` 从既有
 run 目录的最新续训状态恢复训练（仅单阶段组、须显式 --run-dir）。
 分布式启动（检测到 RANK env）必须显式 --run-dir——默认目录按进程
-时间戳生成，无法跨 rank 对齐。
+时间戳生成，无法跨 rank 对齐。pretrain 执行判别器 warm-start 预训练
+（ADR-0007）：密集步进至 held-out AUC 达 RM readiness gate 或步数上限，
+产出判别器 checkpoint + 预训练报告；单进程执行（World-1 退化路径），
+torchrun 启动显式拒绝——多 rank 各自预训练会分叉判别器。
 """
 
 import argparse
@@ -27,6 +30,7 @@ from pydantic import ValidationError
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.distributed import DistributedContext
 from cynosure.policy import TrajectoryDiagnosticRunner
+from cynosure.pretrain import PretrainDriver, PretrainRun
 from cynosure.reward import PreparePipeline
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
 
@@ -44,7 +48,7 @@ class CynosureCli:
     def run(self) -> int:
         parser = self._build_parser()
         args = parser.parse_args(self._argv)
-        # 三子命令共享同一 config schema：dispatch 前统一校验
+        # 四子命令共享同一 config schema：dispatch 前统一校验
         config = self._load_config(args.config)
         if config is None:
             return _EXIT_USAGE_ERROR
@@ -52,6 +56,7 @@ class CynosureCli:
             "train": self._train,
             "eval": self._eval,
             "prepare": self._prepare,
+            "pretrain": self._pretrain,
         }
         return handlers[args.command](args, config)
 
@@ -65,6 +70,7 @@ class CynosureCli:
             ("train", "启动 RL 训练（run 目录 + 指标流 + checkpoint）"),
             ("eval", "从 checkpoint + Real sample pool 产出评测指标"),
             ("prepare", "构建 Real sample pool / Held-out real / per-channel 统计量"),
+            ("pretrain", "判别器 warm-start 预训练（RM readiness gate 的上岗产物）"),
         ):
             sub = subparsers.add_parser(name, help=help_text)
             sub.add_argument("--config", required=True, help="config JSON 路径")
@@ -88,6 +94,12 @@ class CynosureCli:
                 sub.add_argument(
                     "--run-dir", default=None,
                     help="run 目录（评测目标 run）",
+                )
+            elif name == "pretrain":
+                sub.add_argument(
+                    "--run-dir", default=None,
+                    help="预训练 run 目录（默认 = config 的 "
+                         "reward.pretrain_report_json 所在目录）",
                 )
         return parser
 
@@ -389,6 +401,73 @@ class CynosureCli:
         print(
             f"  - per-channel 标准化统计量: {report.channel_stats}"
             f"（mean/std × {len(report.mean)} 通道）",
+            file=self._stdout,
+        )
+        return 0
+
+    def _pretrain(
+        self, args: argparse.Namespace, config: CynosureConfig,
+    ) -> int:
+        """判别器 warm-start 预训练（ADR-0007）：单进程执行（产物全局
+        唯一），密集步进至 RM readiness gate 达标或步数上限。
+
+        run 目录默认 = config 的 ``reward.pretrain_report_json`` 所在
+        目录（产物位置在 config 里声明，train 上岗按同一路径装载）；
+        ``--run-dir`` 可显式覆盖（重跑换目录）。装配失败的预占目录回滚
+        （未产出任何工件）；执行中途失败保留目录（事件可取证）。"""
+        env_rank = DistributedContext.env_rank()
+        if env_rank is not None:
+            print(
+                "预训练以单进程执行（World-1 退化路径；多 rank 各自"
+                f"预训练会分叉判别器），拒绝 torchrun 启动（RANK={env_rank}）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        run_root = (
+            Path(args.run_dir) if args.run_dir
+            else Path(config.reward.pretrain_report_json).parent
+        )
+        try:
+            run = PretrainRun.init(config, run_root)
+        except FileExistsError:
+            print(
+                f"预训练 run 目录已存在（不静默覆盖）: {run_root}",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        # 装配期 = 输入契约（网络/工件装载、跨字段守卫）：失败回滚本次
+        # 预占的 run 目录（尚无任何产出）
+        try:
+            driver = PretrainDriver(config, run, device=self._prepare_device())
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
+            shutil.rmtree(run_root)
+            return _EXIT_USAGE_ERROR
+        try:
+            report = driver.run()
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        outcome = "已达标" if report.gate_passed else "未达标（步数上限耗尽）"
+        print(
+            f"预训练完成（group={report.group}，步数 "
+            f"{report.steps_completed}/{config.reward.pretrain_max_steps}）：",
+            file=self._stdout,
+        )
+        print(
+            f"  - 最终 held-out AUC: {report.final_heldout_auc:.4f}"
+            f"（门槛 {report.gate_auc}，{outcome}）",
+            file=self._stdout,
+        )
+        print(
+            f"  - 判别器 checkpoint: {run.paths.discriminator_ckpt}",
+            file=self._stdout,
+        )
+        print(
+            f"  - 预训练报告: {run.paths.report}",
             file=self._stdout,
         )
         return 0

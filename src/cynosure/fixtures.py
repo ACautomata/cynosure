@@ -252,6 +252,11 @@ class Fixture:
                 "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
                 "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
                 "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
+                # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源
+                # （必填无默认）；fixture 产物路径 = 预训练 run 目录内的报告名
+                "pretrain_report_json": str(
+                    artifacts_dir / "pretrain_run" / "pretrain_report.json"
+                ),
             },
             # N_baseline fixture 缩小（Baseline manifest 条目随全流程走）
             "schedule": {"seed": 0, "baseline_samples": 4},
