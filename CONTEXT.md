@@ -80,8 +80,17 @@ _Avoid_: 验证集（val split 是划分段，held-out real 是其预编码工�
 当前 policy rollout 的去噪输出 latent，作为判别器的「假」。
 _Avoid_: 生成样本、负样本
 
+**Warm-start pre-training（判别器预训练）**:
+RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取 base policy 量产 rollout；训练至通过 RM readiness gate，产物作为在线更新的初始权重（ADR-0007）。
+_Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）
+
+**RM readiness gate（RM 上岗门槛）**:
+RL 启动的硬前置：判别器预训练后 held-out AUC 须出 chance 带并达标，才允许进入 RL 循环；不过线拒绝开跑。
+_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）
+
 **Online update（在线更新）**:
-reward model 随 RL 训练每个 iteration 用新 fake 样本重训，而非一次性预训练。
+reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking。
+_Avoid_: 在线从零（冷启动形态，已被预训练取代）
 
 **Replay buffer（回放缓冲）**:
 封顶 FIFO 的 fake latent 存库（base 时期 + 近期），更新判别器时按比例混入，防漂移、防灾难性遗忘。

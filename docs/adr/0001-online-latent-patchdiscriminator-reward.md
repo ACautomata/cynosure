@@ -2,7 +2,7 @@
 
 RL 后训练需要一个 reward model 给 policy rollout 的 latent 打分。在大方向已定（MONAI 3D PatchDiscriminator、latent 域打分、real=训练集 VAE 预编码 latent、fake=当前 rollout 去噪输出、在线更新）之上，本章钉死：**损失用 LSGAN、reward 取 raw real-logit（不过 sigmoid）、归一化用 GroupNorm（弃默认 BatchNorm）、在线更新配封顶 FIFO 回放、起步不加 KL/参考模型而以 EMA 锚为升级项**。完整设计见 `docs/spec/reward-model.md`。
 
-**Status**: accepted
+**Status**: accepted（「在线从零」部分由 ADR-0007 修订为预训练 warm-start + 上岗门槛）
 
 ## Considered Options
 
