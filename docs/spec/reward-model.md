@@ -44,8 +44,24 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 - **数据**：real = Real sample pool manifest（kind 守卫装载）；fake = base policy 冻结 rollout 量产，复用回放缓冲的 base 分区采样入口（批量分块、独立随机流、输出归一到 pool 存储域）。组1 / 组2 各自预训练 run（fake 分布不同）：采样场与条件分布经 `GroupPolicy` 按 config 分派——**同一条代码路径，仅 config 不同**。
 - **训练循环**：复用在线期同款判别器单步更新原语（`OnlineUpdate.step`：混采 + LSGAN + AdamW）密集步进，**无第二套判别器训练逻辑**。预训练期无「当前 policy」，混采语义退化为 base fake 库内采样；real 侧口径与在线期一致。终止条件 = held-out AUC ≥ 门槛（`pretrain_gate_auc`，暂定 **0.65**、chance 带外，用预训练曲线校准后定版）或步数上限（`pretrain_max_steps`），两者皆配置化；最终 held-out AUC 与落盘 checkpoint 同快照。
 - **产物契约**：判别器 checkpoint（可装载 state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（`kind="pretrain_report"`：组别、最终 held-out AUC、门槛与达标与否、数据口径指纹——ChannelStats / Real sample pool manifest / held-out manifest / 判别器网络配置的内容 sha256）。装载走守卫入口（`PretrainReport.load` → `load_discriminator`）：**缺报告 / kind 不符 / 形态指纹不符即拒绝**。
-- **指标事件**：`pretrain` 事件类型（步号 + loss + held-out AUC + buffer 占用）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；预训练事件**不参与**续训回退（rewind）记账。
+- **指标事件**：`pretrain` 事件类型（步号 + loss + held-out AUC + buffer 占用）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；事件类型清单与各型的回退记账口径见下节。
 - **RM readiness gate**：train 入口的硬前置（加载预训练产物、按当前 run 数据口径**重算** held-out AUC、不过线拒绝启动并回滚 run 目录）由后续 ticket 交付；本实现先行落位 schema 字段（`pretrain_report_json`，生产配置**必填无默认**）——RL 不带 warm-start 工件在 schema 层就无法启动。门槛是启动期机制，与「防 reward hacking」节的训练期监控（AUC 掉回 chance 带）互不替代。
+
+
+## 指标事件流的事件类型清单（metrics.jsonl）
+
+指标流是 run 目录的契约工件：一行一事件的 JSONL，`event` 为类型判别字段。契约口径**可扩不可改名**——新增事件类型 = 新判别值 + 新字段，既有类型的判别值、字段名与语义不动；三处同批同步：事件模型（`train/artifacts`）、回退记账登记表（`REWIND_ACCOUNTING`）、本节清单。消费方按判别字段分派，未知类型跳过而非报错。
+
+| 事件类型 | 产出方 | 字段 | 回退（rewind）记账口径 |
+|---|---|---|---|
+| `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `buffer_current_fraction` / `buffer_replay_fraction` / `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
+| `milestone` | 里程碑解码评测（train 循环） | `iteration` / `stage` / `fid` / `kid` / `ssim` / `mae` / `psnr` / `criteria_summary` / `early_stop` / `early_stop_reason` | 以完成数记账：保留完成数 ≤ 恢复点（评测与恢复点 checkpoint 同批产出） |
+| `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `heldout_auc` / `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | **不参与回退**：全量保留 |
+
+- **预训练事件排除在回退口径外的理由**：warm-start 执行史没有对应的 checkpoint 可重放，按任何边界删都是永久丢失——预训练收敛曲线断点、RM readiness gate 的阈值校准（`pretrain_gate_auc` 定版）失去数据基础。
+- **曲线的读法**：`heldout_auc` 一律是「本步更新**前**」的快照（与在线期 iter 事件同口径：更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。终止那一次测量（达标跨界 / 步数耗尽后的补测）不进事件流——它在报告的 `final_heldout_auc`（与落盘 checkpoint 同快照），离线画预训练收敛曲线时两端拼读。
+- **登记表 = 删除的准入名单**：回退只对表内口径为删除的轴做判定，表外（未登记 / 新增未声明）的事件类型一律保留——宁可留痕不可误删。
+- **同流混存的口径**：流的类型契约不假设一份流里有哪几型事件——当前 CLI 布局下 warm-start 与 RL 各在自己 run 目录（pretrain 写 `pretrain_report_json` 所在目录，train 另建 run 目录），两者分居两流；同流时（warm-start 历史并入 RL run 流）续训回退只重写恢复点之后的 RL 半截执行史，预训练事件**逐字**保留（真 `--resume` 回退路径的专属用例锁死）。
 
 
 ## KL / 稳定性锚定

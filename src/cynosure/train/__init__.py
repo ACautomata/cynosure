@@ -17,11 +17,13 @@
 """
 
 from cynosure.train.artifacts import (
+    REWIND_ACCOUNTING,
     BaselineManifest,
     IterEvent,
     ManifestEntry,
     MilestoneEvent,
     PretrainEvent,
+    RewindAccounting,
     RunArtifacts,
     RunPaths,
 )
@@ -46,6 +48,7 @@ from cynosure.train.trainer import (
 )
 
 __all__ = [
+    "REWIND_ACCOUNTING",
     "AmpContext",
     "BaselineManifest",
     "ConditionSampler",
@@ -61,6 +64,7 @@ __all__ = [
     "ModalLabelConditionSampler",
     "PretrainEvent",
     "RewardCoordinator",
+    "RewindAccounting",
     "RolloutPhase",
     "RunArtifacts",
     "RunPaths",

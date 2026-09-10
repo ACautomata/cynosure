@@ -27,7 +27,7 @@ import torch
 from cynosure.config import ConfigLoader
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.train import IterationLoop, RunArtifacts
+from cynosure.train import IterationLoop, PretrainEvent, RunArtifacts
 from cynosure.train.policy import GroupPolicy
 from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
@@ -66,6 +66,32 @@ class MidRunCrash:
 
     def __exit__(self, *exc_info) -> None:
         self._patch.__exit__(*exc_info)
+
+
+def prepend_pretrain_events(run_dir: Path, steps: int) -> list[dict]:
+    """把 ``steps`` 条预训练事件插到指标流头部（warm-start 先于 RL 执行史
+    落盘的同流混存布局），返回插入事件的读回字典——逐字保留对账的基准。
+
+    事件经生产写入口与读取面（``RunArtifacts.append_event`` / ``read_events``）
+    落盘，头部让位给既有行：注入内容与生产写出的逐字一致，不另抄一份
+    序列化与布局知识。"""
+    artifacts = RunArtifacts(RunArtifacts.layout(run_dir))
+    existing = artifacts.paths.metrics.read_text(encoding="utf-8")
+    artifacts.paths.metrics.write_text("", encoding="utf-8")
+    for step in range(steps):
+        artifacts.append_event(PretrainEvent(
+            step=step,
+            loss_discriminator=1.0,
+            heldout_auc=0.5 + step * 0.01,
+            buffer_base_occupied=32,
+            buffer_recent_occupied=4,
+            lr=5e-5,
+            elapsed_s=0.1,
+        ))
+    injected = artifacts.read_events()
+    with open(artifacts.paths.metrics, "a", encoding="utf-8") as fh:
+        fh.write(existing)
+    return injected
 
 
 @pytest.fixture
@@ -310,6 +336,56 @@ class TestNoopResumeIntegrity:
         assert scenario.resume(dump=True).code == 0
         after = json.loads(diagnostic_path.read_text(encoding="utf-8"))
         assert after == original
+
+
+class TestPretrainEventRewindIsolation:
+    """预训练事件与 RL 事件同流混存下的续训回退（ticket #59 专属用例）。
+
+    warm-start 的 ``pretrain`` 事件与 RL 的 iter/milestone 事件住在同一份
+    metrics.jsonl 契约流里，而续训回退只重写恢复点之后的 RL 半截执行史：
+    **误删**方向——预训练事件没有对应的 checkpoint 可重放，被回退波及即
+    永久丢失（收敛曲线断点、RM readiness gate 的阈值校准数据不可复现）；
+    **漏删**方向——半截 iter 事件必须删干净，否则重执行后同一 iteration
+    留下两条事件，污染早停判定与离线曲线。"""
+
+    def test_resume_rewind_preserves_pretrain_events(
+        self, scenario: TrainingLoopScenario, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """崩溃（checkpoint 周期 5 / 里程碑间隔 2 → 恢复点 2）→ 指标流混入
+        预训练事件 → 续训：预训练事件逐字保留，iter 事件连续无重复。"""
+        scenario.write_inputs()
+        scenario.patch_config(schedule={
+            "max_iterations": 4, "milestone_interval": 2, "checkpoint_interval": 5,
+        })
+        with MidRunCrash(monkeypatch, iteration=3):
+            with pytest.raises(KeyboardInterrupt):
+                scenario.train()
+        pretrain_events = prepend_pretrain_events(scenario.run_dir, steps=3)
+        crashed_iter = [
+            event for event in scenario.events() if event["event"] == "iter"
+        ]
+        # 回退确有其事（非空转用例）：恢复点 = 里程碑强制的 checkpoint@2，
+        # 而流里已有 iteration 2 的半截事件——续训必删它并重执行重写
+        assert scenario.resume_state()["iteration"] == 2
+        assert [event["iteration"] for event in crashed_iter] == [0, 1, 2]
+
+        assert scenario.resume().code == 0
+        events = scenario.events()
+        # 误删方向：预训练事件全量、逐字保留（含头部位置与字段序）
+        assert events[:len(pretrain_events)] == pretrain_events
+        assert [
+            event["step"] for event in events if event["event"] == "pretrain"
+        ] == [0, 1, 2]
+        # 漏删方向：半截 iter@2 被重执行重写——号连续、无重复、无旧值残留
+        resumed_iter = [
+            event for event in events if event["event"] == "iter"
+        ]
+        assert [event["iteration"] for event in resumed_iter] == [0, 1, 2, 3]
+        assert RunTrajectory(resumed_iter[:3]) == RunTrajectory(crashed_iter)
+        # 恢复点已覆盖的里程碑评测不被重放、也不被删除
+        assert [
+            event["iteration"] for event in events if event["event"] == "milestone"
+        ] == [2, 4]
 
 
 class TestLegacyDirCompatibility:
