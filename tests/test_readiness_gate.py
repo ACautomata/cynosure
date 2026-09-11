@@ -45,6 +45,7 @@ from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
     CliResult,
     CliSession,
+    FailingAuc,
     FixturePrepareScenario,
     PretrainLightweightReward,
 )
@@ -67,14 +68,6 @@ class StubAuc:
     def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
         self.calls.append((fake_latents.shape[0], modality))
         return self.value
-
-
-class FailingAuc:
-    """HeldOutAuc 的失败替身：以非 ValueError 的工件读盘异常失败
-    （held-out manifest 条目缺失/损坏的真实异常面）。"""
-
-    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
-        raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")
 
 
 class SplitVerdictDist:

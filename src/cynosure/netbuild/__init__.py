@@ -89,14 +89,18 @@ class NetworkAssembler:
 
         - **谱归一化形态**（含 ``.parametrizations.`` 键：original 权重与
           幂迭代 buffer ``_u``/``_v`` 整份在内）→ 先叠加谱归一化、再严格
-          装载：参数化状态**逐位还原**（同权重的前向余差只剩浮点执行
-          路径的末位噪声），且装载不消费 RNG（重新叠加会以随机 u/v 起步
-          做 15 次幂迭代、再归一化一次——上岗的判别函数随 ambient RNG
-          漂移）。``spectral_norm=False`` 时显式拒绝：开关翻转会静默丢弃
-          文件里的谱归一化状态，换 regime 须重新预训练；
+          装载：参数化状态**逐位还原**（构造期叠加虽抽随机 u/v，但严格
+          装载把它们与 original 一并覆写为文件内容——结果与 ambient
+          seed 无关；重新物化则会以随机 u/v 起步做 15 次幂迭代、再归一化
+          一次，上岗的判别函数随 ambient seed 漂移）。
+          ``spectral_norm=False`` 时显式拒绝：开关翻转会静默丢弃文件里
+          的谱归一化状态，换 regime 须重新预训练；
         - **裸权重形态**（MAISI 发布权重 / fixture 网络工件）→ 先严格
           装载，``spectral_norm=True`` 时再叠加（谱归一化从这份权重起步
-          的冷启动语义）。
+          的冷启动语义）。裸形态无法与本项目**旧版物化形态**的判别器
+          产物区分（键形相同）：SN 启用下装载即冷启动再归一化、判别
+          函数失真——旧物化形态的产物在 SN regime 须重新预训练
+          （发布说明声明）。
         """
         model = PatchDiscriminator(
             **cls._known_kwargs(PatchDiscriminator, artifact.config),
@@ -135,7 +139,8 @@ class NetworkAssembler:
         **参数化状态整份落盘**：parametrization 键
         ``<prefix>.parametrizations.<attr>.original``（原始权重）与幂迭代
         buffer ``_u``/``_v`` 同盘——装载面（``discriminator``）先叠形态、
-        再严格装载，状态逐位还原，且装载不消费 RNG。
+        再严格装载，状态逐位还原、结果与 ambient seed 无关（装载期的
+        随机初始化与 u/v 抽样被文件内容整体覆写）。
         物化有效权重的形态看似兼容（装载静默成功）实则**再归一化一次**
         （随机 u/v 起步的幂迭代估计）：消费面拿到的不再是保存的那一份
         判别函数，故不采用。无参数化模型逐键同一（``state_dict`` 直通）；

@@ -61,6 +61,7 @@ class TrainingLoopScenario:
         train_steps: set[int] = frozenset({1}),
         seed: int = 0,
         group: str = "modal-label",
+        reward: dict | None = None,
     ) -> None:
         """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
         选实验组：组2/组3 的 config 携带 ControlNet 工件）。
@@ -68,7 +69,9 @@ class TrainingLoopScenario:
         warm-start 前置（ADR-0007）：RM readiness gate 是 train 入口的
         硬检查、消费预训练产物——场景先以同一 config 的预训练轻量变体
         跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
-        再落训练 config。"""
+        再落训练 config。``reward`` 覆写在预训练前置**之前**生效——
+        预训练与训练同一 reward regime（如 SN 启用时预训练产物即
+        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。"""
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(self.fixture_dir)
@@ -83,6 +86,8 @@ class TrainingLoopScenario:
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
+        if reward:
+            config.reward = config.reward.model_copy(update=reward)
         self._pretrain_warm_start(config, group)
         self.config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
@@ -287,7 +292,7 @@ class TestSingleIterationLoop:
         parametrization 键（``*.parametrizations.<attr>.original`` 与其
         power iteration buffer ``_u``/``_v``）整份在内。装载面按形态分派
         （先叠谱归一化 → 严格装载整份还原）：重建的判别器状态与训练时
-        **逐位一致**，且装载不消费 ambient RNG。
+        **逐位一致**，且结果与 ambient RNG 无关。
 
         对照（固化有效权重的形态）：装载时重新叠谱归一化会**再归一化
         一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
@@ -313,7 +318,7 @@ class TestSingleIterationLoop:
         )
         normalized = normalizer.normalize(sample)
         expected = live(normalized)[-1]
-        for seed in (11, 20260910):  # 装载不消费 RNG：状态逐位一致
+        for seed in (11, 20260910):  # ambient seed 不同：装载结果不得依赖它
             torch.manual_seed(seed)
             reloaded = NetworkAssembler.discriminator(
                 NetworkArtifact(

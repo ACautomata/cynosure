@@ -463,7 +463,7 @@ class TestPretrainEndToEnd:
         携带**参数化状态**（``*.parametrizations.weight.*`` = original 权重
         + 幂迭代 buffer ``_u``/``_v``）；``load_discriminator`` 按形态先叠
         谱归一化再严格装载——重建的判别器状态与落盘时**逐位一致**，且
-        装载不消费 ambient RNG（两个不同 seed 下装配结果全等）。
+        结果与 ambient RNG 无关（两个不同 seed 下装配结果全等）。
 
         对照（固化有效权重的形态）在装载时要**再归一化一次**（随机 u/v
         起步 + 15 次幂迭代）→ 上岗的判别器不是预训练认证的那一份（实测
@@ -486,7 +486,7 @@ class TestPretrainEndToEnd:
         config = scenario.config()
         torch.manual_seed(11)
         first = report.load_discriminator(config, device=torch.device("cpu"))
-        torch.manual_seed(20260910)  # ambient RNG 不同：装载不得消费它
+        torch.manual_seed(20260910)  # ambient seed 不同：装载结果不得依赖它
         second = report.load_discriminator(config, device=torch.device("cpu"))
         for scorer in (first, second):
             restored = scorer.discriminator.state_dict()

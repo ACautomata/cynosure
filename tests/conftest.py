@@ -1,5 +1,6 @@
 """共享测试夹具：CLI 会话（唯一 seam 驱动器）、合法最小 config 样板、
-合成 BraTS 数据集（fixture 策略）、预训练轻量 reward 变体。"""
+合成 BraTS 数据集（fixture 策略）、预训练轻量 reward 变体、HeldOutAuc
+失败替身。"""
 
 import copy
 import io
@@ -10,6 +11,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import pytest
+import torch
 
 from cynosure.cli import CynosureCli
 from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
@@ -231,3 +233,14 @@ class PretrainLightweightReward:
         pretrain.reward.pretrain_gate_auc = 0.60
         pretrain.reward.pretrain_max_steps = 24
         return pretrain
+
+
+class FailingAuc:
+    """HeldOutAuc 的失败替身（readiness gate / 分布式集合序用例共用）：
+    以非 ValueError 的工件读盘异常失败——manifest 条目缺失/损坏与
+    latent 文件缺失是同一失败面（本地异常先于任何前向进入 gate 的
+    裁决输入）。rank 间不同的文件系统状态不可在共享盘上构造，替身是
+    「本 rank 重算失败」的确定性载体。"""
+
+    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
+        raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")

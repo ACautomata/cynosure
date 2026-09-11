@@ -47,7 +47,11 @@ from cynosure.train import (
 )
 from cynosure.train.rng import TrainingRngStreams
 from cynosure.distributed import DistributedContext, RankSlicedPool
-from tests.conftest import CliSession, FixturePrepareScenario
+from tests.conftest import (
+    CliSession,
+    FailingAuc,
+    FixturePrepareScenario,
+)
 from tests.test_train_loop import TrainingLoopScenario
 
 _WORKER_JOIN_TIMEOUT_S = 600.0
@@ -280,19 +284,11 @@ _GATE_JOIN_TIMEOUT_S = 180.0
 打分前向（数十秒量级），超时即集合序错位回归（邻居卡在内层集合里）。"""
 
 
-class MissingHeldoutAuc:
-    """held-out 读取失败的重算桩：把「本 rank 重算失败」注入 RM
-    readiness gate 的重算面——rank 间不同的文件系统不可在共享盘上构造，
-    桩是同一失败面（本地异常先于任何前向进入裁决输入）的确定性载体。"""
-
-    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
-        raise FileNotFoundError("held-out latent 缺失（本 rank 读取失败）")
-
-
 class GateWorldWorker:
     """单 rank 的 RM readiness gate 执行体（torchrun 语义环境变量 + 真实
-    判别器装配路径）：rank 0 走真实重算，其余 rank 注入重算失败——启动期
-    集合裁决的「失败 rank + 健康 rank」现场。结果经队列回传主进程。"""
+    判别器装配路径）：rank 0 走真实重算，其余 rank 注入重算失败
+    （``FailingAuc``）——启动期集合裁决的「失败 rank + 健康 rank」现场。
+    结果经队列回传主进程。"""
 
     def __init__(
         self, rank: int, world: int, port: int, config_path: Path, queue,
@@ -329,7 +325,7 @@ class GateWorldWorker:
             dist.derive_seed(config.schedule.seed),
         ).named()
         rewards = TrainingRuntime.assemble_rewards(config, amp, generators, dist)
-        auc = rewards.auc if self.rank == 0 else MissingHeldoutAuc()
+        auc = rewards.auc if self.rank == 0 else FailingAuc()
         gate = ReadinessGate(config, auc, dist)  # type: ignore[arg-type]
         torch.manual_seed(0)  # 各 rank 同 fake 批（重算输入一致）
         fakes = torch.randn(2, *config.latent_shape)
@@ -612,6 +608,33 @@ class TestTwoRankSharding:
         synced = shards.state(0)["discriminator_network"]
         assert any(
             not torch.equal(initial[name], synced[name]) for name in initial
+        )
+
+    def test_two_rank_spectral_norm_buffers_stay_bitwise_identical(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """SN 启用（判别器带 ``_u``/``_v`` buffer）+ world=2 在线多步推进
+        （``ReplicatedDiscriminator`` 关闭前向期 buffer 广播的论证兜底）：
+        u/v 只在 train 相前向就地推进，而推进点只有在线更新（各 rank
+        前向次数对称、权重经梯度 allreduce 逐位一致）；打分/监控前向恒
+        eval 相不推进——广播关闭后各 rank 的参数化 buffer 仍不得漂移
+        （若 rank 间前向次数不对称，此断言即暴露分叉）。warm-start 链路
+        同 regime：预训练（SN 启用）产物为谱归一化形态，train 装载走
+        形态分派的逐位还原。"""
+        scenario.write_inputs(reward={"spectral_norm_enabled": True})
+        scenario.patch_config(
+            schedule={"max_iterations": 2, "checkpoint_interval": 2},
+        )
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch()
+        result.assert_green()
+        # SN 真的启用（断言有判别力）：参数化 buffer 在分片状态里
+        shards = RankResumeShards(scenario.run_dir, world=2)
+        names = shards.state(0)["discriminator_network"]
+        assert any(name.endswith("._u") for name in names)
+        shards.assert_bitwise_identical_across_ranks(
+            keys=["policy_network", "discriminator_network"],
         )
 
     def test_two_rank_milestone_eval_and_stop_broadcast(
