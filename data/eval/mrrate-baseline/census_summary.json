@@ -1,0 +1,21 @@
+{
+  "total_metadata_rows": 705254,
+  "flag_excluded_rows": 0,
+  "five_modality_rows_flags_ok": 705254,
+  "train_series_5mod_flags_ok": 638345,
+  "val_series_5mod_flags_ok": 27003,
+  "test_series_5mod_flags_ok": 39906,
+  "train_oblique_5mod_flags_ok": 11292,
+  "official_v1_train_total_incl_oblique": 665371,
+  "official_v1_train_total_excl_oblique": 656565,
+  "t6_replay_reported_train_705254": 705254,
+  "other_modalities_flags_ok": [],
+  "planes_seen": [
+    "AXIAL",
+    "CORONAL",
+    "OBLIQUE",
+    "SAGITTAL"
+  ],
+  "unknown_split_rows": 0,
+  "unknown_batch_studies": 0
+}
