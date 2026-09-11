@@ -25,12 +25,24 @@ import pytest
 import torch
 
 from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
-from cynosure.pretrain import PretrainDriver, PretrainReport, PretrainRun
+from cynosure.pretrain import (
+    PretrainDriver,
+    PretrainProvenance,
+    PretrainReport,
+    PretrainRun,
+)
 from cynosure.reward.artifacts import ChannelStats
-from cynosure.train import GranularGrpoTrainer, RunArtifacts
+from cynosure.train import (
+    AmpContext,
+    GranularGrpoTrainer,
+    RunArtifacts,
+    TrainingRuntime,
+)
 from cynosure.train.gate import ReadinessGate
+from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import CliResult, CliSession, FixturePrepareScenario
 
 FIXTURE_GATE = 0.51
@@ -471,6 +483,46 @@ class TestResumeSkipsGate:
         assert pretrained.train().code == 0  # train 不消费 discriminator_ckpt
         shutil.rmtree(report_path.parent)
         assert pretrained.resume().code == 0  # 占位装配不读任何工件
+
+
+class TestAssemblyCombinationGuard:
+    """assemble_rewards 的 report/resume 组合态收口（API 层守卫）。"""
+
+    def test_report_with_resume_rejected(self) -> None:
+        """report 给定 + resume=True 的矛盾组合显式拒绝：warm-start 守卫
+        重载（新 run）与占位装配（续训恢复）是互斥语境，两来源权重同时
+        声明时以谁为准的歧义不许静默消解。build 层恒传 report=None +
+        resume=True（实际调用图不可达本组合），本守卫收口 API 层的直接
+        调用——拒绝发生在消费报告内容与装配链之前（占位 sha256 不经
+        校验）。"""
+        report = PretrainReport(
+            group="modal-label",
+            latent_shape=(4, 16, 16, 8),
+            final_heldout_auc=0.72,
+            steps_completed=40,
+            gate_auc=0.65,
+            gate_passed=True,
+            discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
+            provenance=PretrainProvenance(
+                real_pool_manifest="real_pool.json",
+                real_pool_manifest_sha256="0" * 64,
+                heldout_manifest="heldout_real.json",
+                heldout_manifest_sha256="0" * 64,
+                channel_stats="stats.json",
+                channel_stats_sha256="0" * 64,
+                discriminator_config="disc.json",
+                discriminator_config_sha256="0" * 64,
+            ),
+        )
+        with pytest.raises(ValueError, match="互斥"):
+            TrainingRuntime.assemble_rewards(
+                _minimal_gate_config(),
+                AmpContext(device=torch.device("cpu"), dtype=torch.float32),
+                TrainingRngStreams(0).named(),
+                DistributedContext.bootstrap(),
+                report=report,
+                resume=True,
+            )
 
 
 def _minimal_gate_config() -> CynosureConfig:

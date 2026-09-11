@@ -202,6 +202,14 @@ class TrainingRuntime:
         判别器全量状态，占位权重被 ``ResumeStore.restore`` 整体覆写；
         ``discriminator_ckpt`` 即便指向预训练目录，产物清理也不再阻断
         续训）。"""
+        if report is not None and resume:
+            # 矛盾组合（带报告装配的恢复）显式拒绝：两来源权重同时
+            # 声明时以谁为准的歧义不许静默消解（build 层恒传
+            # report=None + resume=True，本守卫是 API 层的组合态收口）
+            raise ValueError(
+                "assemble_rewards 的 report 与 resume 互斥：warm-start 守卫"
+                "重载（新 run）与占位装配（续训恢复）是互斥语境"
+            )
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
                 "训练循环需要判别器网络配置（discriminator_config_json）："
