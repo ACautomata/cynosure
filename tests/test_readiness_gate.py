@@ -46,7 +46,7 @@ from tests.conftest import (
     CliResult,
     CliSession,
     FixturePrepareScenario,
-    apply_pretrain_lightweight_reward,
+    PretrainLightweightReward,
 )
 
 FIXTURE_GATE = 0.51
@@ -123,9 +123,9 @@ class GateScenario:
         """以 config 的预训练轻量变体跑 pretrain（报告路径 = config 声明）。
 
         轻量五元组与 gate 0.60 留 margin 的 rationale 集中在
-        ``apply_pretrain_lightweight_reward``（conftest）；显式
+        ``PretrainLightweightReward``（conftest）；显式
         ``reward_overrides`` 可覆盖（如重演用例的 gate=0.01）。"""
-        config = apply_pretrain_lightweight_reward(
+        config = PretrainLightweightReward.apply(
             ConfigLoader.load(self.config_path),
         )
         for key, value in reward_overrides.items():
@@ -340,7 +340,7 @@ class TestRecomputeConsistency:
         config = ConfigLoader.load(scenario.config_path)
         # 与 scenario.pretrain 同套轻量五元组（重演消耗序的前提：fake 批
         # /缓冲容量/LR 一致；单点定义避免两处漂移）
-        pretrain_config = apply_pretrain_lightweight_reward(config)
+        pretrain_config = PretrainLightweightReward.apply(config)
         run = PretrainRun.init(
             pretrain_config, tmp_path / "replay_run",
         )

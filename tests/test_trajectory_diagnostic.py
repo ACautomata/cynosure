@@ -14,10 +14,10 @@ import torch
 
 from cynosure.fixtures import Fixture
 from tests.conftest import (
-    CliSession,
     CliResult,
+    CliSession,
     FixturePrepareScenario,
-    apply_pretrain_lightweight_reward,
+    PretrainLightweightReward,
 )
 
 RUN_DIR = "diag-run"
@@ -46,8 +46,8 @@ class DiagnosticScenario:
         # warm-start 前置（ADR-0007）：RM readiness gate 消费预训练产物；
         # 轻量五元组只降低本步成本（η 不影响预训练的 anchor 确定性
         # rollout），gate 抬高使产物显著出带（rationale 集中在
-        # apply_pretrain_lightweight_reward）
-        pretrain_config = apply_pretrain_lightweight_reward(config)
+        # PretrainLightweightReward）
+        pretrain_config = PretrainLightweightReward.apply(config)
         pretrain_path = self._tmp_path / "pretrain_config.json"
         pretrain_path.write_text(
             pretrain_config.model_dump_json(indent=2), encoding="utf-8",

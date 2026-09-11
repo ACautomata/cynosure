@@ -40,7 +40,7 @@ from tests.conftest import (
     CliResult,
     CliSession,
     FixturePrepareScenario,
-    apply_pretrain_lightweight_reward,
+    PretrainLightweightReward,
 )
 
 
@@ -90,11 +90,11 @@ class TrainingLoopScenario:
 
     def _pretrain_warm_start(self, config, group: str) -> None:
         """场景的预训练前置：报告落 config 声明的产物路径（train 装配
-        与门槛检查的装载源）。轻量五元组（``apply_pretrain_lightweight_reward``，
+        与门槛检查的装载源）。轻量五元组（``PretrainLightweightReward``，
         含 gate 0.60 留 margin 的 rationale）只降低本步执行成本、不进训练
         config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
         sequential 组的单次装配）。"""
-        pretrain_config = apply_pretrain_lightweight_reward(config)
+        pretrain_config = PretrainLightweightReward.apply(config)
         pretrain_config.experiment.group = (
             "modal-label" if group == "sequential" else group
         )
