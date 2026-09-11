@@ -283,17 +283,15 @@ class TestSingleIterationLoop:
     def test_spectral_norm_checkpoint_is_reloadable(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """spectral norm 启用时判别器 checkpoint 以可重载形式落盘：
+        """spectral norm 启用时判别器 checkpoint 以**参数化状态**落盘：
         parametrization 键（``*.parametrizations.<attr>.original`` 与其
-        power iteration buffer ``_u``/``_v``）不进保存面——保存面固化
-        **有效权重**（parametrization 输出），netbuild 严格装载路径重建
-        的裸网络判别函数与训练时**数值等价**（固化原始参数则前向不同：
-        装载静默成功但 reward/评测漂移）。
+        power iteration buffer ``_u``/``_v``）整份在内。装载面按形态分派
+        （先叠谱归一化 → 严格装载整份还原）：重建的判别器状态与训练时
+        **逐位一致**，且装载不消费 ambient RNG。
 
-        等价断言用严格容差（rtol 1e-5）而非逐位：跨「保存→磁盘→装载」
-        链的前向在同一权重下可差 1 ulp（浮点执行路径的进程态选择，
-        实测 maxdiff 1.19e-07 = 2^-23）；语义错误（固化参数视图）的
-        偏离是 σ 偏离 1 的百分量级，容差区分度充分。"""
+        对照（固化有效权重的形态）：装载时重新叠谱归一化会**再归一化
+        一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
+        消费面拿到的不再是训练时那一份判别函数。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -304,31 +302,39 @@ class TestSingleIterationLoop:
         assert trainer.run() == 1
         checkpoint = scenario.run_dir / "checkpoints" / "discriminator_iter1.pt"
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        # 保存面键形 = 原始模块键形（parametrization 视图与可重建 buffer 不落盘）
-        fresh = NetworkAssembler.discriminator(NetworkArtifact(
-            config=NetworkAssembler.load_json(
-                config.artifacts.discriminator_config_json,
-            ),
-        ))
-        assert set(saved.keys()) == set(fresh.state_dict().keys())
-        # 严格装载成功（netbuild 装配路径直接可用），且重建的裸网络
-        # 判别函数与训练时数值等价（有效权重语义，eval 相对照）
-        reloaded = NetworkAssembler.discriminator(NetworkArtifact(
-            config=NetworkAssembler.load_json(
-                config.artifacts.discriminator_config_json,
-            ),
-            checkpoint=checkpoint,
-        ))
-        reloaded.eval()
+        live = trainer.rewards.discriminator
+        # 保存面键形 = 训练态参数化状态（不是裸网络的物化有效权重）
+        assert set(saved.keys()) == set(live.state_dict().keys())
+        assert any(".parametrizations." in key for key in saved)
+        live.eval()
         sample = trainer.rewards.buffer.recent_samples()[0].unsqueeze(0)
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
         )
         normalized = normalizer.normalize(sample)
-        expected = trainer.rewards.discriminator(normalized)[-1]
-        assert torch.allclose(
-            reloaded(normalized)[-1], expected, rtol=1e-5, atol=1e-6,
-        )
+        expected = live(normalized)[-1]
+        for seed in (11, 20260910):  # 装载不消费 RNG：状态逐位一致
+            torch.manual_seed(seed)
+            reloaded = NetworkAssembler.discriminator(
+                NetworkArtifact(
+                    config=NetworkAssembler.load_json(
+                        config.artifacts.discriminator_config_json,
+                    ),
+                    checkpoint=checkpoint,
+                ),
+                spectral_norm=True,
+            )
+            restored = reloaded.state_dict()
+            assert restored.keys() == saved.keys()
+            assert all(torch.equal(restored[key], saved[key]) for key in saved)
+            reloaded.eval()
+            # 前向层用绝对容差而非逐位：判别力由上面的 state 逐位对比承担
+            # （形态语义所在），前向在**同权重、不同实例**间可差 1 ulp
+            # （2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测偶发），
+            # 逐位断言会假红；1e-6 在噪声底之上、修复前形态的偏离之下。
+            assert torch.allclose(
+                reloaded(normalized)[-1], expected, rtol=0.0, atol=1e-6,
+            )
 
     def test_milestone_iteration_forces_checkpoint(
         self, scenario: TrainingLoopScenario,

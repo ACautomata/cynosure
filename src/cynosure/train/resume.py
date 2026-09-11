@@ -18,10 +18,10 @@ trainer 消费 config 契约驱动）。per-rank 分片的原因：Replay buffer
 
 与产物 checkpoint（``policy_iter*.pt`` / ``discriminator_iter*.pt``，
 rank 0 独写）的分工：后者是**契约工件**（评测 / milestone / 组3
-stage-1 复用消费的可装载有效权重）；本文件是**训练机内部状态**，判定
-目标是恢复后逐位续跑——判别器以原始 ``state_dict`` 落盘（spectral
-norm 启用时含 power iteration buffer ``_u``/``_v``；有效权重语义的
-可装载形式见 ``netbuild.loadable_state_dict``）。
+stage-1 复用消费的可装载形态）；本文件是**训练机内部状态**，判定
+目标是恢复后逐位续跑——判别器同样以原始 ``state_dict`` 落盘
+（spectral norm 启用时含 power iteration buffer ``_u``/``_v``；与
+``netbuild.loadable_state_dict`` 的导出形态同形）。
 
 清单各项的落地面：
 

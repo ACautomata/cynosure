@@ -9,9 +9,11 @@
   （守卫哲学），判别器形态指纹对照后经 netbuild 严格装载路径还原。
 
 判别器 checkpoint 与训练期产物同构（``NetworkAssembler.loadable_state_dict``
-的可装载 state_dict），下游消费点 = train 新 run 的 warm-start 守卫
-重载（``PretrainReport.load_discriminator`` 按报告内相对路径还原）；
-resume 占位装配不消费本产物（随机初始化占位，分片恢复覆写）。
+的可装载 state_dict；spectral norm 启用时携带参数化状态，装载面按形态
+分派**逐位还原**——见 ``NetworkAssembler.discriminator``），下游消费点
+= train 新 run 的 warm-start 守卫重载（``PretrainReport.load_discriminator``
+按报告内相对路径还原）；resume 占位装配不消费本产物（随机初始化占位，
+分片恢复覆写）。
 """
 
 import hashlib

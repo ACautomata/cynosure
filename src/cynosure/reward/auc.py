@@ -100,9 +100,29 @@ class HeldOutAuc:
         排序 midrank 秩统计实现（与配对枚举口径严格等价）：U = R_real −
         n(n+1)/2，AUC = U/(n·m)；并列块取平均秩（midrank）恰好等价于
         「并列各计 0.5」。秩平方和 ~1e12 在 float64（2^53）内精确。
+
+        非有限分数显式拒绝（本方法是所有消费点的单一闸口）：排序把
+        NaN/Inf 当普通值排（NaN 排尾、+Inf 排头），数值发散或半损坏的
+        判别器因此能伪装出高分（实测全 NaN → 1.5、real 单侧 NaN →
+        0.875），「失明的判别器」反被认证为高判别力——宁可在测量层
+        失败，也不让 gate 拿一个无意义的数做上岗判定。
         """
         if real_scores.numel() == 0 or fake_scores.numel() == 0:
             raise ValueError("AUC 配对统计需要非空 real/fake 分数")
+        if not (
+            torch.isfinite(real_scores).all() and torch.isfinite(fake_scores).all()
+        ):
+            nan_real = int(torch.isnan(real_scores).sum())
+            nan_fake = int(torch.isnan(fake_scores).sum())
+            inf_real = int(torch.isinf(real_scores).sum())
+            inf_fake = int(torch.isinf(fake_scores).sum())
+            raise ValueError(
+                "AUC 配对统计的分数须为有限值（判别器数值发散或工件"
+                f"损坏）：real 侧 NaN×{nan_real} Inf×{inf_real}、"
+                f"fake 侧 NaN×{nan_fake} Inf×{inf_fake}——非有限分数在"
+                "排序口径下会伪装成分数（NaN 排尾、Inf 排头），AUC 因此"
+                "失去意义"
+            )
         real_count = real_scores.numel()
         combined = torch.cat([real_scores, fake_scores]).double()
         order = combined.argsort()

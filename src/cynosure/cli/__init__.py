@@ -431,10 +431,12 @@ class CynosureCli:
         )
         # 产物路径一致性不变式（init 之前校验：分叉配置不预占目录）：
         # 报告是 run 目录布局内的契约文件，train 按 config 声明的精确
-        # 路径装载——两者不一致时 producer/consumer 断链
+        # 路径装载——两者不一致时 producer/consumer 断链。比对**归一化
+        # 后**的路径而非字面拼写：相对 vs 绝对、``.`` 分量、符号链接
+        # 祖先都是同一位置的不同写法，字面比较会把合法调用误判成分叉。
         declared_report = Path(config.reward.pretrain_report_json)
         produced_report = PretrainRun.layout(run_root).report
-        if produced_report != declared_report:
+        if produced_report.resolve() != declared_report.resolve():
             print(
                 f"预训练产物路径与 config 声明分叉：本次将产出 "
                 f"{produced_report}，train 按声明装载 {declared_report}"

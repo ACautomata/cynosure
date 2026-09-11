@@ -122,6 +122,22 @@ class TestAucNumericContract:
         )
         assert isinstance(auc, float)
 
+    def test_non_finite_scores_rejected(self) -> None:
+        """NaN/Inf 分数显式拒绝：排序把非有限值当普通值排（NaN 排尾、
+        +Inf 排头），发散或半损坏的 checkpoint 因此能伪装出高分（实测
+        全 NaN → AUC 1.5、real 单侧 NaN → 0.875）——「判别器失明」反被
+        认证为高判别力。有限性校验是所有消费点（在线监控 / 预训练 gate
+        / RM readiness gate）共用的单一闸口。"""
+        for label, real, fake in (
+            ("real 含 NaN", torch.tensor([torch.nan, 0.1]), torch.tensor([0.0, 0.5])),
+            ("fake 含 NaN", torch.tensor([0.9, 0.1]), torch.tensor([torch.nan, 0.5])),
+            ("real 含 +Inf", torch.tensor([torch.inf, 0.1]), torch.tensor([0.0, 0.5])),
+            ("fake 含 -Inf", torch.tensor([0.9, 0.1]), torch.tensor([-torch.inf, 0.5])),
+            ("两侧全 NaN", torch.tensor([torch.nan]), torch.tensor([torch.nan])),
+        ):
+            with pytest.raises(ValueError, match="有限"):
+                HeldOutAuc.auc_from_scores(real, fake)
+
 
 class PairwiseAucReference:
     """配对枚举口径的 AUC 参考实现（O(n·m) 朴素循环，等价性锚定用）。"""

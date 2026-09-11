@@ -456,6 +456,55 @@ class TestPretrainEndToEnd:
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         assert all(torch.equal(restored[key], saved[key]) for key in saved)
 
+    def test_spectral_norm_warm_start_is_bitwise_faithful(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """SN 启用时的 warm-start 保真（ADR-0007 上岗语义）：落盘 checkpoint
+        携带**参数化状态**（``*.parametrizations.weight.*`` = original 权重
+        + 幂迭代 buffer ``_u``/``_v``）；``load_discriminator`` 按形态先叠
+        谱归一化再严格装载——重建的判别器状态与落盘时**逐位一致**，且
+        装载不消费 ambient RNG（两个不同 seed 下装配结果全等）。
+
+        对照（固化有效权重的形态）在装载时要**再归一化一次**（随机 u/v
+        起步 + 15 次幂迭代）→ 上岗的判别器不是预训练认证的那一份（实测
+        fixture 端到端 logits 偏离 4.5e-6、held-out AUC 0.5386 vs 0.5389）。"""
+        scenario.write_config(reward={
+            "spectral_norm_enabled": True,
+            "pretrain_gate_auc": 0.99,  # 不可达：走满步数上限（真训练态）
+            "pretrain_max_steps": 3,
+        })
+        result = scenario.pretrain()
+        assert result.code == 0, result.stderr
+        report = scenario.report()
+        assert report.steps_completed == 3
+        saved = torch.load(
+            scenario.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
+            map_location="cpu", weights_only=True,
+        )
+        # 落盘面 = 参数化状态（原始权重 + u/v 同盘），不是物化有效权重
+        assert any(".parametrizations." in key for key in saved)
+        config = scenario.config()
+        torch.manual_seed(11)
+        first = report.load_discriminator(config, device=torch.device("cpu"))
+        torch.manual_seed(20260910)  # ambient RNG 不同：装载不得消费它
+        second = report.load_discriminator(config, device=torch.device("cpu"))
+        for scorer in (first, second):
+            restored = scorer.discriminator.state_dict()
+            assert restored.keys() == saved.keys()
+            assert all(torch.equal(restored[key], saved[key]) for key in saved)
+        # 判别函数层：两次装配的前向一致（形态还原的语义本体）。容差而非
+        # 逐位：同权重、不同实例的前向可差 1 ulp（2^-23 ≈ 1.2e-7，浮点
+        # 执行路径的分配/分块选择，实测偶发）——判别力由上面的 state
+        # 逐位对比承担；1e-6 在噪声底之上、修复前形态的偏离之下。
+        torch.manual_seed(3)
+        probe = torch.randn(2, *config.latent_shape)
+        first.discriminator.eval()
+        second.discriminator.eval()
+        assert torch.allclose(
+            first.patch_logits(probe), second.patch_logits(probe),
+            rtol=0.0, atol=1e-6,
+        )
+
     def test_dense_steps_terminate_at_gate_or_cap(
         self, scenario: PretrainScenario,
     ) -> None:
@@ -565,6 +614,23 @@ class TestPretrainCliGuards:
         """--run-dir 与 config 声明路径一致（目录与契约名都对上）：
         显式覆盖放行——一致性不变式只拒绝分叉，不拒绝显式声明。"""
         scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        result = scenario.pretrain("--run-dir", str(scenario.run_dir))
+        assert result.code == 0, result.stderr
+        assert scenario.report().gate_passed is True
+
+    def test_same_location_different_spelling_passes(
+        self, scenario: PretrainScenario, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """同一位置的两种写法（config 声明相对路径、--run-dir 给绝对
+        路径）是同一份工件：一致性不变式比对**归一化后的**路径，不比对
+        字面拼写——字面比较会把「相对 vs 绝对」「``.`` 分量」「符号链接
+        祖先」这些同址写法误判成分叉，拒绝合法调用。"""
+        monkeypatch.chdir(tmp_path)
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.01,
+            "pretrain_report_json": "pretrain_run/pretrain_report.json",
+        })
         result = scenario.pretrain("--run-dir", str(scenario.run_dir))
         assert result.code == 0, result.stderr
         assert scenario.report().gate_passed is True

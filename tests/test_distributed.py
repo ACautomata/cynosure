@@ -35,9 +35,19 @@ import pytest
 import torch
 
 from cynosure.cli import CynosureCli
+from cynosure.config import ConfigLoader
+from cynosure.fixtures import Fixture
+from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.reward.artifacts import LatentManifest
-from cynosure.train import RunArtifacts
+from cynosure.train import (
+    AmpContext,
+    ReadinessGate,
+    RunArtifacts,
+    TrainingRuntime,
+)
+from cynosure.train.rng import TrainingRngStreams
 from cynosure.distributed import DistributedContext, RankSlicedPool
+from tests.conftest import CliSession, FixturePrepareScenario
 from tests.test_train_loop import TrainingLoopScenario
 
 _WORKER_JOIN_TIMEOUT_S = 600.0
@@ -265,6 +275,71 @@ class RankResumeShards:
                     )
 
 
+_GATE_JOIN_TIMEOUT_S = 180.0
+"""gate 集合序用例的 worker join 上限（秒）：worker 只做装配 + 一两次
+打分前向（数十秒量级），超时即集合序错位回归（邻居卡在内层集合里）。"""
+
+
+class MissingHeldoutAuc:
+    """held-out 读取失败的重算桩：把「本 rank 重算失败」注入 RM
+    readiness gate 的重算面——rank 间不同的文件系统不可在共享盘上构造，
+    桩是同一失败面（本地异常先于任何前向进入裁决输入）的确定性载体。"""
+
+    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
+        raise FileNotFoundError("held-out latent 缺失（本 rank 读取失败）")
+
+
+class GateWorldWorker:
+    """单 rank 的 RM readiness gate 执行体（torchrun 语义环境变量 + 真实
+    判别器装配路径）：rank 0 走真实重算，其余 rank 注入重算失败——启动期
+    集合裁决的「失败 rank + 健康 rank」现场。结果经队列回传主进程。"""
+
+    def __init__(
+        self, rank: int, world: int, port: int, config_path: Path, queue,
+    ) -> None:
+        self.rank = rank
+        self.world = world
+        self.port = port
+        self.config_path = config_path
+        self.queue = queue
+
+    def __call__(self) -> None:
+        os.environ.update(
+            RANK=str(self.rank),
+            LOCAL_RANK=str(self.rank),
+            WORLD_SIZE=str(self.world),
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=str(self.port),
+        )
+        try:
+            payload = self._run()
+        except Exception as exc:  # worker 崩溃的诊断面
+            payload = {"verdict": "crashed", "error": f"{type(exc).__name__}: {exc}"}
+        self.queue.put({"rank": self.rank, **payload})
+
+    def _run(self) -> dict:
+        """真实装配（判别器 DDP 副本 + 谱归一化 buffer）→ gate 重算。"""
+        config = ConfigLoader.load(self.config_path)
+        dist = DistributedContext.bootstrap()
+        amp = AmpContext(
+            device=dist.local_device(),
+            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        )
+        generators = TrainingRngStreams(
+            dist.derive_seed(config.schedule.seed),
+        ).named()
+        rewards = TrainingRuntime.assemble_rewards(config, amp, generators, dist)
+        auc = rewards.auc if self.rank == 0 else MissingHeldoutAuc()
+        gate = ReadinessGate(config, auc, dist)  # type: ignore[arg-type]
+        torch.manual_seed(0)  # 各 rank 同 fake 批（重算输入一致）
+        fakes = torch.randn(2, *config.latent_shape)
+        try:
+            measured = gate.check(fakes)
+        except ValueError as exc:
+            return {"verdict": "rejected", "error": str(exc)}
+        return {"verdict": "passed", "measured": measured}
+
+
 class TestDistributedContextUnit:
     """进程组 Facade 的单进程退化与 seed 派生语义。"""
 
@@ -384,6 +459,81 @@ class TestPoolSliceUnit:
         for rank in range(2):
             with pytest.raises(ValueError, match="不足"):
                 RankSlicedPool(starved, DistributedContext(rank, 2, True)).view()
+
+
+class TestGateCollectiveOrder:
+    """RM readiness gate 的集合序（启动期集合裁决的前提）：打分/监控前向
+    必须是纯本地计算。判别器 DDP 副本带 buffer（谱归一化的 ``_u``/``_v``）
+    时，DDP 默认在首次前向做一次跨 rank buffer 广播——重算失败的 rank
+    绕过前向直奔 all_gather，健康 rank 卡在那次广播里互等（world=2 实测
+    死锁）。判别器 buffer 无状态语义（GroupNorm 无 running stats、
+    ``_u``/``_v`` 由确定性装载与确定性幂迭代在各 rank 逐位一致），前向期
+    广播因此显式关闭。
+    """
+
+    _next_port = 29840
+    """TCPStore 端口游标（与 ``SpawnedTrainWorld`` 的游标分段，互不重叠）。"""
+
+    def test_rank_local_recompute_failure_reaches_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """rank 1 重算失败（held-out 读取异常）、rank 0 重算成功：全 rank
+        收敛到同一拒绝裁决（失败 rank 的错误经裁决传播给全体）——worker
+        回传超时即健康 rank 卡在内层集合里的集合序错位回归。"""
+        config_path = self._write_inputs(tmp_path)
+        type(self)._next_port += 1
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        workers = [
+            GateWorldWorker(rank, 2, type(self)._next_port, config_path, queue)
+            for rank in range(2)
+        ]
+        processes = [context.Process(target=worker) for worker in workers]
+        for process in processes:
+            process.start()
+        collected: dict[int, dict] = {}
+        for _ in workers:
+            try:
+                payload = queue.get(timeout=_GATE_JOIN_TIMEOUT_S)
+            except _QueueEmpty:
+                self._stop(processes)
+                raise AssertionError(
+                    f"gate worker 回传超时（{_GATE_JOIN_TIMEOUT_S}s）——"
+                    "打分前向里出现跨 rank 集合点（失败 rank 在裁决点等、"
+                    f"健康 rank 在内层集合里等）。已回传: {collected}"
+                )
+            collected[payload["rank"]] = payload
+        self._stop(processes)
+        assert [collected[rank]["verdict"] for rank in range(2)] == [
+            "rejected", "rejected",
+        ], collected
+        for rank in range(2):
+            assert "重算失败" in collected[rank]["error"]
+            assert "rank 1" in collected[rank]["error"]
+
+    @staticmethod
+    def _stop(processes: list) -> None:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5.0)
+
+    @staticmethod
+    def _write_inputs(tmp_path: Path) -> Path:
+        """夹具：网络工件 + prepare 三工件 + 谱归一化启用的 gate config
+        ——判别器 buffer 只在谱归一化启用时存在，那是 DDP 前向期广播的
+        触发条件（无 buffer 的判别器整套语义不变）。"""
+        fixture_dir = tmp_path / "fixtures"
+        config = Fixture().config(fixture_dir)
+        FixturePrepareScenario(CliSession(), config, tmp_path).run(
+            tmp_path / "prepare_config.json",
+        )
+        torch.manual_seed(7)  # fixture 网络「固定 seed」机制
+        Fixture().write_artifacts(fixture_dir)
+        config.reward.spectral_norm_enabled = True
+        path = tmp_path / "gate_config.json"
+        path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
+        return path
 
 
 class TestSingleRankEquivalence:

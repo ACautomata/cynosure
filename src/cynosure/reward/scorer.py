@@ -5,7 +5,8 @@ PatchDiscriminator 封装。
 - patch logit 图 ``[B,1,D',H',W']`` → raw real-logit 标量聚合（mean 为主 /
   min 消融），不过 sigmoid；tanh 压 (−1,1) 是触发式保险；
 - LSGAN 判别器损失 = mean((D(real) − 1)²) + mean(D(fake)²)；
-- SpectralNorm 默认关闭、经 config 触发启用（叠在 conv 上，Lipschitz 约束）；
+- SpectralNorm 默认关闭、经 config 触发启用（叠在 conv 上，Lipschitz 约束；
+  叠加与按形态分派的装载由 netbuild 装配面单点接管，含 checkpoint 形态契约）；
 - 数值锚：网络配置 JSON 的 norm（GroupNorm 定死）/ num_layers_d /
   in_channels 与 config 契约一致（静默错位即拒绝）；
 - RewardScorer / ChannelNormalizer 是 nn.Module 聚合（统计量为 buffer）：
@@ -128,10 +129,9 @@ class RewardScorer(torch.nn.Module):
     ) -> None:
         super().__init__()
         self._check_network_contract(artifact.config, config)
-        discriminator = NetworkAssembler.discriminator(artifact)
-        if config.spectral_norm_enabled:
-            self._apply_spectral_norm(discriminator)
-        self._discriminator = discriminator
+        self._discriminator = NetworkAssembler.discriminator(
+            artifact, spectral_norm=config.spectral_norm_enabled,
+        )
         self._normalizer = ChannelNormalizer(stats)
         self._aggregation = config.patch_aggregation
         self._tanh_bounding = config.reward_tanh_bounding
@@ -188,13 +188,6 @@ class RewardScorer(torch.nn.Module):
         real_term = ((logits_real - 1.0) ** 2).mean()
         fake_term = (logits_fake ** 2).mean()
         return LsganTerms(real_term + fake_term, real_term, fake_term)
-
-    @staticmethod
-    def _apply_spectral_norm(discriminator: PatchDiscriminator) -> None:
-        """SpectralNorm 叠加（触发式）：对所有 conv 层施加谱归一化。"""
-        for module in discriminator.modules():
-            if isinstance(module, torch.nn.Conv3d):
-                torch.nn.utils.parametrizations.spectral_norm(module)
 
     @staticmethod
     def _check_network_contract(net_config: dict, config: RewardConfig) -> None:

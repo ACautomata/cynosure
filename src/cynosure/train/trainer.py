@@ -514,10 +514,10 @@ class GranularGrpoTrainer:
         PolicySharding 导出、键形与裸网络一致；导出本身是集合操作，
         ``full_state`` 必传——由调用方全 rank 完成导出后传入，本方法内部
         不按需导出（rank0-only 导出会互等死锁））；判别器经
-        loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
-        重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
-        历史布局逐字一致）。续训全状态由 ResumeStore.save 同节奏
-        落盘（per-rank 分片文件）。"""
+        loadable_state_dict 固化可装载形态（spectral norm 启用时携带
+        参数化状态，消费面按形态分派逐位还原）；stage 前缀隔离组3
+        两阶段的同名产物（stage-1 无前缀 = 历史布局逐字一致）。续训
+        全状态由 ResumeStore.save 同节奏落盘（per-rank 分片文件）。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
             full_state,
