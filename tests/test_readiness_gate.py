@@ -18,6 +18,7 @@
 import copy
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,14 @@ class StubAuc:
     def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
         self.calls.append((fake_latents.shape[0], modality))
         return self.value
+
+
+class FailingAuc:
+    """HeldOutAuc 的失败替身：以非 ValueError 的工件读盘异常失败
+    （held-out manifest 条目缺失/损坏的真实异常面）。"""
+
+    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
+        raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")
 
 
 class SplitVerdictDist:
@@ -233,6 +242,24 @@ class TestWarmStartAssembly:
         assert "训练输入契约违反" in result.stderr
         assert not pretrained.run_dir.exists()
 
+    def test_latent_shape_mismatch_rejected(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """报告 latent_shape 与当前 run 不符（换分辨率）：口径指纹与
+        判别器形态指纹都不覆盖它，全卷积 scorer 可用旧 shape 的 real
+        评新 shape 的 fake 静默通过 gate 并带错位数据进在线更新——
+        装载前显式对照拒绝。"""
+        data = json.loads(pretrained.config_path.read_text(encoding="utf-8"))
+        data["latent_shape"] = [4, 16, 16, 4]
+        data["policy"]["input_img_size_numel"] = 16 * 16 * 4  # numel 锚随行
+        pretrained.config_path.write_text(
+            json.dumps(data), encoding="utf-8",
+        )
+        result = pretrained.train()
+        assert result.code == 2
+        assert "latent 形状不符" in result.stderr
+        assert not pretrained.run_dir.exists()
+
 
 class TestGateVerdict:
     """preflight 重算 AUC 双分支（fixture 双分支判定专属测试）。"""
@@ -287,9 +314,10 @@ class TestRecomputeConsistency:
         逐位一致——门槛不信任报告旧值，但重算必须能复现报告值
         （重算与预训练测量是同一份 HeldOutAuc.compute 口径）。
 
-        gate=0.01 恒 0 步达标：报告值 = 初始权重（checkpoint 未更新）
-        对第一批量产 fake 的测量——重演消耗序确定（seed_base 的 base
-        分区抽取 → 第一测量批）。"""
+        gate=0.01 恒 0 步达标：报告值 = 达标测量与复测（两批独立
+        测量取小——producer 侧成功判据对单批测量噪声鲁棒）中较小者；
+        消耗序确定（seed_base 的 base 分区抽取 → 达标测量批 → 复测
+        批）。"""
         scenario = GateScenario(cli, tmp_path)
         scenario.write_inputs()
         result = scenario.pretrain(pretrain_gate_auc=0.01)
@@ -313,13 +341,20 @@ class TestRecomputeConsistency:
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         live = NetworkAssembler.loadable_state_dict(driver.rewards.discriminator)
         assert all(torch.equal(restored[key], live[key]) for key in restored)
-        # 消耗序重演：先 base 分区（seed_base）、再第一测量批 → 同流同批
+        # 消耗序重演：先 base 分区（seed_base）、再达标测量批、再复测批
+        # → 同流同批；报告值 = 两次独立测量的较小者
         driver.rollout.base_partition_samples(
             driver.rewards.buffer.base_capacity,
         )
-        fakes = driver.rollout.base_partition_samples(4)
-        measured = driver.rewards.auc.compute(fakes)
-        assert measured == pytest.approx(report.final_heldout_auc, abs=0.0)
+        first = driver.rewards.auc.compute(
+            driver.rollout.base_partition_samples(4),
+        )
+        second = driver.rewards.auc.compute(
+            driver.rollout.base_partition_samples(4),
+        )
+        assert report.final_heldout_auc == pytest.approx(
+            min(first, second), abs=0.0,
+        )
 
     def test_readiness_gate_uses_full_pool_modality_free_recompute(self) -> None:
         """重算口径 = 全池混采（modality=None，与预训练 gate 同口径）：
@@ -358,6 +393,18 @@ class TestGateVerdictUnit:
         with pytest.raises(ValueError, match="rank 1"):
             gate.check(torch.zeros(1, 4, 16, 16, 8))
 
+    def test_artifact_read_failure_converges_to_collective_rejection(
+        self,
+    ) -> None:
+        """本地重算的非 ValueError 异常（held-out manifest 条目缺失 =
+        FileNotFoundError；损坏 = 反序列化异常）也收敛为 local_error 进
+        集体裁决——捕窄会让失败 rank 先于 all_gather 退出、其余 rank
+        永等在集合操作（拒绝方退出、通过方挂死）。"""
+        config = _minimal_gate_config()
+        gate = ReadinessGate(config, FailingAuc(), SplitVerdictDist([]))
+        with pytest.raises(ValueError, match="held-out latent 缺失"):
+            gate.check(torch.zeros(1, 4, 16, 16, 8))
+
 
 class TestResumeSkipsGate:
     """resume 跳过门槛：续训状态已含判别器全量状态。"""
@@ -389,6 +436,18 @@ class TestResumeSkipsGate:
         result = pretrained.resume()
         assert result.code == 2
         assert "pretrain_report_json" in result.stderr
+
+    def test_resume_survives_pretrain_artifact_cleanup(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """resume 不消费 warm-start 报告：续训状态已含判别器全量状态
+        （分片恢复整体覆写判别器权重与 optimizer），预训练 run 目录被
+        清理（报告 + checkpoint 删除）后仍可续训——resume 路径强制
+        装载会让中断 run 永不可恢复。"""
+        assert pretrained.train().code == 0
+        config = ConfigLoader.load(pretrained.config_path)
+        shutil.rmtree(Path(config.reward.pretrain_report_json).parent)
+        assert pretrained.resume().code == 0
 
 
 def _minimal_gate_config() -> CynosureConfig:

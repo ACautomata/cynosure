@@ -262,7 +262,7 @@ class CynosureCli:
                 else:
                     trainer = GranularGrpoTrainer(
                         config, artifacts, dump_trajectory=dump_trajectory,
-                        dist_context=dist,
+                        dist_context=dist, resume=resume,
                     )
             except (
                 ValueError, FileNotFoundError, RuntimeError,
@@ -413,7 +413,9 @@ class CynosureCli:
 
         run 目录默认 = config 的 ``reward.pretrain_report_json`` 所在
         目录（产物位置在 config 里声明，train 上岗按同一路径装载）；
-        ``--run-dir`` 可显式覆盖（重跑换目录）。装配失败的预占目录回滚
+        ``--run-dir`` 可显式覆盖（产物路径以 config 声明为准——覆盖
+        目录与声明路径分叉时拒绝：train 按 config 声明装载，分叉即
+        missing-report 或静默装旧报告）。装配失败的预占目录回滚
         （未产出任何工件）；执行中途失败保留目录（事件可取证）。"""
         env_rank = DistributedContext.env_rank()
         if env_rank is not None:
@@ -427,6 +429,19 @@ class CynosureCli:
             Path(args.run_dir) if args.run_dir
             else Path(config.reward.pretrain_report_json).parent
         )
+        # 产物路径一致性不变式（init 之前校验：分叉配置不预占目录）：
+        # 报告是 run 目录布局内的契约文件，train 按 config 声明的精确
+        # 路径装载——两者不一致时 producer/consumer 断链
+        declared_report = Path(config.reward.pretrain_report_json)
+        produced_report = PretrainRun.layout(run_root).report
+        if produced_report != declared_report:
+            print(
+                f"预训练产物路径与 config 声明分叉：本次将产出 "
+                f"{produced_report}，train 按声明装载 {declared_report}"
+                "（换目录请同步更新 reward.pretrain_report_json）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         try:
             run = PretrainRun.init(config, run_root)
         except FileExistsError:

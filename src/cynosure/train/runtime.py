@@ -86,9 +86,16 @@ class TrainingRuntime:
         *,
         device: torch.device | None = None,
         dist_context: DistributedContext | None = None,
+        resume: bool = False,
     ) -> "TrainingRuntime":
         """config 驱动装配：单进程与分布式同一条装配序，分布式包装点
-        （FSDP/DDP/切片/归并/seed 派生）在 world-1 下恒等。"""
+        （FSDP/DDP/切片/归并/seed 派生）在 world-1 下恒等。
+
+        ``resume=True`` 时跳过 warm-start 报告装载：续训状态分片已含
+        判别器全量状态（权重与 optimizer 恢复时整体覆写），报告在
+        resume 路径无消费价值——强制装载会让预训练产物被清理的中断
+        run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
+        覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
         dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
         # seed 的 rank 派生：六条流的演化各 rank 独立（rollout 数据多样性
         # 来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性前提。
@@ -113,7 +120,10 @@ class TrainingRuntime:
         )
         rewards = cls.assemble_rewards(
             config, amp, generators, dist,
-            report=PretrainReport.load(config.reward.pretrain_report_json),
+            report=(
+                None if resume
+                else PretrainReport.load(config.reward.pretrain_report_json)
+            ),
         )
         sampler = cls.assemble_sampler(config, policy.field)
         updater = StepwisePolicyUpdate(
@@ -179,11 +189,14 @@ class TrainingRuntime:
         RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
         同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
 
-        权重来源按语境二分：``report`` 给定（train 语境）= warm-start
-        守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告 checkpoint
-        严格装载，ADR-0007——RL 不带预训练产物在装配层就无法启动）；
-        ``None``（pretrain driver 语境）= 冷启动路径（checkpoint 工件
-        或随机初始化，预训练本身即产物的生产方）。"""
+        权重来源按语境二分：``report`` 给定（train 新 run 语境）=
+        warm-start 守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告
+        checkpoint 严格装载，ADR-0007——RL 不带预训练产物在装配层就
+        无法启动）；``None`` = 冷启动路径（checkpoint 工件或随机初始
+        化），消费方 = 预训练 driver（预训练本身即产物的生产方）与
+        resume 装配（续训分片已含判别器全量状态，占位权重被
+        ``ResumeStore.restore`` 整体覆写——报告在 resume 路径无消费
+        价值，强制装载会让预训练产物被清理的中断 run 不可恢复）。"""
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
                 "训练循环需要判别器网络配置（discriminator_config_json）："

@@ -30,6 +30,14 @@ from cynosure.reward.scorer import LatentScorer
 class HeldOutAuc:
     """held-out 判别力监控信号（hacking 签名判定的输入）。"""
 
+    SCORE_CHUNK = 8
+    """打分前向的定块上界（3D 体数/块）：评估批量 = base 分区
+    （capacity//2 体，量产侧限 ``_BASE_BATCH`` 分块生成）或 fake 批，
+    一次性全量前向让激活显存随批量无界增长——训练开始前就可能耗尽
+    加速器。判别器归一化定死 GroupNorm（前向对 batch 维逐样本独立），
+    分块前向与全批逐位等价；AUC 是分数上的 rank 统计，分数级拼接
+    不改变口径。"""
+
     def __init__(
         self,
         heldout_manifest: LatentManifest,
@@ -45,6 +53,15 @@ class HeldOutAuc:
         self._manifest = heldout_manifest
         self._scorer = scorer
         self._real_sampler = RealPoolSampler(heldout_manifest, generator, device)
+
+    def _chunked_logits(self, latents: torch.Tensor) -> torch.Tensor:
+        """分块打分前向（``SCORE_CHUNK`` 定块，分数级拼接）。"""
+        return torch.cat([
+            self._scorer.patch_logits(
+                latents[start:start + self.SCORE_CHUNK],
+            )
+            for start in range(0, latents.shape[0], self.SCORE_CHUNK)
+        ]).flatten()
 
     def compute(
         self, fake_latents: torch.Tensor, modality: Modality | None = None,
@@ -69,8 +86,8 @@ class HeldOutAuc:
             )
         with torch.no_grad():
             reals = self._real_sampler.sample(count, modality=modality)
-            real_scores = self._scorer.patch_logits(reals).flatten()
-            fake_scores = self._scorer.patch_logits(fake_latents).flatten()
+            real_scores = self._chunked_logits(reals)
+            fake_scores = self._chunked_logits(fake_latents)
         return self.auc_from_scores(real_scores, fake_scores)
 
     @staticmethod

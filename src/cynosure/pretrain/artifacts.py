@@ -85,7 +85,8 @@ class PretrainReport(BaseModel):
     """本次预训练采用的门槛阈值（报告留痕：阈值可配置，跨 run 可比性
     以报告值为准）。"""
     gate_passed: bool
-    """最终 held-out AUC 是否达门槛（False = 步数上限耗尽仍未达标，
+    """上岗判据是否通过：两次独立测量（达标测量 + 换批复测）都达门槛
+    且报告值取两次较小者（False = 步数上限耗尽或复测始终掉线仍未确认，
     checkpoint 仍落盘供诊断；上岗与否由 train 侧重算判定）。"""
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对本报告文件所在目录；可装载
@@ -105,13 +106,23 @@ class PretrainReport(BaseModel):
         return report
 
     def assert_data_provenance(self, config: CynosureConfig) -> None:
-        """当前 config 的数据口径三工件与报告指纹对照：不匹配即拒绝。
+        """当前 config 的数据口径与报告对照：不匹配即拒绝。
 
-        real pool / held-out manifest / channel stats 任一文件内容与
-        预训练时的指纹不符（manifest 重建、统计量换源）都让上岗判别力
-        与预训练报告脱钩——warm-start 装载前显式拒绝，不给静默错位
-        留缝（判别器形态指纹的对照在 ``load_discriminator``）。
+        latent 形状先行对照（纯内存比较）：口径指纹与判别器形态指纹都
+        不覆盖分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的
+        fake 静默通过 gate 并把错位数据带进在线更新。real pool /
+        held-out manifest / channel stats 任一文件内容与预训练时的指纹
+        不符（manifest 重建、统计量换源）都让上岗判别力与预训练报告
+        脱钩——warm-start 装载前显式拒绝，不给静默错位留缝（判别器
+        形态指纹的对照在 ``load_discriminator``）。
         """
+        if tuple(config.latent_shape) != self.latent_shape:
+            raise ValueError(
+                f"latent 形状不符：报告 {list(self.latent_shape)}，"
+                f"当前 config {list(config.latent_shape)}（分辨率不在口径"
+                "指纹与网络配置指纹的覆盖面内——预训练与上岗须同一 "
+                "latent 口径）"
+            )
         checks = (
             ("real_pool_manifest", config.reward.real_pool_manifest,
              self.provenance.real_pool_manifest_sha256),

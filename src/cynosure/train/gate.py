@@ -62,7 +62,13 @@ class ReadinessGate:
                     "的 reward model 开跑——ADR-0007；预训练产物 "
                     f"{self._config.reward.pretrain_report_json}）"
                 )
-        except ValueError as exc:
+        except Exception as exc:
+            # 捕获面放宽到 Exception（重算的失败面不止 ValueError：
+            # held-out manifest 条目缺失 = FileNotFoundError、工件损坏 =
+            # 反序列化异常、scorer 前向 shape 错位 = RuntimeError）——
+            # 任何本地重算失败都必须成为 all_gather 集体裁决的输入，
+            # 捕窄会让失败 rank 先于集合点退出、其余 rank 永等
+            #（ResumeStore.restore 的两段集合裁决同款语义）
             local_error = (
                 f"RM readiness gate 重算失败（{exc}）——held-out AUC "
                 "无法按当前数据口径测得"

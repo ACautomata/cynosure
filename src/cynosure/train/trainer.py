@@ -176,6 +176,7 @@ class GranularGrpoTrainer:
         stage: StageTag | None = None,
         dist_context: DistributedContext | None = None,
         evaluation: EvaluationPhase | None = None,
+        resume: bool = False,
     ) -> None:
         if config.experiment.group == "sequential":
             raise ValueError(
@@ -217,8 +218,14 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
         self.stage_tag = stage if stage is not None else StageTag()
+        # resume 装配开关（与 run 的 resume 参数须一致，错位组合在 run
+        # 显式拒绝）：resume 装配跳过 warm-start 报告装载（续训分片已含
+        # 判别器全量状态，报告无消费价值），判别器占位冷启动装配被
+        # ResumeStore.restore 整体覆写
+        self._resume_assembled = resume
         self.runtime = TrainingRuntime.build(
             config, run_artifacts, device=device, dist_context=dist_context,
+            resume=resume,
         )
         # 策略侧执行序两相（eval 相 rollout → train 相逐 k 更新）合成
         # 单 iteration 循环体（判别器侧协作者见 self.rewards）
@@ -324,6 +331,15 @@ class GranularGrpoTrainer:
         的累计完成数；早停时小于 max_iterations；零训练迭代时 = 恢复
         点）。"""
         dist = self.runtime.dist
+        if resume != self._resume_assembled:
+            # 错位组合 = 占位装配配门槛检查（构造 resume=True +
+            # run(resume=False) 时 gate 对随机初始化权重重算）或带报告
+            # 装配的恢复（语义矛盾），显式拒绝
+            raise ValueError(
+                f"resume 装配开关与 run 入参不一致（构造 {self._resume_assembled}"
+                f" vs run {resume}）：恢复语义由两处共同声明，错位组合是"
+                "装配契约违反"
+            )
         start_iteration = 0
         if resume:
             start_iteration = self.resume_store.restore(self)

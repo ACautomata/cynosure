@@ -532,12 +532,42 @@ class TestPretrainCliGuards:
     def test_explicit_run_dir_override(
         self, scenario: PretrainScenario, tmp_path: Path,
     ) -> None:
-        """--run-dir 显式覆盖默认（config 报告路径所在目录）。"""
+        """--run-dir 显式覆盖默认（config 报告路径所在目录）：产物路径
+        以 config 声明为准——覆盖目录与声明分叉时拒绝（train 按 config
+        声明装载，分叉即 missing-report 或静默装旧）。"""
         scenario.write_config(reward={"pretrain_gate_auc": 0.01})
         override = tmp_path / "override_run"
         result = scenario.pretrain("--run-dir", str(override))
+        assert result.code == 2
+        assert "声明" in result.stderr
+        assert not override.exists()
+
+    def test_report_path_divergence_rejected(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """config 声明 basename ≠ 报告契约名：pretrain 固定写 run 目录
+        内的 ``pretrain_report.json``，train 按声明路径装载——分叉即
+        missing-report 或静默装旧报告，入口显式拒绝。"""
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.01,
+            "pretrain_report_json": str(
+                scenario.run_dir / "warm_start_v2.json"
+            ),
+        })
+        result = scenario.pretrain()
+        assert result.code == 2
+        assert "声明" in result.stderr
+        assert not scenario.run_dir.exists()
+
+    def test_run_dir_matching_declared_path_passes(
+        self, scenario: PretrainScenario, tmp_path: Path,
+    ) -> None:
+        """--run-dir 与 config 声明路径一致（目录与契约名都对上）：
+        显式覆盖放行——一致性不变式只拒绝分叉，不拒绝显式声明。"""
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        result = scenario.pretrain("--run-dir", str(scenario.run_dir))
         assert result.code == 0, result.stderr
-        assert (override / "pretrain_report.json").is_file()
+        assert scenario.report().gate_passed is True
 
 
 class TestPretrainDriverAssembly:
