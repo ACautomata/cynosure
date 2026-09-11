@@ -100,7 +100,7 @@ class NetworkAssembler:
           的冷启动语义）。裸形态无法与本项目**旧版物化形态**的判别器
           产物区分（键形相同）：SN 启用下装载即冷启动再归一化、判别
           函数失真——旧物化形态的产物在 SN regime 须重新预训练
-          （发布说明声明）。
+          （见 PR #66 发布说明）。
         """
         model = PatchDiscriminator(
             **cls._known_kwargs(PatchDiscriminator, artifact.config),

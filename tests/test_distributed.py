@@ -617,8 +617,9 @@ class TestTwoRankSharding:
         （``ReplicatedDiscriminator`` 关闭前向期 buffer 广播的论证兜底）：
         u/v 只在 train 相前向就地推进，而推进点只有在线更新（各 rank
         前向次数对称、权重经梯度 allreduce 逐位一致）；打分/监控前向恒
-        eval 相不推进——广播关闭后各 rank 的参数化 buffer 仍不得漂移
-        （若 rank 间前向次数不对称，此断言即暴露分叉）。warm-start 链路
+        eval 相不推进——广播关闭后各 rank 的参数化 buffer 仍不得漂移。
+        「rank 间前向次数不对称 → 分叉」的子风险只有论证面、无测试构造
+        （注入不对称前向须异常路径，超出常规回归面）。warm-start 链路
         同 regime：预训练（SN 启用）产物为谱归一化形态，train 装载走
         形态分派的逐位还原。"""
         scenario.write_inputs(reward={"spectral_norm_enabled": True})
