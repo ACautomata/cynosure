@@ -40,20 +40,29 @@ class RewardCoordinator:
         """底层判别器（checkpoint 落盘用；DDP 装配下为解包后的裸网络）。"""
         return self.update.scorer.discriminator
 
-    def seed_base(self, samples: torch.Tensor) -> None:
-        """冻结初始 policy 的产出填充 base 分区（train 启动期一次）。"""
-        self.buffer.fill_base(samples)
+    def seed_base(
+        self, samples: torch.Tensor, modalities: list[Modality],
+    ) -> None:
+        """冻结初始 policy 的产出填充 base 分区（train 启动期一次，
+        逐样本目标模态标签对齐——ADR-0008-01 的配额量产标签输入）。"""
+        self.buffer.fill_base(samples, modalities)
 
-    def update_step(self, current_fakes: torch.Tensor) -> UpdateReport:
+    def update_step(
+        self, current_fakes: torch.Tensor, modality: Modality,
+    ) -> UpdateReport:
         """判别器 Online update 一步：全批 fake 随机置换后交更新
         （50% 当前 / 50% 回放的混采由 update 消费置换批的头部），更新
         期间判别器 train 相、结束后恢复 eval 相。置换过的整批照常入
-        近期分区（近期分布记录是集合语义，次序无关）。"""
+        近期分区（近期分布记录是集合语义，次序无关）。
+
+        ``modality`` = 本 iteration 的目标模态：整批 fake 的条件标签
+        （入近期分区）与回放半区的过滤条件（ADR-0008 决策 2）同源。
+        """
         order = torch.randperm(current_fakes.shape[0], generator=self._generator)
         shuffled = current_fakes[order]
         self.discriminator.train()
         try:
-            return self.update.step(shuffled)
+            return self.update.step(shuffled, modality)
         finally:
             self.discriminator.eval()
 

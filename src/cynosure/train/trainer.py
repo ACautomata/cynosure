@@ -31,16 +31,18 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
 
 import time
 from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 from pydantic import BaseModel, ConfigDict
 
-from cynosure.config import CynosureConfig
+from cynosure.config import CynosureConfig, Modality
 from cynosure.distributed import DistributedContext
 from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
 from cynosure.grpo import MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AmpContext
+from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
 from cynosure.train.artifacts import (
     BaselineManifest,
     IterEvent,
@@ -109,9 +111,12 @@ class IterationLoop:
         self.updater = updater
         self._amp = amp
 
-    def base_partition_samples(self, capacity: int) -> torch.Tensor:
-        """冻结初始 policy 的 base 分区供给（train 启动期一次）。"""
-        return self.rollout.base_partition_samples(capacity)
+    def base_partition_samples(
+        self, quota: Mapping[Modality, int],
+    ) -> tuple[torch.Tensor, list[Modality]]:
+        """冻结初始 policy 的 base 分区供给（train 启动期一次，按每条件
+        配额量产；返回样本批 + 逐样本目标模态标签）。"""
+        return self.rollout.base_partition_samples(quota)
 
     def run_iteration(self) -> IterationRollout:
         """执行序第 1 相：eval 相 rollout（调用方负责相位于前就绪）。"""
@@ -196,24 +201,11 @@ class GranularGrpoTrainer:
                 "参数 EMA 锚为升级项（ADR-0001），实现未交付："
                 "ema_anchor_enabled=true 显式拒绝"
             )
-        # 回放供给跨字段守卫：首次判别器更新时近期分区为空，回放半区
-        # （floor(K/2) 条，50/50 混采定死）全由 base 分区（capacity//2）
-        # 承担；K=1 则回放半区为 0 条、回放采样 API 直接拒绝。无效组合
-        # 在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本
-        replay_count = config.reward.disc_batch_size_k // 2
-        if replay_count < 1:
-            raise ValueError(
-                f"回放供给不足：disc_batch_size_k={config.reward.disc_batch_size_k}"
-                " 的回放半区为 0 条（K 须 ≥2）"
-            )
-        if config.reward.replay_buffer_capacity // 2 < replay_count:
-            raise ValueError(
-                "回放供给不足：replay_buffer_capacity="
-                f"{config.reward.replay_buffer_capacity} 的 base 分区仅 "
-                f"{config.reward.replay_buffer_capacity // 2} 条，不足以承担"
-                f"首次判别器更新的回放半区 {replay_count} 条"
-                f"（disc_batch_size_k={config.reward.disc_batch_size_k}）"
-            )
+        # 回放供给装配期守卫（ADR-0008 决策 4，预训练 driver 同口径）：
+        # 回放半区非零 + base 分区每条件配额 ≥ 回放半区需求（首次判别器
+        # 更新时近期分区为空，按条件过滤的回放全量由 base 承担；无效
+        # 组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本）
+        assert_replay_supply(config.reward)
         self.config = config
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
@@ -306,14 +298,16 @@ class GranularGrpoTrainer:
 
     def seed_base_partition(self) -> torch.Tensor:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
-        （未参与任何梯度步）rollout 产出填满 per-rank base 分区（spec
-        补钉；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。
+        （未参与任何梯度步）rollout 产出按每条件配额填满 per-rank base
+        分区（spec 补钉 + ADR-0008-01：每条件配额量产、条目带目标模态
+        标签；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。
         返回量产的样本批（RM readiness gate 重算的 fake 侧输入——同
         一批量产既是 buffer 种子又是门槛重算口径，不二次消耗 RNG 流）。"""
-        base_fakes = self.loop.base_partition_samples(
-            self.rewards.buffer.base_capacity,
+        quota = base_condition_quota(
+            self.config.reward.replay_buffer_capacity,
         )
-        self.rewards.seed_base(base_fakes)
+        base_fakes, modalities = self.loop.base_partition_samples(quota)
+        self.rewards.seed_base(base_fakes, modalities)
         return base_fakes
 
     def run(self) -> int:
@@ -377,9 +371,11 @@ class GranularGrpoTrainer:
                 record.new_fakes, record.modality,
             )
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
-            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）
+            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）；
+            # 本 iteration 的目标模态随 fake 批穿入——回放按条件过滤
+            # （ADR-0008 决策 2），real 侧条件匹配归 ADR-0008-03
             report = (
-                self.rewards.update_step(record.new_fakes)
+                self.rewards.update_step(record.new_fakes, record.modality)
                 if iteration % update_interval == 0 else None
             )
             if report is not None:

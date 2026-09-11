@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader
+from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import IterationLoop, PretrainEvent, RunArtifacts
@@ -175,7 +175,7 @@ class TestResumeStateChecklist:
         state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 2
+        assert state["format_version"] == 3
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
         assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
@@ -197,9 +197,16 @@ class TestResumeStateChecklist:
             assert optimizer_state, name
             assert "exp_avg" in next(iter(optimizer_state.values()))
 
-        # buffer 两区：base 满容量（64//2），recent = |M|×G×|Λ| + anchor = 25
-        assert state["replay_buffer"]["base"].shape == (32, 4, 16, 16, 8)
-        assert state["replay_buffer"]["recent"].shape == (25, 4, 16, 16, 8)
+        # buffer 两区（v3：条目带目标模态标签，latents + modalities 成对）：
+        # base 满容量（64//2）且每条件配额分布，recent = |M|×G×|Λ| + anchor = 25
+        base = state["replay_buffer"]["base"]
+        assert base["latents"].shape == (32, 4, 16, 16, 8)
+        assert len(base["modalities"]) == 32
+        assert set(base["modalities"]) == set(MODALITIES)  # 配额量产全条件覆盖
+        recent = state["replay_buffer"]["recent"]
+        assert recent["latents"].shape == (25, 4, 16, 16, 8)
+        assert len(recent["modalities"]) == 25
+        assert all(m in MODALITIES for m in recent["modalities"])
 
         # RNG：六条命名流 + 全局 torch/numpy/python（fixture CPU 无 CUDA）
         assert set(state["generators"]) == {
@@ -521,3 +528,23 @@ class TestResumeGuards:
         result = scenario.resume()
         assert result.code == 2
         assert "CUDA" in result.stderr
+
+    def test_resume_rejects_legacy_v2_shard(self, scenario: TrainingLoopScenario) -> None:
+        """ADR-0008-01：旧格式（v2，replay buffer 为裸 latent 分区、条目
+        不带来源标签）分片被版本对账显式拒绝——跨口径续训不可恢复
+        （恢复后回放采样无法按条件过滤），报错须指向格式口径变更。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        state = scenario.resume_state()
+        # 回写成 v2 形态：分区 = 裸 tensor、format_version = 2
+        legacy = dict(state)
+        legacy["format_version"] = 2
+        legacy["replay_buffer"] = {
+            "base": state["replay_buffer"]["base"]["latents"],
+            "recent": state["replay_buffer"]["recent"]["latents"],
+        }
+        torch.save(legacy, scenario.run_dir / RESUME_STATE)
+        result = scenario.resume()
+        assert result.code == 2
+        assert "格式版本" in result.stderr
+        assert "ADR-0008" in result.stderr

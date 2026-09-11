@@ -5,6 +5,9 @@ fake 源（Fixture 策略）：固定 seed + 预置固定 fake + policy 不参�
 （等效 policy lr=0）——OnlineUpdate 的 fake 批由调用方注入（生产 =
 policy rollout 输出，fixture = 预置固定 latent 批），一步 = 采 real 批 →
 混采 fake 批 → LSGAN loss → AdamW step → 当前 fake push 入近期分区。
+
+ADR-0008-01：step 穿本 iteration 目标模态——回放半区按该条件过滤，
+入区 fake 带同标签（real 侧条件匹配归 ADR-0008-03）。
 """
 
 import json
@@ -13,7 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import CynosureConfig
+from cynosure.config import MODALITIES, CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
@@ -109,8 +112,11 @@ class UpdateScenario:
 
     def update(self) -> tuple[OnlineUpdate, ReplayBuffer]:
         buffer = ReplayBuffer(self.config.reward.replay_buffer_capacity)
-        buffer.fill_base(self.fakes(32, seed=11))
-        buffer.push(self.fakes(12, seed=22))  # 预填 recent：混采即可 1+1
+        buffer.fill_base(
+            self.fakes(32, seed=11),
+            [MODALITIES[i % 4] for i in range(32)],  # 每模态 8 条
+        )
+        buffer.push(self.fakes(12, seed=22), "t2w")  # 预填 recent：混采即可 1+1
         pool = LatentManifest.load(self.pool_path, kind="real_pool")
         update = OnlineUpdate(
             scorer=self.scorer(),
@@ -131,14 +137,14 @@ class TestMixComposition:
     def test_half_current_half_replay(self, scenario: UpdateScenario) -> None:
         """AC：混采占比 50/50（K=4 → 2 当前 + 2 回放）。"""
         update, _ = scenario.update()
-        report = update.step(scenario.fakes(12))
+        report = update.step(scenario.fakes(12), "t2w")
         assert report.num_current == 2
         assert report.num_replay == 2
 
     def test_replay_half_split_across_zones(self, scenario: UpdateScenario) -> None:
         """AC：回放半区跨两区均匀（K=4 → base 1 + recent 1）。"""
         update, _ = scenario.update()
-        report = update.step(scenario.fakes(12))
+        report = update.step(scenario.fakes(12), "t2w")
         assert report.num_base_replay == 1
         assert report.num_recent_replay == 1
 
@@ -147,11 +153,35 @@ class TestMixComposition:
         update, buffer = scenario.update()
         fakes = scenario.fakes(12)
         recent_before = buffer.zone_sizes().recent
-        update.step(fakes)
+        update.step(fakes, "t2w")
         assert buffer.zone_sizes().recent == recent_before + 12
         assert any(
-            torch.equal(fakes[0], sample) for sample in buffer.recent_samples()
+            torch.equal(fakes[0], entry.latent)
+            for entry in buffer.recent_samples()
         )
+
+    def test_step_labels_pushed_fakes_with_condition(self, scenario: UpdateScenario) -> None:
+        """ADR-0008-01：入区 fake 带本 iteration 条件标签（目标模态）。"""
+        update, buffer = scenario.update()
+        update.step(scenario.fakes(12), "t1n")
+        pushed = buffer.recent_samples()[-12:]
+        assert all(entry.modality == "t1n" for entry in pushed)
+
+    def test_replay_draw_carries_condition_labels(self, scenario: UpdateScenario) -> None:
+        """ADR-0008-01：回放采样结果的标签观测与过滤条件一致。"""
+        update, _ = scenario.update()
+        draw = update.buffer.sample_replay(
+            2, scenario.generator(9), "t2w",
+        )
+        assert draw.modalities == ["t2w", "t2w"]
+
+    def test_replay_shortage_raises_for_condition(self, scenario: UpdateScenario) -> None:
+        """ADR-0008-01：该条件回放候选不足显式拒绝（可区分于总数不足，
+        绝不静默回退全池混采）——recent 预填的 t2w 不在 t1n 候选内。"""
+        update, _ = scenario.update()
+        with pytest.raises(ValueError, match="t1n"):
+            # base 每条件 8 条：需求 9 超出 t1n 候选（base 8 + recent 0）
+            update.buffer.sample_replay(9, scenario.generator(9), "t1n")
 
 
 class TestUpdateStep:
@@ -160,7 +190,7 @@ class TestUpdateStep:
     ) -> None:
         """loss = mean((D(real)−1)²) + mean(D(fake)²)：报告两项分解一致。"""
         update, _ = scenario.update()
-        report = update.step(scenario.fakes(12))
+        report = update.step(scenario.fakes(12), "t2w")
         assert report.loss_discriminator == pytest.approx(
             report.loss_real_term + report.loss_fake_term, abs=1e-6,
         )
@@ -192,7 +222,7 @@ class TestUpdateStep:
             p for p in update.scorer.discriminator.parameters() if p.ndim == 5
         )
         before = weight.detach().clone()
-        update.step(scenario.fakes(12))
+        update.step(scenario.fakes(12), "t2w")
         assert not torch.equal(before, weight.detach())
 
     def test_identical_generator_sequences_reproduce_losses(
@@ -201,8 +231,8 @@ class TestUpdateStep:
         """固定 seed + 预置固定 fake：同场景重放 → 损失轨迹逐位一致。"""
         first, _ = scenario.update()
         second, _ = scenario.update()
-        losses_first = [first.step(scenario.fakes(12)).loss_discriminator for _ in range(3)]
-        losses_second = [second.step(scenario.fakes(12)).loss_discriminator for _ in range(3)]
+        losses_first = [first.step(scenario.fakes(12), "t2w").loss_discriminator for _ in range(3)]
+        losses_second = [second.step(scenario.fakes(12), "t2w").loss_discriminator for _ in range(3)]
         assert losses_first == pytest.approx(losses_second)
 
     def test_real_batch_comes_from_pool(self, scenario: UpdateScenario) -> None:
@@ -228,7 +258,7 @@ class TestLossDecreases:
         （尾半段均值 < 头半段均值，且末步 < 首步）。"""
         update, _ = scenario.update()
         fakes = scenario.fakes(12)
-        losses = [update.step(fakes).loss_discriminator for _ in range(30)]
+        losses = [update.step(fakes, "t2w").loss_discriminator for _ in range(30)]
         half = len(losses) // 2
         assert losses[-1] < losses[0]
         assert sum(losses[half:]) / half < sum(losses[:half]) / half

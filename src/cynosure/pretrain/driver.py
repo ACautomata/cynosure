@@ -25,7 +25,7 @@ import time
 
 import torch
 
-from cynosure.config import CynosureConfig
+from cynosure.config import CynosureConfig, Modality
 from cynosure.distributed import DistributedContext
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
@@ -34,6 +34,7 @@ from cynosure.pretrain.artifacts import (
     PretrainReport,
     PretrainRun,
 )
+from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
 from cynosure.train.artifacts import PretrainEvent
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
@@ -55,10 +56,11 @@ class PretrainDriver:
         self._config = config
         self._run = run
         reward = config.reward
-        # 装配守卫（train 循环同款先例：无效组合在装配期显式拒绝，而非
-        # 让昂贵 rollout 先行、更新时才缺样本）：每步量产的 fake 须覆盖
-        # 判别器更新批的当前半区；回放半区须非空且 base 分区足以承担
-        # 首次更新的回放需求（首次更新时近期分区为空）
+        # 装配守卫（train 装配同口径，ADR-0008 决策 4：assert_replay_supply
+        # 管回放半区非零 + base 分区每条件配额 ≥ 回放半区需求）+ 预训练
+        # 特有守卫：每步量产的 fake 须覆盖判别器更新批的当前半区——
+        # 无效组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本
+        assert_replay_supply(reward)
         current_count = math.ceil(
             reward.disc_batch_size_k * reward.replay_current_fraction,
         )
@@ -67,19 +69,6 @@ class PretrainDriver:
                 f"预训练 fake 批量 {reward.pretrain_fake_batch} 不足判别器"
                 f"更新批的当前半区 {current_count} 条"
                 f"（disc_batch_size_k={reward.disc_batch_size_k}）"
-            )
-        replay_count = reward.disc_batch_size_k - current_count
-        if replay_count < 1:
-            raise ValueError(
-                f"回放供给不足：disc_batch_size_k={reward.disc_batch_size_k}"
-                " 的回放半区为 0 条（K 须 ≥2）"
-            )
-        if reward.replay_buffer_capacity // 2 < replay_count:
-            raise ValueError(
-                "回放供给不足：replay_buffer_capacity="
-                f"{reward.replay_buffer_capacity} 的 base 分区仅 "
-                f"{reward.replay_buffer_capacity // 2} 条，不足以承担"
-                f"首次判别器更新的回放半区 {replay_count} 条"
             )
         # 单进程执行：无 torchrun 环境下 bootstrap 为 world-1 恒等
         # （不初始化进程组），集合通信原语退化——与 train 同一条装配序
@@ -132,37 +121,39 @@ class PretrainDriver:
         达标，报告值取两次较小者——producer 侧成功判据对单批测量噪声
         鲁棒，train 侧按独立采样的重算不再与非确定性拒绝耦合）或步数
         上限，产出判别器 checkpoint 与预训练报告（产物全局唯一：单进程
-        唯一写者）。"""
+        唯一写者）。
+
+        每步先采一个条件、量产该条件的 fake 批（ADR-0008-03 的最小诚实
+        形态：update_step 的回放按本步条件过滤，混采量产批没有诚实标签
+        可穿；轮转调度与 per-condition AUC 归因归 ADR-0008-04）。"""
         reward = self._config.reward
-        batch = reward.pretrain_fake_batch
         gate = reward.pretrain_gate_auc
         self._policy.eval_phase()  # 冻结 base 的 rollout（执行序第 1 相口径）
         self._rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
-        # buffer base 分区由冻结初始 policy 产出填充（与在线期同源：base
-        # 分区采样入口；预训练期无「当前 policy」，混采语义退化为 base
-        # fake 库内采样）
-        self._rewards.seed_base(
-            self._rollout.base_partition_samples(
-                self._rewards.buffer.base_capacity,
-            ),
-        )
+        # buffer base 分区由冻结初始 policy 产出按每条件配额填充（与在线期
+        # 同源：base 分区采样入口；条目带目标模态标签——ADR-0008-01）
+        quota = base_condition_quota(reward.replay_buffer_capacity)
+        base_fakes, base_modalities = self._rollout.base_partition_samples(quota)
+        self._rewards.seed_base(base_fakes, base_modalities)
         steps_completed = 0
         gate_passed = False
         final_auc = 0.0
+        modality: Modality | None = None
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
-            fakes = self._rollout.base_partition_samples(batch)
+            _, modality = self._policy.conditions.sample()
+            fakes = self._measurement_batch(modality)
             auc = self._rewards.auc.compute(fakes)  # 更新前快照（在线期口径）
             if auc >= gate:
                 # 达标不复停（复测确认语义见 run() docstring）
                 confirm = self._rewards.auc.compute(
-                    self._rollout.base_partition_samples(batch),
+                    self._measurement_batch(modality),
                 )
                 if confirm >= gate:
                     final_auc = min(auc, confirm)  # 保守口径：两次取小
                     gate_passed = True
                     break
-            update = self._rewards.update_step(fakes)
+            update = self._rewards.update_step(fakes, modality)
             zones = self._rewards.buffer.zone_sizes()
             self._run.append_event(PretrainEvent(
                 step=step,
@@ -176,11 +167,23 @@ class PretrainDriver:
             steps_completed = step + 1
         if not gate_passed:
             # 步数上限耗尽：补测落盘权重的 held-out AUC（循环内最后一次
-            # 测得值属于更新前的上一份权重，与 checkpoint 不同快照）
+            # 测得值属于更新前的上一份权重，与 checkpoint 不同快照）。
+            # 条件用循环最后一步的采样值——补测批与循环批同条件，不引入
+            # 第三个条件口径（pretrain_max_steps ≥ 1 config ge=1 保证，
+            # 走到此处循环至少执行一步，modality 非空）
+            assert modality is not None
             final_auc = self._rewards.auc.compute(
-                self._rollout.base_partition_samples(batch),
+                self._measurement_batch(modality),
             )
         return self._finalize(steps_completed, final_auc, gate_passed)
+
+    def _measurement_batch(self, modality: Modality) -> torch.Tensor:
+        """单条件量产一批 fake（gate 测量/复测/补测共用入口）：update_step
+        的回放按本步条件过滤，测量批与更新批同条件——混采量产批没有诚实
+        标签可穿（ADR-0008-03 的最小诚实形态）。"""
+        return self._rollout.base_partition_samples(
+            {modality: self._config.reward.pretrain_fake_batch},
+        )[0]
 
     def _finalize(
         self, steps_completed: int, final_auc: float, gate_passed: bool,

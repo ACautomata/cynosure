@@ -34,6 +34,7 @@ from cynosure.pretrain import (
     PretrainRun,
 )
 from cynosure.reward.artifacts import ChannelStats
+from cynosure.reward.buffer import base_condition_quota
 from cynosure.train import (
     AmpContext,
     GranularGrpoTrainer,
@@ -322,8 +323,8 @@ class TestRecomputeConsistency:
 
         gate=0.01 恒 0 步达标：报告值 = 达标测量与复测（两批独立
         测量取小——producer 侧成功判据对单批测量噪声鲁棒）中较小者；
-        消耗序确定（seed_base 的 base 分区抽取 → 达标测量批 → 复测
-        批）。"""
+        消耗序确定（ADR-0008-01：base 分区按每条件配额量产 → 本步
+        条件采样 → 单条件量产测量批 → 复测批）。"""
         scenario = GateScenario(cli, tmp_path)
         scenario.write_inputs()
         result = scenario.pretrain(pretrain_gate_auc=0.01)
@@ -331,8 +332,8 @@ class TestRecomputeConsistency:
         report = scenario.report()
         assert report.steps_completed == 0
         config = ConfigLoader.load(scenario.config_path)
-        # 与 scenario.pretrain 同套轻量五元组（重演消耗序的前提：fake 批
-        # /缓冲容量/LR 一致；单点定义避免两处漂移）
+        # 与 scenario.pretrain 同套轻量五元组（重演消耗序的前提：fake 批 /
+        # 缓冲容量/LR 一致；单点定义避免两处漂移）
         pretrain_config = PretrainLightweightReward.apply(config)
         run = PretrainRun.init(
             pretrain_config, tmp_path / "replay_run",
@@ -346,16 +347,18 @@ class TestRecomputeConsistency:
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         live = NetworkAssembler.loadable_state_dict(driver.rewards.discriminator)
         assert all(torch.equal(restored[key], live[key]) for key in restored)
-        # 消耗序重演：先 base 分区（seed_base）、再达标测量批、再复测批
-        # → 同流同批；报告值 = 两次独立测量的较小者
-        driver.rollout.base_partition_samples(
-            driver.rewards.buffer.base_capacity,
-        )
+        # 消耗序重演：先 base 分区（每条件配额量产）、再本步条件采样 +
+        # 单条件量产测量批、再复测批（同条件）→ 同流同批；报告值 =
+        # 两次独立测量的较小者
+        quota = base_condition_quota(pretrain_config.reward.replay_buffer_capacity)
+        driver.rollout.base_partition_samples(quota)
+        batch = pretrain_config.reward.pretrain_fake_batch
+        _, modality = driver.policy.conditions.sample()
         first = driver.rewards.auc.compute(
-            driver.rollout.base_partition_samples(4),
+            driver.rollout.base_partition_samples({modality: batch})[0],
         )
         second = driver.rewards.auc.compute(
-            driver.rollout.base_partition_samples(4),
+            driver.rollout.base_partition_samples({modality: batch})[0],
         )
         assert report.final_heldout_auc == pytest.approx(
             min(first, second), rel=0.0, abs=0.0,

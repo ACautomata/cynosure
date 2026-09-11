@@ -25,17 +25,24 @@ import torch
 from cynosure.config import ConfigLoader, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.policy.condition import ModalityMapping
+from cynosure.policy.condition import (
+    CONDITION_SPACING_X1E2,
+    ModalityMapping,
+)
 from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.buffer import ReplayBuffer
+from cynosure.reward.buffer import ReplayBuffer, ReplayEntry, base_condition_quota
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
-from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
+from cynosure.train.rollout import (
+    CrossModalConditionSampler,
+    ModalLabelConditionSampler,
+    SourceLatentPool,
+)
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -312,7 +319,7 @@ class TestSingleIterationLoop:
         assert set(saved.keys()) == set(live.state_dict().keys())
         assert any(".parametrizations." in key for key in saved)
         live.eval()
-        sample = trainer.rewards.buffer.recent_samples()[0].unsqueeze(0)
+        sample = trainer.rewards.buffer.recent_samples()[0].latent.unsqueeze(0)
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
         )
@@ -424,12 +431,12 @@ class TestSingleIterationLoop:
     def test_replay_capacity_guard_rejects_undersized_combinations(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """回放供给跨字段守卫（装配期 fail-fast）：首次判别器更新时近期
-        分区为空、回放半区全由 base 分区承担（floor(K/2) 条）——
-        ``capacity//2 < floor(K/2)`` 的组合（如 K=4/capacity=2）在昂贵
-        rollout 完成后才会缺样本炸掉；K=1 则回放半区为 0 条、回放采样
-        API 直接拒绝。两类 schema 合法但集成无效的组合在装配期显式
-        拒绝。"""
+        """回放供给装配期守卫（ADR-0008 决策 4，fail-fast）：首次判别器
+        更新时近期分区为空、回放半区全由 base 分区按条件承担——
+        ``每条件配额 < 回放半区需求`` 的组合（如 K=4/capacity=2，配额
+        0 < 2）在昂贵 rollout 完成后才会缺样本炸掉；K=1 则回放半区为
+        0 条、回放采样 API 直接拒绝。两类 schema 合法但集成无效的组合
+        在装配期显式拒绝。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["disc_batch_size_k"] = 4
@@ -730,6 +737,81 @@ class TestCrossModalPairSampling:
                 torch.device("cpu"),
             )
 
+    def test_sample_target_draws_source_for_fixed_target(self, tmp_path: Path) -> None:
+        """ADR-0008-01：base 配额量产的条件源——目标端固定为指定模态
+        （label 恒为 target），源序列自由度仍按组2 分布在合法源上
+        均匀抽取（12 对中目标端为 target 的 3 个源全覆盖）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        targets = {modality: set() for modality in MODALITIES}
+        for target in MODALITIES:
+            for _ in range(60):
+                condition = sampler.sample_target(target)
+                label = int(condition.label[0].item())
+                mapped = {
+                    label_value: name
+                    for name, label_value in FIXTURE_MODALITY_MAPPING.items()
+                }[label]
+                source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+                assert mapped == target  # 目标端恒为指定模态
+                assert source != target  # 有序对不自配对
+                targets[target].add(source)
+        for target in MODALITIES:
+            # 目标端为 target 的 3 个源序列都被真实走到
+            assert targets[target] == set(MODALITIES) - {target}
+
+    def test_sample_target_rejects_unknown_target(self, tmp_path: Path) -> None:
+        """注入清单无目标端为 target 的有序对（cross_modal_pairs 可配置）：
+        显式拒绝而非静默回退全目标采样。"""
+        torch.manual_seed(0)
+        pool_path = self._write_identifiable_pool(tmp_path)
+        pool = SourceLatentPool(
+            LatentManifest.load(pool_path, kind="real_pool"), torch.device("cpu"),
+        )
+        pairs = [("t1n", "t1c"), ("t1c", "t1n")]  # 仅两对，t2w/t2f 不作目标
+        sampler = CrossModalConditionSampler(
+            ModalityMapping(dict(FIXTURE_MODALITY_MAPPING)),
+            pairs,
+            pool,
+            torch.Generator().manual_seed(1),
+            torch.device("cpu"),
+        )
+        with pytest.raises(ValueError, match="t2w"):
+            sampler.sample_target("t2w")
+
+
+class TestModalLabelTargetSampling:
+    """组1 条件分布的 sample_target（ADR-0008-01：base 配额量产的条件源）。"""
+
+    def test_sample_target_binds_label_to_target(self) -> None:
+        """label 条件不耗 RNG（label 由 target 决定）：给定目标序列
+        构造的条件 label 恒为映射值、spacing 为单位间距常量。"""
+        mapping = ModalityMapping(dict(FIXTURE_MODALITY_MAPPING))
+        device = torch.device("cpu")
+        sampler = ModalLabelConditionSampler(
+            mapping, torch.Generator().manual_seed(0), device,
+        )
+        for target in MODALITIES:
+            condition = sampler.sample_target(target)
+            assert int(condition.label[0].item()) == FIXTURE_MODALITY_MAPPING[target]
+            assert tuple(condition.spacing[0].tolist()) == CONDITION_SPACING_X1E2
+
+    def test_sample_target_ignores_stream(self) -> None:
+        """组1 的 sample_target 不消耗传入流：base 量产的 RNG 消耗
+        全部来自初始噪声（条件无随机自由度）。"""
+        mapping = ModalityMapping(dict(FIXTURE_MODALITY_MAPPING))
+        sampler = ModalLabelConditionSampler(
+            mapping, torch.Generator().manual_seed(0), torch.device("cpu"),
+        )
+        stream = torch.Generator().manual_seed(3)
+        before = stream.get_state()
+        sampler.sample_target("t2w", stream)
+        assert torch.equal(before, stream.get_state())
+
 
 class RecordingScorer:
     """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""
@@ -751,7 +833,9 @@ class RecordingUpdate:
         self.received: list[torch.Tensor] = []
         self.training_at_call: list[bool] = []
 
-    def step(self, current_fakes: torch.Tensor) -> UpdateReport:
+    def step(
+        self, current_fakes: torch.Tensor, modality: str,
+    ) -> UpdateReport:
         self.received.append(current_fakes)
         self.training_at_call.append(self.scorer.discriminator.training)
         return UpdateReport(
@@ -797,7 +881,7 @@ class TestDiscriminatorSideOrchestration:
             generator=torch.Generator().manual_seed(11),
         )
         fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
-        coordinator.update_step(fakes)
+        coordinator.update_step(fakes, "t2w")
         received = update.received[0]
         expected_perm = torch.randperm(
             6, generator=torch.Generator().manual_seed(11),
@@ -821,7 +905,7 @@ class TestDiscriminatorSideOrchestration:
         trainer = GranularGrpoTrainer(config, artifacts)
         assert trainer.run() == 1
         assert trainer.rewards.discriminator.training is False
-        sample = trainer.rewards.buffer.recent_samples()[0]
+        sample = trainer.rewards.buffer.recent_samples()[0].latent
         scorer = trainer.rewards.update.scorer
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
@@ -910,7 +994,7 @@ class TestDevicePlacement:
             config, artifacts, device=torch.device("cpu"),
         )
         trainer.seed_base_partition()
-        sample = trainer.rewards.buffer.base_samples()[0]
+        sample = trainer.rewards.buffer.base_samples()[0].latent
         assert sample.device.type == "cpu"
         assert trainer.rewards.update.scorer.reward(
             sample.unsqueeze(0),
@@ -918,7 +1002,8 @@ class TestDevicePlacement:
 
 
 class TestBufferBaseSeeding:
-    """AC 5：buffer base 分区在 train 启动时由冻结初始 policy 自动生成。"""
+    """AC 5 + ADR-0008-01：buffer base 分区在 train 启动时由冻结初始
+    policy 按每条件配额自动生成，条目带目标模态标签。"""
 
     def test_base_partition_filled_before_first_iteration(
         self, scenario: TrainingLoopScenario,
@@ -935,8 +1020,38 @@ class TestBufferBaseSeeding:
         assert sizes.base == trainer.rewards.buffer.base_capacity
         base = trainer.rewards.buffer.base_samples()
         assert len(base) == sizes.base
-        assert all(torch.isfinite(sample).all() for sample in base)
+        assert all(torch.isfinite(entry.latent).all() for entry in base)
         assert sizes.recent == 0  # base 生成不进近期分区
+
+    def test_base_partition_seeded_by_per_condition_quota(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ADR-0008-01 AC 3：base 分区按每条件配额量产——每目标模态
+        的条目数恰为配额（回放条件过滤后每条件候选的供给根基）。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        trainer.seed_base_partition()
+        quota = base_condition_quota(config.reward.replay_buffer_capacity)
+        assert trainer.rewards.buffer.zone_modalities().base == quota
+
+    def test_base_partition_entries_carry_target_labels(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ADR-0008-01 AC 1：base 分区观测面（快照）带目标模态标签——
+        每条目为 ReplayEntry，标签 ∈ MODALITIES、按配额分布。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        trainer.seed_base_partition()
+        entries = trainer.rewards.buffer.base_samples()
+        assert all(isinstance(entry, ReplayEntry) for entry in entries)
+        assert all(entry.modality in MODALITIES for entry in entries)
+        assert {
+            modality for entry in entries for modality in [entry.modality]
+        } == set(MODALITIES)
 
     def test_base_partition_samples_differ_from_post_training_fakes(
         self, scenario: TrainingLoopScenario,
@@ -957,7 +1072,7 @@ class TestBaseSeedingIsolation:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """base seeding 走独立派生 generator：base seeding 消耗的条件/
-        噪声抽取数由 replay_buffer_capacity 决定——与训练 rollout 共用
+        噪声抽取数随 replay_buffer_capacity 决定——与训练 rollout 共用
         流时，改 buffer 容量（保持 schedule.seed）会漂移后续全部 rollout
         抽样（modality、初始噪声、SDE 方向），buffer 容量实验与 policy
         样本流混淆（不同 capacity 的同 seed run 不可比）。"""

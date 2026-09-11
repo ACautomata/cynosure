@@ -110,9 +110,16 @@ class RewardFixtureScenario:
             config.reward.heldout_real_manifest, kind="heldout_real",
         )
         buffer = ReplayBuffer(config.reward.replay_buffer_capacity)
-        buffer.fill_base(self.fake_batches(
-            count=1, batch=buffer.base_capacity, seed=100,
-        )[0])
+        # fixture 无条件语义（固定 fake 批、事件 modality 恒 t1n）：base
+        # 标签同口径全 t1n——回放条件过滤的候选池与既有两区语义等价，
+        # 训练轨迹不因标签切分漂移（混合标签的条件过滤行为由
+        # test_replay_buffer 专门覆盖）
+        buffer.fill_base(
+            self.fake_batches(
+                count=1, batch=buffer.base_capacity, seed=100,
+            )[0],
+            ["t1n"] * buffer.base_capacity,
+        )
         update = OnlineUpdate(
             scorer=scorer,
             buffer=buffer,
@@ -143,7 +150,9 @@ class RewardFixtureScenario:
         assert components is not None
         fakes = self.fake_batches(NUM_STEPS, FAKE_BATCH, seed=300)
         for iteration, fake_batch in enumerate(fakes):
-            report = components.update.step(fake_batch)
+            # fixture 固定 fake 批无生产条件——整批按事件口径标 t1n
+            # （ADR-0008-01 后 step 须穿条件：回放过滤与入区标签的来源）
+            report = components.update.step(fake_batch, "t1n")
             rewards = components.scorer.reward(fake_batch)
             auc = components.auc.compute(fake_batch)
             components.run_artifacts.append_event(IterEvent(
@@ -203,12 +212,16 @@ class TestFixtureAcceptance:
         self, scenario: RewardFixtureScenario,
     ) -> None:
         """AC 3：base 分区内容不变、近期分区 FIFO 滚动、混采 50/50、
-        回放半区跨两区均匀。"""
+        回放半区跨两区均匀（条目观测面为带标签 ReplayEntry）。"""
         components = scenario.assemble()
         assert components is not None
-        base_before = [t.clone() for t in components.buffer.base_samples()]
+        base_before = [
+            entry.latent.clone() for entry in components.buffer.base_samples()
+        ]
         scenario.run_loop()
-        base_after = [t.clone() for t in components.buffer.base_samples()]
+        base_after = [
+            entry.latent.clone() for entry in components.buffer.base_samples()
+        ]
         assert all(
             torch.equal(a, b) for a, b in zip(base_before, base_after)
         )  # base 固定
@@ -216,9 +229,16 @@ class TestFixtureAcceptance:
         batches = scenario.fake_batches(NUM_STEPS, FAKE_BATCH, seed=300)
         recent = components.buffer.recent_samples()
         assert len(recent) == components.buffer.recent_capacity
-        assert all(torch.equal(recent[i], batches[197][4 + i]) for i in range(8))
-        assert all(torch.equal(recent[8 + i], batches[198][i]) for i in range(12))
-        assert all(torch.equal(recent[20 + i], batches[199][i]) for i in range(12))
+        assert all(
+            torch.equal(recent[i].latent, batches[197][4 + i]) for i in range(8)
+        )
+        assert all(
+            torch.equal(recent[8 + i].latent, batches[198][i]) for i in range(12)
+        )
+        assert all(
+            torch.equal(recent[20 + i].latent, batches[199][i]) for i in range(12)
+        )
+        assert all(entry.modality == "t1n" for entry in recent)
         # 混采占比（每步 report 断言 2/2 与 1/1，此处抽查落盘占比）
         events = components.run_artifacts.read_events()
         assert events[0]["buffer_current_fraction"] == pytest.approx(0.5)

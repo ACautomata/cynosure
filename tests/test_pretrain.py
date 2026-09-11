@@ -362,11 +362,12 @@ class PretrainScenario:
         self.config_path = tmp_path / "config.json"
         self.run_dir = tmp_path / "pretrain_run"
         # 报告路径 = run 目录内的契约名（run 目录缺省随它派生）；buffer
-        # 缩小到 8（base 分区 4 ≥ 回放半区 2）：量产启动成本是每用例
-        # 固定开销，容量与判定逻辑无关（生产 64）
+        # 缩小到 16（base 分区 8、每条件配额 2 = 回放半区 2——ADR-0008
+        # 决策 4 装配守卫的下限）：量产启动成本是每用例固定开销，容量
+        # 与判定逻辑无关（生产 64）
         self.config_dict["reward"].update({
             "pretrain_report_json": str(self.run_dir / "pretrain_report.json"),
-            "replay_buffer_capacity": 8,
+            "replay_buffer_capacity": 16,
         })
 
     def write_config(
