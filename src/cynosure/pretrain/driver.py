@@ -154,18 +154,12 @@ class PretrainDriver:
             fakes = self._rollout.base_partition_samples(batch)
             auc = self._rewards.auc.compute(fakes)  # 更新前快照（在线期口径）
             if auc >= gate:
-                # 复测确认：train 侧 gate 按独立采样（base 分区批）对同一
-                # 阈值重算，单批贴线越过的 checkpoint 会被非确定性拒绝——
-                # 换新一批再测，两次独立测量都达标才算 producer 侧通过；
-                # 复测掉线视作测量噪声，继续训练
+                # 达标不复停（复测确认语义见 run() docstring）
                 confirm = self._rewards.auc.compute(
                     self._rollout.base_partition_samples(batch),
                 )
                 if confirm >= gate:
-                    # 报告值取两次独立测量中较小者（保守口径）：报告值
-                    # 达标蕴含「判别力对单批采样噪声鲁棒」——贴线越过
-                    # 不再作为达标判据落盘
-                    final_auc = min(auc, confirm)
+                    final_auc = min(auc, confirm)  # 保守口径：两次取小
                     gate_passed = True
                     break
             update = self._rewards.update_step(fakes)

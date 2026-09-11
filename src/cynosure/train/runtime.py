@@ -124,6 +124,7 @@ class TrainingRuntime:
                 None if resume
                 else PretrainReport.load(config.reward.pretrain_report_json)
             ),
+            resume=resume,
         )
         sampler = cls.assemble_sampler(config, policy.field)
         updater = StepwisePolicyUpdate(
@@ -181,6 +182,8 @@ class TrainingRuntime:
         generators: dict[str, torch.Generator],
         dist: DistributedContext,
         report: PretrainReport | None = None,
+        *,
+        resume: bool = False,
     ) -> RewardCoordinator:
         """判别器侧装配：网络构建 → DDP 副本升级（分布式）→ pool 切片
         （real 侧；held-out 不切）→ Online update / AUC 协作者。
@@ -189,21 +192,23 @@ class TrainingRuntime:
         RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
         同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
 
-        权重来源按语境二分：``report`` 给定（train 新 run 语境）=
+        权重来源按语境三分：``report`` 给定（train 新 run 语境）=
         warm-start 守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告
         checkpoint 严格装载，ADR-0007——RL 不带预训练产物在装配层就
-        无法启动）；``None`` = 冷启动路径（checkpoint 工件或随机初始
-        化），消费方 = 预训练 driver（预训练本身即产物的生产方）与
-        resume 装配（续训分片已含判别器全量状态，占位权重被
-        ``ResumeStore.restore`` 整体覆写——报告在 resume 路径无消费
-        价值，强制装载会让预训练产物被清理的中断 run 不可恢复）。"""
+        无法启动）；``report=None`` + ``resume=False`` = 冷启动路径
+        （``discriminator_ckpt`` 工件装载或随机初始化，消费方 = 预训练
+        driver——预训练本身即产物的生产方）；``resume=True`` = 占位
+        装配（不消费任何 checkpoint 工件，纯随机初始化——续训分片已含
+        判别器全量状态，占位权重被 ``ResumeStore.restore`` 整体覆写；
+        ``discriminator_ckpt`` 即便指向预训练目录，产物清理也不再阻断
+        续训）。"""
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
                 "训练循环需要判别器网络配置（discriminator_config_json）："
                 "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
                 "随机初始化起步的在线训练，冷启动工作流）"
             )
-        scorer = cls._assemble_scorer(config, report)
+        scorer = cls._assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
         update = OnlineUpdate(
@@ -234,7 +239,10 @@ class TrainingRuntime:
 
     @staticmethod
     def _assemble_scorer(
-        config: CynosureConfig, report: PretrainReport | None,
+        config: CynosureConfig,
+        report: PretrainReport | None,
+        *,
+        resume: bool = False,
     ) -> RewardScorer:
         """判别器 scorer 的权重来源分派（见 ``assemble_rewards``）。"""
         if report is not None:
@@ -242,11 +250,12 @@ class TrainingRuntime:
             # （任一不符在装配期拒绝，CLI 层回滚 run 目录）
             report.assert_data_provenance(config)
             return report.load_discriminator(config)
-        # 冷启动：网络构建（随机初始化或 checkpoint 工件装载）在
+        # 冷启动/占位：网络构建（checkpoint 工件装载或随机初始化）在
         # schedule.seed 的派生流下进行，并 fork 隔离全局 RNG——同 config
         # 的两次冷启动判别器权重逐位可复现，且跨 rank 逐位一致（seed
         # 不含 rank 偏移：DDP 装配要求各 rank 初始副本一致）。不扰动
-        # 进程全局 RNG 状态（sampling generators 独立对象本就不受影响）
+        # 进程全局 RNG 状态（sampling generators 独立对象本就不受影响）。
+        # resume 占位不消费任何 checkpoint 工件（权重随恢复整体覆写）
         with torch.random.fork_rng():
             torch.manual_seed(config.schedule.seed + 6)
             return RewardScorer(
@@ -254,7 +263,10 @@ class TrainingRuntime:
                     config=NetworkAssembler.load_json(
                         config.artifacts.discriminator_config_json,
                     ),
-                    checkpoint=config.artifacts.discriminator_ckpt,
+                    checkpoint=(
+                        None if resume
+                        else config.artifacts.discriminator_ckpt
+                    ),
                 ),
                 config.reward,
                 ChannelStats.load(config.reward.channel_stats_json),

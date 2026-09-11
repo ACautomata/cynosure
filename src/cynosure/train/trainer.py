@@ -218,10 +218,9 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
         self.stage_tag = stage if stage is not None else StageTag()
-        # resume 装配开关（与 run 的 resume 参数须一致，错位组合在 run
-        # 显式拒绝）：resume 装配跳过 warm-start 报告装载（续训分片已含
-        # 判别器全量状态，报告无消费价值），判别器占位冷启动装配被
-        # ResumeStore.restore 整体覆写
+        # resume 单点声明（装配与 run 执行共用同一开关）：resume 装配
+        # 跳过 warm-start 报告装载、判别器占位冷启动（不消费任何
+        # checkpoint 工件），权重被 ResumeStore.restore 整体覆写
         self._resume_assembled = resume
         self.runtime = TrainingRuntime.build(
             config, run_artifacts, device=device, dist_context=dist_context,
@@ -317,29 +316,22 @@ class GranularGrpoTrainer:
         self.rewards.seed_base(base_fakes)
         return base_fakes
 
-    def run(self, *, resume: bool = False) -> int:
+    def run(self) -> int:
         """训练主循环：base 分区自动生成 → RM readiness gate（ADR-0007，
         resume 跳过）→ Baseline 采样（rank 0，冻结
         初始 policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停
         判定）→ RL 后重采（rank 0）→ checkpoint 与续训状态落盘。
-        ``resume=True`` 时从 run 目录各 rank 的最新续训状态恢复（全清单
-        覆写，resume 模块），rank 0 回退指标流中恢复点之后的半截事件后
-        从恢复点继续——base 分区种子生成与 Baseline 采样随之跳过（buffer
-        随状态整体回归；Baseline 冻结只采一次，恢复点 policy 已非初始
-        权重）。恢复点已达标（无训练迭代）的续训是完整无操作：不重执行
-        收官重采、不改写任何工件。返回完成的 iteration 数（config 口径
-        的累计完成数；早停时小于 max_iterations；零训练迭代时 = 恢复
-        点）。"""
+        恢复语义由构造的 ``resume`` 单点声明（装配与执行共用同一开关，
+        无双点声明可错位）：resume 构造时从 run 目录各 rank 的最新续训
+        状态恢复（全清单覆写，resume 模块），rank 0 回退指标流中恢复点
+        之后的半截事件后从恢复点继续——base 分区种子生成与 Baseline
+        采样随之跳过（buffer 随状态整体回归；Baseline 冻结只采一次，
+        恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）的续训
+        是完整无操作：不重执行收官重采、不改写任何工件。返回完成的
+        iteration 数（config 口径的累计完成数；早停时小于
+        max_iterations；零训练迭代时 = 恢复点）。"""
         dist = self.runtime.dist
-        if resume != self._resume_assembled:
-            # 错位组合 = 占位装配配门槛检查（构造 resume=True +
-            # run(resume=False) 时 gate 对随机初始化权重重算）或带报告
-            # 装配的恢复（语义矛盾），显式拒绝
-            raise ValueError(
-                f"resume 装配开关与 run 入参不一致（构造 {self._resume_assembled}"
-                f" vs run {resume}）：恢复语义由两处共同声明，错位组合是"
-                "装配契约违反"
-            )
+        resume = self._resume_assembled
         start_iteration = 0
         if resume:
             start_iteration = self.resume_store.restore(self)

@@ -11,7 +11,9 @@ chance 带）互不替代；续训跳过本检查（续训状态已含判别器�
 重算口径与预训练 gate 测量同源（同一 ``HeldOutAuc.compute``、全池
 混采 ``modality=None``——预训练 fake 批跨条件混合，无单一目标序列可
 归因）；同 scorer 快照（warm-start 装载的 checkpoint 权重）+ 同输入
-下重算值与报告 ``final_heldout_auc`` 逐位可比。
+下重算值与预训练任一次测量逐位可比。报告 ``final_heldout_auc`` 是
+达标跨界与换批复测的较小者（保守口径），本 rank 重算（对 base 分区
+批）不复现它也不必复现——门槛判定只依赖本次重算与阈值。
 
 分布式（ADR-0003）：各 rank 的 base fake 独立演化，重算值本 rank
 本地——判定经 all_gather 集合裁决，任一 rank 不达标全体一致拒绝

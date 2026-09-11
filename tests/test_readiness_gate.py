@@ -449,6 +449,29 @@ class TestResumeSkipsGate:
         shutil.rmtree(Path(config.reward.pretrain_report_json).parent)
         assert pretrained.resume().code == 0
 
+    def test_resume_survives_discriminator_ckpt_cleanup(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """resume 占位装配不消费 discriminator_ckpt：旧惯例（config 的
+        判别器 checkpoint 工件指向预训练产物——ADR-0007 之前的消费
+        形态）下清理整个预训练目录（报告 + checkpoint 一并消失），
+        resume 仍可续训；train 语境同不消费该字段（warm-start 权重
+        只经报告装载）。"""
+        config = ConfigLoader.load(pretrained.config_path)
+        report_path = Path(config.reward.pretrain_report_json)
+        ckpt = (
+            report_path.parent / "checkpoints" / "pretrain_discriminator.pt"
+        )
+        assert ckpt.is_file()
+        data = json.loads(
+            pretrained.config_path.read_text(encoding="utf-8"),
+        )
+        data["artifacts"]["discriminator_ckpt"] = str(ckpt)
+        pretrained.config_path.write_text(json.dumps(data), encoding="utf-8")
+        assert pretrained.train().code == 0  # train 不消费 discriminator_ckpt
+        shutil.rmtree(report_path.parent)
+        assert pretrained.resume().code == 0  # 占位装配不读任何工件
+
 
 def _minimal_gate_config() -> CynosureConfig:
     """ReadinessGate 单测的最小 config（只消费 pretrain_gate_auc）。"""

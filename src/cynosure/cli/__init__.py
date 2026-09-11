@@ -273,7 +273,7 @@ class CynosureCli:
                     self._rollback_untouched_run(artifacts)
                 return _EXIT_USAGE_ERROR
             try:
-                completed = trainer.run(resume=resume)
+                completed = trainer.run()
             except (ValueError, FileNotFoundError) as exc:
                 print(f"训练输入契约违反: {exc}", file=self._stderr)
                 if not resume and dist.rank == 0:
