@@ -70,9 +70,13 @@ T2w train 达 176,297 series（留出池 18,609），全取将使 T2w 成为评�
 ## 影像落位（gauss）
 
 - 体数据：`/data72/junran/mrrate_eval_volumes/<batch_id>/<study_uid>/{img,seg}/`
-  （img = 原始 NIfTI；seg = HD-BET brain-mask；zip 拉完即删）
+  （img = 原始 NIfTI；seg = HD-BET brain-mask；zip 拉完即删；**2,514/2,514 卷实得，
+  逐卷 verdict 全 ok**，共 ~28 GB）
 - 逐卷判定：`gauss:/home/junran/mrrate_eval/verdicts.csv`（append-only，续跑点）
 - 下载日志：`gauss:/home/junran/logs/mrrate_eval_download.log`
+- 实得核验：NIfTI 头维度与元数据 `array_shape` 抽查 30/30 一致；唯一非瞬时失败为
+  `batch22/ATCCLTOEBC.zip`（hf-mirror 该 blob 同步缺口，403），改走官方
+  `huggingface.co` 直连成功——将来 top-up 若遇 zip_failed 先疑镜像缺口再疑本地。
 
 ## 复现
 
