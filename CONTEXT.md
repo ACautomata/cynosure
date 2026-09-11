@@ -85,15 +85,23 @@ RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool�
 _Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）
 
 **RM readiness gate（RM 上岗门槛）**:
-RL 启动的硬前置：判别器预训练后 held-out AUC 须出 chance 带并达标，才允许进入 RL 循环；不过线拒绝开跑。
-_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）
+RL 启动的硬前置：判别器预训练后按条件报告 held-out AUC，过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。
+_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）、池化达标（全池单一标量口径，已被按条件取代）
+
+**条件白名单（Condition whitelist）**:
+RM readiness gate 的产物：预训练后逐条件判定的「判别器在该条件上有分辨率」清单。RL 期间它是 policy 更新的按条件开关——名单内正常更新，名单外只跑 rollout 与判别器更新，待其在线判别力出带自动恢复。
+_Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
 
 **Online update（在线更新）**:
 reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking。
 _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 
+**条件匹配采样（Condition-matched sampling）**:
+判别器一步更新的 real 侧与回放半区都按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采喂出的模态分类捷径。
+_Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
+
 **Replay buffer（回放缓冲）**:
-封顶 FIFO 的 fake latent 存库（base 时期 + 近期），更新判别器时按比例混入，防漂移、防灾难性遗忘。
+封顶 FIFO 的 fake latent 存库（base 时期 + 近期），条目带条件标记；更新判别器时按比例混入、回放抽取与本 iteration 条件匹配，防漂移、防灾难性遗忘。
 
 **Reward hacking（奖励攻击）**:
 policy 学会骗过判别器拿高分，而非真正提升样本质量。
