@@ -36,7 +36,12 @@ from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
-from tests.conftest import CliResult, CliSession, FixturePrepareScenario
+from tests.conftest import (
+    CliResult,
+    CliSession,
+    FixturePrepareScenario,
+    apply_pretrain_lightweight_reward,
+)
 
 
 class TrainingLoopScenario:
@@ -85,20 +90,14 @@ class TrainingLoopScenario:
 
     def _pretrain_warm_start(self, config, group: str) -> None:
         """场景的预训练前置：报告落 config 声明的产物路径（train 装配
-        与门槛检查的装载源）。轻量参数只降低本步执行成本、不进训练
+        与门槛检查的装载源）。轻量五元组（``apply_pretrain_lightweight_reward``，
+        含 gate 0.60 留 margin 的 rationale）只降低本步执行成本、不进训练
         config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
-        sequential 组的单次装配）。预训练 gate 抬到 0.60——达标即停
-        让重算值贴着停止阈值，对 train gate（0.51）留出测量噪声的
-        安全 margin。"""
-        pretrain_config = config.model_copy(deep=True)
+        sequential 组的单次装配）。"""
+        pretrain_config = apply_pretrain_lightweight_reward(config)
         pretrain_config.experiment.group = (
             "modal-label" if group == "sequential" else group
         )
-        pretrain_config.reward.pretrain_fake_batch = 4
-        pretrain_config.reward.replay_buffer_capacity = 8
-        pretrain_config.reward.disc_lr = 2e-4
-        pretrain_config.reward.pretrain_gate_auc = 0.60
-        pretrain_config.reward.pretrain_max_steps = 24
         path = self.tmp_path / "pretrain_config.json"
         path.write_text(
             pretrain_config.model_dump_json(indent=2), encoding="utf-8",

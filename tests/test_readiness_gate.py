@@ -15,7 +15,6 @@
   从门槛之上起步。
 """
 
-import copy
 import json
 import re
 import shutil
@@ -43,7 +42,12 @@ from cynosure.train import (
 )
 from cynosure.train.gate import ReadinessGate
 from cynosure.train.rng import TrainingRngStreams
-from tests.conftest import CliResult, CliSession, FixturePrepareScenario
+from tests.conftest import (
+    CliResult,
+    CliSession,
+    FixturePrepareScenario,
+    apply_pretrain_lightweight_reward,
+)
 
 FIXTURE_GATE = 0.51
 """fixture 低阈值（Fixture.config 声明）：chance 带上沿之上、fixture
@@ -118,15 +122,12 @@ class GateScenario:
     def pretrain(self, **reward_overrides) -> CliResult:
         """以 config 的预训练轻量变体跑 pretrain（报告路径 = config 声明）。
 
-        默认把预训练 gate 抬到 0.60：达标即停让重算值贴着停止阈值，
-        对 train gate（0.51）留出测量噪声的安全 margin；显式
+        轻量五元组与 gate 0.60 留 margin 的 rationale 集中在
+        ``apply_pretrain_lightweight_reward``（conftest）；显式
         ``reward_overrides`` 可覆盖（如重演用例的 gate=0.01）。"""
-        config = ConfigLoader.load(self.config_path)
-        config.reward.pretrain_fake_batch = 4
-        config.reward.replay_buffer_capacity = 8
-        config.reward.disc_lr = 2e-4
-        config.reward.pretrain_gate_auc = 0.60
-        config.reward.pretrain_max_steps = 24
+        config = apply_pretrain_lightweight_reward(
+            ConfigLoader.load(self.config_path),
+        )
         for key, value in reward_overrides.items():
             setattr(config.reward, key, value)
         path = self.tmp_path / "pretrain_config.json"
@@ -337,10 +338,9 @@ class TestRecomputeConsistency:
         report = scenario.report()
         assert report.steps_completed == 0
         config = ConfigLoader.load(scenario.config_path)
-        pretrain_config = config.model_copy(deep=True)
-        pretrain_config.reward.pretrain_fake_batch = 4
-        pretrain_config.reward.replay_buffer_capacity = 8
-        pretrain_config.reward.disc_lr = 2e-4
+        # 与 scenario.pretrain 同套轻量五元组（重演消耗序的前提：fake 批
+        # /缓冲容量/LR 一致；单点定义避免两处漂移）
+        pretrain_config = apply_pretrain_lightweight_reward(config)
         run = PretrainRun.init(
             pretrain_config, tmp_path / "replay_run",
         )
@@ -365,7 +365,7 @@ class TestRecomputeConsistency:
             driver.rollout.base_partition_samples(4),
         )
         assert report.final_heldout_auc == pytest.approx(
-            min(first, second), abs=0.0,
+            min(first, second), rel=0.0, abs=0.0,
         )
 
     def test_readiness_gate_uses_full_pool_modality_free_recompute(self) -> None:
@@ -527,7 +527,7 @@ class TestAssemblyCombinationGuard:
 
 def _minimal_gate_config() -> CynosureConfig:
     """ReadinessGate 单测的最小 config（只消费 pretrain_gate_auc）。"""
-    data = copy.deepcopy({
+    data = {
         "experiment": {"group": "modal-label"},
         "latent_shape": [4, 16, 16, 8],
         "fixture_mode": True,
@@ -551,5 +551,5 @@ def _minimal_gate_config() -> CynosureConfig:
             "pretrain_gate_auc": 0.65,
         },
         "schedule": {"seed": 0},
-    })
+    }
     return CynosureConfig.model_validate(data)

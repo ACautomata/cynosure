@@ -270,7 +270,7 @@ class TestScoringPhase:
             for batch in probe.received_batches
         )
         # 等价性参考：同流 real 采样 + 全批单次前向的 AUC（分数拼接在
-        # rank 统计下与分块前向逐位一致）
+        # rank 统计下与分块前向逐位一致——rel=0.0 + abs=0.0 真逐位断言）
         reals = RealPoolSampler(manifest, scenario.generator(1)).sample(
             min(20, len(manifest.entries)), modality=None,
         )
@@ -279,4 +279,4 @@ class TestScoringPhase:
             scorer.patch_logits(reals).flatten(),
             scorer.patch_logits(scenario.fakes(20)).flatten(),
         )
-        assert chunked == pytest.approx(expected, abs=0.0)
+        assert chunked == pytest.approx(expected, rel=0.0, abs=0.0)

@@ -212,9 +212,11 @@ class TrainingRuntime:
             )
         if config.artifacts.discriminator_config_json is None:
             raise ValueError(
-                "训练循环需要判别器网络配置（discriminator_config_json）："
-                "在线 reward model 的装配源（discriminator_ckpt 缺省 = "
-                "随机初始化起步的在线训练，冷启动工作流）"
+                "判别器网络配置缺失（discriminator_config_json）：判别器"
+                "网络构建的统一前提——warm-start 守卫重载（train 新 run）、"
+                "预训练 driver 冷启动、resume 占位装配均经它构建网络"
+                "（ADR-0007 后 train 侧不再有冷启动装配源，"
+                "discriminator_ckpt 仅预训练 driver 冷启动消费）"
             )
         scorer = cls._assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer

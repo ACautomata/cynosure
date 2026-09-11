@@ -1,5 +1,5 @@
 """共享测试夹具：CLI 会话（唯一 seam 驱动器）、合法最小 config 样板、
-合成 BraTS 数据集（fixture 策略）。"""
+合成 BraTS 数据集（fixture 策略）、预训练轻量 reward 变体。"""
 
 import copy
 import io
@@ -208,3 +208,21 @@ class FixturePrepareScenario:
         result = self._cli.run("prepare", "--config", str(config_path))
         assert result.code == 0, result.stderr
         return self._config
+
+
+def apply_pretrain_lightweight_reward(config: CynosureConfig) -> CynosureConfig:
+    """返回 reward 侧设为预训练轻量五元组的 config 副本（``model_copy``，
+    不改入参）：fake 批 4 / 回放容量 8 / 判别器 LR 2e-4 / gate 0.60 /
+    步数上限 24。
+
+    warm-start 前置（ADR-0007）的三处消费方（readiness gate / train loop /
+    trajectory diagnostic）共用同一套取值：轻量参数只降低预训练本步执行
+    成本、不进训练 config；预训练 gate 抬到 0.60——达标即停让重算值贴着
+    停止阈值，对 train gate（0.51）留出测量噪声的安全 margin。"""
+    pretrain = config.model_copy(deep=True)
+    pretrain.reward.pretrain_fake_batch = 4
+    pretrain.reward.replay_buffer_capacity = 8
+    pretrain.reward.disc_lr = 2e-4
+    pretrain.reward.pretrain_gate_auc = 0.60
+    pretrain.reward.pretrain_max_steps = 24
+    return pretrain
