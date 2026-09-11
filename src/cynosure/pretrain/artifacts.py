@@ -9,15 +9,18 @@
   （守卫哲学），判别器形态指纹对照后经 netbuild 严格装载路径还原。
 
 判别器 checkpoint 与训练期产物同构（``NetworkAssembler.loadable_state_dict``
-的可装载 state_dict），下游消费点 = ``NetworkArtifact(checkpoint=...)``
-装配路径（train 侧经 ``artifacts.discriminator_ckpt`` 字段指向）。
+的可装载 state_dict；spectral norm 启用时携带参数化状态，装载面按形态
+分派**逐位还原**——见 ``NetworkAssembler.discriminator``），下游消费点
+= train 新 run 的 warm-start 守卫重载（``PretrainReport.load_discriminator``
+按报告内相对路径还原）；resume 占位装配不消费本产物（随机初始化占位，
+分片恢复覆写）。
 """
 
 import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -26,7 +29,12 @@ from cynosure.config import CynosureConfig
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.scorer import RewardScorer
-from cynosure.train.artifacts import PretrainEvent
+
+if TYPE_CHECKING:
+    # 事件模型在 train.artifacts（指标流事件类型的集中地）；仅作类型标注
+    # 使用——运行时 import 会与 train.runtime 的 PretrainReport 装配依赖
+    # 成环（train 侧 warm-start 装载反向消费本模块）
+    from cynosure.train.artifacts import PretrainEvent
 
 
 class PretrainProvenance(BaseModel):
@@ -80,7 +88,8 @@ class PretrainReport(BaseModel):
     """本次预训练采用的门槛阈值（报告留痕：阈值可配置，跨 run 可比性
     以报告值为准）。"""
     gate_passed: bool
-    """最终 held-out AUC 是否达门槛（False = 步数上限耗尽仍未达标，
+    """上岗判据是否通过：两次独立测量（达标测量 + 换批复测）都达门槛
+    且报告值取两次较小者（False = 步数上限耗尽或复测始终掉线仍未确认，
     checkpoint 仍落盘供诊断；上岗与否由 train 侧重算判定）。"""
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对本报告文件所在目录；可装载
@@ -98,6 +107,45 @@ class PretrainReport(BaseModel):
         report = cls.model_validate(json.loads(path.read_text(encoding="utf-8")))
         report._path = path
         return report
+
+    def assert_data_provenance(self, config: CynosureConfig) -> None:
+        """当前 config 的数据口径与报告对照：不匹配即拒绝。
+
+        latent 形状先行对照（纯内存比较）：口径指纹与判别器形态指纹都
+        不覆盖分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的
+        fake 静默通过 gate 并把错位数据带进在线更新。real pool /
+        held-out manifest / channel stats 任一文件内容与预训练时的指纹
+        不符（manifest 重建、统计量换源）都让上岗判别力与预训练报告
+        脱钩——warm-start 装载前显式拒绝，不给静默错位留缝（判别器
+        形态指纹的对照在 ``load_discriminator``）。
+        """
+        if tuple(config.latent_shape) != self.latent_shape:
+            raise ValueError(
+                f"latent 形状不符：报告 {list(self.latent_shape)}，"
+                f"当前 config {list(config.latent_shape)}（分辨率不在口径"
+                "指纹与网络配置指纹的覆盖面内——预训练与上岗须同一 "
+                "latent 口径）"
+            )
+        checks = (
+            ("real_pool_manifest", config.reward.real_pool_manifest,
+             self.provenance.real_pool_manifest_sha256),
+            ("heldout_real_manifest", config.reward.heldout_real_manifest,
+             self.provenance.heldout_manifest_sha256),
+            ("channel_stats_json", config.reward.channel_stats_json,
+             self.provenance.channel_stats_sha256),
+        )
+        mismatched = []
+        for name, path, recorded in checks:
+            current = PretrainProvenance.digest(path)  # 每工件读盘+哈希一次
+            if current != recorded:
+                mismatched.append(
+                    f"{name}（报告 {recorded[:12]}… ≠ 当前 {current[:12]}…）",
+                )
+        if mismatched:
+            raise ValueError(
+                "预训练数据口径指纹不符（预训练与上岗须同一数据口径）: "
+                + "; ".join(mismatched)
+            )
 
     def load_discriminator(
         self, config: CynosureConfig, device: torch.device | None = None,
@@ -184,7 +232,7 @@ class PretrainRun:
             report=root / "pretrain_report.json",
         )
 
-    def append_event(self, event: PretrainEvent) -> None:
+    def append_event(self, event: "PretrainEvent") -> None:
         """向预训练指标流追加一行 JSON 事件（事件类型与 iter/milestone
         混存同一 metrics.jsonl，event 判别字段区分）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:

@@ -30,6 +30,14 @@ from cynosure.reward.scorer import LatentScorer
 class HeldOutAuc:
     """held-out 判别力监控信号（hacking 签名判定的输入）。"""
 
+    SCORE_CHUNK = 8
+    """打分前向的定块上界（3D 体数/块）：评估批量 = base 分区
+    （capacity//2 体，量产侧限 ``_BASE_BATCH`` 分块生成）或 fake 批，
+    一次性全量前向让激活显存随批量无界增长——训练开始前就可能耗尽
+    加速器。判别器归一化定死 GroupNorm（前向对 batch 维逐样本独立），
+    分块前向与全批逐位等价；AUC 是分数上的 rank 统计，分数级拼接
+    不改变口径。"""
+
     def __init__(
         self,
         heldout_manifest: LatentManifest,
@@ -45,6 +53,15 @@ class HeldOutAuc:
         self._manifest = heldout_manifest
         self._scorer = scorer
         self._real_sampler = RealPoolSampler(heldout_manifest, generator, device)
+
+    def _chunked_logits(self, latents: torch.Tensor) -> torch.Tensor:
+        """分块打分前向（``SCORE_CHUNK`` 定块，分数级拼接）。"""
+        return torch.cat([
+            self._scorer.patch_logits(
+                latents[start:start + self.SCORE_CHUNK],
+            )
+            for start in range(0, latents.shape[0], self.SCORE_CHUNK)
+        ]).flatten()
 
     def compute(
         self, fake_latents: torch.Tensor, modality: Modality | None = None,
@@ -69,8 +86,8 @@ class HeldOutAuc:
             )
         with torch.no_grad():
             reals = self._real_sampler.sample(count, modality=modality)
-            real_scores = self._scorer.patch_logits(reals).flatten()
-            fake_scores = self._scorer.patch_logits(fake_latents).flatten()
+            real_scores = self._chunked_logits(reals)
+            fake_scores = self._chunked_logits(fake_latents)
         return self.auc_from_scores(real_scores, fake_scores)
 
     @staticmethod
@@ -83,9 +100,29 @@ class HeldOutAuc:
         排序 midrank 秩统计实现（与配对枚举口径严格等价）：U = R_real −
         n(n+1)/2，AUC = U/(n·m)；并列块取平均秩（midrank）恰好等价于
         「并列各计 0.5」。秩平方和 ~1e12 在 float64（2^53）内精确。
+
+        非有限分数显式拒绝（本方法是所有消费点的单一闸口）：排序把
+        NaN/Inf 当普通值排（NaN 排尾、+Inf 排头），数值发散或半损坏的
+        判别器因此能伪装出高分（实测全 NaN → 1.5、real 单侧 NaN →
+        0.875），「失明的判别器」反被认证为高判别力——宁可在测量层
+        失败，也不让 gate 拿一个无意义的数做上岗判定。
         """
         if real_scores.numel() == 0 or fake_scores.numel() == 0:
             raise ValueError("AUC 配对统计需要非空 real/fake 分数")
+        if not (
+            torch.isfinite(real_scores).all() and torch.isfinite(fake_scores).all()
+        ):
+            nan_real = int(torch.isnan(real_scores).sum())
+            nan_fake = int(torch.isnan(fake_scores).sum())
+            inf_real = int(torch.isinf(real_scores).sum())
+            inf_fake = int(torch.isinf(fake_scores).sum())
+            raise ValueError(
+                "AUC 配对统计的分数须为有限值（判别器数值发散或工件"
+                f"损坏）：real 侧 NaN×{nan_real} Inf×{inf_real}、"
+                f"fake 侧 NaN×{nan_fake} Inf×{inf_fake}——非有限分数在"
+                "排序口径下会伪装成分数（NaN 排尾、Inf 排头），AUC 因此"
+                "失去意义"
+            )
         real_count = real_scores.numel()
         combined = torch.cat([real_scores, fake_scores]).double()
         order = combined.argsort()

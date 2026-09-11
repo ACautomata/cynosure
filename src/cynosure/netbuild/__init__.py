@@ -5,6 +5,10 @@ PatchDiscriminator 的按 artifact 构建与装载、per-channel 标准化统计
 已交付 UNet / VAE / ControlNet / PatchDiscriminator / RFlowScheduler 装配面；
 生产网络配置 JSON（NV-Generate 字段名 → MONAI 构造参数）的完整映射
 由后续 ticket 在真实工件可得后深化。
+
+判别器的 checkpoint 有**形态**之分（裸权重 / 谱归一化形态）：装载按形态
+分派、导出面 ``loadable_state_dict`` 与之成对（形态契约与分派理由见
+``discriminator``）。
 """
 
 import inspect
@@ -75,39 +79,74 @@ class NetworkAssembler:
         return model
 
     @classmethod
-    def discriminator(cls, artifact: NetworkArtifact) -> PatchDiscriminator:
-        """按网络工件构建 PatchDiscriminator（GroupNorm 等 norm 参数随配置传入）。"""
+    def discriminator(
+        cls, artifact: NetworkArtifact, *, spectral_norm: bool = False,
+    ) -> PatchDiscriminator:
+        """按网络工件构建 PatchDiscriminator（GroupNorm 等 norm 参数随配置传入）。
+
+        装载按 checkpoint 的**形态**分派（形态 = ``loadable_state_dict``
+        的导出面）：
+
+        - **谱归一化形态**（含 ``.parametrizations.`` 键：original 权重与
+          幂迭代 buffer ``_u``/``_v`` 整份在内）→ 先叠加谱归一化、再严格
+          装载：参数化状态**逐位还原**（构造期叠加虽抽随机 u/v，但严格
+          装载把它们与 original 一并覆写为文件内容——结果与 ambient
+          seed 无关；重新物化则会以随机 u/v 起步做 15 次幂迭代、再归一化
+          一次，上岗的判别函数随 ambient seed 漂移）。
+          ``spectral_norm=False`` 时显式拒绝：开关翻转会静默丢弃文件里
+          的谱归一化状态，换 regime 须重新预训练；
+        - **裸权重形态**（MAISI 发布权重 / fixture 网络工件）→ 先严格
+          装载，``spectral_norm=True`` 时再叠加（谱归一化从这份权重起步
+          的冷启动语义）。裸形态无法与本项目**旧版物化形态**的判别器
+          产物区分（键形相同）：SN 启用下装载即冷启动再归一化、判别
+          函数失真——旧物化形态的产物在 SN regime 须重新预训练
+          （见 PR #66 发布说明）。
+        """
         model = PatchDiscriminator(
             **cls._known_kwargs(PatchDiscriminator, artifact.config),
         )
-        cls._load_state_dict(model, artifact.checkpoint)
+        state = cls._read_state_dict(artifact.checkpoint)
+        if state is not None and cls._is_spectral_norm_state(state):
+            if not spectral_norm:
+                raise ValueError(
+                    "判别器 checkpoint 是谱归一化形态（含 "
+                    ".parametrizations. 键），但本装配未启用谱归一化："
+                    "开关翻转会静默丢弃文件里的参数化状态（original 权重 "
+                    "+ 幂迭代 u/v），上岗的判别函数将不是落盘的那一份——"
+                    "换 regime 须重新预训练"
+                )
+            cls.apply_spectral_norm(model)
+            model.load_state_dict(state, strict=True)
+            return model
+        if state is not None:
+            model.load_state_dict(state, strict=True)
+        if spectral_norm:
+            cls.apply_spectral_norm(model)
         return model
 
     @classmethod
+    def apply_spectral_norm(cls, model: Any) -> None:
+        """谱归一化叠加（触发式装配动作）：对所有 Conv3d 施加谱归一化
+        （Lipschitz 约束；判别器默认关闭、经 config 开关触发）。"""
+        for module in model.modules():
+            if isinstance(module, torch.nn.Conv3d):
+                torch.nn.utils.parametrizations.spectral_norm(module)
+
+    @classmethod
     def loadable_state_dict(cls, model: Any) -> dict:
-        """模型 state_dict 的可重载形式（与 ``_load_state_dict`` 的严格
-        装载成对的导出面）：parametrization（如 spectral norm）的视图键
-        ``<prefix>.parametrizations.<attr>.original`` 与其内部状态
-        （power iteration buffer ``_u``/``_v``）不落盘，取而代之固化该
-        参数化属性的**有效权重**（parametrization 输出，即训练前向实际
-        使用的张量）到原键 ``<prefix>.<attr>``——本方法产出的 checkpoint
-        经本类装配路径严格重载后，重建的裸网络判别函数与保存时逐位
-        一致（固化原始参数则装载静默成功但前向漂移；无参数化模型逐键
-        同一）。"""
-        state = model.state_dict()
-        if not any(".parametrizations." in key for key in state):
-            return state
-        loadable: dict = {}
-        for key, value in state.items():
-            prefix, marker, rest = key.partition(".parametrizations.")
-            if not marker:
-                loadable[key] = value
-                continue
-            attribute, _, tail = rest.partition(".")
-            if tail == "original":
-                parametrized = getattr(model.get_submodule(prefix), attribute)
-                loadable[f"{prefix}.{attribute}"] = parametrized.detach()
-        return loadable
+        """模型 state_dict 的可装载形式（与装载面形态分派成对的导出面）。
+
+        **参数化状态整份落盘**：parametrization 键
+        ``<prefix>.parametrizations.<attr>.original``（原始权重）与幂迭代
+        buffer ``_u``/``_v`` 同盘——装载面（``discriminator``）先叠形态、
+        再严格装载，状态逐位还原、结果与 ambient seed 无关（装载期的
+        随机初始化与 u/v 抽样被文件内容整体覆写）。
+        物化有效权重的形态看似兼容（装载静默成功）实则**再归一化一次**
+        （随机 u/v 起步的幂迭代估计）：消费面拿到的不再是保存的那一份
+        判别函数，故不采用。无参数化模型逐键同一（``state_dict`` 直通）；
+        续训分片（``ResumeStore``）存的也是这一形态，两处同形。
+        """
+        return model.state_dict()
 
     @classmethod
     def rflow_scheduler(
@@ -132,11 +171,24 @@ class NetworkAssembler:
         return {key: value for key, value in config.items() if key in params}
 
     @classmethod
-    def _load_state_dict(cls, model: Any, ckpt: Path | None) -> None:
+    def _read_state_dict(cls, ckpt: Path | None) -> dict | None:
+        """读 checkpoint 的 state_dict（None → 无 checkpoint = 随机初始化；
+        weights_only 严格反序列化）。"""
         if ckpt is None:
-            return
-        state = torch.load(ckpt, map_location="cpu", weights_only=True)
-        model.load_state_dict(state, strict=True)
+            return None
+        return torch.load(ckpt, map_location="cpu", weights_only=True)
+
+    @classmethod
+    def _is_spectral_norm_state(cls, state: dict) -> bool:
+        """形态判定：含 parametrization 键 = 谱归一化形态
+        （``loadable_state_dict`` 导出面的判别特征）。"""
+        return any(".parametrizations." in key for key in state)
+
+    @classmethod
+    def _load_state_dict(cls, model: Any, ckpt: Path | None) -> None:
+        state = cls._read_state_dict(ckpt)
+        if state is not None:
+            model.load_state_dict(state, strict=True)
 
 
 __all__ = ["NetworkArtifact", "NetworkAssembler"]

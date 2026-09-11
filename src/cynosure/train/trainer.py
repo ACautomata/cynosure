@@ -10,8 +10,10 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
-    train 启动时：per-rank buffer 的 base 分区由冻结初始 policy 生成
-    （续训恢复时跳过——buffer 两区内容随状态整体回归）；Baseline manifest
+    train 启动时：RM readiness gate 硬检查（per-rank base 分区由冻结
+    初始 policy 生成后、按当前 run 数据口径重算 held-out AUC，不过线
+    拒绝开跑并回滚——ADR-0007；续训恢复时跳过，resume 状态已含判别器
+    全量状态）；Baseline manifest
     条目采样落盘只在 rank 0（冻结只采一次，续训恢复时同样跳过——恢复点
     policy 已非初始权重）；到达里程碑间隔时触发评测相的解码评测 →
     ``milestone`` 事件写入同一指标流（rank 0 独写）→ train 进程内早停
@@ -47,6 +49,7 @@ from cynosure.train.artifacts import (
     RunArtifacts,
 )
 from cynosure.train.earlystop import EarlyStopJudge
+from cynosure.train.gate import ReadinessGate
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.resume import ResumeStore
 from cynosure.train.rewards import RewardCoordinator
@@ -173,6 +176,7 @@ class GranularGrpoTrainer:
         stage: StageTag | None = None,
         dist_context: DistributedContext | None = None,
         evaluation: EvaluationPhase | None = None,
+        resume: bool = False,
     ) -> None:
         if config.experiment.group == "sequential":
             raise ValueError(
@@ -214,8 +218,13 @@ class GranularGrpoTrainer:
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
         self.stage_tag = stage if stage is not None else StageTag()
+        # resume 单点声明（装配与 run 执行共用同一开关）：resume 装配
+        # 跳过 warm-start 报告装载、判别器占位冷启动（不消费任何
+        # checkpoint 工件），权重被 ResumeStore.restore 整体覆写
+        self._resume_assembled = resume
         self.runtime = TrainingRuntime.build(
             config, run_artifacts, device=device, dist_context=dist_context,
+            resume=resume,
         )
         # 策略侧执行序两相（eval 相 rollout → train 相逐 k 更新）合成
         # 单 iteration 循环体（判别器侧协作者见 self.rewards）
@@ -230,6 +239,11 @@ class GranularGrpoTrainer:
             run_artifacts.paths.checkpoints,
             self.stage_tag.checkpoint_prefix,
             self.runtime.dist,
+        )
+        # RM readiness gate（ADR-0007）：启动期的上岗硬检查——重算口径
+        # 与分布式裁决原语在此装配（resume 跳过检查，见 run）
+        self.readiness = ReadinessGate(
+            config, self.runtime.rewards.auc, self.runtime.dist,
         )
         # 评测相（Baseline 采样 / 里程碑解码评测 / RL 后重采）；测试可注入替身。
         # manifest 由本侧从 run 目录装载注入（eval 不反向依赖 train 契约模块）：
@@ -290,29 +304,34 @@ class GranularGrpoTrainer:
         """数值口径（device + autocast dtype）。"""
         return self.runtime.amp
 
-    def seed_base_partition(self) -> None:
+    def seed_base_partition(self) -> torch.Tensor:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
         （未参与任何梯度步）rollout 产出填满 per-rank base 分区（spec
-        补钉；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。"""
-        self.rewards.seed_base(
-            self.loop.base_partition_samples(
-                self.rewards.buffer.base_capacity,
-            ),
+        补钉；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。
+        返回量产的样本批（RM readiness gate 重算的 fake 侧输入——同
+        一批量产既是 buffer 种子又是门槛重算口径，不二次消耗 RNG 流）。"""
+        base_fakes = self.loop.base_partition_samples(
+            self.rewards.buffer.base_capacity,
         )
+        self.rewards.seed_base(base_fakes)
+        return base_fakes
 
-    def run(self, *, resume: bool = False) -> int:
-        """训练主循环：base 分区自动生成 → Baseline 采样（rank 0，冻结
+    def run(self) -> int:
+        """训练主循环：base 分区自动生成 → RM readiness gate（ADR-0007，
+        resume 跳过）→ Baseline 采样（rank 0，冻结
         初始 policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停
         判定）→ RL 后重采（rank 0）→ checkpoint 与续训状态落盘。
-        ``resume=True`` 时从 run 目录各 rank 的最新续训状态恢复（全清单
-        覆写，resume 模块），rank 0 回退指标流中恢复点之后的半截事件后
-        从恢复点继续——base 分区种子生成与 Baseline 采样随之跳过（buffer
-        随状态整体回归；Baseline 冻结只采一次，恢复点 policy 已非初始
-        权重）。恢复点已达标（无训练迭代）的续训是完整无操作：不重执行
-        收官重采、不改写任何工件。返回完成的 iteration 数（config 口径
-        的累计完成数；早停时小于 max_iterations；零训练迭代时 = 恢复
-        点）。"""
+        恢复语义由构造的 ``resume`` 单点声明（装配与执行共用同一开关，
+        无双点声明可错位）：resume 构造时从 run 目录各 rank 的最新续训
+        状态恢复（全清单覆写，resume 模块），rank 0 回退指标流中恢复点
+        之后的半截事件后从恢复点继续——base 分区种子生成与 Baseline
+        采样随之跳过（buffer 随状态整体回归；Baseline 冻结只采一次，
+        恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）的续训
+        是完整无操作：不重执行收官重采、不改写任何工件。返回完成的
+        iteration 数（config 口径的累计完成数；早停时小于
+        max_iterations；零训练迭代时 = 恢复点）。"""
         dist = self.runtime.dist
+        resume = self._resume_assembled
         start_iteration = 0
         if resume:
             start_iteration = self.resume_store.restore(self)
@@ -326,7 +345,13 @@ class GranularGrpoTrainer:
         self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         if not resume:
-            self.seed_base_partition()
+            base_fakes = self.seed_base_partition()
+            # RM readiness gate（ADR-0007）：warm-start 产物按当前 run
+            # 数据口径（本 rank base fake 批 + held-out real）重算 AUC，
+            # 不过线拒绝开跑——在 Baseline 采样等昂贵启动动作之前。
+            # resume 跳过：续训状态已含判别器全量状态（恢复点判别器
+            # 已在岗），门槛只把守「从预训练产物开跑」的新 run
+            self.readiness.check(base_fakes)
             # Baseline 采样（冻结只采一次：更新开始前的当前权重即初始
             # policy）。policy 采样前向是 FSDP 集合操作，全 rank 对称
             # 参与；样本落盘与 manifest 回写是 rank 0 独写产物契约
@@ -489,10 +514,10 @@ class GranularGrpoTrainer:
         PolicySharding 导出、键形与裸网络一致；导出本身是集合操作，
         ``full_state`` 必传——由调用方全 rank 完成导出后传入，本方法内部
         不按需导出（rank0-only 导出会互等死锁））；判别器经
-        loadable_state_dict 固化有效权重（spectral norm 启用时仍可严格
-        重载）；stage 前缀隔离组3 两阶段的同名产物（stage-1 无前缀 =
-        历史布局逐字一致）。续训全状态由 ResumeStore.save 同节奏
-        落盘（per-rank 分片文件）。"""
+        loadable_state_dict 固化可装载形态（spectral norm 启用时携带
+        参数化状态，消费面按形态分派逐位还原）；stage 前缀隔离组3
+        两阶段的同名产物（stage-1 无前缀 = 历史布局逐字一致）。续训
+        全状态由 ResumeStore.save 同节奏落盘（per-rank 分片文件）。"""
         prefix = self.stage_tag.checkpoint_prefix
         torch.save(
             full_state,

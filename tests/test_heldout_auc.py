@@ -16,6 +16,7 @@ import torch
 from cynosure.config import MODALITIES
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
+from cynosure.reward.sampler import RealPoolSampler
 
 from tests.test_online_update import SHAPE, UpdateScenario, WrittenPool
 
@@ -120,6 +121,22 @@ class TestAucNumericContract:
             torch.tensor([1.0]), torch.tensor([0.0]),
         )
         assert isinstance(auc, float)
+
+    def test_non_finite_scores_rejected(self) -> None:
+        """NaN/Inf 分数显式拒绝：排序把非有限值当普通值排（NaN 排尾、
+        +Inf 排头），发散或半损坏的 checkpoint 因此能伪装出高分（实测
+        全 NaN → AUC 1.5、real 单侧 NaN → 0.875）——「判别器失明」反被
+        认证为高判别力。有限性校验是所有消费点（在线监控 / 预训练 gate
+        / RM readiness gate）共用的单一闸口。"""
+        for label, real, fake in (
+            ("real 含 NaN", torch.tensor([torch.nan, 0.1]), torch.tensor([0.0, 0.5])),
+            ("fake 含 NaN", torch.tensor([0.9, 0.1]), torch.tensor([torch.nan, 0.5])),
+            ("real 含 +Inf", torch.tensor([torch.inf, 0.1]), torch.tensor([0.0, 0.5])),
+            ("fake 含 -Inf", torch.tensor([0.9, 0.1]), torch.tensor([-torch.inf, 0.5])),
+            ("两侧全 NaN", torch.tensor([torch.nan]), torch.tensor([torch.nan])),
+        ):
+            with pytest.raises(ValueError, match="有限"):
+                HeldOutAuc.auc_from_scores(real, fake)
 
 
 class PairwiseAucReference:
@@ -242,3 +259,40 @@ class TestScoringPhase:
         auc.compute(scenario.fakes(8), modality="t1n")
         real_batch = probe.received_batches[0]  # compute 先 real 后 fake
         assert torch.all(real_batch == HeldOutPoolWriter.FILL["t1n"])
+
+    def test_forward_runs_in_bounded_chunks_and_matches_full_batch(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """打分前向按定块分块累积（显存上界不随评估批量增长）且与全批
+        单次前向逐位等价（判别器归一化定死 GroupNorm：前向对 batch 维
+        逐样本独立，分块不改变分数；AUC 是分数上的 rank 统计，拼接
+        等价）。RM readiness gate 的 fake 侧 = 本 rank base 分区
+        （capacity//2 个 3D 体，量产侧限 ``_BASE_BATCH`` 分块生成），
+        一次性全量前向会让评估显存随 buffer 容量无界增长——训练开始前
+        就可能耗尽加速器。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        probe = GradProbeScorer(scenario.scorer())
+        auc = HeldOutAuc(
+            heldout_manifest=manifest, scorer=probe,  # type: ignore[arg-type]
+            generator=scenario.generator(1),
+        )
+        chunked = auc.compute(scenario.fakes(20))  # > 单块上界 → 多次前向
+        assert len(probe.received_batches) > 2  # real 1 次 + fake 多块
+        assert all(
+            batch.shape[0] <= HeldOutAuc.SCORE_CHUNK
+            for batch in probe.received_batches
+        )
+        # 等价性参考：同流 real 采样 + 全批单次前向的 AUC（分数拼接在
+        # rank 统计下与分块前向逐位一致——rel=0.0 + abs=0.0 真逐位断言）
+        reals = RealPoolSampler(manifest, scenario.generator(1)).sample(
+            min(20, len(manifest.entries)), modality=None,
+        )
+        scorer = scenario.scorer()
+        expected = HeldOutAuc.auc_from_scores(
+            scorer.patch_logits(reals).flatten(),
+            scorer.patch_logits(scenario.fakes(20)).flatten(),
+        )
+        assert chunked == pytest.approx(expected, rel=0.0, abs=0.0)

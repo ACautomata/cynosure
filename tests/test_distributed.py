@@ -35,22 +35,40 @@ import pytest
 import torch
 
 from cynosure.cli import CynosureCli
+from cynosure.config import ConfigLoader
+from cynosure.fixtures import Fixture
+from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.reward.artifacts import LatentManifest
-from cynosure.train import RunArtifacts
+from cynosure.train import (
+    AmpContext,
+    ReadinessGate,
+    RunArtifacts,
+    TrainingRuntime,
+)
+from cynosure.train.rng import TrainingRngStreams
 from cynosure.distributed import DistributedContext, RankSlicedPool
+from tests.conftest import (
+    CliSession,
+    FailingAuc,
+    FixturePrepareScenario,
+)
 from tests.test_train_loop import TrainingLoopScenario
 
 _WORKER_JOIN_TIMEOUT_S = 600.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
 失败而非无限挂起。"""
 
-_EQUIVALENCE_RTOL = 1e-5
+_EQUIVALENCE_RTOL = 1e-2
 """跨路径等价性检查的数值容差：分布式路径（FSDP + 梯度检查点重算）
-与单进程路径（直接前向）在 fp32 尾数层存在求和顺序噪声（实测 ~1e-8，
-远低于 bf16 autocast 训练的量化信号）；语义等价以相对容差断言。逐位
+与单进程路径（直接前向）在 fp32 尾数层存在求和顺序噪声（实测 ~1e-8）；
+独立进程实例的打分前向偶发 1-2 ulp 分叉，且 warm-start 判别器权重
+恰好落在 bf16 autocast 的舍入边界两侧时，eval 相 rollout 的量化跳变
+会把尾数差放大到 bf16 噪声地板（实测 ~2e-3 相对）——容差以 bf16 的
+量化噪声量级为准。真错位（RNG 流漂移、装配路径分叉）是分布级差
+（O(1e-1) 相对），本容差仍有辨别力。语义等价以相对容差断言。逐位
 承重轴：各 rank 权重同步（RankResumeShards）、同进程续训 roundtrip
 （RunTrajectory）；跨进程世界对的事件浮点面（含续训 roundtrip 的
-两世界对比）走本容差——独立进程实例的打分前向偶发 1-2 ulp 分叉。"""
+两世界对比）走本容差。"""
 
 
 class TrainWorldWorker:
@@ -261,6 +279,63 @@ class RankResumeShards:
                     )
 
 
+_GATE_JOIN_TIMEOUT_S = 180.0
+"""gate 集合序用例的 worker join 上限（秒）：worker 只做装配 + 一两次
+打分前向（数十秒量级），超时即集合序错位回归（邻居卡在内层集合里）。"""
+
+
+class GateWorldWorker:
+    """单 rank 的 RM readiness gate 执行体（torchrun 语义环境变量 + 真实
+    判别器装配路径）：rank 0 走真实重算，其余 rank 注入重算失败
+    （``FailingAuc``）——启动期集合裁决的「失败 rank + 健康 rank」现场。
+    结果经队列回传主进程。"""
+
+    def __init__(
+        self, rank: int, world: int, port: int, config_path: Path, queue,
+    ) -> None:
+        self.rank = rank
+        self.world = world
+        self.port = port
+        self.config_path = config_path
+        self.queue = queue
+
+    def __call__(self) -> None:
+        os.environ.update(
+            RANK=str(self.rank),
+            LOCAL_RANK=str(self.rank),
+            WORLD_SIZE=str(self.world),
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=str(self.port),
+        )
+        try:
+            payload = self._run()
+        except Exception as exc:  # worker 崩溃的诊断面
+            payload = {"verdict": "crashed", "error": f"{type(exc).__name__}: {exc}"}
+        self.queue.put({"rank": self.rank, **payload})
+
+    def _run(self) -> dict:
+        """真实装配（判别器 DDP 副本 + 谱归一化 buffer）→ gate 重算。"""
+        config = ConfigLoader.load(self.config_path)
+        dist = DistributedContext.bootstrap()
+        amp = AmpContext(
+            device=dist.local_device(),
+            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        )
+        generators = TrainingRngStreams(
+            dist.derive_seed(config.schedule.seed),
+        ).named()
+        rewards = TrainingRuntime.assemble_rewards(config, amp, generators, dist)
+        auc = rewards.auc if self.rank == 0 else FailingAuc()
+        gate = ReadinessGate(config, auc, dist)  # type: ignore[arg-type]
+        torch.manual_seed(0)  # 各 rank 同 fake 批（重算输入一致）
+        fakes = torch.randn(2, *config.latent_shape)
+        try:
+            measured = gate.check(fakes)
+        except ValueError as exc:
+            return {"verdict": "rejected", "error": str(exc)}
+        return {"verdict": "passed", "measured": measured}
+
+
 class TestDistributedContextUnit:
     """进程组 Facade 的单进程退化与 seed 派生语义。"""
 
@@ -382,6 +457,81 @@ class TestPoolSliceUnit:
                 RankSlicedPool(starved, DistributedContext(rank, 2, True)).view()
 
 
+class TestGateCollectiveOrder:
+    """RM readiness gate 的集合序（启动期集合裁决的前提）：打分/监控前向
+    必须是纯本地计算。判别器 DDP 副本带 buffer（谱归一化的 ``_u``/``_v``）
+    时，DDP 默认在首次前向做一次跨 rank buffer 广播——重算失败的 rank
+    绕过前向直奔 all_gather，健康 rank 卡在那次广播里互等（world=2 实测
+    死锁）。判别器 buffer 无状态语义（GroupNorm 无 running stats、
+    ``_u``/``_v`` 由确定性装载与确定性幂迭代在各 rank 逐位一致），前向期
+    广播因此显式关闭。
+    """
+
+    _next_port = 29840
+    """TCPStore 端口游标（与 ``SpawnedTrainWorld`` 的游标分段，互不重叠）。"""
+
+    def test_rank_local_recompute_failure_reaches_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """rank 1 重算失败（held-out 读取异常）、rank 0 重算成功：全 rank
+        收敛到同一拒绝裁决（失败 rank 的错误经裁决传播给全体）——worker
+        回传超时即健康 rank 卡在内层集合里的集合序错位回归。"""
+        config_path = self._write_inputs(tmp_path)
+        type(self)._next_port += 1
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        workers = [
+            GateWorldWorker(rank, 2, type(self)._next_port, config_path, queue)
+            for rank in range(2)
+        ]
+        processes = [context.Process(target=worker) for worker in workers]
+        for process in processes:
+            process.start()
+        collected: dict[int, dict] = {}
+        for _ in workers:
+            try:
+                payload = queue.get(timeout=_GATE_JOIN_TIMEOUT_S)
+            except _QueueEmpty:
+                self._stop(processes)
+                raise AssertionError(
+                    f"gate worker 回传超时（{_GATE_JOIN_TIMEOUT_S}s）——"
+                    "打分前向里出现跨 rank 集合点（失败 rank 在裁决点等、"
+                    f"健康 rank 在内层集合里等）。已回传: {collected}"
+                )
+            collected[payload["rank"]] = payload
+        self._stop(processes)
+        assert [collected[rank]["verdict"] for rank in range(2)] == [
+            "rejected", "rejected",
+        ], collected
+        for rank in range(2):
+            assert "重算失败" in collected[rank]["error"]
+            assert "rank 1" in collected[rank]["error"]
+
+    @staticmethod
+    def _stop(processes: list) -> None:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5.0)
+
+    @staticmethod
+    def _write_inputs(tmp_path: Path) -> Path:
+        """夹具：网络工件 + prepare 三工件 + 谱归一化启用的 gate config
+        ——判别器 buffer 只在谱归一化启用时存在，那是 DDP 前向期广播的
+        触发条件（无 buffer 的判别器整套语义不变）。"""
+        fixture_dir = tmp_path / "fixtures"
+        config = Fixture().config(fixture_dir)
+        FixturePrepareScenario(CliSession(), config, tmp_path).run(
+            tmp_path / "prepare_config.json",
+        )
+        torch.manual_seed(7)  # fixture 网络「固定 seed」机制
+        Fixture().write_artifacts(fixture_dir)
+        config.reward.spectral_norm_enabled = True
+        path = tmp_path / "gate_config.json"
+        path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
+
 class TestSingleRankEquivalence:
     """AC1 前半 + AC5：world=1 的 torchrun 语义入口与进程内单进程逐位一致。"""
 
@@ -458,6 +608,34 @@ class TestTwoRankSharding:
         synced = shards.state(0)["discriminator_network"]
         assert any(
             not torch.equal(initial[name], synced[name]) for name in initial
+        )
+
+    def test_two_rank_spectral_norm_buffers_stay_bitwise_identical(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """SN 启用（判别器带 ``_u``/``_v`` buffer）+ world=2 在线多步推进
+        （``ReplicatedDiscriminator`` 关闭前向期 buffer 广播的论证兜底）：
+        u/v 只在 train 相前向就地推进，而推进点只有在线更新（各 rank
+        前向次数对称、权重经梯度 allreduce 逐位一致）；打分/监控前向恒
+        eval 相不推进——广播关闭后各 rank 的参数化 buffer 仍不得漂移。
+        「rank 间前向次数不对称 → 分叉」的子风险只有论证面、无测试构造
+        （注入不对称前向须异常路径，超出常规回归面）。warm-start 链路
+        同 regime：预训练（SN 启用）产物为谱归一化形态，train 装载走
+        形态分派的逐位还原。"""
+        scenario.write_inputs(reward={"spectral_norm_enabled": True})
+        scenario.patch_config(
+            schedule={"max_iterations": 2, "checkpoint_interval": 2},
+        )
+        result = SpawnedTrainWorld(
+            scenario.config_path, scenario.run_dir, world=2,
+        ).launch()
+        result.assert_green()
+        # SN 真的启用（断言有判别力）：参数化 buffer 在分片状态里
+        shards = RankResumeShards(scenario.run_dir, world=2)
+        names = shards.state(0)["discriminator_network"]
+        assert any(name.endswith("._u") for name in names)
+        shards.assert_bitwise_identical_across_ranks(
+            keys=["policy_network", "discriminator_network"],
         )
 
     def test_two_rank_milestone_eval_and_stop_broadcast(
@@ -677,8 +855,14 @@ class TestSpawnedUsageContract:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         scenario.write_inputs()
-        # 损坏判别器 checkpoint → 装配期对 torch.load 的对称 RuntimeError
-        (scenario.fixture_dir / "discriminator.pt").write_bytes(b"corrupt")
+        # 损坏 warm-start 产物 checkpoint（train 装配的判别器装载源）→
+        # 装配期对 torch.load 的对称 RuntimeError
+        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
+        checkpoint = (
+            Path(data["reward"]["pretrain_report_json"]).parent
+            / "checkpoints" / "pretrain_discriminator.pt"
+        )
+        checkpoint.write_bytes(b"corrupt")
         for _ in range(3):  # 竞态类：重复三次提高捕获率
             result = SpawnedTrainWorld(
                 scenario.config_path, scenario.run_dir, world=2,

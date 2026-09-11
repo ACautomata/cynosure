@@ -175,6 +175,30 @@ class TestSpectralNorm:
         reward = scorer.reward(scenario.latents())
         assert torch.isfinite(reward).all()
 
+    def test_form_flip_on_checkpoint_rejected(
+        self, scenario: ScorerScenario, tmp_path: Path,
+    ) -> None:
+        """形态与开关必须一致：谱归一化形态的 checkpoint（含参数化状态）
+        在 spectral_norm_enabled=false 下装载 → 显式拒绝。开关翻转会把
+        文件里的谱归一化状态（original 参数 + u/v 幂迭代估计）静默丢弃、
+        上岗的是另一份判别函数——换 regime 须重新预训练，不留静默错位。"""
+        enabled = scenario.scorer(spectral_norm_enabled=True)
+        ckpt = tmp_path / "sn_discriminator.pt"
+        torch.save(
+            NetworkAssembler.loadable_state_dict(enabled.discriminator), ckpt,
+        )
+        reward_config = scenario.config.reward.model_copy(
+            update={"spectral_norm_enabled": False},
+        )
+        with pytest.raises(ValueError, match="谱归一化形态"):
+            RewardScorer(
+                NetworkArtifact(
+                    config=scenario.artifact().config, checkpoint=ckpt,
+                ),
+                reward_config,
+                scenario.stats(),
+            )
+
 
 class TestModuleAggregation:
     """设备迁移结构（nn.Module 聚合）：统计量注册为 buffer、scorer 单点 .to()。

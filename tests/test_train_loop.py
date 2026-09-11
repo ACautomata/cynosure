@@ -14,6 +14,7 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 
 import json
 import math
+import shutil
 from collections import Counter
 from itertools import product
 from pathlib import Path
@@ -35,7 +36,12 @@ from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
-from tests.conftest import CliResult, CliSession, FixturePrepareScenario
+from tests.conftest import (
+    CliResult,
+    CliSession,
+    FixturePrepareScenario,
+    PretrainLightweightReward,
+)
 
 
 class TrainingLoopScenario:
@@ -55,12 +61,23 @@ class TrainingLoopScenario:
         train_steps: set[int] = frozenset({1}),
         seed: int = 0,
         group: str = "modal-label",
+        reward: dict | None = None,
     ) -> None:
         """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
-        选实验组：组2/组3 的 config 携带 ControlNet 工件）。"""
+        选实验组：组2/组3 的 config 携带 ControlNet 工件）。
+
+        warm-start 前置（ADR-0007）：RM readiness gate 是 train 入口的
+        硬检查、消费预训练产物——场景先以同一 config 的预训练轻量变体
+        跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
+        再落训练 config。``reward`` 覆写在预训练前置**之前**生效——
+        预训练与训练同一 reward regime（如 SN 启用时预训练产物即
+        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。"""
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(self.fixture_dir)
+        # 场景工具的幂等重建（write_inputs 可重复调用——预训练 run 目录
+        # 由本步重建，不静默覆盖语义是 CLI 的、工具面先清后建）
+        shutil.rmtree(self.fixture_dir / "pretrain_run", ignore_errors=True)
         prepare_config = FixturePrepareScenario(
             self.cli, fixture.config(self.fixture_dir, group=group), self.tmp_path,
         ).run(self.tmp_path / "prepare_config.json")
@@ -69,9 +86,29 @@ class TrainingLoopScenario:
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
+        if reward:
+            config.reward = config.reward.model_copy(update=reward)
+        self._pretrain_warm_start(config, group)
         self.config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
+
+    def _pretrain_warm_start(self, config, group: str) -> None:
+        """场景的预训练前置：报告落 config 声明的产物路径（train 装配
+        与门槛检查的装载源）。轻量五元组（``PretrainLightweightReward``，
+        含 gate 0.60 留 margin 的 rationale）只降低本步执行成本、不进训练
+        config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
+        sequential 组的单次装配）。"""
+        pretrain_config = PretrainLightweightReward.apply(config)
+        pretrain_config.experiment.group = (
+            "modal-label" if group == "sequential" else group
+        )
+        path = self.tmp_path / "pretrain_config.json"
+        path.write_text(
+            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = self.cli.run("pretrain", "--config", str(path))
+        assert result.code == 0, result.stderr
 
     def train(self, *, dump: bool = False):
         argv = ["train", "--config", str(self.config_path), "--run-dir", str(self.run_dir)]
@@ -251,17 +288,15 @@ class TestSingleIterationLoop:
     def test_spectral_norm_checkpoint_is_reloadable(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """spectral norm 启用时判别器 checkpoint 以可重载形式落盘：
+        """spectral norm 启用时判别器 checkpoint 以**参数化状态**落盘：
         parametrization 键（``*.parametrizations.<attr>.original`` 与其
-        power iteration buffer ``_u``/``_v``）不进保存面——保存面固化
-        **有效权重**（parametrization 输出），netbuild 严格装载路径重建
-        的裸网络判别函数与训练时**数值等价**（固化原始参数则前向不同：
-        装载静默成功但 reward/评测漂移）。
+        power iteration buffer ``_u``/``_v``）整份在内。装载面按形态分派
+        （先叠谱归一化 → 严格装载整份还原）：重建的判别器状态与训练时
+        **逐位一致**，且结果与 ambient RNG 无关。
 
-        等价断言用严格容差（rtol 1e-5）而非逐位：跨「保存→磁盘→装载」
-        链的前向在同一权重下可差 1 ulp（浮点执行路径的进程态选择，
-        实测 maxdiff 1.19e-07 = 2^-23）；语义错误（固化参数视图）的
-        偏离是 σ 偏离 1 的百分量级，容差区分度充分。"""
+        对照（固化有效权重的形态）：装载时重新叠谱归一化会**再归一化
+        一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
+        消费面拿到的不再是训练时那一份判别函数。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -272,31 +307,39 @@ class TestSingleIterationLoop:
         assert trainer.run() == 1
         checkpoint = scenario.run_dir / "checkpoints" / "discriminator_iter1.pt"
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        # 保存面键形 = 原始模块键形（parametrization 视图与可重建 buffer 不落盘）
-        fresh = NetworkAssembler.discriminator(NetworkArtifact(
-            config=NetworkAssembler.load_json(
-                config.artifacts.discriminator_config_json,
-            ),
-        ))
-        assert set(saved.keys()) == set(fresh.state_dict().keys())
-        # 严格装载成功（netbuild 装配路径直接可用），且重建的裸网络
-        # 判别函数与训练时数值等价（有效权重语义，eval 相对照）
-        reloaded = NetworkAssembler.discriminator(NetworkArtifact(
-            config=NetworkAssembler.load_json(
-                config.artifacts.discriminator_config_json,
-            ),
-            checkpoint=checkpoint,
-        ))
-        reloaded.eval()
+        live = trainer.rewards.discriminator
+        # 保存面键形 = 训练态参数化状态（不是裸网络的物化有效权重）
+        assert set(saved.keys()) == set(live.state_dict().keys())
+        assert any(".parametrizations." in key for key in saved)
+        live.eval()
         sample = trainer.rewards.buffer.recent_samples()[0].unsqueeze(0)
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
         )
         normalized = normalizer.normalize(sample)
-        expected = trainer.rewards.discriminator(normalized)[-1]
-        assert torch.allclose(
-            reloaded(normalized)[-1], expected, rtol=1e-5, atol=1e-6,
-        )
+        expected = live(normalized)[-1]
+        for seed in (11, 20260910):  # ambient seed 不同：装载结果不得依赖它
+            torch.manual_seed(seed)
+            reloaded = NetworkAssembler.discriminator(
+                NetworkArtifact(
+                    config=NetworkAssembler.load_json(
+                        config.artifacts.discriminator_config_json,
+                    ),
+                    checkpoint=checkpoint,
+                ),
+                spectral_norm=True,
+            )
+            restored = reloaded.state_dict()
+            assert restored.keys() == saved.keys()
+            assert all(torch.equal(restored[key], saved[key]) for key in saved)
+            reloaded.eval()
+            # 前向层用绝对容差而非逐位：判别力由上面的 state 逐位对比承担
+            # （形态语义所在），前向在**同权重、不同实例**间可差 1 ulp
+            # （2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测偶发），
+            # 逐位断言会假红；1e-6 在噪声底之上、修复前形态的偏离之下。
+            assert torch.allclose(
+                reloaded(normalized)[-1], expected, rtol=0.0, atol=1e-6,
+            )
 
     def test_milestone_iteration_forces_checkpoint(
         self, scenario: TrainingLoopScenario,
@@ -366,10 +409,10 @@ class TestSingleIterationLoop:
     def test_discriminator_cold_start_without_checkpoint(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """冷启动在线判别器（schema 语义 ``discriminator_ckpt=None = 随机
-        初始化起步的在线训练``）：网络配置 JSON 必需、checkpoint 可缺省
-        ——训练全链路绿且判别器 checkpoint 正常落盘（冷启动工作流，
-        reward-model 章）。"""
+        """discriminator_ckpt=None 的工件面（随机初始化起步）：预训练
+        侧冷启动（ADR-0007 的 warm-start 产物生产方）不受影响，train
+        侧判别器一律从预训练报告守卫重载——``discriminator_ckpt`` 在
+        train 装配中不再是消费点（warm-start 接入后废弃冷启动训练）。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["artifacts"]["discriminator_ckpt"] = None
@@ -429,16 +472,17 @@ class TestSingleIterationLoop:
     def test_incompatible_checkpoint_rolls_back_run(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """checkpoint 装载失败（键/shape 不匹配 → 严格装载 RuntimeError）
-        同属输入契约违反：构造期得到干净消息 + 未产出工件的 run 目录
-        回滚——RuntimeError 不在捕获集内则裸 traceback 且目录残留，
-        修正 checkpoint 后同 --run-dir 重试被拒。"""
+        """warm-start 产物 checkpoint 装载失败（键/shape 不匹配 → 严格
+        装载 RuntimeError）同属输入契约违反：构造期得到干净消息 + 未
+        产出工件的 run 目录回滚——修正预训练产物后同 --run-dir 重试
+        不被残留目录拒绝。"""
         scenario.write_inputs()
-        bad = scenario.tmp_path / "bad_discriminator.pt"
-        torch.save({"bogus": torch.zeros(1)}, bad)  # 键形与网络不符
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-        data["artifacts"]["discriminator_ckpt"] = str(bad)
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
+        checkpoint = (
+            Path(data["reward"]["pretrain_report_json"]).parent
+            / "checkpoints" / "pretrain_discriminator.pt"
+        )
+        torch.save({"bogus": torch.zeros(1)}, checkpoint)  # 键形与网络不符
         result = scenario.train()
         assert result.code == 2
         assert "训练输入契约违反" in result.stderr

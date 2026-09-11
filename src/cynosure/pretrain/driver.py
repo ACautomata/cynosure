@@ -3,7 +3,9 @@
 密集步进循环：每步以 base policy 冻结 rollout 量产一批 fake（复用回放
 缓冲 base 分区采样入口——批量分块、独立随机流、输出归一到 pool 存储
 域）→ 以更新前快照测 held-out AUC（与在线期 iter 事件同口径：更新后测
-同一 fake 批会把 in-sample 拟合计入 AUC）→ 达 RM readiness gate 即终止，
+同一 fake 批会把 in-sample 拟合计入 AUC）→ 达 RM readiness gate 即复测
+确认（换新一批再测：train 侧 gate 按独立采样对同一阈值重算，单批贴线
+越过会被非确定性拒绝——两次独立测量都达标才终止，报告值取两次较小者）
 否则以在线期同款 ``OnlineUpdate.step`` 原语更新一步（预训练期无「当前
 policy」，混采语义退化为 base fake 库内采样；real 侧口径与在线期一致）
 → 预训练事件落盘。步数上限耗尽仍未达标时补测一次落盘权重的 AUC
@@ -119,9 +121,18 @@ class PretrainDriver:
         """判别器侧协作者组（Online update 原语 / held-out AUC / buffer）。"""
         return self._rewards
 
+    @property
+    def rollout(self) -> RolloutPhase:
+        """rollout 封装（base fake 量产的公开面——RM readiness gate
+        重算口径的消耗序重演消费它）。"""
+        return self._rollout
+
     def run(self) -> PretrainReport:
-        """密集步进至 RM readiness gate 达标或步数上限，产出判别器
-        checkpoint 与预训练报告（产物全局唯一：单进程唯一写者）。"""
+        """密集步进至 RM readiness gate 达标（复测确认：两次独立测量都
+        达标，报告值取两次较小者——producer 侧成功判据对单批测量噪声
+        鲁棒，train 侧按独立采样的重算不再与非确定性拒绝耦合）或步数
+        上限，产出判别器 checkpoint 与预训练报告（产物全局唯一：单进程
+        唯一写者）。"""
         reward = self._config.reward
         batch = reward.pretrain_fake_batch
         gate = reward.pretrain_gate_auc
@@ -143,10 +154,14 @@ class PretrainDriver:
             fakes = self._rollout.base_partition_samples(batch)
             auc = self._rewards.auc.compute(fakes)  # 更新前快照（在线期口径）
             if auc >= gate:
-                # 达标即停：判别器不再更新，checkpoint 与判定同快照
-                final_auc = auc
-                gate_passed = True
-                break
+                # 达标不复停（复测确认语义见 run() docstring）
+                confirm = self._rewards.auc.compute(
+                    self._rollout.base_partition_samples(batch),
+                )
+                if confirm >= gate:
+                    final_auc = min(auc, confirm)  # 保守口径：两次取小
+                    gate_passed = True
+                    break
             update = self._rewards.update_step(fakes)
             zones = self._rewards.buffer.zone_sizes()
             self._run.append_event(PretrainEvent(
