@@ -26,7 +26,8 @@ class VolumeDecoder(Protocol):
 
 
 class LatentDecoder:
-    """生产解码器：AutoencoderKlMaisi 工件装载、eval 相、no_grad 前向。
+    """生产解码器：AutoencoderKlMaisi 工件装载、eval 相、no_grad 前向
+    （fp16 autocast 口径，见 ``decode``）。
 
     域语义：policy（官方基座权重）工作在 **scaled** latent 域
     （checkpoint scale_factor = 1/std(z)），prepared latents 按存储契约
@@ -72,23 +73,30 @@ class LatentDecoder:
         self._vae.eval()  # 解码是评测前向：恒 eval 相，不推进任何训练语义
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """latent 批 → 像素体批 [B, 1, X, Y, Z]（fp32 口径，指标质量优先；
-        输入先除 scale factor 归位 encoder 域——逐元素算子，整批除与
-        官方逐 patch 除等价）。"""
+        """latent 批 → 像素体批 [B, 1, X, Y, Z]（解码前向在 **fp16
+        autocast** 内执行——官方 NV-Generate-CTMR utils_infer 口径，
+        不得换 bf16：与官方 fp16 口径输出差 ~6.8e-02，对指标口径不可
+        忽略；无条件包 autocast、不分设备分支——生产 config
+        ``norm_float16=true`` 使 norm 输出转 fp16，纯 fp32 前向对
+        fp32 conv 抛 dtype RuntimeError，CPU 也不例外）。输出统一
+        上浮 fp32（fp16→fp32 无损），下游指标/落盘契约不变；输入先
+        除 scale factor 归位 encoder 域——逐元素算子，保留在
+        autocast 外，整批除与官方逐 patch 除等价。"""
         scaled = latents / self._latent_scale_factor
         with torch.no_grad():
-            if scaled[0].numel() <= math.prod(self._roi_size):
-                decoded = self._vae.decode(scaled)
-            else:
-                decoded = SlidingWindowInferer(
-                    roi_size=list(self._roi_size),
-                    sw_batch_size=1,
-                    progress=False,
-                    mode="gaussian",
-                    overlap=self._overlap,
-                    sw_device=self._device,
-                    device=self._device,
-                )(inputs=scaled, network=self._vae.decode)
+            with torch.autocast(self._device.type, dtype=torch.float16):
+                if scaled[0].numel() <= math.prod(self._roi_size):
+                    decoded = self._vae.decode(scaled)
+                else:
+                    decoded = SlidingWindowInferer(
+                        roi_size=list(self._roi_size),
+                        sw_batch_size=1,
+                        progress=False,
+                        mode="gaussian",
+                        overlap=self._overlap,
+                        sw_device=self._device,
+                        device=self._device,
+                    )(inputs=scaled, network=self._vae.decode)
         if isinstance(decoded, tuple):
             decoded = decoded[0]
         if decoded.dim() != 5 or decoded.shape[1] != 1:
@@ -96,4 +104,4 @@ class LatentDecoder:
                 f"解码输出须为 [B, 1, X, Y, Z]，得到 {tuple(decoded.shape)}"
                 "（里程碑评测面向单通道影像体）"
             )
-        return decoded
+        return decoded.float()

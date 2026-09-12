@@ -203,6 +203,56 @@ class TestLatentDomainAndSlidingWindow:
         assert tuple(sliding.shape) == (1, 1, 64, 64, 32)  # 4× 上采样拼合完整
 
 
+class TestFp16AutocastDecoding:
+    """生产 VAE（``norm_float16=true``）解码的 fp16 autocast 口径（#98 回归）。
+
+    上游 config ``norm_float16=true`` 使 MaisiGroupNorm3D 把 norm 输出转
+    fp16——纯 fp32 前向把 fp16 张量交给 fp32 conv 即抛 dtype RuntimeError
+    （生产尺寸 latent 解码直接不可用）；官方 NV-Generate-CTMR 口径把解码
+    前向包在 fp16 autocast 内（不得换 bf16——与官方口径输出差不可忽略）。
+    """
+
+    def _norm_float16_artifact(self, scenario: TrainingLoopScenario) -> NetworkArtifact:
+        """fixture VAE 工件 + ``norm_float16=true``：该开关只改 norm 前向
+        的输出 dtype、不改参数结构，fixture ckpt 原样装载。"""
+        config = ConfigLoader.load(scenario.config_path)
+        net_config = NetworkAssembler.load_json(config.artifacts.vae_config_json)
+        net_config["norm_float16"] = True
+        return NetworkArtifact(
+            config=net_config, checkpoint=config.artifacts.vae_ckpt,
+        )
+
+    def test_norm_float16_whole_forward_path_decodes_finite_fp32(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """小体豁免整前向路径：``norm_float16=true`` 下解码不再抛 dtype 错，
+        输出逐元素有限、出口上浮 fp32（下游指标/落盘契约）。"""
+        scenario.write_inputs()
+        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048 ≤ 48³ → 整前向
+        decoded = LatentDecoder(
+            self._norm_float16_artifact(scenario), torch.device("cpu"),
+            1.0, (48, 48, 48), 0.5,
+        ).decode(latents)
+        assert tuple(decoded.shape) == (1, 1, 64, 64, 32)
+        assert decoded.dtype == torch.float32
+        assert torch.isfinite(decoded).all()
+
+    def test_norm_float16_sliding_window_path_decodes_finite_fp32(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """滑窗路径（生产大体积语义）：超出豁免阈值的 latent 分块解码
+        不抛 dtype 错，输出逐元素有限、出口上浮 fp32。"""
+        scenario.write_inputs()
+        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048 > 8³ → 滑窗
+        decoded = LatentDecoder(
+            self._norm_float16_artifact(scenario), torch.device("cpu"),
+            1.0, (8, 8, 8), 0.5,
+        ).decode(latents)
+        assert tuple(decoded.shape) == (1, 1, 64, 64, 32)
+        assert decoded.dtype == torch.float32
+        assert torch.isfinite(decoded).all()
+
+
 class TestDecodeOnlyInEvaluationPaths:
     """AC（结构断言）：解码只发生在里程碑路径，不进逐 iteration 循环。"""
 
