@@ -58,6 +58,19 @@ _WORKER_JOIN_TIMEOUT_S = 600.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
 失败而非无限挂起。"""
 
+
+def _worker_port_base() -> int:
+    """TCPStore 端口基址按 xdist worker 序号分带：类级端口游标是
+    **进程内**的，``pytest -n`` 下各 worker 进程独立 import、都从同一
+    基址起跑，并行跑多个分布式测试即互相 EADDRINUSE（集群全量 -n 16
+    实测 9 failed 同根因）——每 worker 独占一段端口带避让；单进程跑
+    （无 ``PYTEST_XDIST_WORKER``）回到历史基址 29730，行为不变。
+    29730..31230 位于 Linux 默认临时端口段（32768+）之下，不与系统
+    动态端口冲突。"""
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    return 29730 + (int(worker[2:]) if worker else 0) * 100
+
+
 _EQUIVALENCE_RTOL = 1e-2
 """跨路径等价性检查的数值容差：分布式路径（FSDP + 梯度检查点重算）
 与单进程路径（直接前向）在 fp32 尾数层存在求和顺序噪声（实测 ~1e-8）；
@@ -121,8 +134,9 @@ class SpawnedTrainWorld:
     """torchrun 语义的本地多进程 world（fixture CPU gloo）：spawn 起
     world 个 ``TrainWorldWorker`` 并行跑 ``train``，收集全 rank 结果。"""
 
-    _next_port = 29730
-    """TCPStore 端口游标（world 间串行递增，避 TIME_WAIT 冲突）。"""
+    _next_port = _worker_port_base()
+    """TCPStore 端口游标（world 间串行递增，避 TIME_WAIT 冲突；基址
+    按 xdist worker 分带，见 ``_worker_port_base``）。"""
 
     def __init__(
         self, config_path: Path, run_dir: Path, world: int,
