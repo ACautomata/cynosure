@@ -12,6 +12,7 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 5. buffer base 分区在 train 启动时由冻结初始 policy 自动生成。
 """
 
+import copy
 import json
 import math
 import shutil
@@ -306,9 +307,12 @@ class TestSingleIterationLoop:
         消费面拿到的不再是训练时那一份判别函数。
 
         执行 device 跟随训练装配（GPU 可见即加速器、CPU 强制即 CPU）：
-        手动构造的 normalizer 与装载实例按被测 latent 的 device 落位
-        （生产装配由 trainer 单点 ``.to()`` 接管的同款语义，#95）；
-        state_dict 逐位对比在 CPU 侧先做，前向对比在迁移后做。"""
+        手动构造的 normalizer 按被测 latent 的 device 落位（生产装配由
+        trainer 单点 ``.to()`` 接管的同款语义，#95），GPU 可见环境不再被
+        normalize 的 device fail-fast 拦在断言层之前；state_dict 逐位对比
+        与前向对比都在 CPU 侧做——加速器上同权重不同实例的前向偏离实测
+        可超 1e-6 容差（conv kernel 的分块/归约随实例内存布局漂移，#95
+        集群复测非偶发），CPU 路径的 1 ulp 噪声底下这层容差才站得住。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -334,7 +338,11 @@ class TestSingleIterationLoop:
             ChannelStats.load(config.reward.channel_stats_json),
         ).to(device)
         normalized = normalizer.normalize(sample)
-        expected = live(normalized)[-1]
+        # 前向对比固定 CPU 执行路径（#95 集群实测）：加速器上同权重不同
+        # 实例的前向偏离可超 1e-6 容差且非偶发，装载实例不迁移——断言层
+        # 与 CPU 强制执行完全同噪声特性；打分语义由 state_dict 逐位对比
+        # 承担（见下），前向只作同权重可复现性的复核。
+        expected = copy.deepcopy(live).cpu().eval()(normalized.cpu())[-1]
         for seed in (11, 20260910):  # ambient seed 不同：装载结果不得依赖它
             torch.manual_seed(seed)
             reloaded = NetworkAssembler.discriminator(
@@ -348,16 +356,16 @@ class TestSingleIterationLoop:
             )
             restored = reloaded.state_dict()
             assert restored.keys() == saved.keys()
-            # 逐位对比在 CPU 侧先做（saved 以 map_location="cpu" 读入，
+            # 逐位对比承担形态判别力（saved 以 map_location="cpu" 读入，
             # torch.equal 跨 device 拒绝；逐位还原语义与执行 device 无关）
             assert all(torch.equal(restored[key], saved[key]) for key in saved)
-            reloaded = reloaded.to(device).eval()  # 前向对比与被测 latent 同源
-            # 前向层用绝对容差而非逐位：判别力由上面的 state 逐位对比承担
-            # （形态语义所在），前向在**同权重、不同实例**间可差 1 ulp
-            # （2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测偶发），
-            # 逐位断言会假红；1e-6 在噪声底之上、修复前形态的偏离之下。
+            # 前向层用绝对容差而非逐位：前向在**同权重、不同实例**间可差
+            # 1 ulp（2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测
+            # 偶发），逐位断言会假红；1e-6 在噪声底之上、修复前形态的
+            # 偏离之下。
             assert torch.allclose(
-                reloaded(normalized)[-1], expected, rtol=0.0, atol=1e-6,
+                reloaded.eval()(normalized.cpu())[-1], expected,
+                rtol=0.0, atol=1e-6,
             )
 
     def test_milestone_iteration_forces_checkpoint(
