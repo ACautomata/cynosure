@@ -54,9 +54,11 @@ from tests.conftest import (
 )
 from tests.test_train_loop import TrainingLoopScenario
 
-_WORKER_JOIN_TIMEOUT_S = 600.0
+_WORKER_JOIN_TIMEOUT_S = 1800.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
-失败而非无限挂起。"""
+失败而非无限挂起。成功路径的墙钟由 fixture train 时长决定（集群实测
+单 rank ~10 分钟级——CPU 栈 + 多会话并行分核，本机 ~2 分钟），上限取
+其 2 倍以上余量；死锁互等才吃满上限。"""
 
 
 def _worker_port_base() -> int:
@@ -100,14 +102,15 @@ class TrainWorldWorker:
         self.queue = queue
 
     def __call__(self) -> None:
-        # spawn 子进程不继承 xdist worker 的单线程限制（conftest
-        # pytest_configure 只在 pytest 进程生效）——``pytest -n`` 下多
-        # worker 同刻 spawn 出的每个 rank 都拉满 OMP 线程，对 128 核
-        # 是几十倍超订阅，rank 集体饿到 join 超时（集群 -n 16 实测 9
-        # failed：600s 内无任何回传）。rank 进程恒单线程：fixture
-        # 前向与线程数无关，「两路径一致」类数值断言在同为单线程下
-        # 自洽，语义不变。
-        torch.set_num_threads(1)
+        # spawn 子进程不继承 xdist worker 的线程限制（conftest
+        # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
+        # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
+        # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
+        # 超时）。恒取核数的 1/16（128 核 = 8 线程）：16 worker 并行时
+        # rank 总线程数恰好贴着物理核数，单 rank 训练时长从单线程的
+        # ~10 分钟回到分钟级。fixture 前向的数值语义与线程数无关，
+        # 「两路径一致」类断言在两路径同线程数下自洽。
+        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -322,14 +325,15 @@ class GateWorldWorker:
         self.queue = queue
 
     def __call__(self) -> None:
-        # spawn 子进程不继承 xdist worker 的单线程限制（conftest
-        # pytest_configure 只在 pytest 进程生效）——``pytest -n`` 下多
-        # worker 同刻 spawn 出的每个 rank 都拉满 OMP 线程，对 128 核
-        # 是几十倍超订阅，rank 集体饿到 join 超时（集群 -n 16 实测 9
-        # failed：600s 内无任何回传）。rank 进程恒单线程：fixture
-        # 前向与线程数无关，「两路径一致」类数值断言在同为单线程下
-        # 自洽，语义不变。
-        torch.set_num_threads(1)
+        # spawn 子进程不继承 xdist worker 的线程限制（conftest
+        # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
+        # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
+        # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
+        # 超时）。恒取核数的 1/16（128 核 = 8 线程）：16 worker 并行时
+        # rank 总线程数恰好贴着物理核数，单 rank 训练时长从单线程的
+        # ~10 分钟回到分钟级。fixture 前向的数值语义与线程数无关，
+        # 「两路径一致」类断言在两路径同线程数下自洽。
+        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
