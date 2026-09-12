@@ -100,6 +100,14 @@ class TrainWorldWorker:
         self.queue = queue
 
     def __call__(self) -> None:
+        # spawn 子进程不继承 xdist worker 的单线程限制（conftest
+        # pytest_configure 只在 pytest 进程生效）——``pytest -n`` 下多
+        # worker 同刻 spawn 出的每个 rank 都拉满 OMP 线程，对 128 核
+        # 是几十倍超订阅，rank 集体饿到 join 超时（集群 -n 16 实测 9
+        # failed：600s 内无任何回传）。rank 进程恒单线程：fixture
+        # 前向与线程数无关，「两路径一致」类数值断言在同为单线程下
+        # 自洽，语义不变。
+        torch.set_num_threads(1)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -314,6 +322,14 @@ class GateWorldWorker:
         self.queue = queue
 
     def __call__(self) -> None:
+        # spawn 子进程不继承 xdist worker 的单线程限制（conftest
+        # pytest_configure 只在 pytest 进程生效）——``pytest -n`` 下多
+        # worker 同刻 spawn 出的每个 rank 都拉满 OMP 线程，对 128 核
+        # 是几十倍超订阅，rank 集体饿到 join 超时（集群 -n 16 实测 9
+        # failed：600s 内无任何回传）。rank 进程恒单线程：fixture
+        # 前向与线程数无关，「两路径一致」类数值断言在同为单线程下
+        # 自洽，语义不变。
+        torch.set_num_threads(1)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
