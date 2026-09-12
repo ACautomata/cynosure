@@ -3,6 +3,7 @@
 失败替身。"""
 
 import copy
+import hashlib
 import io
 import json
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import torch
 
 from cynosure.cli import CynosureCli
 from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
+from cynosure.fixtures import Fixture
 
 
 @dataclass
@@ -82,6 +84,20 @@ class CliSession:
 @pytest.fixture
 def cli() -> CliSession:
     return CliSession()
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    """``gpu`` 标记的执行环境分派：无 CUDA 环境自动跳过大轮次测试——
+    CPU 口径（本机 / 集群 ``CUDA_VISIBLE_DEVICES=""``）只跑轻量子集，
+    验证职责由集群 GPU 口径全量承担（仓库纪律：测试一律上集群）。"""
+    if torch.cuda.is_available():
+        return
+    skip_gpu = pytest.mark.skip(
+        reason="gpu 标记（大轮次测试）：CPU 环境跳过，由集群 GPU 口径全量覆盖",
+    )
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip_gpu)
 
 
 # 12 个有序 src→tgt 对（脑 MRI 四序列，每序列作 anchor、其余三序列为目标）
@@ -237,6 +253,74 @@ class PretrainLightweightReward:
         pretrain.reward.pretrain_gate_auc = 0.60
         pretrain.reward.pretrain_max_steps = 24
         return pretrain
+
+
+class FixtureArtifactLibrary:
+    """fixture 场景工件库（pytest 进程内共享缓存）：网络工件 + prepare
+    三工件 + 预训练产物按场景变体只构建一次，全进程的 train 场景只读
+    复用——场景搭建的 prepare/pretrain 重建成本从每测试一次降为每变体
+    一次（集群全量按小时计的执行成本由此收敛）。
+
+    缓存键 = 场景变体全签名（组 × 采样日程 × seed × reward 覆写）：键内
+    变体的产物与逐测试重建**逐位一致**（构建流程与原 write_inputs 相同）。
+    ``sde_eta`` 例外——η 不影响预训练的 anchor 确定性 rollout，不进键。
+
+    工件目录对消费方**只读**；要篡改/删除预训练产物的测试先 fork 成
+    私有副本（场景的 ``fork_pretrained_artifacts``），写共享目录即跨
+    测试污染。"""
+
+    _cache: dict[tuple, Path] = {}
+
+    @classmethod
+    def artifacts_dir(
+        cls,
+        cli: CliSession,
+        work_dir: Path,
+        group: str,
+        *,
+        num_steps: int = 3,
+        train_steps: frozenset[int] = frozenset({1}),
+        seed: int = 0,
+        reward: dict | None = None,
+    ) -> Path:
+        """返回该场景变体的工件目录（缺则构建：网络工件 → prepare →
+        预训练 warm-start，流程与原逐测试 write_inputs 逐行一致）。"""
+        signature = (
+            group, num_steps, tuple(sorted(train_steps)), seed,
+            tuple(sorted((reward or {}).items())),
+        )
+        cached = cls._cache.get(signature)
+        if cached is not None:
+            return cached
+        token = hashlib.md5(repr(signature).encode()).hexdigest()[:8]
+        fixture_dir = work_dir / f"shared_fixtures_{token}"
+        fixture = Fixture()
+        torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
+        fixture.write_artifacts(fixture_dir)
+        FixturePrepareScenario(
+            cli, fixture.config(fixture_dir, group=group), work_dir,
+        ).run(work_dir / f"prepare_config_{token}.json")
+        # 预训练 warm-start 前置（ADR-0007）：reward 覆写在预训练**之前**
+        # 生效——如 SN 启用时预训练产物即谱归一化形态；轻量五元组只降
+        # 低本步执行成本（rationale 集中在 PretrainLightweightReward）
+        config = fixture.config(fixture_dir, group=group)
+        config.policy.num_inference_steps = num_steps
+        config.policy.train_step_indices_m = set(train_steps)
+        config.schedule.seed = seed
+        if reward:
+            config.reward = config.reward.model_copy(update=reward)
+        pretrain_config = PretrainLightweightReward.apply(config)
+        pretrain_config.experiment.group = (
+            "modal-label" if group == "sequential" else group
+        )
+        pretrain_path = work_dir / f"pretrain_config_{token}.json"
+        pretrain_path.write_text(
+            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = cli.run("pretrain", "--config", str(pretrain_path))
+        assert result.code == 0, result.stderr
+        cls._cache[signature] = fixture_dir
+        return fixture_dir
 
 
 class FailingAuc:

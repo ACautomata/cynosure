@@ -129,10 +129,16 @@ wandb/tensorboard，监控与出图都从它出发。
 仓库纪律「验证以集群全量 pytest 绿为准」（CLAUDE.md）有两种跑法，行为
 差异必须先分清再判定结果（#95 两类脆弱性的教训）：
 
-| 跑法 | 执行路径 | 适用 |
-|---|---|---|
-| 裸跑（GPU 可见） | 训练装配链路经 `dist.local_device()` 真实走 DCU | 默认口径：覆盖设备放置的真实分支 |
-| `CUDA_VISIBLE_DEVICES="" pytest` | 强制 CPU | 逐位断言类偶发失败的噪声排查 |
+| 跑法 | 执行路径 | 覆盖面 | 适用 |
+|---|---|---|---|
+| 裸跑（GPU 可见） | 训练装配链路经 `dist.local_device()` 真实走 DCU | **全量**（`gpu` 标记只在此口径执行） | 默认口径：设备放置真实分支 + 大轮次测试 |
+| `CUDA_VISIBLE_DEVICES="" pytest` | 强制 CPU | 轻量子集（`gpu` 标记自动 skip） | 逐位断言噪声排查、快速回归 |
+
+`gpu` 标记（大轮次测试：多 iteration 训练、torchrun 多进程、像素域解码
+评测、每场景多次完整训练）是执行环境分派——CPU 口径自动跳过（conftest
+`pytest_collection_modifyitems`），验证职责由 GPU 口径全量承担；功能
+断言面不因标记减少，只随跑法分派。场景搭建的 prepare/pretrain 由
+`FixtureArtifactLibrary`（conftest）按变体进程内共享，两种口径都受益。
 
 判定口径：
 
@@ -147,8 +153,10 @@ wandb/tensorboard，监控与出图都从它出发。
   测试）——装载还原、回归对账类断言固定 CPU 侧做，别靠放大容差硬扛；
 - **CPU 强制下偶发 allclose 假红同样存在**（同权重不同实例的 ulp 噪声
   与设备无关，历史实测 1 次）：单次红先复跑确认，连续失败才是回归；
-- 全量验证默认裸跑 GPU 可见；与并行训练同实例时注意大测试互相拖慢
-  （spectral norm checkpoint 类测试高负载下单个可达 ~24 min）。
+- 全量验证默认裸跑 GPU 可见（= 真全量）；CPU 强制口径的「全量」是
+  轻量子集，不能替代 GPU 口径出全绿结论；与并行训练同实例时注意大
+  测试互相拖慢（spectral norm checkpoint 类测试高负载下单个可达
+  ~24 min）。
 
 注意：两种跑法都从仓库根起 pytest（`pythonpath = ["src"]` 兜底导入），
 集群用系统 python（DCU torch 唯一宿主），缺 pytest 装进系统 python。

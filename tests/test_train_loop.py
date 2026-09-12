@@ -47,8 +47,7 @@ from cynosure.train.rollout import (
 from tests.conftest import (
     CliResult,
     CliSession,
-    FixturePrepareScenario,
-    PretrainLightweightReward,
+    FixtureArtifactLibrary,
 )
 
 
@@ -71,52 +70,50 @@ class TrainingLoopScenario:
         group: str = "modal-label",
         reward: dict | None = None,
     ) -> None:
-        """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
-        选实验组：组2/组3 的 config 携带 ControlNet 工件）。
+        """落盘训练 config（group 选实验组：组2/组3 的 config 携带
+        ControlNet 工件）。
 
-        warm-start 前置（ADR-0007）：RM readiness gate 是 train 入口的
-        硬检查、消费预训练产物——场景先以同一 config 的预训练轻量变体
-        跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
-        再落训练 config。``reward`` 覆写在预训练前置**之前**生效——
-        预训练与训练同一 reward regime（如 SN 启用时预训练产物即
-        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。"""
-        fixture = Fixture()
-        torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
-        fixture.write_artifacts(self.fixture_dir)
-        # 场景工具的幂等重建（write_inputs 可重复调用——预训练 run 目录
-        # 由本步重建，不静默覆盖语义是 CLI 的、工具面先清后建）
-        shutil.rmtree(self.fixture_dir / "pretrain_run", ignore_errors=True)
-        prepare_config = FixturePrepareScenario(
-            self.cli, fixture.config(self.fixture_dir, group=group), self.tmp_path,
-        ).run(self.tmp_path / "prepare_config.json")
-        config = fixture.config(self.fixture_dir, group=group)
+        场景工件（fixture 网络工件 + prepare 三工件 + 预训练产物）由
+        ``FixtureArtifactLibrary`` 按 (group, 日程, seed, reward 覆写)
+        变体构建一次、进程内只读共享——本方法只剩 config 落盘（场景
+        搭建成本从每测试一次降为每变体一次）。warm-start 前置（ADR-0007）
+        由库承担：RM readiness gate 是 train 入口的硬检查、消费预训练
+        产物；``reward`` 覆写进库键（在预训练之前生效）——预训练与训练
+        同一 reward regime（如 SN 启用时预训练产物即谱归一化形态，
+        warm-start 装载走形态分派的逐位还原路径）。工件对本场景只读；
+        要篡改预训练产物的测试先 ``fork_pretrained_artifacts``。"""
+        self.fixture_dir = FixtureArtifactLibrary.artifacts_dir(
+            self.cli, self.tmp_path, group,
+            num_steps=num_steps, train_steps=frozenset(train_steps),
+            seed=seed, reward=reward,
+        )
+        config = Fixture().config(self.fixture_dir, group=group)
         config.policy.num_inference_steps = num_steps
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
         if reward:
             config.reward = config.reward.model_copy(update=reward)
-        self._pretrain_warm_start(config, group)
         self.config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
 
-    def _pretrain_warm_start(self, config, group: str) -> None:
-        """场景的预训练前置：报告落 config 声明的产物路径（train 装配
-        与门槛检查的装载源）。轻量五元组（``PretrainLightweightReward``，
-        含 gate 0.60 留 margin 的 rationale）只降低本步执行成本、不进训练
-        config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
-        sequential 组的单次装配）。"""
-        pretrain_config = PretrainLightweightReward.apply(config)
-        pretrain_config.experiment.group = (
-            "modal-label" if group == "sequential" else group
+    def fork_pretrained_artifacts(self) -> None:
+        """把共享库的预训练产物目录拷贝为本场景私有，并把 config 的
+        ``pretrain_report_json`` 改指私有副本（篡改预训练产物的测试的
+        写前隔离：共享工件只读，直接写共享目录即跨测试污染）。
+        checkpoint 在 report 内以相对路径引用（解析基准 = 报告自身
+        位置），整目录拷贝后引用随之闭合。"""
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        shared_report = Path(data["reward"]["pretrain_report_json"])
+        private_dir = self.tmp_path / "pretrain_run"
+        shutil.copytree(shared_report.parent, private_dir)
+        data["reward"]["pretrain_report_json"] = str(
+            private_dir / shared_report.name,
         )
-        path = self.tmp_path / "pretrain_config.json"
-        path.write_text(
-            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
+        self.config_path.write_text(
+            json.dumps(data, indent=2), encoding="utf-8",
         )
-        result = self.cli.run("pretrain", "--config", str(path))
-        assert result.code == 0, result.stderr
 
     def train(self, *, dump: bool = False):
         argv = ["train", "--config", str(self.config_path), "--run-dir", str(self.run_dir)]
@@ -368,6 +365,7 @@ class TestSingleIterationLoop:
                 rtol=0.0, atol=1e-6,
             )
 
+    @pytest.mark.gpu  # 里程碑节奏需 3 iteration 训练
     def test_milestone_iteration_forces_checkpoint(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -390,6 +388,7 @@ class TestSingleIterationLoop:
         assert (checkpoints / "discriminator_iter2.pt").is_file()
         assert (checkpoints / "policy_iter3.pt").is_file()
 
+    @pytest.mark.gpu  # 5 步 rollout 日程（本机实测 72s，大轮次）
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -504,6 +503,7 @@ class TestSingleIterationLoop:
         产出工件的 run 目录回滚——修正预训练产物后同 --run-dir 重试
         不被残留目录拒绝。"""
         scenario.write_inputs()
+        scenario.fork_pretrained_artifacts()  # 篡改面私有化（共享工件只读）
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         checkpoint = (
             Path(data["reward"]["pretrain_report_json"]).parent
@@ -1093,6 +1093,7 @@ class TestBufferBaseSeeding:
 class TestBaseSeedingIsolation:
     """base 分区种子生成与训练 rollout 的 RNG 流隔离。"""
 
+    @pytest.mark.gpu  # 双容量 × 完整场景训练（流隔离对比）
     def test_capacity_change_does_not_shift_rollout_stream(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1150,6 +1151,7 @@ class TestLogProbConsistency:
             assert math.isfinite(pair["recorded"])
             assert pair["recorded"] == pair["recomputed"]  # 同权重逐位一致
 
+    @pytest.mark.gpu  # |M|=2 的 5 步日程 × dump 重放（本机实测 78s）
     def test_multi_step_pairs_cover_every_train_step(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1201,6 +1203,7 @@ class TestRewardDomainNormalization:
         record = trainer.loop.run_iteration()
         return record, scored
 
+    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
     def test_scored_fakes_match_replay_domain(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1211,6 +1214,7 @@ class TestRewardDomainNormalization:
         assert scored, "打分记录为空"
         assert torch.equal(torch.cat(scored), record.new_fakes)
 
+    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
     def test_scale_only_affects_reward_side_not_rollout(
         self, scenario: TrainingLoopScenario,
     ) -> None:
