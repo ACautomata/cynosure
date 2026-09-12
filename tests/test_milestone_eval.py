@@ -210,6 +210,10 @@ class TestFp16AutocastDecoding:
     fp16——纯 fp32 前向把 fp16 张量交给 fp32 conv 即抛 dtype RuntimeError
     （生产尺寸 latent 解码直接不可用）；官方 NV-Generate-CTMR 口径把解码
     前向包在 fp16 autocast 内（不得换 bf16——与官方口径输出差不可忽略）。
+
+    「生产尺寸」语义 = 超出小体豁免阈值的 latent（触发滑窗路径），以缩小
+    roi 复现（fixture VAE 形状契约使真 ~64³ 生产尺寸在测试不现实），
+    与滑窗行为既有测试同口径。
     """
 
     def _norm_float16_artifact(self, scenario: TrainingLoopScenario) -> NetworkArtifact:

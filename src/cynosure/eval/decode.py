@@ -78,7 +78,11 @@ class LatentDecoder:
         不得换 bf16：与官方 fp16 口径输出差 ~6.8e-02，对指标口径不可
         忽略；无条件包 autocast、不分设备分支——生产 config
         ``norm_float16=true`` 使 norm 输出转 fp16，纯 fp32 前向对
-        fp32 conv 抛 dtype RuntimeError，CPU 也不例外）。输出统一
+        fp32 conv 抛 dtype RuntimeError，CPU 也不例外（与 reward
+        预编码器 ``reward/encoder.py`` 的按设备分支不同：彼处 CPU
+        路径只服务无 ``norm_float16`` 的 fixture、生产恒走 CUDA
+        分支，此处语义不可照抄）。
+        输出统一
         上浮 fp32（fp16→fp32 无损），下游指标/落盘契约不变；输入先
         除 scale factor 归位 encoder 域——逐元素算子，保留在
         autocast 外，整批除与官方逐 patch 除等价。"""
