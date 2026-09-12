@@ -39,7 +39,7 @@ from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
-from cynosure.reward.sampler import RealPoolSampler
+from cynosure.reward.sampler import RealPoolSampler, assert_real_capacity
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train.artifacts import RunArtifacts
@@ -221,16 +221,21 @@ class TrainingRuntime:
         scorer = cls._assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
+        # real 侧视图：分布式 = 本 rank 条带切片，单进程 = 全池（RankSlicedPool
+        # 恒等语义）。装配期逐 (切片或全池, 模态) 容量 ≥ K 守卫（ADR-0008
+        # 决策 4 / ADR-0008-03：条件匹配采样后每条件独立供满无放回 real 批）
+        real_view = RankSlicedPool(
+            LatentManifest.load(
+                config.reward.real_pool_manifest, kind="real_pool",
+            ),
+            dist,
+        ).view()
+        assert_real_capacity(real_view, config.reward.disc_batch_size_k)
         update = OnlineUpdate(
             scorer=scorer,
             buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
             real_sampler=RealPoolSampler(
-                RankSlicedPool(
-                    LatentManifest.load(
-                        config.reward.real_pool_manifest, kind="real_pool",
-                    ),
-                    dist,
-                ).view(),
+                real_view,
                 generators["real_pool"],
                 amp.device,
             ),

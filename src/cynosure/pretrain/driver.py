@@ -57,9 +57,11 @@ class PretrainDriver:
         self._run = run
         reward = config.reward
         # 装配守卫（train 装配同口径，ADR-0008 决策 4：assert_replay_supply
-        # 管回放半区非零 + base 分区每条件配额 ≥ 回放半区需求）+ 预训练
-        # 特有守卫：每步量产的 fake 须覆盖判别器更新批的当前半区——
-        # 无效组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本
+        # 管回放半区非零 + base 分区每条件配额 ≥ 回放半区需求；real 侧的
+        # 逐 (全池, 模态) 容量 ≥ K 守卫在共享装配缝 assemble_rewards 内，
+        # ADR-0008-03）+ 预训练特有守卫：每步量产的 fake 须覆盖判别器
+        # 更新批的当前半区——无效组合在装配期显式拒绝，而非让昂贵 rollout
+        # 先行、更新时才缺样本
         assert_replay_supply(reward)
         current_count = math.ceil(
             reward.disc_batch_size_k * reward.replay_current_fraction,

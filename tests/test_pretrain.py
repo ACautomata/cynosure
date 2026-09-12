@@ -674,3 +674,35 @@ class TestPretrainDriverAssembly:
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         with pytest.raises(ValueError, match="fake"):
             PretrainDriver(config, run, device=torch.device("cpu"))
+
+    def test_rejects_real_pool_below_batch_capacity(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """ADR-0008-03 装配守卫：逐 (全池, 模态) real 容量 < K → fail-fast
+        可读报错（driver 经 assemble_rewards 与 train 同一条装配缝——
+        守卫先于任何 rollout/更新执行）。"""
+        small_pool = scenario.tmp_path / "starved_pool.json"
+        small_pool.write_text(json.dumps({
+            "kind": "real_pool",
+            "encoder": "starved-fixture",
+            "latent_shape": [4, 16, 16, 8],
+            "split_seed": 0,
+            "split_sizes": {"train": 12},
+            "entries": [
+                {
+                    "case_id": f"case-{modality}-{index}",
+                    "modality": modality,
+                    "latent": f"latents/{modality}-{index}.pt",
+                    "spacing": [100.0, 100.0, 100.0],
+                }
+                for modality in ("t1n", "t1c", "t2w", "t2f")
+                for index in range(3)  # 每模态 3 条 < K=4
+            ],
+        }), encoding="utf-8")
+        scenario.write_config(reward={"real_pool_manifest": str(small_pool)})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "capacity_run")
+        with pytest.raises(ValueError, match="容量不足") as exc_info:
+            PretrainDriver(config, run, device=torch.device("cpu"))
+        message = str(exc_info.value)
+        assert "disc_batch_size_k" in message  # 可读：点名条件、可用量与 knob

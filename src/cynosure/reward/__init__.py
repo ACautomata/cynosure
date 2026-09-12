@@ -38,7 +38,11 @@ from cynosure.reward.encoder import (
 )
 from cynosure.reward.pipeline import PreparePipeline, PrepareReport
 from cynosure.reward.preprocessing import UpstreamPreprocessChain
-from cynosure.reward.sampler import RealPoolSampler, RealSampling
+from cynosure.reward.sampler import (
+    RealPoolSampler,
+    RealSampling,
+    assert_real_capacity,
+)
 from cynosure.reward.scorer import (
     ChannelNormalizer,
     LatentScorer,
@@ -87,6 +91,7 @@ __all__ = [
     "VolumeScoreClusters",
     "ZoneModalities",
     "ZoneSizes",
+    "assert_real_capacity",
     "assert_replay_supply",
     "base_condition_quota",
     "bootstrap_ci_lower_bound",

@@ -21,7 +21,7 @@ from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
 from cynosure.reward.buffer import ReplayBuffer
-from cynosure.reward.sampler import RealPoolSampler
+from cynosure.reward.sampler import RealPoolSampler, assert_real_capacity
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 
@@ -72,6 +72,23 @@ class WrittenPool:
         return self.manifest_path
 
 
+class RecordingRealSampler:
+    """测试仪器：记录 real 侧采样的 (count, modality) 并返回确定性批
+    （RealSampling 协议替身——real 侧条件匹配穿参的观测缝）。"""
+
+    def __init__(self, latent_shape: tuple[int, ...]) -> None:
+        self._shape = latent_shape
+        self.calls: list[tuple[int, str]] = []
+
+    @property
+    def size(self) -> int:
+        return 1024
+
+    def sample(self, count: int, *, modality: str | None = None) -> torch.Tensor:
+        self.calls.append((count, modality))
+        return torch.zeros(count, *self._shape)
+
+
 class UpdateScenario:
     """OnlineUpdate 单元场景：pool 工件 + fixture 判别器 + 满 buffer。"""
 
@@ -110,7 +127,9 @@ class UpdateScenario:
     def fakes(self, count: int, seed: int = 3) -> torch.Tensor:
         return torch.randn(count, *SHAPE, generator=self.generator(seed))
 
-    def update(self) -> tuple[OnlineUpdate, ReplayBuffer]:
+    def update(
+        self, real_sampler: RealPoolSampler | RecordingRealSampler | None = None,
+    ) -> tuple[OnlineUpdate, ReplayBuffer]:
         buffer = ReplayBuffer(self.config.reward.replay_buffer_capacity)
         buffer.fill_base(
             self.fakes(32, seed=11),
@@ -121,10 +140,39 @@ class UpdateScenario:
         update = OnlineUpdate(
             scorer=self.scorer(),
             buffer=buffer,
-            real_sampler=RealPoolSampler(pool, self.generator(5)),
+            real_sampler=(
+                real_sampler if real_sampler is not None
+                else RealPoolSampler(pool, self.generator(5))
+            ),
             config=self.config.reward,
             generator=self.generator(6),
         )
+        return update, buffer
+
+    def depleted_condition_update(
+        self, modality: str,
+        real_sampler: RealPoolSampler | RecordingRealSampler | None = None,
+    ) -> tuple[OnlineUpdate, ReplayBuffer]:
+        """该条件回放候选耗尽的场景（退化路径专用）：base 全部另一条件
+        填充、recent 不动——``condition_supply(modality)`` = 0 <
+        回放半区需求。"""
+        buffer = ReplayBuffer(self.config.reward.replay_buffer_capacity)
+        buffer.fill_base(
+            self.fakes(32, seed=11),
+            ["t1n"] * 32,
+        )
+        pool = LatentManifest.load(self.pool_path, kind="real_pool")
+        update = OnlineUpdate(
+            scorer=self.scorer(),
+            buffer=buffer,
+            real_sampler=(
+                real_sampler if real_sampler is not None
+                else RealPoolSampler(pool, self.generator(5))
+            ),
+            config=self.config.reward,
+            generator=self.generator(6),
+        )
+        assert buffer.condition_supply(modality) == 0
         return update, buffer
 
 
@@ -182,6 +230,94 @@ class TestMixComposition:
         with pytest.raises(ValueError, match="t1n"):
             # base 每条件 8 条：需求 9 超出 t1n 候选（base 8 + recent 0）
             update.buffer.sample_replay(9, scenario.generator(9), "t1n")
+
+
+class TestConditionMatchedRealSide:
+    """ADR-0008-03 AC 1：在线更新 real 侧按本 iteration 目标模态匹配
+    采样（与 held-out AUC 同条件归因口径同源）——real 侧候选不足属装配
+    守卫（assert_real_capacity）的拒绝面，采样语义本身不动。"""
+
+    def test_real_batch_matches_iteration_condition(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """real 批以本 iteration 目标模态过滤采样（观测缝：RealSampling
+        替身记录 (count, modality)）。"""
+        sampler = RecordingRealSampler(SHAPE)
+        update, _ = scenario.update(real_sampler=sampler)
+        update.step(scenario.fakes(12), "t1n")
+        assert sampler.calls == [(4, "t1n")]  # K=4、条件 = 步条件
+
+    def test_report_carries_condition(self, scenario: UpdateScenario) -> None:
+        """AC：UpdateReport 带条件——本步更新归因的目标模态。"""
+        update, _ = scenario.update()
+        report = update.step(scenario.fakes(12), "t1c")
+        assert report.modality == "t1c"
+
+    def test_condition_filtering_keeps_mix_ratio_semantics(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """AC：两区混采配比语义（各半、可互补）在条件匹配下保持——
+        real 侧条件化不改变 fake 侧混采构成。"""
+        update, _ = scenario.update()
+        report = update.step(scenario.fakes(12), "t2f")
+        assert report.num_current == 2
+        assert report.num_replay == 2
+        assert (report.num_base_replay, report.num_recent_replay) == (1, 1)
+
+
+class TestReplayShortageDegradation:
+    """ADR-0008-03 AC 2：回放不足退化路径——该步纯 current 半区（回放
+    0 条）+ 可观测标记，real 侧与退化后批同量匹配，不静默漂移。"""
+
+    def test_short_condition_degrades_to_pure_current_half(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """该条件候选 < 回放半区需求：回放 0 条、批 = 当前半区、报告带
+        退化标记（不静默漂移为全池混采或半途截断的回放）。"""
+        update, _ = scenario.depleted_condition_update("t2w")
+        report = update.step(scenario.fakes(12), "t2w")
+        assert report.replay_degraded is True
+        assert report.num_replay == 0
+        assert (report.num_base_replay, report.num_recent_replay) == (0, 0)
+        assert report.num_current == 2  # 批 = 当前半区（K=4 → 2 条）
+        assert report.modality == "t2w"
+
+    def test_degraded_real_batch_matches_degraded_size(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """real 侧与退化后批同量匹配（不再抽满 K）——真两侧批等量，
+        LSGAN 损失的 real/fake 配对语义保持。"""
+        sampler = RecordingRealSampler(SHAPE)
+        update, _ = scenario.depleted_condition_update("t2w", sampler)
+        update.step(scenario.fakes(12), "t2w")
+        assert sampler.calls == [(2, "t2w")]  # 与退化后批（当前半区 2 条）同量
+
+    def test_degraded_step_still_trains_and_pushes(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """退化步判别器照常更新、当前 fake 照常带标签入近期分区——
+        回放缺失不停摆更新（gated 条件的判别器持续受训语义）。"""
+        update, buffer = scenario.depleted_condition_update("t2w")
+        weight = next(
+            p for p in update.scorer.discriminator.parameters() if p.ndim == 5
+        )
+        before = weight.detach().clone()
+        fakes = scenario.fakes(12)
+        report = update.step(fakes, "t2w")
+        assert not torch.equal(before, weight.detach())
+        pushed = buffer.recent_samples()
+        assert len(pushed) == 12
+        assert all(entry.modality == "t2w" for entry in pushed)
+
+    def test_sufficient_condition_reports_no_degradation(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """正常混采步退化标记为 False（观测面零歧义：0 回放占比只可能
+        出现在退化步或 N_d 跳过，标记区分二者）。"""
+        update, _ = scenario.update()
+        report = update.step(scenario.fakes(12), "t2w")
+        assert report.replay_degraded is False
+        assert report.num_replay == 2
 
 
 class TestUpdateStep:
@@ -248,6 +384,67 @@ class TestUpdateStep:
         sampler = RealPoolSampler(pool, scenario.generator(9))
         with pytest.raises(ValueError, match="pool"):
             sampler.sample(len(pool.entries) + 1)
+
+
+class TestRealCapacityGuard:
+    """ADR-0008-03 AC 5：装配期 real 容量守卫——逐 (rank 切片或全池,
+    模态) real 容量 ≥ K，不足 fail-fast 可读报错（RealPoolSampler 无放回
+    采样语义不动，不引入有放回采样补洞）。"""
+
+    @staticmethod
+    def _manifest(per_modality: dict[str, int]) -> LatentManifest:
+        entries = [
+            PoolEntry(
+                case_id=f"case-{modality}-{index}",
+                modality=modality,
+                latent=f"real_pool_latents/{modality}-{index}.pt",
+                spacing=(100.0, 100.0, 100.0),
+            )
+            for modality, count in per_modality.items()
+            for index in range(count)
+        ]
+        return LatentManifest(
+            kind="real_pool",
+            encoder="guard-test",
+            latent_shape=SHAPE,
+            split_seed=0,
+            split_sizes={"train": len(entries)},
+            entries=entries,
+        )
+
+    def test_capacity_at_exact_k_passes(self) -> None:
+        """每模态恰好 K 条：守卫放行（无放回采 K 条可行）。"""
+        assert_real_capacity(self._manifest({m: 4 for m in MODALITIES}), 4)
+
+    def test_capacity_above_k_passes(self) -> None:
+        assert_real_capacity(self._manifest({m: 110 for m in MODALITIES}), 8)
+
+    def test_starved_modality_rejected_with_readable_error(self) -> None:
+        """单条件不足即拒（总量够、单条件不够不是放行理由——条件匹配
+        采样后每条件独立供满 real 批）：报错点名条件、可用量与 K。"""
+        manifest = self._manifest(
+            {"t1n": 2, "t1c": 4, "t2w": 4, "t2f": 4},
+        )
+        with pytest.raises(ValueError, match="容量不足") as exc_info:
+            assert_real_capacity(manifest, 4)
+        message = str(exc_info.value)
+        assert "t1n" in message and "2" in message and "4" in message
+        assert "disc_batch_size_k" in message  # 可行动：点名 config knob
+
+    def test_zero_capacity_modality_rejected(self) -> None:
+        """某模态 0 条（稀疏模态切片断供的极端）：显式拒绝，不静默空采。"""
+        manifest = self._manifest({"t1n": 4, "t1c": 4, "t2w": 4, "t2f": 0})
+        with pytest.raises(ValueError, match="t2f"):
+            assert_real_capacity(manifest, 4)
+
+    def test_guard_consumes_rank_sliced_view_by_contract(self) -> None:
+        """守卫消费「采样器实际看到的 manifest」（rank 切片视图或全池）：
+        函数对传入 manifest 的逐模态计数判定，切片语义归 RankSlicedPool
+        （装配缝先切片后守卫——本测试锁守卫面与切片视图的契约方向）。"""
+        manifest = self._manifest({m: 4 for m in MODALITIES})
+        sliced = manifest.with_entries(manifest.entries[:2])  # 模拟切片视图
+        with pytest.raises(ValueError, match="容量不足"):
+            assert_real_capacity(sliced, 4)
 
 
 class TestLossDecreases:
