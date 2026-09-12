@@ -54,11 +54,12 @@ from tests.conftest import (
 )
 from tests.test_train_loop import TrainingLoopScenario
 
-_WORKER_JOIN_TIMEOUT_S = 1800.0
+_WORKER_JOIN_TIMEOUT_S = 3600.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
-失败而非无限挂起。成功路径的墙钟由 fixture train 时长决定（集群实测
-单 rank ~10 分钟级——CPU 栈 + 多会话并行分核，本机 ~2 分钟），上限取
-其 2 倍以上余量；死锁互等才吃满上限。"""
+失败而非无限挂起。成功路径的墙钟由 fixture train 时长决定（rank 恒
+单线程、集群实测单 rank ~10 分钟级——CPU 栈 + 多会话并行分核，本机
+~2 分钟），单线程 rank 进程间无 CPU 争抢（128 核 ≫ 并行 rank 数），
+上限取实测 6 倍余量；死锁互等才吃满上限。"""
 
 
 def _worker_port_base() -> int:
@@ -106,11 +107,12 @@ class TrainWorldWorker:
         # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
         # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
         # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
-        # 超时）。恒取核数的 1/16（128 核 = 8 线程）：16 worker 并行时
-        # rank 总线程数恰好贴着物理核数，单 rank 训练时长从单线程的
-        # ~10 分钟回到分钟级。fixture 前向的数值语义与线程数无关，
-        # 「两路径一致」类断言在两路径同线程数下自洽。
-        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
+        # 超时）。rank 恒单线程，**必须与单进程参考路径同线程数**——
+        # torch 卷积的求和顺序随线程数变，跨路径数值等价断言
+        # （``_EQUIVALENCE_RTOL``）在两路径同线程数下才自洽（集群实测
+        # rank 8 线程 vs 参考 1 线程 → loss ~1e-6 尺度 7% 相对差超容差；
+        # 本机两路径同为 1 线程 → 绿）。单线程 rank 进程间无 CPU 争抢。
+        torch.set_num_threads(1)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -329,11 +331,12 @@ class GateWorldWorker:
         # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
         # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
         # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
-        # 超时）。恒取核数的 1/16（128 核 = 8 线程）：16 worker 并行时
-        # rank 总线程数恰好贴着物理核数，单 rank 训练时长从单线程的
-        # ~10 分钟回到分钟级。fixture 前向的数值语义与线程数无关，
-        # 「两路径一致」类断言在两路径同线程数下自洽。
-        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
+        # 超时）。rank 恒单线程，**必须与单进程参考路径同线程数**——
+        # torch 卷积的求和顺序随线程数变，跨路径数值等价断言
+        # （``_EQUIVALENCE_RTOL``）在两路径同线程数下才自洽（集群实测
+        # rank 8 线程 vs 参考 1 线程 → loss ~1e-6 尺度 7% 相对差超容差；
+        # 本机两路径同为 1 线程 → 绿）。单线程 rank 进程间无 CPU 争抢。
+        torch.set_num_threads(1)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
