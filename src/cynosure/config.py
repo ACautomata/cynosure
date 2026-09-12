@@ -471,6 +471,15 @@ class RewardConfig(BaseModel):
         "校准后定版）",
         default=0.65, gt=0.0, lt=1.0,
     )
+    gate_support_min_volumes: int = SpecField(
+        "tunable", "ADR-0008",
+        "门槛支撑度界（ADR-0008 决策 6）：条件 held-out 卷数 < 此界时，该条件"
+        "过线判据从池化点估计改为 bootstrap CI 下界 ≥ 门槛（卷级聚类重采样，"
+        "重复数与分位固化在 cynosure.reward.support；MRA ≈ 16 卷命中走 CI "
+        "口径、T2w ≈ 67 卷不命中走点估计）；≥ 界维持点估计口径（暂定 20，"
+        "MR-RATE 预训练曲线校准后定版）",
+        default=20, ge=1,
+    )
     pretrain_max_steps: int = SpecField(
         "tunable", "ADR-0007",
         "预训练密集步进上限（远超在线期 1 step/iter；AUC 达门槛即提前终止，"

@@ -7,13 +7,14 @@
 - Reward model（reward-model 章 + ADR-0001）：MONAI PatchDiscriminator
   封装（GroupNorm、raw real-logit patch 聚合、SpectralNorm 触发式）、
   LSGAN 在线更新一步（AdamW、50% 当前 / 50% 回放）、两区 Replay buffer
-  （固定 base + FIFO recent）、held-out AUC 监控信号。
+  （固定 base + FIFO recent）、held-out AUC 监控信号、支撑度判定原语
+  （ADR-0008 决策 6：低支撑条件走 bootstrap CI 下界口径）。
 
 数值语义见 docs/spec/reward-model.md 与 ADR-0001。
 """
 
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
-from cynosure.reward.auc import HeldOutAuc
+from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
 from cynosure.reward.buffer import (
     ReplayBuffer,
     ReplayDraw,
@@ -44,6 +45,13 @@ from cynosure.reward.scorer import (
     LsganTerms,
     RewardScorer,
 )
+from cynosure.reward.support import (
+    DEFAULT_REPLICATES,
+    LOWER_QUANTILE,
+    SupportRule,
+    bootstrap_ci_lower_bound,
+    bootstrap_replicates,
+)
 from cynosure.reward.update import OnlineUpdate, UpdateReport
 
 __all__ = [
@@ -53,7 +61,9 @@ __all__ = [
     "CaseSplitter",
     "ChannelNormalizer",
     "ChannelStats",
+    "DEFAULT_REPLICATES",
     "HeldOutAuc",
+    "LOWER_QUANTILE",
     "LatentEncoder",
     "LatentManifest",
     "LatentScorer",
@@ -70,11 +80,15 @@ __all__ = [
     "ReplayEntry",
     "ReplayStore",
     "RewardScorer",
+    "SupportRule",
     "SyntheticLatentEncoder",
     "UpdateReport",
     "UpstreamPreprocessChain",
+    "VolumeScoreClusters",
     "ZoneModalities",
     "ZoneSizes",
     "assert_replay_supply",
     "base_condition_quota",
+    "bootstrap_ci_lower_bound",
+    "bootstrap_replicates",
 ]
