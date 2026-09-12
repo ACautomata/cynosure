@@ -3,8 +3,13 @@
 失败替身。"""
 
 import copy
+import hashlib
 import io
 import json
+import os
+import shutil
+import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +20,59 @@ import torch
 
 from cynosure.cli import CynosureCli
 from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
+
+
+class SceneCache:
+    """训练场景包的进程级缓存（``TrainingLoopScenario.write_inputs`` 的
+    确定性前置去冗余）：网络工件 + 合成数据集 + prepare 三工件 + pretrain
+    产物全部由固定 seed 决定——同场景参数下逐测试重算是纯冗余（全量
+    pytest 的小时级大头）。命中即整包 ``copytree`` 回各测试的 tmp_path：
+    保持每测试独占工件、可自由篡改（坏工件拒绝类测试）的现有语义。
+
+    并发（pytest-xdist 多 worker 共享缓存目录）：``store`` 以唯一临时
+    目录构建后原子 ``rename`` 提交，最终目录存在即完整，读侧无锁。
+    """
+
+    ROOT = Path(tempfile.gettempdir()) / "cynosure-scene-cache"
+
+    _namespace: str | None = None
+
+    @classmethod
+    def key(cls, *parts: object) -> str:
+        """场景参数 → 缓存键（入参须 JSON 可序列化；集合型先排序归一）。
+
+        键掺 src 树内容指纹：场景产物依赖整条 prepare/pretrain 代码
+        路径，任何源码改动都使旧缓存失效（否则修 bug 的测试会吃到旧
+        代码的产物）。指纹每进程只算一次。"""
+        if cls._namespace is None:
+            digest = hashlib.sha256()
+            root = Path(__file__).resolve().parent.parent / "src" / "cynosure"
+            for source in sorted(root.rglob("*.py")):
+                digest.update(str(source.relative_to(root)).encode())
+                digest.update(source.read_bytes())
+            cls._namespace = digest.hexdigest()[:12]
+        return hashlib.sha256(
+            json.dumps([cls._namespace, *parts], sort_keys=True, default=list).encode(),
+        ).hexdigest()[:16]
+
+    @classmethod
+    def load(cls, key: str) -> Path | None:
+        cached = cls.ROOT / key
+        return cached if cached.is_dir() else None
+
+    @classmethod
+    def store(cls, key: str, source: Path) -> None:
+        """构建缓存包（原子提交；已存在则放弃自己的副本用现成的）。"""
+        final = cls.ROOT / key
+        if final.exists():
+            return
+        cls.ROOT.mkdir(parents=True, exist_ok=True)
+        staging = cls.ROOT / f".staging-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(source, staging)
+            os.replace(staging, final)  # 同盘 rename 原子
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 @dataclass
@@ -248,3 +306,12 @@ class FailingAuc:
 
     def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
         raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """pytest-xdist worker 单线程：多 worker 合计已饱和 CPU，各 worker
+    再拉满 OpenMP 线程只会超订阅互抢（集群 128 核跑 4 个全量的实测
+    load 307）。单进程跑不受影响。"""
+    if hasattr(config, "workerinput"):
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)

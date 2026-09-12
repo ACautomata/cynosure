@@ -48,6 +48,7 @@ from tests.conftest import (
     CliSession,
     FixturePrepareScenario,
     PretrainLightweightReward,
+    SceneCache,
 )
 
 
@@ -78,9 +79,50 @@ class TrainingLoopScenario:
         跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
         再落训练 config。``reward`` 覆写在预训练前置**之前**生效——
         预训练与训练同一 reward regime（如 SN 启用时预训练产物即
-        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。"""
+        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。
+
+        确定性前置（网络工件 + 合成数据集 + prepare + pretrain）由
+        固定 seed 决定，走 ``SceneCache`` 进程级缓存去冗余（全量
+        pytest 的小时级大头）：命中整包 copytree 回本测试 tmp_path
+        （每测试仍独占工件、可自由篡改）；键覆盖全部影响前置产物的
+        场景参数，不同参数各自成键、互不串味。
+        """
+        cache_key = SceneCache.key(
+            group, num_steps, sorted(train_steps), seed, reward,
+        )
+        cached = SceneCache.load(cache_key)
+        if cached is not None:
+            shutil.rmtree(self.fixture_dir, ignore_errors=True)
+            shutil.copytree(cached, self.fixture_dir)
+        else:
+            self._build_inputs(num_steps, train_steps, seed, group, reward)
+            SceneCache.store(cache_key, self.fixture_dir)
         fixture = Fixture()
+        config = fixture.config(self.fixture_dir, group=group)
+        config.policy.num_inference_steps = num_steps
+        config.policy.train_step_indices_m = set(train_steps)
+        config.schedule.seed = seed
+        config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
+        if reward:
+            config.reward = config.reward.model_copy(update=reward)
+        self.config_path.write_text(
+            config.model_dump_json(indent=2), encoding="utf-8",
+        )
+
+    def _build_inputs(
+        self,
+        num_steps: int,
+        train_steps: set[int],
+        seed: int,
+        group: str,
+        reward: dict | None,
+    ) -> None:
+        """确定性前置的真构建（缓存 miss 路径）：网络工件 + prepare +
+        pretrain warm-start（``torch.manual_seed(7)`` 固定网络初始化）。
+        pretrain 消费调用方场景参数（原 ``write_inputs`` 语义——前置
+        与训练同一 config 形态），缓存键含同组参数、产物随键一致。"""
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
+        fixture = Fixture()
         fixture.write_artifacts(self.fixture_dir)
         # 场景工具的幂等重建（write_inputs 可重复调用——预训练 run 目录
         # 由本步重建，不静默覆盖语义是 CLI 的、工具面先清后建）
@@ -96,9 +138,6 @@ class TrainingLoopScenario:
         if reward:
             config.reward = config.reward.model_copy(update=reward)
         self._pretrain_warm_start(config, group)
-        self.config_path.write_text(
-            config.model_dump_json(indent=2), encoding="utf-8",
-        )
 
     def _pretrain_warm_start(self, config, group: str) -> None:
         """场景的预训练前置：报告落 config 声明的产物路径（train 装配
