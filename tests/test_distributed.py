@@ -54,6 +54,11 @@ from tests.conftest import (
 )
 from tests.test_train_loop import TrainingLoopScenario
 
+# 整文件大轮次：torchrun 多进程集合并行验证——标记 gpu：CPU 环境自动
+# 跳过（conftest 执行环境分派），验证职责由集群 GPU 口径全量承担
+# （仓库纪律：测试一律上集群）。
+pytestmark = [pytest.mark.gpu]
+
 _WORKER_JOIN_TIMEOUT_S = 600.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
 失败而非无限挂起。"""

@@ -17,6 +17,11 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
 from tests.test_train_loop import TrainingLoopScenario
 
+# 整文件大轮次：组3 序贯两段训练（stage-1 + stage-2）——标记 gpu：CPU
+# 环境自动跳过（conftest 执行环境分派），验证职责由集群 GPU 口径全量
+# 承担（仓库纪律：测试一律上集群）。
+pytestmark = [pytest.mark.gpu]
+
 
 @pytest.fixture
 def scenario(cli, tmp_path: Path) -> TrainingLoopScenario:

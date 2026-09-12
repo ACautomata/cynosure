@@ -12,6 +12,7 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 5. buffer base 分区在 train 启动时由冻结初始 policy 自动生成。
 """
 
+import copy
 import json
 import math
 import shutil
@@ -46,8 +47,7 @@ from cynosure.train.rollout import (
 from tests.conftest import (
     CliResult,
     CliSession,
-    FixturePrepareScenario,
-    PretrainLightweightReward,
+    FixtureArtifactLibrary,
 )
 
 
@@ -70,52 +70,50 @@ class TrainingLoopScenario:
         group: str = "modal-label",
         reward: dict | None = None,
     ) -> None:
-        """落盘 fixture 网络工件 + prepare 三工件 + 训练 config（group
-        选实验组：组2/组3 的 config 携带 ControlNet 工件）。
+        """落盘训练 config（group 选实验组：组2/组3 的 config 携带
+        ControlNet 工件）。
 
-        warm-start 前置（ADR-0007）：RM readiness gate 是 train 入口的
-        硬检查、消费预训练产物——场景先以同一 config 的预训练轻量变体
-        跑出报告与 checkpoint（fixture 低阈值 gate，Fixture.config），
-        再落训练 config。``reward`` 覆写在预训练前置**之前**生效——
-        预训练与训练同一 reward regime（如 SN 启用时预训练产物即
-        谱归一化形态，warm-start 装载走形态分派的逐位还原路径）。"""
-        fixture = Fixture()
-        torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
-        fixture.write_artifacts(self.fixture_dir)
-        # 场景工具的幂等重建（write_inputs 可重复调用——预训练 run 目录
-        # 由本步重建，不静默覆盖语义是 CLI 的、工具面先清后建）
-        shutil.rmtree(self.fixture_dir / "pretrain_run", ignore_errors=True)
-        prepare_config = FixturePrepareScenario(
-            self.cli, fixture.config(self.fixture_dir, group=group), self.tmp_path,
-        ).run(self.tmp_path / "prepare_config.json")
-        config = fixture.config(self.fixture_dir, group=group)
+        场景工件（fixture 网络工件 + prepare 三工件 + 预训练产物）由
+        ``FixtureArtifactLibrary`` 按 (group, 日程, seed, reward 覆写)
+        变体构建一次、进程内只读共享——本方法只剩 config 落盘（场景
+        搭建成本从每测试一次降为每变体一次）。warm-start 前置（ADR-0007）
+        由库承担：RM readiness gate 是 train 入口的硬检查、消费预训练
+        产物；``reward`` 覆写进库键（在预训练之前生效）——预训练与训练
+        同一 reward regime（如 SN 启用时预训练产物即谱归一化形态，
+        warm-start 装载走形态分派的逐位还原路径）。工件对本场景只读；
+        要篡改预训练产物的测试先 ``fork_pretrained_artifacts``。"""
+        self.fixture_dir = FixtureArtifactLibrary.artifacts_dir(
+            self.cli, self.tmp_path, group,
+            num_steps=num_steps, train_steps=frozenset(train_steps),
+            seed=seed, reward=reward,
+        )
+        config = Fixture().config(self.fixture_dir, group=group)
         config.policy.num_inference_steps = num_steps
         config.policy.train_step_indices_m = set(train_steps)
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # tracer bullet：单 iteration 全链路
         if reward:
             config.reward = config.reward.model_copy(update=reward)
-        self._pretrain_warm_start(config, group)
         self.config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
 
-    def _pretrain_warm_start(self, config, group: str) -> None:
-        """场景的预训练前置：报告落 config 声明的产物路径（train 装配
-        与门槛检查的装载源）。轻量五元组（``PretrainLightweightReward``，
-        含 gate 0.60 留 margin 的 rationale）只降低本步执行成本、不进训练
-        config；组3 的预训练走 stage-1 的组1 形态（GroupPolicy 拒绝
-        sequential 组的单次装配）。"""
-        pretrain_config = PretrainLightweightReward.apply(config)
-        pretrain_config.experiment.group = (
-            "modal-label" if group == "sequential" else group
+    def fork_pretrained_artifacts(self) -> None:
+        """把共享库的预训练产物目录拷贝为本场景私有，并把 config 的
+        ``pretrain_report_json`` 改指私有副本（篡改预训练产物的测试的
+        写前隔离：共享工件只读，直接写共享目录即跨测试污染）。
+        checkpoint 在 report 内以相对路径引用（解析基准 = 报告自身
+        位置），整目录拷贝后引用随之闭合。"""
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        shared_report = Path(data["reward"]["pretrain_report_json"])
+        private_dir = self.tmp_path / "pretrain_run"
+        shutil.copytree(shared_report.parent, private_dir)
+        data["reward"]["pretrain_report_json"] = str(
+            private_dir / shared_report.name,
         )
-        path = self.tmp_path / "pretrain_config.json"
-        path.write_text(
-            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
+        self.config_path.write_text(
+            json.dumps(data, indent=2), encoding="utf-8",
         )
-        result = self.cli.run("pretrain", "--config", str(path))
-        assert result.code == 0, result.stderr
 
     def train(self, *, dump: bool = False):
         argv = ["train", "--config", str(self.config_path), "--run-dir", str(self.run_dir)]
@@ -303,7 +301,15 @@ class TestSingleIterationLoop:
 
         对照（固化有效权重的形态）：装载时重新叠谱归一化会**再归一化
         一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
-        消费面拿到的不再是训练时那一份判别函数。"""
+        消费面拿到的不再是训练时那一份判别函数。
+
+        执行 device 跟随训练装配（GPU 可见即加速器、CPU 强制即 CPU）：
+        手动构造的 normalizer 按被测 latent 的 device 落位（生产装配由
+        trainer 单点 ``.to()`` 接管的同款语义，#95），GPU 可见环境不再被
+        normalize 的 device fail-fast 拦在断言层之前；state_dict 逐位对比
+        与前向对比都在 CPU 侧做——加速器上同权重不同实例的前向偏离实测
+        可超 1e-6 容差（conv kernel 的分块/归约随实例内存布局漂移，#95
+        集群复测非偶发），CPU 路径的 1 ulp 噪声底下这层容差才站得住。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -320,11 +326,20 @@ class TestSingleIterationLoop:
         assert any(".parametrizations." in key for key in saved)
         live.eval()
         sample = trainer.rewards.buffer.recent_samples()[0].latent.unsqueeze(0)
+        device = sample.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
+        # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
+        # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
+        # normalizer 与生产装配一样迁移到 latent 所在 device，GPU 可见环境
+        # 不再被契约拦截在真正的断言层之前。
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
-        )
+        ).to(device)
         normalized = normalizer.normalize(sample)
-        expected = live(normalized)[-1]
+        # 前向对比固定 CPU 执行路径（#95 集群实测）：加速器上同权重不同
+        # 实例的前向偏离可超 1e-6 容差且非偶发，装载实例不迁移——断言层
+        # 与 CPU 强制执行完全同噪声特性；打分语义由 state_dict 逐位对比
+        # 承担（见下），前向只作同权重可复现性的复核。
+        expected = copy.deepcopy(live).cpu().eval()(normalized.cpu())[-1]
         for seed in (11, 20260910):  # ambient seed 不同：装载结果不得依赖它
             torch.manual_seed(seed)
             reloaded = NetworkAssembler.discriminator(
@@ -338,16 +353,19 @@ class TestSingleIterationLoop:
             )
             restored = reloaded.state_dict()
             assert restored.keys() == saved.keys()
+            # 逐位对比承担形态判别力（saved 以 map_location="cpu" 读入，
+            # torch.equal 跨 device 拒绝；逐位还原语义与执行 device 无关）
             assert all(torch.equal(restored[key], saved[key]) for key in saved)
-            reloaded.eval()
-            # 前向层用绝对容差而非逐位：判别力由上面的 state 逐位对比承担
-            # （形态语义所在），前向在**同权重、不同实例**间可差 1 ulp
-            # （2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测偶发），
-            # 逐位断言会假红；1e-6 在噪声底之上、修复前形态的偏离之下。
+            # 前向层用绝对容差而非逐位：前向在**同权重、不同实例**间可差
+            # 1 ulp（2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测
+            # 偶发），逐位断言会假红；1e-6 在噪声底之上、修复前形态的
+            # 偏离之下。
             assert torch.allclose(
-                reloaded(normalized)[-1], expected, rtol=0.0, atol=1e-6,
+                reloaded.eval()(normalized.cpu())[-1], expected,
+                rtol=0.0, atol=1e-6,
             )
 
+    @pytest.mark.gpu  # 里程碑节奏需 3 iteration 训练
     def test_milestone_iteration_forces_checkpoint(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -370,6 +388,7 @@ class TestSingleIterationLoop:
         assert (checkpoints / "discriminator_iter2.pt").is_file()
         assert (checkpoints / "policy_iter3.pt").is_file()
 
+    @pytest.mark.gpu  # 5 步 rollout 日程（本机实测 72s，大轮次）
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -484,6 +503,7 @@ class TestSingleIterationLoop:
         产出工件的 run 目录回滚——修正预训练产物后同 --run-dir 重试
         不被残留目录拒绝。"""
         scenario.write_inputs()
+        scenario.fork_pretrained_artifacts()  # 篡改面私有化（共享工件只读）
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         checkpoint = (
             Path(data["reward"]["pretrain_report_json"]).parent
@@ -895,7 +915,12 @@ class TestDiscriminatorSideOrchestration:
     ) -> None:
         """spectral norm 启用时打分幂等：打分/监控前向恒在 eval 相
         （power iteration 不推进）——判别器若停在 train 相打分，同批
-        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。"""
+        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。
+
+        断言用绝对容差而非逐位（#95，与 checkpoint 测试同款 rationale）：
+        幂等防的是 power iteration 推进，偏离量级远大于 ulp；而同权重
+        两次前向可差 1 ulp（浮点执行路径固有噪声底，加速器上实测偶发），
+        逐位断言假红；1e-6 在噪声底之上、真实泄漏的偏离之下。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -909,7 +934,7 @@ class TestDiscriminatorSideOrchestration:
         scorer = trainer.rewards.update.scorer
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
-        assert torch.equal(first, second)  # eval 相打分幂等
+        assert torch.allclose(first, second, rtol=0.0, atol=1e-6)  # eval 相打分幂等
 
     def test_heldout_auc_precedes_discriminator_update(
         self, scenario: TrainingLoopScenario,
@@ -1068,6 +1093,7 @@ class TestBufferBaseSeeding:
 class TestBaseSeedingIsolation:
     """base 分区种子生成与训练 rollout 的 RNG 流隔离。"""
 
+    @pytest.mark.gpu  # 双容量 × 完整场景训练（流隔离对比）
     def test_capacity_change_does_not_shift_rollout_stream(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1125,6 +1151,7 @@ class TestLogProbConsistency:
             assert math.isfinite(pair["recorded"])
             assert pair["recorded"] == pair["recomputed"]  # 同权重逐位一致
 
+    @pytest.mark.gpu  # |M|=2 的 5 步日程 × dump 重放（本机实测 78s）
     def test_multi_step_pairs_cover_every_train_step(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1176,6 +1203,7 @@ class TestRewardDomainNormalization:
         record = trainer.loop.run_iteration()
         return record, scored
 
+    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
     def test_scored_fakes_match_replay_domain(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1186,6 +1214,7 @@ class TestRewardDomainNormalization:
         assert scored, "打分记录为空"
         assert torch.equal(torch.cat(scored), record.new_fakes)
 
+    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
     def test_scale_only_affects_reward_side_not_rollout(
         self, scenario: TrainingLoopScenario,
     ) -> None:

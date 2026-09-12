@@ -10,14 +10,12 @@ import math
 from pathlib import Path
 
 import pytest
-import torch
 
 from cynosure.fixtures import Fixture
 from tests.conftest import (
     CliResult,
     CliSession,
-    FixturePrepareScenario,
-    PretrainLightweightReward,
+    FixtureArtifactLibrary,
 )
 
 RUN_DIR = "diag-run"
@@ -29,31 +27,19 @@ class DiagnosticScenario:
     def __init__(self, cli: CliSession, tmp_path: Path) -> None:
         self._cli = cli
         self._tmp_path = tmp_path
-        self._fixture_dir = tmp_path / "fixtures"
         self._config_path = tmp_path / "config.json"
 
     def run(self, *, eta: float = 0.7, seed: int = 0) -> CliResult:
-        torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_train_loop 先例）
-        fixture = Fixture()
-        fixture.write_artifacts(self._fixture_dir)
-        config = fixture.config(self._fixture_dir)
+        # 场景工件由 FixtureArtifactLibrary 按 (组, 日程, seed) 变体构建
+        # 一次、进程内只读共享（η 不影响预训练的 anchor 确定性 rollout，
+        # 不进缓存键）；warm-start 前置（ADR-0007）由库承担
+        fixture_dir = FixtureArtifactLibrary.artifacts_dir(
+            self._cli, self._tmp_path, "modal-label", seed=seed,
+        )
+        config = Fixture().config(fixture_dir)
         config.policy.sde_eta = eta
         config.schedule.seed = seed
         config.schedule.max_iterations = 1  # 诊断场景聚焦工件：单 iteration
-        FixturePrepareScenario(self._cli, config, self._tmp_path).run(
-            self._tmp_path / "prepare_config.json",
-        )
-        # warm-start 前置（ADR-0007）：RM readiness gate 消费预训练产物；
-        # 轻量五元组只降低本步成本（η 不影响预训练的 anchor 确定性
-        # rollout），gate 抬高使产物显著出带（rationale 集中在
-        # PretrainLightweightReward）
-        pretrain_config = PretrainLightweightReward.apply(config)
-        pretrain_path = self._tmp_path / "pretrain_config.json"
-        pretrain_path.write_text(
-            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
-        )
-        prepared = self._cli.run("pretrain", "--config", str(pretrain_path))
-        assert prepared.code == 0, prepared.stderr
         self._config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
