@@ -1,0 +1,50 @@
+{
+  "seed": 20260912,
+  "head_n_per_cell": 250,
+  "head_cells": [
+    "T1w/AXIAL",
+    "T1w/SAGITTAL",
+    "T1w/CORONAL",
+    "FLAIR/AXIAL",
+    "FLAIR/SAGITTAL",
+    "FLAIR/CORONAL",
+    "SWI/AXIAL",
+    "T2w/AXIAL",
+    "T2w/SAGITTAL",
+    "T2w/CORONAL"
+  ],
+  "modality_census_all": [
+    "MRA"
+  ],
+  "cell_census_all": [
+    [
+      "SWI",
+      "CORONAL"
+    ],
+    [
+      "SWI",
+      "SAGITTAL"
+    ]
+  ],
+  "pool_filters": {
+    "splits": [
+      "val",
+      "test"
+    ],
+    "flag_exclusion": [
+      "is_derived",
+      "is_localizer",
+      "is_subtraction"
+    ],
+    "modalities": [
+      "T1w",
+      "T2w",
+      "FLAIR",
+      "SWI",
+      "MRA"
+    ]
+  },
+  "sampling": "python random.Random(seed).sample over rows sorted by (study_uid, series_id), cells in fixed HEAD_CELLS order",
+  "script": "scripts/mrrate_eval_census.py (run dir, uncommitted per CLAUDE.md)",
+  "reproduce": "python3 mrrate_eval_census.py census <snap> <out> && python3 mrrate_eval_census.py sample <out>"
+}
