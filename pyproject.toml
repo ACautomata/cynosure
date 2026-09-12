@@ -46,7 +46,6 @@ markers = [
     # 大轮次测试（多 iteration 训练 / torchrun 多进程 / 像素域解码评测）的
     # 执行环境分派标记：无 CUDA 环境自动跳过（conftest
     # pytest_collection_modifyitems），验证职责由集群 GPU 口径全量承担
-    # （仓库纪律：测试一律上集群）。sugon-deploy skill 的 pytest 执行协议
-    # 节记录两种跑法的子集口径。
+    # （仓库纪律：测试一律上集群）。
     "gpu: 大轮次测试，要求显卡执行（CPU 环境跳过）",
 ]
