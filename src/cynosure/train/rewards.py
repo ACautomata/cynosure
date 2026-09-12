@@ -51,12 +51,14 @@ class RewardCoordinator:
         self, current_fakes: torch.Tensor, modality: Modality,
     ) -> UpdateReport:
         """判别器 Online update 一步：全批 fake 随机置换后交更新
-        （50% 当前 / 50% 回放的混采由 update 消费置换批的头部），更新
-        期间判别器 train 相、结束后恢复 eval 相。置换过的整批照常入
-        近期分区（近期分布记录是集合语义，次序无关）。
+        （50% 当前 / 50% 回放的混采由 update 消费置换批的头部；该条件
+        回放候选不足时该步退化纯 current 半区，退化标记随报告透出，
+        ADR-0008-03），更新期间判别器 train 相、结束后恢复 eval 相。
+        置换过的整批照常入近期分区（近期分布记录是集合语义，次序无关）。
 
         ``modality`` = 本 iteration 的目标模态：整批 fake 的条件标签
-        （入近期分区）与回放半区的过滤条件（ADR-0008 决策 2）同源。
+        （入近期分区）、回放半区的过滤条件与 real 批的条件匹配采样
+        （ADR-0008 决策 1/2）同源。
         """
         order = torch.randperm(current_fakes.shape[0], generator=self._generator)
         shuffled = current_fakes[order]

@@ -360,6 +360,27 @@ class TestSampleReplayByCondition:
         assert len(set(values)) == 6
 
 
+class TestConditionSupply:
+    """ADR-0008-03：该条件回放候选数的查询面（Online update 退化判定
+    的单一事实源——查询与抽取同走条件过滤，控制流不重复计数逻辑）。"""
+
+    def test_supply_sums_both_zones_within_condition(self) -> None:
+        """该条件候选数 = 两区该条件条目合计（t2w：base 8 + recent 16）。"""
+        buffer, _ = ZoneScenario.tagged_full_buffer()
+        assert buffer.condition_supply("t2w") == 24
+        assert buffer.condition_supply("t1n") == 8  # 仅 base 有
+        assert buffer.condition_supply("t1c") == 8
+
+    def test_supply_zero_for_condition_absent_from_both_zones(self) -> None:
+        buffer, _, _ = ZoneScenario.full_buffer()  # 两区全部 t2w
+        assert buffer.condition_supply("t1n") == 0
+        assert buffer.condition_supply("t2w") == 64
+
+    def test_supply_empty_buffer_is_zero(self) -> None:
+        buffer = ReplayBuffer(CAPACITY)
+        assert buffer.condition_supply("t1c") == 0
+
+
 class TestBaseConditionQuota:
     """ADR-0008-01 AC 3/4：base 分区每条件配额的量产依据与装配期守卫。"""
 

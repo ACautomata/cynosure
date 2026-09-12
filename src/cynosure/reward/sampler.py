@@ -5,6 +5,13 @@ Real sample pool manifest 的消费端：均匀无放回采 K 条 latent 成批�
 （fixture 与生产共用同一采样语义；固定 seed + 同一 generator 状态
 序列 → 采样序列可复现）。pool / held-out 两侧共用本采样器，
 kind 语义由 LatentManifest 装载层守卫。
+
+ADR-0008-03：online update 的 real 侧按本 iteration 目标模态过滤采样
+（``sample`` 的 ``modality`` 缺省 None 保留为诊断/预训练 gate 的全池
+口径）；按条件匹配后每条件须独立供满无放回 real 批——装配期逐
+(rank 切片或全池, 模态) 容量守卫在候选不足处 fail-fast（
+``LatentManifest.assert_condition_capacity``），绝不引入有放回采样
+补洞（小池 bagging 是过拟合加速器，ADA, arXiv:2006.06676）。
 """
 
 from typing import Protocol
@@ -62,9 +69,10 @@ class RealPoolSampler:
     ) -> torch.Tensor:
         """无放回均匀采 count 条 latent；超出候选条目数显式拒绝。
 
-        ``modality`` 给定时候选收窄为该序列条目（held-out AUC 按本
-        iteration 采样的目标序列归因）；缺省 None 为全池（Online update
-        的 real 侧语义）。"""
+        ``modality`` 给定时候选收窄为该序列条目（online update 的 real
+        侧与 held-out AUC 均按本 iteration 采样的目标序列归因）；
+        缺省 None 为全池（诊断与预训练 gate 口径——预训练 fake 批跨
+        条件混合，无单一目标序列可归因）。"""
         candidates = self._manifest.entries
         if modality is not None:
             candidates = [

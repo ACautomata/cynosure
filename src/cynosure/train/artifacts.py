@@ -57,6 +57,12 @@ class IterEvent(BaseModel):
     """更新批的当前 fake 混合占比（N_d 跳过的 iteration 为 0）。"""
     buffer_replay_fraction: float
     """更新批的回放混合占比（N_d 跳过的 iteration 为 0）。"""
+    buffer_replay_degraded: bool = False
+    """更新步回放退化标记（ADR-0008-03）：本步目标模态的回放候选不足
+    半区需求，该步退化纯 current 半区（回放 0 条、real 侧与退化后批
+    同量匹配，批减半而两个占比字段仍按 K 分母记账）——正常混采步与
+    N_d 跳过的 iteration 均为 False，占比 0 的两种成因靠本标记区分
+    （观测面扩展：事件契约可扩不可改名）。"""
     buffer_base_occupied: int
     """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
     buffer_recent_occupied: int

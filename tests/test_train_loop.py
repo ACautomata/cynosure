@@ -34,9 +34,8 @@ from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.buffer import ReplayBuffer, ReplayEntry, base_condition_quota
+from cynosure.reward.buffer import ReplayEntry, base_condition_quota
 from cynosure.reward.scorer import ChannelNormalizer
-from cynosure.reward.update import UpdateReport
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
 from cynosure.train.rollout import (
     CrossModalConditionSampler,
@@ -48,6 +47,8 @@ from tests.conftest import (
     CliSession,
     FixturePrepareScenario,
     PretrainLightweightReward,
+    RecordingScorer,
+    RecordingUpdate,
 )
 
 
@@ -239,6 +240,18 @@ class TestSingleIterationLoop:
         assert event["buffer_recent_occupied"] == 25
         assert event["lr"] == pytest.approx(2e-6)
         assert event["elapsed_s"] >= 0.0
+
+    def test_iter_event_carries_replay_degradation_marker(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ADR-0008-03：iter 事件观测面扩展——回放退化标记（契约可扩
+        不可改名）。正常混采步为 False：fixture 装配守卫下回放供给恒
+        充足，「占比 0」与「退化」不靠对方推断，标记独立落盘。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        event = scenario.events()[0]
+        assert event["buffer_replay_degraded"] is False
+        assert event["buffer_replay_fraction"] == pytest.approx(0.5)
 
     def test_discriminator_update_interval_n_d_is_consumed(
         self, scenario: TrainingLoopScenario,
@@ -813,42 +826,6 @@ class TestModalLabelTargetSampling:
         assert torch.equal(before, stream.get_state())
 
 
-class RecordingScorer:
-    """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""
-
-    def __init__(self, discriminator: torch.nn.Module) -> None:
-        self.discriminator = discriminator
-
-
-class RecordingUpdate:
-    """测试仪器：记录 update.step 收到的批与调用时的判别器相位
-    （buffer 用真实两区实现——RewardCoordinator 的 zone_sizes 观测面
-    经它委托；optimizer 为真实现——续训状态机的判别器侧 checkpoint
-    经 RewardCoordinator 消费 update.optimizer，协作者契约面的一部分）。"""
-
-    def __init__(self, discriminator: torch.nn.Module) -> None:
-        self.scorer = RecordingScorer(discriminator)
-        self.buffer = ReplayBuffer(64)
-        self.optimizer = torch.optim.AdamW(discriminator.parameters(), lr=5e-5)
-        self.received: list[torch.Tensor] = []
-        self.training_at_call: list[bool] = []
-
-    def step(
-        self, current_fakes: torch.Tensor, modality: str,
-    ) -> UpdateReport:
-        self.received.append(current_fakes)
-        self.training_at_call.append(self.scorer.discriminator.training)
-        return UpdateReport(
-            loss_discriminator=0.0,
-            loss_real_term=0.0,
-            loss_fake_term=0.0,
-            num_current=1,
-            num_replay=0,
-            num_base_replay=0,
-            num_recent_replay=0,
-        )
-
-
 class SequencedAuc:
     """测试仪器：记录 held-out AUC 相对判别器更新的调用顺序
     （每次调用时判别器 update 是否已执行过）。"""
@@ -910,6 +887,40 @@ class TestDiscriminatorSideOrchestration:
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
         assert torch.equal(first, second)  # eval 相打分幂等
+
+    def test_iter_event_consumes_report_degradation_marker(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """UpdateReport 的退化标记穿入 iter 事件（观测面消费接线）：
+        退化 update 替身（replay_degraded=True）下事件落 True——退化
+        步在指标流上可观测，不静默漂移。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        trainer.rewards.update = RecordingUpdate(
+            trainer.rewards.discriminator, replay_degraded=True,
+        )
+        assert trainer.run() == 1
+        event = scenario.events()[0]
+        assert event["buffer_replay_degraded"] is True
+        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
+
+    def test_update_step_receives_iteration_condition(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """AC4：train 循环的 update_step 调用点穿本 iteration 条件——
+        替身记录到的条件与 iter 事件的 modality 归因轴一致（本 iteration
+        的 fake 批、回放过滤与 real 采样三侧条件的同源观测锁）。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        update = RecordingUpdate(trainer.rewards.discriminator)
+        trainer.rewards.update = update
+        assert trainer.run() == 1
+        event = scenario.events()[0]
+        assert update.modalities == [event["modality"]]
 
     def test_heldout_auc_precedes_discriminator_update(
         self, scenario: TrainingLoopScenario,

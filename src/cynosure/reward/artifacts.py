@@ -21,7 +21,7 @@ from typing import Literal
 import torch
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from cynosure.config import Modality
+from cynosure.config import MODALITIES, Modality
 from cynosure.reward.dataset import SplitPart
 
 
@@ -102,6 +102,38 @@ class LatentManifest(BaseModel):
         )
         sliced._path = self._path
         return sliced
+
+    def assert_condition_capacity(
+        self, batch_size_k: int, world_size: int = 1,
+    ) -> None:
+        """逐（目标模态, 本 manifest 全量）容量 ≥ ``batch_size_k`` 的
+        装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：判别器 real 侧按本
+        iteration 条件匹配采样后每目标模态独立供满无放回 real 批——判定
+        按**全量**做、需量为 ``batch_size_k × world_size``（条带切片
+        ``entries[rank::world]`` 下「每 rank 视图 ≥ K」的等价条件；判定
+        放全量保失败路径全 rank 一致——与 RankSlicedPool 的切片前校验
+        同款理由，按切片后本地视图判定会让失败方单方面退出、其余 rank
+        互等）；单进程 world_size=1 判据退化为全池 ≥ K。无放回采样语义
+        不动，不引入有放回采样补洞。
+        """
+        required = batch_size_k * world_size
+        starved: list[tuple[Modality, int]] = []
+        for modality in MODALITIES:
+            count = self.modalities.get(modality, 0)
+            if count < required:
+                starved.append((modality, count))
+        if starved:
+            detail = ", ".join(
+                f"{modality}×{count}" for modality, count in starved
+            )
+            raise ValueError(
+                f"Real sample pool 容量不足：逐模态 real 容量须 ≥ "
+                f"disc_batch_size_k={batch_size_k} × world_size={world_size}"
+                f" = {required} 条（条件匹配采样后每 rank 独立供满无放回 "
+                "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
+                f"不变，不引入有放回采样补洞）；不足: {detail}。"
+                "增大 real pool（或减小 disc_batch_size_k / 切片路数）"
+            )
 
     def load_latent(self, entry: PoolEntry) -> torch.Tensor:
         """装载单条 latent（按条目懒加载，供判别器 real 切片采样）。"""
