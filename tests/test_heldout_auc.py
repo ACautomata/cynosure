@@ -1,6 +1,6 @@
 """held-out AUC 信号测试（ticket #20 AC）：rank 统计数值口径（tie-aware）、
 held-out 与训练 real 不相交语义、kind 守卫、推理相位与序列归因
-（review #5109004720）。
+（review #5109004720）、卷级分数聚类观测面（ADR-0008-02，issue #85）。
 
 AUC = Mann-Whitney U 口径：real 分数高于 fake 分数的配对占比（并列 0.5）。
 held-out real 永不参与判别器更新（prepare 工件 + kind 守卫保证），
@@ -14,9 +14,10 @@ import pytest
 import torch
 
 from cynosure.config import MODALITIES
-from cynosure.reward.auc import HeldOutAuc
+from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
+from cynosure.reward.support import SupportRule
 
 from tests.test_online_update import SHAPE, UpdateScenario, WrittenPool
 
@@ -29,13 +30,21 @@ def scenario(tmp_path) -> UpdateScenario:
 class HeldOutPoolWriter:
     """直写最小 heldout_real 工件（manifest + latent 文件）：latent 按序列
     填常数（t1n → 1.0、其余序列 → 2.0），real 侧条目的序列身份可从输入
-    张量取值直接反查（modality 归因断言的观测面）。"""
+    张量取值直接反查（modality 归因断言的观测面）。
+
+    ``distinct_fill=True`` 时每条目填互不相同的常数（1.0 + 下标×0.05，
+    跨序列同样互异）——逐卷分数组的成员断言（卷级分组正确性）的观测
+    载体：同序列各卷同值时，分组错位在组值上不可见。"""
 
     FILL: dict[str, float] = {"t1n": 1.0, "t1c": 2.0, "t2w": 2.0, "t2f": 2.0}
 
-    def __init__(self, root: Path, per_modality: dict[str, int]) -> None:
+    def __init__(
+        self, root: Path, per_modality: dict[str, int],
+        distinct_fill: bool = False,
+    ) -> None:
         self._root = root
         self._per_modality = per_modality
+        self._distinct_fill = distinct_fill
         self.manifest_path = root / "heldout_real.json"
 
     def write(self) -> Path:
@@ -45,8 +54,9 @@ class HeldOutPoolWriter:
         index = 0
         for modality, count in self._per_modality.items():
             for _ in range(count):
+                fill = 1.0 + index * 0.05 if self._distinct_fill else self.FILL[modality]
                 latent_path = latent_dir / f"{index}.pt"
-                torch.save(torch.full(SHAPE, self.FILL[modality]), latent_path)
+                torch.save(torch.full(SHAPE, fill), latent_path)
                 entries.append(PoolEntry(
                     case_id=f"case-{index:03d}",
                     modality=modality,
@@ -296,3 +306,234 @@ class TestScoringPhase:
             scorer.patch_logits(scenario.fakes(20)).flatten(),
         )
         assert chunked == pytest.approx(expected, rel=0.0, abs=0.0)
+
+
+class NanScorer:
+    """测试仪器：打分前向输出全 NaN（LatentScorer Protocol 的替身）——
+    判别器数值发散面经聚类观测面的有限性闸口的确定性载体。"""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    @property
+    def discriminator(self) -> torch.nn.Module:
+        return self._inner.discriminator  # type: ignore[attr-defined]
+
+    def patch_logits(self, latents: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(self._inner.patch_logits(latents), torch.nan)  # type: ignore[attr-defined]
+
+
+class TestVolumeScoreClusters:
+    """卷级分数聚类观测面（ADR-0008-02，issue #85）：held-out AUC 暴露
+    每卷一组 patch 分数 + fake 侧全量分数，支撑支撑度规则的卷级聚类
+    bootstrap 重采样；现有全池/按条件单标量消费路径（compute）不变。"""
+
+    def _auc(self, scenario: UpdateScenario, manifest: LatentManifest,
+             seed: int = 1) -> HeldOutAuc:
+        return HeldOutAuc(
+            heldout_manifest=manifest, scorer=scenario.scorer(),
+            generator=scenario.generator(seed),
+        )
+
+    def test_all_condition_volumes_exposed_regardless_of_fake_batch(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """聚类观测面与 compute() 的单标量口径的本质差：real 侧不做
+        min(fake 批量, 池) 的对称下采样——该条件 held-out **全量卷**
+        整卷暴露（卷数是支撑度判定的输入）。池 17 卷、fake 批仅 2：
+        compute 只采 2 条 real，聚类仍 17 组。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout",
+            {"t1n": 2, "t1c": 5, "t2w": 5, "t2f": 5},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        clusters = auc.compute_volume_clusters(
+            scenario.fakes(2), modality="t2w",
+        )
+        assert clusters.volume_count == 5  # t2w 全量 5 卷，非 min(2, 5)=2
+        assert len(clusters.real_volume_scores) == 5
+
+    def test_pool_wide_clusters_cover_every_volume(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """缺省 modality=None（全池口径，诊断/预训练 gate 侧）：聚类覆盖
+        全部 8 卷，fake 侧全量参与。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        clusters = auc.compute_volume_clusters(scenario.fakes(4))
+        assert clusters.volume_count == 8
+        patches_per_volume = clusters.real_volume_scores[0].numel()
+        assert all(
+            volume.numel() == patches_per_volume
+            for volume in clusters.real_volume_scores
+        )
+        assert clusters.fake_scores.numel() == 4 * patches_per_volume
+
+    def test_volume_groups_align_with_per_volume_forwards(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """卷级分组正确性：聚类的每组 patch 分数与「某一条目逐卷单次
+        前向」的展平分数逐位一致，且全体构成双射（同形 latent 每卷等
+        patch 数，展平分按卷 reshape 还原；逐卷常数填充互异，分组错位/
+        跨界在组值上可见）。分组语义是支撑度规则「整卷进出」的前提。
+        注意采样器的无放回 randperm 使组的**顺序**是随机的——按成员
+        等价断言，不按 manifest 顺序断言。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 3 for modality in MODALITIES},
+            distinct_fill=True,
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        clusters = auc.compute_volume_clusters(scenario.fakes(2))
+        scorer = scenario.scorer()
+        expected_groups = {
+            tuple(scorer.patch_logits(
+                manifest.load_latent(entry).unsqueeze(0),
+            ).flatten().tolist())
+            for entry in manifest.entries
+        }
+        actual_groups = {
+            tuple(volume.tolist()) for volume in clusters.real_volume_scores
+        }
+        assert actual_groups == expected_groups
+
+    def test_cluster_pooled_auc_matches_compute_when_pool_fully_sampled(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """fake 批量 ≥ 池时 compute() 的 real 侧采样 = 全量池（无放回
+        采 n 条于 n 条池即全取）：聚类 pooled_auc 与 compute 单标量
+        逐位一致——两个观测面在同一采样面上同源。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout",
+            {"t1n": 2, "t1c": 3, "t2w": 5, "t2f": 4},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        clusters = auc.compute_volume_clusters(scenario.fakes(14))
+        scalar = auc.compute(scenario.fakes(14))
+        assert clusters.pooled_auc() == pytest.approx(scalar, rel=0.0, abs=0.0)
+
+    def test_clusters_feed_support_rule_bootstrap(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """观测面 → 判定原语的端到端：聚类直接喂 SupportRule.passes
+        （< 界路径算 CI、≥ 界路径看点估计），支撑度判定不需要第二份
+        打分前向。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        clusters = auc.compute_volume_clusters(scenario.fakes(4))
+        rule = SupportRule(
+            threshold=0.65, support_bound=20,
+            generator=scenario.generator(0),
+        )
+        assert isinstance(rule.passes(clusters.pooled_auc(), clusters), bool)
+
+    def test_clusters_scored_without_grad(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """聚类打分与单标量口径同款推理相位约定：AUC 非可微，前向须在
+        no_grad 下进行（生产 patch 规模下 grad-enabled 前向白耗激活
+        显存至 OOM）。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        probe = GradProbeScorer(scenario.scorer())
+        auc = HeldOutAuc(
+            heldout_manifest=manifest, scorer=probe,  # type: ignore[arg-type]
+            generator=scenario.generator(1),
+        )
+        auc.compute_volume_clusters(scenario.fakes(4))
+        assert probe.grad_enabled_at_call
+        assert all(enabled is False for enabled in probe.grad_enabled_at_call)
+
+    def test_cluster_scoring_runs_in_bounded_chunks(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """聚类观测面与单标量口径共用 SCORE_CHUNK 定块上界：real 侧
+        全量卷（可能远超 fake 批量）打分显存不随池长无界增长。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 3 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        probe = GradProbeScorer(scenario.scorer())
+        auc = HeldOutAuc(
+            heldout_manifest=manifest, scorer=probe,  # type: ignore[arg-type]
+            generator=scenario.generator(1),
+        )
+        auc.compute_volume_clusters(scenario.fakes(20))
+        assert all(
+            batch.shape[0] <= HeldOutAuc.SCORE_CHUNK
+            for batch in probe.received_batches
+        )
+
+    def test_empty_modality_pool_rejected(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """该条件 held-out 为空（卷数 = 0）显式拒绝：卷数是支撑度
+        判定的输入，0 卷无判定面（与 compute 的口径守卫同语义）。"""
+        writer = HeldOutPoolWriter(tmp_path / "heldout", {"t1n": 2})
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        with pytest.raises(ValueError, match="held-out"):
+            auc.compute_volume_clusters(scenario.fakes(2), modality="t2w")
+
+    def test_empty_fake_batch_rejected(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        with pytest.raises(ValueError, match="非空"):
+            auc.compute_volume_clusters(scenario.fakes(2)[:0])
+
+    def test_non_finite_scores_rejected_at_cluster_gate(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """发散判别器在聚类构造期即拒（有限性闸口前置）：bootstrap 在
+        重采样簇上重算池化 AUC，NaN 若流入重采样中途才爆将难以定位。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = HeldOutAuc(
+            heldout_manifest=manifest,
+            scorer=NanScorer(scenario.scorer()),  # type: ignore[arg-type]
+            generator=scenario.generator(1),
+        )
+        with pytest.raises(ValueError, match="有限"):
+            auc.compute_volume_clusters(scenario.fakes(2))
+
+    def test_existing_scalar_consumption_paths_unchanged(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """ADR-0008-02 的观测面是**新增**面：聚类方法存在且被调用后，
+        compute() 的单标量语义（全池口径、按条件口径）不受影响。逐卷
+        异值填充 + fake 批量 ≥ 池：real 侧无放回采样取全池（randperm
+        只换顺序不换成员），重算值对采样器状态漂移免疫——逐位不等即
+        语义真回归。"""
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout",
+            {modality: 2 for modality in MODALITIES},
+            distinct_fill=True,
+        )
+        manifest = LatentManifest.load(writer.write(), kind="heldout_real")
+        auc = self._auc(scenario, manifest)
+        before_pool = auc.compute(scenario.fakes(8))
+        before_cond = auc.compute(scenario.fakes(8), modality="t1n")
+        auc.compute_volume_clusters(scenario.fakes(2), modality="t2w")
+        assert auc.compute(scenario.fakes(8)) == pytest.approx(
+            before_pool, rel=0.0, abs=0.0,
+        )
+        assert auc.compute(scenario.fakes(8), modality="t1n") == pytest.approx(
+            before_cond, rel=0.0, abs=0.0,
+        )

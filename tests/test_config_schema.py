@@ -43,6 +43,9 @@ class TestValidConfigs:
         assert config.reward.disc_weight_decay == pytest.approx(1e-4)
         assert config.reward.disc_weight_decay == config.policy.policy_weight_decay
         assert config.reward.pretrain_gate_auc == pytest.approx(0.65)
+        # 支撑度界（ADR-0008 决策 6）：条件 held-out 卷数 < 此界走 bootstrap
+        # CI 下界口径，≥ 界点估计口径——暂定 20 待 MR-RATE 曲线校准
+        assert config.reward.gate_support_min_volumes == 20
         assert config.reward.pretrain_max_steps >= 1
         assert config.reward.pretrain_fake_batch >= 1
         assert config.schedule.n_plateau == 3
@@ -116,6 +119,24 @@ class TestRejection:
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
         assert "polic" in str(exc_info.value.errors()[0]["loc"])
+
+    def test_support_bound_rejects_non_positive(self, valid_config_dict: dict) -> None:
+        """支撑度界（ADR-0008 决策 6）：非正整数显式字段级拒绝
+        （0 或负界会让全部条件无条件走点估计口径，规则形同虚设）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["gate_support_min_volumes"] = 0
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward", "gate_support_min_volumes") in self._locations(
+            exc_info.value,
+        )
+
+    def test_support_bound_override_allowed(self, valid_config_dict: dict) -> None:
+        """支撑度界可配置（tunable）：校准期改值合法（暂定值非定死）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["gate_support_min_volumes"] = 8
+        config = CynosureConfig.model_validate(data)
+        assert config.reward.gate_support_min_volumes == 8
 
     def test_group_enum_rejects_unknown(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)

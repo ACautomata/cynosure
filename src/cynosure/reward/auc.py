@@ -19,12 +19,73 @@ torch 原生算子，不引入白名单外的统计库。fake 侧全量参与；
 判别器参数 requires_grad 时带图前向白保留全部激活图。
 """
 
+from dataclasses import dataclass
+
 import torch
 
 from cynosure.config import Modality
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer
+
+
+@dataclass(frozen=True)
+class VolumeScoreClusters:
+    """卷级分数聚类观测面（ADR-0008-02）：每卷一组 patch 分数 + fake 侧
+    全量分数。
+
+    支撑度规则（``cynosure.reward.support``）的 bootstrap 原料：重采样
+    单元是整卷（``real_volume_scores`` 的一整组进出），patch 级打散把
+    同卷内强相关的 patch 当独立观测、低估 CI 宽度——卷才是 i.i.d. 抽
+    样单位。构造即校验非空/一维/有限，与 ``HeldOutAuc.auc_from_scores``
+    的有限性闸口同口径同语义前置：bootstrap 在重采样簇上重算池化 AUC，
+    分数若中途才抛 NaN/Inf 将难以定位。
+    """
+
+    real_volume_scores: tuple[torch.Tensor, ...]
+    """每卷一组展平 patch 分数（一维、非空、有限；卷间 patch 数可不同）。"""
+
+    fake_scores: torch.Tensor
+    """fake 侧全量展平 patch 分数（一维、非空、有限；bootstrap 中固定的对照面）。"""
+
+    def __post_init__(self) -> None:
+        if not self.real_volume_scores:
+            raise ValueError("卷级聚类需要至少一卷 real 分数")
+        for volume in self.real_volume_scores:
+            if volume.dim() != 1:
+                raise ValueError(
+                    f"每卷 patch 分数须为一维展平张量，得到 {tuple(volume.shape)}"
+                )
+            if volume.numel() < 1:
+                raise ValueError("每卷 patch 分数组非空")
+        if self.fake_scores.dim() != 1 or self.fake_scores.numel() < 1:
+            raise ValueError("fake 侧分数须为一维非空张量")
+        for label, scores in (
+            ("real", self.real_volume_scores), ("fake", (self.fake_scores,)),
+        ):
+            bad = [
+                index for index, tensor in enumerate(scores)
+                if not torch.isfinite(tensor).all()
+            ]
+            if bad:
+                raise ValueError(
+                    f"卷级聚类的 {label} 侧分数须为有限值（判别器数值发散或"
+                    f"工件损坏）：{label} 侧第 {bad} 组含 NaN/Inf——非有限"
+                    "分数在排序口径下会伪装成分数，AUC 因此失去意义"
+                )
+
+    @property
+    def volume_count(self) -> int:
+        """该条件的 held-out 卷数（支撑度判定的卷数输入）。"""
+        return len(self.real_volume_scores)
+
+    def pooled_auc(self) -> float:
+        """聚类上的池化点估计：每卷自然重数一次，全部 real patch 对
+        fake 侧的 Mann-Whitney 口径——与 ``HeldOutAuc.compute`` 的
+        estimand 相同（分差只在 real 侧采样面），判据换形态不换被估计量。"""
+        return HeldOutAuc.auc_from_scores(
+            torch.cat(self.real_volume_scores), self.fake_scores,
+        )
 
 
 class HeldOutAuc:
@@ -63,6 +124,13 @@ class HeldOutAuc:
             for start in range(0, latents.shape[0], self.SCORE_CHUNK)
         ]).flatten()
 
+    def _pool_size(self, modality: Modality | None) -> int:
+        """该条件的 held-out 条目数（按条件过滤；None = 全池）。"""
+        return (
+            self._manifest.modalities.get(modality, 0)
+            if modality is not None else self._real_sampler.size
+        )
+
     def compute(
         self, fake_latents: torch.Tensor, modality: Modality | None = None,
     ) -> float:
@@ -74,10 +142,7 @@ class HeldOutAuc:
         与预训练 RM readiness gate——预训练 fake 批跨条件混合，无单一
         目标序列可归因）。fake 侧全量参与。
         """
-        pool_size = (
-            self._manifest.modalities.get(modality, 0)
-            if modality is not None else self._real_sampler.size
-        )
+        pool_size = self._pool_size(modality)
         count = min(fake_latents.shape[0], pool_size)
         if count < 1:
             raise ValueError(
@@ -89,6 +154,39 @@ class HeldOutAuc:
             real_scores = self._chunked_logits(reals)
             fake_scores = self._chunked_logits(fake_latents)
         return self.auc_from_scores(real_scores, fake_scores)
+
+    def compute_volume_clusters(
+        self, fake_latents: torch.Tensor, modality: Modality | None = None,
+    ) -> VolumeScoreClusters:
+        """卷级分数聚类观测面（ADR-0008-02）：每卷一组 patch 分数 +
+        fake 侧全量分数。
+
+        与 ``compute()`` 单标量口径的本质差在 real 侧采样面：该条件
+        held-out **全量卷**整卷暴露（不做 min(fake 批量, 池) 的对称
+        下采样）——卷数是支撑度规则（``cynosure.reward.support``）的
+        判定输入，下采样会篡改它。卷级分组经「同形 latent → 每卷等
+        patch 数」在展平分上 reshape 还原（load_latent 的 latent_shape
+        守卫保证同形）。打分前向同样在 no_grad 下进行、同样 SCORE_CHUNK
+        定块；iter 事件的单标量消费路径不经本方法。
+        """
+        if fake_latents.shape[0] < 1:
+            raise ValueError("held-out AUC 卷级聚类需要非空 fake 批")
+        pool_size = self._pool_size(modality)
+        if pool_size < 1:
+            raise ValueError(
+                "held-out AUC 卷级聚类需要该序列的 held-out real 条目"
+                f"（{modality!r}: {pool_size} 条）"
+            )
+        with torch.no_grad():
+            reals = self._real_sampler.sample(pool_size, modality=modality)
+            real_scores = self._chunked_logits(reals)
+            fake_scores = self._chunked_logits(fake_latents)
+        patches = real_scores.numel() // pool_size
+        per_volume = real_scores.reshape(pool_size, patches)
+        return VolumeScoreClusters(
+            real_volume_scores=tuple(per_volume),
+            fake_scores=fake_scores,
+        )
 
     @staticmethod
     def auc_from_scores(
