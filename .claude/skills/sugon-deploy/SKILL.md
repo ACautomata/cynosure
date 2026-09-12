@@ -124,6 +124,32 @@ wandb/tensorboard，监控与出图都从它出发。
 发布走 experiment-release skill：run 三件套（`config.json`、`metrics.jsonl`、
 `manifest.json`）齐才发布，checkpoint 留集群持久分区不上 release。
 
+## 集群 pytest 执行协议
+
+仓库纪律「验证以集群全量 pytest 绿为准」（CLAUDE.md）有两种跑法，行为
+差异必须先分清再判定结果（#95 两类脆弱性的教训）：
+
+| 跑法 | 执行路径 | 适用 |
+|---|---|---|
+| 裸跑（GPU 可见） | 训练装配链路经 `dist.local_device()` 真实走 DCU | 默认口径：覆盖设备放置的真实分支 |
+| `CUDA_VISIBLE_DEVICES="" pytest` | 强制 CPU | 逐位断言类偶发失败的噪声排查 |
+
+判定口径：
+
+- **GPU 可见下确定性失败** = 真缺陷：设备契约违例（如 scorer 的
+  latent/统计量 device fail-fast）或真数值回归，修构造或修代码，不是环境问题；
+- **GPU 可见下偶发失败**（重复若干次不稳定）≈ 逐位断言（`torch.equal`）
+  撞上加速器前向的 1 ulp 浮点噪声——正确修法是给断言加 allclose 容差层
+  （`rtol=0, atol=1e-6`，噪声底之上、语义偏离之下），不是换 CPU 强制
+  复跑「证明」通过（那是换了执行路径，GPU 分支依旧裸奔）；
+- **CPU 强制下偶发 allclose 假红同样存在**（同权重不同实例的 ulp 噪声
+  与设备无关，历史实测 1 次）：单次红先复跑确认，连续失败才是回归；
+- 全量验证默认裸跑 GPU 可见；与并行训练同实例时注意大测试互相拖慢
+  （spectral norm checkpoint 类测试高负载下单个可达 ~24 min）。
+
+注意：两种跑法都从仓库根起 pytest（`pythonpath = ["src"]` 兜底导入），
+集群用系统 python（DCU torch 唯一宿主），缺 pytest 装进系统 python。
+
 ## 参考
 
 - 启动编排、M0 门槛与 T11 实测结论：`docs/spec/orchestration.md`

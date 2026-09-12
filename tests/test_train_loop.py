@@ -303,7 +303,12 @@ class TestSingleIterationLoop:
 
         对照（固化有效权重的形态）：装载时重新叠谱归一化会**再归一化
         一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
-        消费面拿到的不再是训练时那一份判别函数。"""
+        消费面拿到的不再是训练时那一份判别函数。
+
+        执行 device 跟随训练装配（GPU 可见即加速器、CPU 强制即 CPU）：
+        手动构造的 normalizer 与装载实例按被测 latent 的 device 落位
+        （生产装配由 trainer 单点 ``.to()`` 接管的同款语义，#95）；
+        state_dict 逐位对比在 CPU 侧先做，前向对比在迁移后做。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -320,9 +325,14 @@ class TestSingleIterationLoop:
         assert any(".parametrizations." in key for key in saved)
         live.eval()
         sample = trainer.rewards.buffer.recent_samples()[0].latent.unsqueeze(0)
+        device = sample.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
+        # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
+        # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
+        # normalizer 与生产装配一样迁移到 latent 所在 device，GPU 可见环境
+        # 不再被契约拦截在真正的断言层之前。
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
-        )
+        ).to(device)
         normalized = normalizer.normalize(sample)
         expected = live(normalized)[-1]
         for seed in (11, 20260910):  # ambient seed 不同：装载结果不得依赖它
@@ -338,8 +348,10 @@ class TestSingleIterationLoop:
             )
             restored = reloaded.state_dict()
             assert restored.keys() == saved.keys()
+            # 逐位对比在 CPU 侧先做（saved 以 map_location="cpu" 读入，
+            # torch.equal 跨 device 拒绝；逐位还原语义与执行 device 无关）
             assert all(torch.equal(restored[key], saved[key]) for key in saved)
-            reloaded.eval()
+            reloaded = reloaded.to(device).eval()  # 前向对比与被测 latent 同源
             # 前向层用绝对容差而非逐位：判别力由上面的 state 逐位对比承担
             # （形态语义所在），前向在**同权重、不同实例**间可差 1 ulp
             # （2^-23 ≈ 1.2e-7，浮点执行路径的分配/分块选择，实测偶发），
@@ -895,7 +907,12 @@ class TestDiscriminatorSideOrchestration:
     ) -> None:
         """spectral norm 启用时打分幂等：打分/监控前向恒在 eval 相
         （power iteration 不推进）——判别器若停在 train 相打分，同批
-        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。"""
+        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。
+
+        断言用绝对容差而非逐位（#95，与 checkpoint 测试同款 rationale）：
+        幂等防的是 power iteration 推进，偏离量级远大于 ulp；而同权重
+        两次前向可差 1 ulp（浮点执行路径固有噪声底，加速器上实测偶发），
+        逐位断言假红；1e-6 在噪声底之上、真实泄漏的偏离之下。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
@@ -909,7 +926,7 @@ class TestDiscriminatorSideOrchestration:
         scorer = trainer.rewards.update.scorer
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
-        assert torch.equal(first, second)  # eval 相打分幂等
+        assert torch.allclose(first, second, rtol=0.0, atol=1e-6)  # eval 相打分幂等
 
     def test_heldout_auc_precedes_discriminator_update(
         self, scenario: TrainingLoopScenario,
