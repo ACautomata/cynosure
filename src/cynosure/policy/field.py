@@ -44,13 +44,22 @@ class VelocityField(Protocol):
 
 
 class CfgCombinedField:
-    """CFG 组合场（组1）：v_cfg = v_uncond + w·(v_cond − v_uncond)，w=10 定死。"""
+    """CFG 组合场（组1）：v_cfg = v_uncond + w·(v_cond − v_uncond)。
+
+    训练口径 w=10 定死（ADR-0002）；评测口径（基线 CFG 扫描，#73 裁决）
+    经构造器注入 w——组合公式与前向组织单点不变，扫描只换标量。
+    """
 
     CFG_WEIGHT: float = CFG_MODAL_LABEL
-    """组合场的引导强度 w（组1 定死 10，ADR-0002）。"""
+    """训练口径的引导强度 w（组1 定死 10，ADR-0002）——构造器默认值来源。"""
 
-    def __init__(self, unet: DiffusionModelUNetMaisi) -> None:
+    def __init__(
+        self,
+        unet: DiffusionModelUNetMaisi,
+        cfg_weight: float = CFG_WEIGHT,
+    ) -> None:
         self._unet = unet
+        self._cfg_weight = cfg_weight
 
     def velocity(
         self,
@@ -85,10 +94,9 @@ class CfgCombinedField:
         combined = self._combine(v_cond, v_uncond)
         return combined.expand(group_size, *combined.shape[1:])
 
-    @staticmethod
-    def _combine(v_cond: torch.Tensor, v_uncond: torch.Tensor) -> torch.Tensor:
+    def _combine(self, v_cond: torch.Tensor, v_uncond: torch.Tensor) -> torch.Tensor:
         """组合公式（唯一发生地）：v_cfg = v_uncond + w·(v_cond − v_uncond)。"""
-        return v_uncond + CfgCombinedField.CFG_WEIGHT * (v_cond - v_uncond)
+        return v_uncond + self._cfg_weight * (v_cond - v_uncond)
 
     def _forward(
         self,

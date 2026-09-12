@@ -233,6 +233,28 @@ class TestCfgCombinedField:
             actual = field.velocity(x, timesteps=442, condition=condition)
         assert torch.equal(actual, expected)
 
+    def test_cfg_weight_injection_replaces_guidance_scalar(
+        self, recording: RecordingUnet, fixture_unet: DiffusionModelUNetMaisi,
+        condition: RolloutCondition,
+    ) -> None:
+        """CFG 扫描口径（#73 裁决）：w 经构造器注入，组合公式单点不变——
+        v = v_uncond + w·(v_cond − v_uncond)。默认构造仍走 w=10（上一个
+        用例断言），注入只对显式传入的场生效。"""
+        torch.manual_seed(7)
+        x = torch.randn(1, *LATENT_SHAPE)
+        field = CfgCombinedField(recording, cfg_weight=2.0)
+        with torch.no_grad():
+            paired = fixture_unet(
+                x=torch.cat((x, x)),
+                timesteps=torch.tensor([442, 442]),
+                class_labels=torch.tensor([self.LABEL, 0]),
+                spacing_tensor=torch.cat((SPACING, SPACING)),
+            )
+            v_cond, v_uncond = torch.chunk(paired, 2)
+            expected = v_uncond + 2.0 * (v_cond - v_uncond)
+            actual = field.velocity(x, timesteps=442, condition=condition)
+        assert torch.equal(actual, expected)
+
     def test_group_velocity_two_batch1_forwards_reused_across_group(
         self, field: CfgCombinedField, recording: RecordingUnet,
         condition: RolloutCondition,
