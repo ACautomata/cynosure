@@ -257,12 +257,13 @@ class TestConditionMatchedRealSide:
         self, scenario: UpdateScenario,
     ) -> None:
         """AC：两区混采配比语义（各半、可互补）在条件匹配下保持——
-        real 侧条件化不改变 fake 侧混采构成。"""
+        real 侧条件化不改变 fake 侧混采构成。t2f 仅 base 有（recent
+        预填的是 t2w）：需求 2 全由 base 同条件补足（可互补）。"""
         update, _ = scenario.update()
         report = update.step(scenario.fakes(12), "t2f")
         assert report.num_current == 2
         assert report.num_replay == 2
-        assert (report.num_base_replay, report.num_recent_replay) == (1, 1)
+        assert (report.num_base_replay, report.num_recent_replay) == (2, 0)
 
 
 class TestReplayShortageDegradation:
