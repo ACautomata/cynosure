@@ -5,6 +5,10 @@
 AdamW（默认 lr 5e-5）→ 当前 fake 全部入近期分区。先采回放、后 push：
 当前批不会在本步回放中立即重复出现。
 
+fake 侧条件口径（ADR-0008 决策 2）：本 iteration 目标模态随 fake 批
+穿入——回放半区按该条件过滤（条目标签见 buffer 模块），当前 fake
+入近期分区带同条件标签；real 侧条件匹配采样归 ADR-0008-03。
+
 本类是「一步」原语：``disc_update_interval_n_d`` 的迭代节奏（每 N_d 个
 RL iteration 调用一次 step）由编排方（train 循环，后续 ticket）消费；
 fixture 场景 N_d=1 即每 iter 一步。
@@ -15,7 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
-from cynosure.config import RewardConfig
+from cynosure.config import Modality, RewardConfig
 from cynosure.reward.buffer import ReplayDraw, ReplayStore
 from cynosure.reward.sampler import RealSampling
 from cynosure.reward.scorer import LatentScorer
@@ -63,12 +67,17 @@ class OnlineUpdate:
         self._batch_size_k = config.disc_batch_size_k
         self._current_fraction = config.replay_current_fraction
 
-    def step(self, current_fakes: torch.Tensor) -> UpdateReport:
+    def step(
+        self, current_fakes: torch.Tensor, modality: Modality,
+    ) -> UpdateReport:
         """一步更新：混采 fake 批（50% 当前 / 50% 回放）→ real 批 →
         LSGAN loss → AdamW step → 当前 fake 入近期分区。
 
         当前半区取 fake 批前 current_count 条（确定性口径）；整批当前
-        fake 全部入近期分区（记录近期 policy 分布）。
+        fake 全部入近期分区（记录近期 policy 分布）。``modality`` = 本
+        iteration 的目标模态：回放按条件过滤（ADR-0008 决策 2，条件候选
+        不足显式拒绝——退化路径归 ADR-0008-03），入区 fake 带同标签。
+        real 侧暂为全池采样（条件匹配归 ADR-0008-03）。
         """
         current_count = math.ceil(self._batch_size_k * self._current_fraction)
         replay_count = self._batch_size_k - current_count
@@ -77,7 +86,9 @@ class OnlineUpdate:
                 f"当前 fake {current_fakes.shape[0]} 条 < 当前半区需求"
                 f" {current_count} 条（batch_size_k={self._batch_size_k}）"
             )
-        draw: ReplayDraw = self.buffer.sample_replay(replay_count, self._generator)
+        draw: ReplayDraw = self.buffer.sample_replay(
+            replay_count, self._generator, modality,
+        )
         fakes = torch.cat([current_fakes[:current_count], draw.samples])
         reals = self._real_sampler.sample(self._batch_size_k)
         logits_fake = self.scorer.patch_logits(fakes)
@@ -86,7 +97,7 @@ class OnlineUpdate:
         self.optimizer.zero_grad()
         terms.total.backward()
         self.optimizer.step()
-        self.buffer.push(current_fakes)
+        self.buffer.push(current_fakes, modality)
         return UpdateReport(
             loss_discriminator=terms.total.item(),
             loss_real_term=terms.real_term.item(),

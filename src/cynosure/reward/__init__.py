@@ -14,7 +14,16 @@
 
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
 from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.buffer import ReplayBuffer, ReplayDraw, ReplayStore, ZoneSizes
+from cynosure.reward.buffer import (
+    ReplayBuffer,
+    ReplayDraw,
+    ReplayEntry,
+    ReplayStore,
+    ZoneModalities,
+    ZoneSizes,
+    assert_replay_supply,
+    base_condition_quota,
+)
 from cynosure.reward.dataset import (
     BratsSeriesLayout,
     CaseSeries,
@@ -58,10 +67,14 @@ __all__ = [
     "RealSampling",
     "ReplayBuffer",
     "ReplayDraw",
+    "ReplayEntry",
     "ReplayStore",
     "RewardScorer",
     "SyntheticLatentEncoder",
     "UpdateReport",
     "UpstreamPreprocessChain",
+    "ZoneModalities",
     "ZoneSizes",
+    "assert_replay_supply",
+    "base_condition_quota",
 ]

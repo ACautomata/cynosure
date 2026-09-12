@@ -9,13 +9,18 @@ Sampler（四序列均匀）；组2 = CrossModalConditionSampler（12 有序对�
 源影像 latent 按 real sample pool 的序列分层抽取）。RolloutPhase 经构造
 注入条件分布——rollout 编排本身组无关。
 
+ADR-0008-01：base 分区种子按每条件配额量产（``base_condition_quota``）
+——``ConditionSampler.sample_target`` 按指定目标序列构造条件（组2 的
+源影像自由度仍在合法源上均匀），量产产出逐样本目标模态标签（fill_base
+的标签输入）。
+
 数值口径：采样（Anchor/扰动/续跑的 policy 前向）进 bf16 autocast（与
 更新相同口径，保证 π_old 可被逐位重算）；判别器打分在 autocast 外
 fp32（T05 已锚定的 reward 数值口径）。
 """
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Mapping, Protocol
 
 import torch
 
@@ -92,6 +97,16 @@ class ConditionSampler(Protocol):
         （不漂移训练 rollout 的抽样流，各组实现同一约定）。"""
         ...
 
+    def sample_target(
+        self, target: Modality, generator: torch.Generator | None = None,
+    ) -> RolloutCondition:
+        """按指定目标序列构造 rollout 条件（ADR-0008-01：base 分区
+        配额量产的条件源——配额决定目标端分布，条件内的其余自由度
+        仍按本组分布均匀抽取）。
+
+        ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流。"""
+        ...
+
 
 class ModalLabelConditionSampler:
     """组1 条件分布：四序列均匀采样（experiment-design「条件分布按组定义」）。
@@ -127,6 +142,16 @@ class ModalLabelConditionSampler:
                 spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
             ),
             MODALITIES[index],
+        )
+
+    def sample_target(
+        self, target: Modality, generator: torch.Generator | None = None,
+    ) -> RolloutCondition:
+        """组1 的条件无其余自由度：label 恒为 target 的映射值，不耗 RNG。"""
+        label = self._mapping.label(target)
+        return RolloutCondition(
+            label=torch.tensor([label], device=self._device),
+            spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
         )
 
 
@@ -204,22 +229,50 @@ class CrossModalConditionSampler:
         stream = generator if generator is not None else self._generator
         pair_index = int(torch.randint(len(self._pairs), (1,), generator=stream))
         source_modality, target_modality = self._pairs[pair_index]
+        return (
+            self._condition_for(source_modality, target_modality, stream),
+            target_modality,
+        )
+
+    def sample_target(
+        self, target: Modality, generator: torch.Generator | None = None,
+    ) -> RolloutCondition:
+        """目标端固定为 ``target``（ADR-0008-01 配额量产的条件源），
+        源序列自由度按组2 分布在「目标端为 target 的有序对」上均匀
+        抽取；注入清单无该目标端的有序对时显式拒绝（cross_modal_pairs
+        可配置，不静默回退全目标采样）。"""
+        stream = generator if generator is not None else self._generator
+        candidates = [pair for pair in self._pairs if pair[1] == target]
+        if not candidates:
+            raise ValueError(
+                f"组2 条件分布的有序对清单无目标端为 {target} 的对"
+                "（sample_target 是配额量产的条件源，清单来自 "
+                "cross_modal_pairs 配置）"
+            )
+        pair_index = int(torch.randint(len(candidates), (1,), generator=stream))
+        source_modality, _ = candidates[pair_index]
+        return self._condition_for(source_modality, target, stream)
+
+    def _condition_for(
+        self,
+        source_modality: Modality,
+        target_modality: Modality,
+        stream: torch.Generator,
+    ) -> RolloutCondition:
+        """按 (源序列, 目标序列) 构造组2 条件：源影像 latent 按源序列
+        均匀抽取；per-case spacing 与源 latent 同条目同源（manifest 侧车，
+        issue #46），控制网络条件路径的消费端取值。"""
         source_index = int(torch.randint(
             self._pool.size(source_modality), (1,), generator=stream,
         ))
         label = self._mapping.label(target_modality)
-        return (
-            RolloutCondition(
-                label=torch.tensor([label], device=self._device),
-                # per-case spacing 与源 latent 同条目同源（manifest 侧车，
-                # issue #46），控制网络条件路径的消费端取值
-                spacing=torch.tensor(
-                    [self._pool.spacing(source_modality, source_index)],
-                    device=self._device,
-                ),
-                source_latent=self._pool.latent(source_modality, source_index).unsqueeze(0),
+        return RolloutCondition(
+            label=torch.tensor([label], device=self._device),
+            spacing=torch.tensor(
+                [self._pool.spacing(source_modality, source_index)],
+                device=self._device,
             ),
-            target_modality,
+            source_latent=self._pool.latent(source_modality, source_index).unsqueeze(0),
         )
 
 
@@ -306,31 +359,42 @@ class RolloutPhase:
             intra_group_reward_std=std_sum / std_count,
         )
 
-    def base_partition_samples(self, total: int) -> torch.Tensor:
+    def base_partition_samples(
+        self, quota: Mapping[Modality, int],
+    ) -> tuple[torch.Tensor, list[Modality]]:
         """冻结初始 policy 的 rollout 产出（Anchor 全 ODE 终点）——
         buffer base 分区的种子（train 启动时自动生成，spec 补钉）。
 
-        走独立 base 流（构造注入 base_generator）：其抽取数随 buffer
-        容量变化，不占训练 rollout 的抽样流（同 seed 下容量实验的
-        rollout 流保持不变）。"""
+        ADR-0008-01：按每条件配额量产（``base_condition_quota``）——
+        逐目标模态产满配额，产出逐样本目标模态标签（fill_base 的标签
+        输入；组2 条目按目标模态归因）。走独立 base 流（构造注入
+        base_generator）：其抽取数随 buffer 容量/配额变化，不占训练
+        rollout 的抽样流（同 seed 下容量实验的 rollout 流保持不变）。"""
+        if not quota:
+            raise ValueError("base 分区量产的每条件配额不得为空")
         generator = (
             self._base_generator
             if self._base_generator is not None else self._generator
         )
         terminals: list[torch.Tensor] = []
-        produced = 0
+        modalities: list[Modality] = []
         with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
-            while produced < total:
-                count = min(_BASE_BATCH, total - produced)
-                condition = self._condition_sampler.sample(generator)[0]
-                noise = torch.randn(
-                    (count, *self._config.latent_shape), generator=generator,
-                ).to(self._device)
-                anchor = self._sampler.anchor_trajectory(noise, condition)
-                terminals.append(anchor[-1])
-                produced += count
+            for modality, count in quota.items():
+                produced = 0
+                while produced < count:
+                    batch = min(_BASE_BATCH, count - produced)
+                    condition = self._condition_sampler.sample_target(
+                        modality, generator,
+                    )
+                    noise = torch.randn(
+                        (batch, *self._config.latent_shape), generator=generator,
+                    ).to(self._device)
+                    anchor = self._sampler.anchor_trajectory(noise, condition)
+                    terminals.append(anchor[-1])
+                    modalities.extend([modality] * batch)
+                    produced += batch
         # base 分区与近期分区同一 reward 域（real pool 存储域）
-        return self._to_pool_domain(torch.cat(terminals))
+        return self._to_pool_domain(torch.cat(terminals)), modalities
 
     def _to_pool_domain(self, latent: torch.Tensor) -> torch.Tensor:
         """rollout 终点（policy scaled 采样域）→ real pool 存储域：

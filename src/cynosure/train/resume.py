@@ -51,8 +51,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from cynosure.config import ConfigLoader
+from cynosure.config import MODALITIES, ConfigLoader, Modality
 from cynosure.distributed import DistributedContext
+from cynosure.reward.buffer import ReplayEntry
 
 if TYPE_CHECKING:
     from cynosure.config import CynosureConfig
@@ -71,9 +72,13 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 2
+RESUME_STATE_FORMAT_VERSION = 3
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
-v2：+ world_size（多 rank 续训的拓扑对账）。"""
+v2：+ world_size（多 rank 续训的拓扑对账）。
+v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
+侧）——分区各存 {latents, modalities} 成对清单；旧格式（裸 latent
+分区）条目不带来源标签，恢复后回放采样无法按条件过滤，被版本对账
+显式拒绝（跨口径续训不可恢复）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -299,7 +304,8 @@ class ResumeStore:
         self, trainer: "GranularGrpoTrainer", iteration: int,
         policy_state: dict,
     ) -> dict[str, Any]:
-        """续训状态全清单快照（T07 验收清单的落盘形态）。"""
+        """续训状态全清单快照（T07 验收清单的落盘形态；v3：buffer 两区
+        条目带目标模态标签，latents 与 modalities 成对落盘）。"""
         rewards = trainer.rewards
         base = rewards.buffer.base_samples()
         recent = rewards.buffer.recent_samples()
@@ -317,8 +323,8 @@ class ResumeStore:
             "discriminator_network": rewards.discriminator.state_dict(),
             "discriminator_optimizer": rewards.update.optimizer.state_dict(),
             "replay_buffer": {
-                "base": torch.stack(base) if base else None,
-                "recent": torch.stack(recent) if recent else None,
+                "base": self._capture_zone(base),
+                "recent": self._capture_zone(recent),
             },
             "generators": {
                 name: generator.get_state()
@@ -330,6 +336,19 @@ class ResumeStore:
                 "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
             },
             "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）
+        }
+
+    @staticmethod
+    def _capture_zone(
+        entries: list[ReplayEntry],
+    ) -> dict[str, Any] | None:
+        """单分区落盘形态：latents 按区内序堆叠 + 逐条目目标模态标签
+        （空分区 = None；weights_only 兼容的 Tensor/list[str] 原语）。"""
+        if not entries:
+            return None
+        return {
+            "latents": torch.stack([entry.latent for entry in entries]),
+            "modalities": [entry.modality for entry in entries],
         }
 
     def _assert_resumable_config(
@@ -368,8 +387,10 @@ class ResumeStore:
         version = state.get("format_version")
         if version != RESUME_STATE_FORMAT_VERSION:
             raise ValueError(
-                f"续训状态契约版本不符：期望 {RESUME_STATE_FORMAT_VERSION}，"
-                f"得到 {version}"
+                f"续训状态格式版本不符：本代码口径 v{RESUME_STATE_FORMAT_VERSION}"
+                "（Replay buffer 条目带目标模态标签，ADR-0008），得到 "
+                f"{version!r}——跨口径续训不可恢复（旧分片条目不带来源标签，"
+                "恢复后回放采样无法按条件过滤）；请从产物 checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
         if missing:
@@ -401,36 +422,83 @@ class ResumeStore:
     def _restore_buffer(
         self, trainer: "GranularGrpoTrainer", saved: dict,
     ) -> None:
-        """buffer 两区内容恢复：base 按固定容量严格对账后整体回填，recent
-        按 FIFO 插入序重放；恢复后两区占用必须与落盘一致（容量漂移在显式
-        错误处暴露，不静默截断）。"""
+        """buffer 两区内容恢复（v3：分区为 {latents, modalities} 成对
+        清单）：base 按固定容量严格对账后整体回填，recent 按连续同标签
+        段重放——逐段 push 与落盘时的整批 push 在 FIFO 序上等价（段内
+        插入序保持，段间序保持），恢复后两区内容与落盘逐位一致；恢复后
+        两区占用必须与落盘一致（容量漂移在显式错误处暴露，不静默截断）。"""
         buffer = trainer.rewards.buffer
-        base = saved["base"]
-        recent = saved["recent"]
         expected_shape = tuple(trainer.config.latent_shape)
-        if (
-            base is None
-            or base.shape[0] != buffer.base_capacity
-            or tuple(base.shape[1:]) != expected_shape
-        ):
+        base = saved["base"]
+        if base is None:
+            raise ValueError("续训状态 base 分区缺失（v3 分片 base 须非空）")
+        latents, modalities = self._validate_zone(
+            "base", base, expected_shape,
+        )
+        if latents.shape[0] != buffer.base_capacity:
             raise ValueError(
-                f"续训状态 base 分区（{None if base is None else tuple(base.shape)}）"
-                f"与 buffer 容量 {buffer.base_capacity} × latent {expected_shape} 不符"
+                f"续训状态 base 分区（{tuple(latents.shape)}）与 buffer 容量 "
+                f"{buffer.base_capacity} × latent {expected_shape} 不符"
             )
-        buffer.fill_base(base.to(trainer.device))
+        buffer.fill_base(latents.to(trainer.device), modalities)
+        recent_count = 0
+        recent = saved["recent"]
         if recent is not None:
-            if tuple(recent.shape[1:]) != expected_shape:
-                raise ValueError(
-                    f"续训状态 recent 分区形状 {tuple(recent.shape)} 与 latent "
-                    f"{expected_shape} 不符"
+            recent_latents, recent_modalities = self._validate_zone(
+                "recent", recent, expected_shape,
+            )
+            recent_count = recent_latents.shape[0]
+            # 连续同标签段重放：生产 push 是逐 iteration 整批单条件，
+            # 同标签连续段合并 push 与逐批 extend 在 FIFO 序上等价——
+            # 恢复后的 recent 内部序与落盘逐位一致（采样消耗 randperm
+            # 的行序即内容序，行序漂移会让恢复的 loss 尾数分叉）
+            index = 0
+            while index < recent_count:
+                end = index + 1
+                while (
+                    end < recent_count
+                    and recent_modalities[end] == recent_modalities[index]
+                ):
+                    end += 1
+                buffer.push(
+                    recent_latents[index:end].to(trainer.device),
+                    recent_modalities[index],
                 )
-            buffer.push(recent.to(trainer.device))
+                index = end
         sizes = buffer.zone_sizes()
-        if (sizes.base, sizes.recent) != (
-            buffer.base_capacity,
-            0 if recent is None else recent.shape[0],
-        ):
+        if (sizes.base, sizes.recent) != (buffer.base_capacity, recent_count):
             raise ValueError("续训状态 buffer 恢复后两区占用与落盘不一致")
+
+    @staticmethod
+    def _validate_zone(
+        name: str, zone: dict, expected_shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor, list[Modality]]:
+        """v3 分区清单的输入契约：{latents, modalities} 成对、逐行
+        对齐、标签合法（Modality 取值域——返回值可直接交 fill_base 的
+        Sequence[Modality] 形参）。"""
+        if not isinstance(zone, dict) or set(zone) != {"latents", "modalities"}:
+            raise ValueError(
+                f"续训状态 {name} 分区形态非法（v3 须为 {{latents, modalities}}）: "
+                f"{sorted(zone) if isinstance(zone, dict) else type(zone)}"
+            )
+        latents = zone["latents"]
+        modalities = zone["modalities"]
+        if tuple(latents.shape[1:]) != expected_shape:
+            raise ValueError(
+                f"续训状态 {name} 分区形状 {tuple(latents.shape)} 与 latent "
+                f"{expected_shape} 不符"
+            )
+        if len(modalities) != latents.shape[0]:
+            raise ValueError(
+                f"续训状态 {name} 分区标签清单 {len(modalities)} 条与样本数 "
+                f"{latents.shape[0]} 条不符"
+            )
+        unknown = [m for m in modalities if m not in MODALITIES]
+        if unknown:
+            raise ValueError(
+                f"续训状态 {name} 分区含非法目标模态标签: {sorted(set(unknown))}"
+            )
+        return latents, modalities
 
     def _restore_generators(
         self, trainer: "GranularGrpoTrainer", saved: dict,
