@@ -1,5 +1,5 @@
-"""cynosure 命令行：train / eval / prepare / pretrain 子命令与 config schema
-校验——全库唯一测试 seam（spec「Testing Decisions」）。
+"""cynosure 命令行：train / eval / prepare / pretrain / fid / fid-floor
+子命令与 config schema 校验——全库唯一测试 seam（spec「Testing Decisions」）。
 
 四子命令共享同一 config schema；dispatch 前统一校验。train 执行
 Granular-GRPO 训练循环（MGAI → 逐 k 梯度步 → 判别器 Online update →
@@ -13,6 +13,13 @@ run 目录的最新续训状态恢复训练（仅单阶段组、须显式 --run-
 （ADR-0007）：密集步进至 held-out AUC 达 RM readiness gate 或步数上限，
 产出判别器 checkpoint + 预训练报告；单进程执行（World-1 退化路径），
 torchrun 启动显式拒绝——多 rank 各自预训练会分叉判别器。
+
+fid 是裁决性 MR FID 读数仪器（#73 双轨之一，wayfinder #79 移植）：
+独立 ``MrFidConfig`` schema（9 项冻结变量的载体），单进程执行，
+特征缓存带几何口径 fingerprint 防护。fid-floor 是 real-vs-real
+地板的病例级半分工具（#73 裁决八）：读 MR-RATE 评估 manifest，
+seed 冻结落盘（split_record.json + 逐格双侧清单），产物直接喂 fid。
+两子命令与训练族 config 完全分离（fid 不需要训练工件）。
 """
 
 import argparse
@@ -29,6 +36,12 @@ from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.distributed import DistributedContext
+from cynosure.eval.mr_fid import MrFidConfig, MrFidInstrument
+from cynosure.eval.real_real_floor import (
+    DEFAULT_PATH_TEMPLATE,
+    DEFAULT_SEED,
+    RealRealFloorSplit,
+)
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.pretrain import PretrainDriver, PretrainRun
 from cynosure.reward import PreparePipeline
@@ -48,6 +61,11 @@ class CynosureCli:
     def run(self) -> int:
         parser = self._build_parser()
         args = parser.parse_args(self._argv)
+        # fid / fid-floor 走独立 schema（裁决性评测仪器，与训练 config 分离）
+        if args.command == "fid":
+            return self._fid(args)
+        if args.command == "fid-floor":
+            return self._fid_floor(args)
         # 四子命令共享同一 config schema：dispatch 前统一校验
         config = self._load_config(args.config)
         if config is None:
@@ -71,9 +89,36 @@ class CynosureCli:
             ("eval", "从 checkpoint + Real sample pool 产出评测指标"),
             ("prepare", "构建 Real sample pool / Held-out real / per-channel 统计量"),
             ("pretrain", "判别器 warm-start 预训练（RM readiness gate 的上岗产物）"),
+            ("fid", "裁决性 MR FID 读数（fork 口径 2.5D 仪器，#73 双轨）"),
+            ("fid-floor", "real-vs-real 地板半分（病例级 seed 冻结 + 逐格清单）"),
         ):
             sub = subparsers.add_parser(name, help=help_text)
+            if name == "fid-floor":
+                sub.add_argument(
+                    "--manifest", required=True, type=Path,
+                    help="MR-RATE 评估 manifest（eval_manifest.csv，#78 工件）",
+                )
+                sub.add_argument(
+                    "--seed", type=int, default=DEFAULT_SEED,
+                    help=f"半分 seed（默认 {DEFAULT_SEED}；冻结记录随落盘，重算必须同值）",
+                )
+                sub.add_argument(
+                    "--output-dir", required=True, type=Path,
+                    help="冻结工件输出目录（split_record.json + 逐格双侧清单）",
+                )
+                sub.add_argument(
+                    "--path-template", default=DEFAULT_PATH_TEMPLATE,
+                    help="卷路径模板（manifest 行字段插值；默认 MR-RATE "
+                         "gauss 落位相对路径）",
+                )
+                continue
             sub.add_argument("--config", required=True, help="config JSON 路径")
+            if name == "fid":
+                sub.add_argument(
+                    "--comparison-tag", default="",
+                    help="自由标识，写进 FidResult provenance"
+                         "（如 floor_half_a_vs_half_b、label9_seed42）",
+                )
             if name == "train":
                 sub.add_argument(
                     "--run-dir", default=None,
@@ -353,6 +398,80 @@ class CynosureCli:
             "里程碑间隔触发；Baseline 采样与 RL 后重采随 train 落盘"
             " manifest 样本路径。独立 eval 子命令（验收阶梯汇总）由后续 "
             "ticket 交付",
+            file=self._stdout,
+        )
+        return 0
+
+    def _load_mr_fid_config(self, config_arg: str) -> MrFidConfig | None:
+        """fid 子命令的独立 schema 装载（与训练 config 完全分离：
+        裁决性评测仪器的冻结变量不经由训练 schema）。"""
+        path = Path(config_arg)
+        if not path.is_file():
+            print(f"config 文件不存在: {path}", file=self._stderr)
+            return None
+        try:
+            with path.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+            return MrFidConfig.model_validate(data)
+        except ValidationError as exc:
+            print("config 校验失败：", file=self._stderr)
+            for error in exc.errors():
+                location = ".".join(str(part) for part in error["loc"])
+                print(f"  - {location}: {error['msg']}", file=self._stderr)
+            return None
+        except json.JSONDecodeError as exc:
+            print(f"config 不是合法 JSON: {exc}", file=self._stderr)
+            return None
+
+    def _fid(self, args: argparse.Namespace) -> int:
+        """裁决性 MR FID 读数（#73 双轨之一）：单一对比的一次执行。
+        装配期失败（权重/清单/缓存口径指纹）= 输入契约违反，exit 2；
+        成功则三面 FID + 均值 stdout 展示，FidResult provenance 落盘。"""
+        config = self._load_mr_fid_config(args.config)
+        if config is None:
+            return _EXIT_USAGE_ERROR
+        try:
+            result = MrFidInstrument(config).run(
+                comparison_tag=args.comparison_tag,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"fid 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        print(f"FID XY: {result.fid_xy:.4f}", file=self._stdout)
+        print(f"FID YZ: {result.fid_yz:.4f}", file=self._stdout)
+        print(f"FID ZX: {result.fid_zx:.4f}", file=self._stdout)
+        print(f"FID Avg: {result.fid_avg:.4f}", file=self._stdout)
+        print(
+            f"FID 结果已落盘: {config.result_json}"
+            f"（modality={result.modality}、ratio={result.center_slices_ratio}、"
+            f"num_images={result.num_images}，provenance 随盘）",
+            file=self._stdout,
+        )
+        return 0
+
+    def _fid_floor(self, args: argparse.Namespace) -> int:
+        """real-vs-real 地板半分：manifest → 病例级 seed 半分 → 冻结落盘。
+        产物（split_record.json + 逐格双侧清单）直接作为 fid 子命令的
+        real/synth 清单输入（每对同格清单 = 一次地板对比）。"""
+        try:
+            record = RealRealFloorSplit(
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                seed=args.seed,
+                path_template=args.path_template,
+            ).run()
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"fid-floor 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        print(
+            f"病例 {len(record.half_a) + len(record.half_b)} → "
+            f"half_a={len(record.half_a)}、half_b={len(record.half_b)}"
+            f"（seed={record.seed}，来源 {record.validation_source}）",
+            file=self._stdout,
+        )
+        print(
+            f"冻结记录与逐格双侧清单已落盘: {args.output_dir}"
+            "（split_record.json + filelist_half_<a|b>[_<格>].txt）",
             file=self._stdout,
         )
         return 0

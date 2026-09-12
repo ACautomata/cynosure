@@ -10,6 +10,7 @@ import torch
 from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.frechet import BootstrapKernelMmd, FrechetDistance, KernelMmd
 from cynosure.eval.features import (
+    RadImageNetBackbone,
     RadImageNetFeatureExtractor,
     StubSliceFeatureExtractor,
 )
@@ -149,7 +150,7 @@ class TestRadImageNetFeatureExtractor:
         """生产特征器装载契约：MONAI resnet50 同构 state_dict 可装载，
         装载后对同批切片特征确定。"""
         torch.manual_seed(0)
-        backbone = RadImageNetFeatureExtractor.build_backbone()
+        backbone = RadImageNetBackbone.build_backbone()
         weights = tmp_path / "radimagenet_resnet50.pth"
         torch.save(backbone.state_dict(), weights)
         extractor = RadImageNetFeatureExtractor(weights)
@@ -163,7 +164,7 @@ class TestRadImageNetFeatureExtractor:
         bias 键（Keras conv 默认带 bias）——装载时丢弃拓扑外多余键、
         特征与纯拓扑权重逐位一致；缺键仍显式失败。"""
         torch.manual_seed(0)
-        backbone = RadImageNetFeatureExtractor.build_backbone()
+        backbone = RadImageNetBackbone.build_backbone()
         topology = backbone.state_dict()
         keras_style = {key: value.clone() for key, value in topology.items()}
         keras_style["conv1.bias"] = torch.randn(64)
@@ -183,7 +184,7 @@ class TestRadImageNetFeatureExtractor:
         """键名污染（torch.compile 的 _orig_mod. 前缀 = 拓扑键全缺）：
         显式失败而非静默随机初始化。"""
         torch.manual_seed(0)
-        backbone = RadImageNetFeatureExtractor.build_backbone()
+        backbone = RadImageNetBackbone.build_backbone()
         polluted = {
             f"_orig_mod.{key}": value
             for key, value in backbone.state_dict().items()
@@ -195,25 +196,27 @@ class TestRadImageNetFeatureExtractor:
 
     def test_extraction_streams_in_bounded_forward_batches(self, tmp_path) -> None:
         """生产规模有界前向：一个里程碑上千切片分块进 ResNet50（单批
-        224×224×3 激活分配是 OOM 级），特征按序拼接完整。"""
+        224×224×3 激活分配是 OOM 级），特征按序拼接完整。分块契约
+        住在 ``RadImageNetBackbone.forward``（装载与前向的单一权威），
+        替换内层网络断言逐块尺寸。"""
         torch.manual_seed(0)
-        backbone = RadImageNetFeatureExtractor.build_backbone()
+        backbone = RadImageNetBackbone.build_backbone()
         weights = tmp_path / "radimagenet_resnet50.pth"
         torch.save(backbone.state_dict(), weights)
-        extractor = RadImageNetFeatureExtractor(weights)
+        wrapper = RadImageNetBackbone(weights)
         batches: list[int] = []
 
-        class RecordingBackbone:
-            """前向批大小记录替身（特征维契约同 backbone 出口）。"""
+        class RecordingNetwork:
+            """前向批大小记录替身（内层网络接缝，特征维契约同出口）。"""
 
             def __call__(self, batch: torch.Tensor) -> torch.Tensor:
                 batches.append(batch.shape[0])
-                return torch.zeros(batch.shape[0], extractor.feature_dim)
+                return torch.zeros(batch.shape[0], wrapper.feature_dim)
 
-        extractor._backbone = RecordingBackbone()
-        features = extractor.extract(torch.randn(100, 1, 64, 64))
+        wrapper._backbone = RecordingNetwork()
+        features = wrapper.forward(torch.randn(100, 3, 64, 64))
         assert batches == [32, 32, 32, 4]  # EXTRACT_BATCH 分块
-        assert features.shape == (100, extractor.feature_dim)
+        assert features.shape == (100, wrapper.feature_dim)
 
 
 class TestOrthoPlane:

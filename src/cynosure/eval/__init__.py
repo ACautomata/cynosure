@@ -1,6 +1,12 @@
 """eval 模块：VAE 解码 + 像素域 2.5D FID/KID（RadImageNet-ResNet50、
 三正交面）+ 3D SSIM/MAE + Baseline 采样清单 + 里程碑评测路径。
 
+裁决性 MR FID 读数仪器（``mr_fid``，fork 口径原尺寸切片）与
+real-vs-real 地板工具（``real_real_floor``，病例级 seed 半分）是
+#73 双轨的独立轨：经 ``cynosure fid`` / ``cynosure fid-floor`` 子命令
+驱动，**训练循环不经它们**——里程碑维持本包 224×224 设施口径只看
+趋势，两侧数字不可互比。
+
 关键接口（spec #15 模块划分）：从 checkpoint + Real sample pool 产出指标
 与评测材料。``EvaluationPhase`` 是训练循环依赖的评测相接口（三个动作），
 ``ManifestEvaluation`` 是其 manifest 驱动实现与装配入口：Baseline 采样

@@ -62,8 +62,9 @@ class StubSliceFeatureExtractor:
         return torch.stack(columns, dim=1)
 
 
-class RadImageNetFeatureExtractor:
-    """生产特征器：MONAI ResNet50（2D、2048 维池化特征）+ RadImageNet 权重。
+class RadImageNetBackbone:
+    """RadImageNet-ResNet50 骨架装配与 3 通道分块前向（权重装载契约的
+    单一权威）。
 
     权重装载：MONAI 拓扑键名与 torchvision 同风格（conv1/bn1/layer1-4），
     RadImageNet 官方发布（Keras 转换，conv 全带 bias）在拓扑外多 49 个
@@ -75,13 +76,17 @@ class RadImageNetFeatureExtractor:
     max 1.3%），对跨里程碑 FID/KID 的相对比较无实质影响（同一提取器
     全程一致）；若未来需绝对对齐 RadImageNet 前向，按 γb/σ 修正对应
     BN running_mean 而非保留 bias 键（MONAI 拓扑无此参数位）。
-    骨架落 ``device``（与里程碑评测的归一设备一致）；前向按
-    ``EXTRACT_BATCH`` 分块——生产一个里程碑上千切片，单批前向的激活
-    分配是 OOM 级。
+    骨架落 ``device``；前向按 ``EXTRACT_BATCH`` 分块——生产一个
+    里程碑上千切片，单批前向的激活分配是 OOM 级。
+
+    本类只做「已归一化的 3 通道切片 → 池化特征」前向；切片缩放/归一
+    口径由调用方决定（``RadImageNetFeatureExtractor`` 的 224×224
+    里程碑口径 vs ``mr_fid`` 的 fork 原尺寸口径，#73 双轨）。
     """
 
     EXTRACT_BATCH = 32
-    """单次前向的切片批上限（2.5D 切片量 = K 体 × 法轴长，上千量级）。"""
+    """单次前向的切片批上限（2.5D 切片量 = K 体 × 法轴长，上千量级；
+    分块本身不改数值——upstream-eval-protocol §5.1 冻结变量 #8）。"""
 
     def __init__(
         self, weights: Path | str, device: torch.device | None = None,
@@ -90,8 +95,8 @@ class RadImageNetFeatureExtractor:
         if not weights_path.is_file():
             raise FileNotFoundError(
                 f"RadImageNet-ResNet50 权重文件不存在: {weights_path}"
-                "（config artifacts.radimagenet_weights；公开发布权重的"
-                "下载脚本属施工）"
+                "（config artifacts.radimagenet_weights / mr_fid."
+                "radimagenet_weights；公开发布权重的下载脚本属施工）"
             )
         self._device = device if device is not None else torch.device("cpu")
         self._backbone = self.build_backbone().to(self._device)
@@ -118,7 +123,8 @@ class RadImageNetFeatureExtractor:
         probe = torch.zeros(
             1, _RADIMAGENET_CHANNELS, 64, 64, device=self._device,
         )
-        self.feature_dim = self._backbone(probe).shape[1]
+        with torch.no_grad():
+            self.feature_dim = self._backbone(probe).shape[1]
 
     @staticmethod
     def build_backbone() -> MonaiResNet:
@@ -130,10 +136,12 @@ class RadImageNetFeatureExtractor:
             feed_forward=False,
         )
 
-    def extract(self, slices: torch.Tensor) -> torch.Tensor:
-        if slices.dim() != 4 or slices.shape[1] != 1:
+    def forward(self, slices: torch.Tensor) -> torch.Tensor:
+        """已归一化的 [N, 3, H, W] 切片批 → [N, feature_dim] 池化特征。"""
+        if slices.dim() != 4 or slices.shape[1] != _RADIMAGENET_CHANNELS:
             raise ValueError(
-                f"切片批须为 [N, 1, H, W]，得到 {tuple(slices.shape)}"
+                f"切片批须为 [N, 3, H, W]（3 通道、已归一化），"
+                f"得到 {tuple(slices.shape)}"
             )
         features = [
             self._forward_chunk(slices[start:start + self.EXTRACT_BATCH])
@@ -142,11 +150,34 @@ class RadImageNetFeatureExtractor:
         return torch.cat(features, dim=0)
 
     def _forward_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
-        """单块切片 → 特征（缩放 → 3 通道复制 → 骨干前向）。"""
+        with torch.no_grad():
+            return self._backbone(chunk.to(self._device))
+
+
+class RadImageNetFeatureExtractor:
+    """生产特征器（里程碑评测口径，#73 双轨的一轨）：切片缩放至
+    224×224、复制 3 通道后前向——**与裁决性读数仪器（``mr_fid`` 的
+    原尺寸 fork 口径）不同轨**，两侧数字不可互比。
+
+    网络装配与权重装载契约委托 ``RadImageNetBackbone``（单一权威），
+    本类只叠加里程碑口径的缩放与通道复制。
+    """
+
+    def __init__(
+        self, weights: Path | str, device: torch.device | None = None,
+    ) -> None:
+        self._device = device if device is not None else torch.device("cpu")
+        self._backbone = RadImageNetBackbone(weights, self._device)
+        self.feature_dim = self._backbone.feature_dim
+
+    def extract(self, slices: torch.Tensor) -> torch.Tensor:
+        if slices.dim() != 4 or slices.shape[1] != 1:
+            raise ValueError(
+                f"切片批须为 [N, 1, H, W]，得到 {tuple(slices.shape)}"
+            )
         resized = torch.nn.functional.interpolate(
-            chunk, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
+            slices, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
             mode="bilinear", align_corners=False,
         )
         channels = resized.repeat(1, _RADIMAGENET_CHANNELS, 1, 1)
-        with torch.no_grad():
-            return self._backbone(channels)
+        return self._backbone.forward(channels)

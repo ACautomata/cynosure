@@ -161,6 +161,14 @@ _Avoid_: L1
 按里程碑间隔（默认每 50 iteration）在 train 循环内触发的解码评测——VAE 解码当前 policy 采样到像素域算 FID/KID，结果以 `milestone` 事件写入训练指标流。解码只发生在里程碑路径，不进逐 iteration 训练循环。
 _Avoid_: 定期评测、周期评测
 
+**Adjudication FID（裁决性 FID 读数）**:
+fork 口径 2.5D FID 仪器（切片原尺寸直进 ResNet50、MR 百分位强度臂 crop→强度→pad、padding=0）产出的基线与 RL 终评读数。与里程碑评测**双轨**：里程碑维持 224×224 设施口径只看趋势，两侧数字不可互比；裁决性读数走冻结变量 config 校验（`mr_fid` schema）+ `FidResult` provenance 落盘，特征缓存带口径 fingerprint 防护。解读锚点 = real-vs-real 地板（病例级 seed 半分互比）。
+_Avoid_: 验收 FID、最终 FID（验收是阶梯概念，本仪器只产读数）
+
+**Real-vs-real floor（real-vs-real 地板）**:
+同仪器下 real 集合的病例级 seed 半分（half_a vs half_b）互比 FID——「该仪器在该数据上该样本量的噪声下限」。没有地板，绝对 FID 无法解读；地板同时是仪器接线自检（应与合成读数同量级）。半分记录（seed + 两半 + 来源）冻结落盘一次、永不重算。
+_Avoid_: 基线 FID（基线是 policy 概念，地板是数据切分概念）
+
 **Downstream distribution alignment（下游指标分布对齐）**:
 用 nnUNet 仪器产出肿瘤体积/质心/ET-WT，对合成影像与真实分布做 TOST/KS/EMD 对齐检验；合成影像无 GT，不比 Dice。
 _Avoid_: L2、Dice 主判据
