@@ -100,11 +100,11 @@ def assert_real_capacity(
     拒绝，而非让昂贵 rollout 先行、更新时才「抽不出」；无放回采样语义
     不动，不引入有放回采样补洞。
     """
-    starved = [
-        (modality, manifest.modalities.get(modality, 0))
-        for modality in MODALITIES
-        if manifest.modalities.get(modality, 0) < batch_size_k
-    ]
+    starved: list[tuple[Modality, int]] = []
+    for modality in MODALITIES:
+        count = manifest.modalities.get(modality, 0)
+        if count < batch_size_k:
+            starved.append((modality, count))
     if starved:
         detail = ", ".join(f"{modality}×{count}" for modality, count in starved)
         raise ValueError(
