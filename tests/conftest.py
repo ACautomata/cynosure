@@ -15,6 +15,8 @@ import torch
 
 from cynosure.cli import CynosureCli
 from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
+from cynosure.reward.buffer import ReplayBuffer
+from cynosure.reward.update import UpdateReport
 
 
 @dataclass
@@ -248,3 +250,49 @@ class FailingAuc:
 
     def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
         raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")
+
+
+class RecordingScorer:
+    """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""
+
+    def __init__(self, discriminator: torch.nn.Module) -> None:
+        self.discriminator = discriminator
+
+
+class RecordingUpdate:
+    """测试仪器：记录 update.step 收到的批、条件与调用时的判别器相位
+    （buffer 用真实两区实现——RewardCoordinator 的 zone_sizes 观测面
+    经它委托；optimizer 为真实现——续训状态机的判别器侧 checkpoint
+    经 RewardCoordinator 消费 update.optimizer，协作者契约面的一部分）。
+    train 循环与预训练 driver 的 update_step 穿参观测共用同一替身。"""
+
+    def __init__(
+        self, discriminator: torch.nn.Module, *,
+        buffer_capacity: int = 64, replay_degraded: bool = False,
+    ) -> None:
+        self.scorer = RecordingScorer(discriminator)
+        # 容量须与被替换的装配一致（base 分区填充量随容量配额量产）
+        self.buffer = ReplayBuffer(buffer_capacity)
+        self.optimizer = torch.optim.AdamW(discriminator.parameters(), lr=5e-5)
+        self.received: list[torch.Tensor] = []
+        self.modalities: list[str] = []
+        self.training_at_call: list[bool] = []
+        self._replay_degraded = replay_degraded
+
+    def step(
+        self, current_fakes: torch.Tensor, modality: str,
+    ) -> UpdateReport:
+        self.received.append(current_fakes)
+        self.modalities.append(modality)
+        self.training_at_call.append(self.scorer.discriminator.training)
+        return UpdateReport(
+            loss_discriminator=0.0,
+            loss_real_term=0.0,
+            loss_fake_term=0.0,
+            num_current=1,
+            num_replay=0 if self._replay_degraded else 1,
+            num_base_replay=0,
+            num_recent_replay=0,
+            modality=modality,
+            replay_degraded=self._replay_degraded,
+        )

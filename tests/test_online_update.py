@@ -6,8 +6,10 @@ fake 源（Fixture 策略）：固定 seed + 预置固定 fake + policy 不参�
 policy rollout 输出，fixture = 预置固定 latent 批），一步 = 采 real 批 →
 混采 fake 批 → LSGAN loss → AdamW step → 当前 fake push 入近期分区。
 
-ADR-0008-01：step 穿本 iteration 目标模态——回放半区按该条件过滤，
-入区 fake 带同标签（real 侧条件匹配归 ADR-0008-03）。
+ADR-0008：step 穿本 iteration 目标模态——回放半区按该条件过滤、real
+批同条件匹配采样、入区 fake 带同标签（ADR-0008-03）；该条件回放候选
+不足半区需求时退化纯 current 半区、real 侧与退化后批同量匹配并带
+退化标记。real 池逐模态容量 ≥ K 是装配期守卫（LatentManifest）。
 """
 
 import json
@@ -17,11 +19,12 @@ import pytest
 import torch
 
 from cynosure.config import MODALITIES, CynosureConfig
+from cynosure.distributed import DistributedContext, RankSlicedPool
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
 from cynosure.reward.buffer import ReplayBuffer
-from cynosure.reward.sampler import RealPoolSampler, assert_real_capacity
+from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 
@@ -235,7 +238,8 @@ class TestMixComposition:
 class TestConditionMatchedRealSide:
     """ADR-0008-03 AC 1：在线更新 real 侧按本 iteration 目标模态匹配
     采样（与 held-out AUC 同条件归因口径同源）——real 侧候选不足属装配
-    守卫（assert_real_capacity）的拒绝面，采样语义本身不动。"""
+    守卫（LatentManifest.assert_condition_capacity）的拒绝面，采样
+    语义本身不动。"""
 
     def test_real_batch_matches_iteration_condition(
         self, scenario: UpdateScenario,
@@ -390,7 +394,8 @@ class TestUpdateStep:
 class TestRealCapacityGuard:
     """ADR-0008-03 AC 5：装配期 real 容量守卫——逐 (rank 切片或全池,
     模态) real 容量 ≥ K，不足 fail-fast 可读报错（RealPoolSampler 无放回
-    采样语义不动，不引入有放回采样补洞）。"""
+    采样语义不动，不引入有放回采样补洞）。守卫是 manifest 对本视图
+    逐模态计数的校验（装配缝先切片、后守卫）。"""
 
     @staticmethod
     def _manifest(per_modality: dict[str, int]) -> LatentManifest:
@@ -415,10 +420,10 @@ class TestRealCapacityGuard:
 
     def test_capacity_at_exact_k_passes(self) -> None:
         """每模态恰好 K 条：守卫放行（无放回采 K 条可行）。"""
-        assert_real_capacity(self._manifest({m: 4 for m in MODALITIES}), 4)
+        self._manifest({m: 4 for m in MODALITIES}).assert_condition_capacity(4)
 
     def test_capacity_above_k_passes(self) -> None:
-        assert_real_capacity(self._manifest({m: 110 for m in MODALITIES}), 8)
+        self._manifest({m: 110 for m in MODALITIES}).assert_condition_capacity(8)
 
     def test_starved_modality_rejected_with_readable_error(self) -> None:
         """单条件不足即拒（总量够、单条件不够不是放行理由——条件匹配
@@ -427,7 +432,7 @@ class TestRealCapacityGuard:
             {"t1n": 2, "t1c": 4, "t2w": 4, "t2f": 4},
         )
         with pytest.raises(ValueError, match="容量不足") as exc_info:
-            assert_real_capacity(manifest, 4)
+            manifest.assert_condition_capacity(4)
         message = str(exc_info.value)
         assert "t1n" in message and "2" in message and "4" in message
         assert "disc_batch_size_k" in message  # 可行动：点名 config knob
@@ -436,16 +441,30 @@ class TestRealCapacityGuard:
         """某模态 0 条（稀疏模态切片断供的极端）：显式拒绝，不静默空采。"""
         manifest = self._manifest({"t1n": 4, "t1c": 4, "t2w": 4, "t2f": 0})
         with pytest.raises(ValueError, match="t2f"):
-            assert_real_capacity(manifest, 4)
+            manifest.assert_condition_capacity(4)
 
-    def test_guard_consumes_rank_sliced_view_by_contract(self) -> None:
-        """守卫消费「采样器实际看到的 manifest」（rank 切片视图或全池）：
-        函数对传入 manifest 的逐模态计数判定，切片语义归 RankSlicedPool
-        （装配缝先切片后守卫——本测试锁守卫面与切片视图的契约方向）。"""
-        manifest = self._manifest({m: 4 for m in MODALITIES})
-        sliced = manifest.with_entries(manifest.entries[:2])  # 模拟切片视图
-        with pytest.raises(ValueError, match="容量不足"):
-            assert_real_capacity(sliced, 4)
+    def test_multi_rank_demand_is_k_times_world_size(self) -> None:
+        """逐（rank 切片, 模态）语义：判定按全量做、需量 = K×world_size
+        （条带切片每 rank 视图 ≥ K 的等价条件，且失败路径全 rank 一致）——
+        世界 2 路下每模态 6 条 < 8 被拒（rank 切片后最弱视图 3 < 4）。"""
+        manifest = self._manifest({m: 6 for m in MODALITIES})
+        manifest.assert_condition_capacity(4, 1)  # 单进程：6 ≥ 4 放行
+        with pytest.raises(ValueError, match="容量不足") as exc_info:
+            manifest.assert_condition_capacity(4, 2)
+        message = str(exc_info.value)
+        assert "world_size=2" in message and "8" in message
+
+    def test_rank_sliced_views_keep_k_under_passing_guard(self) -> None:
+        """等价性锁：守卫放行的全量在真实条带切片后每 rank 视图每模态
+        ≥ K（K=4、world=2、每模态 9 条 → 切片 5/4——最弱视图恰过线）。"""
+        manifest = self._manifest({m: 9 for m in MODALITIES})
+        manifest.assert_condition_capacity(4, 2)
+        for rank in (0, 1):
+            view = RankSlicedPool(
+                manifest, DistributedContext(rank, 2, True),
+            ).view()
+            for modality in MODALITIES:
+                assert view.modalities[modality] >= 4
 
 
 class TestLossDecreases:

@@ -39,7 +39,7 @@ from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
-from cynosure.reward.sampler import RealPoolSampler, assert_real_capacity
+from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train.artifacts import RunArtifacts
@@ -221,16 +221,18 @@ class TrainingRuntime:
         scorer = cls._assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
-        # real 侧视图：分布式 = 本 rank 条带切片，单进程 = 全池（RankSlicedPool
-        # 恒等语义）。装配期逐 (切片或全池, 模态) 容量 ≥ K 守卫（ADR-0008
-        # 决策 4 / ADR-0008-03：条件匹配采样后每条件独立供满无放回 real 批）
-        real_view = RankSlicedPool(
-            LatentManifest.load(
-                config.reward.real_pool_manifest, kind="real_pool",
-            ),
-            dist,
-        ).view()
-        assert_real_capacity(real_view, config.reward.disc_batch_size_k)
+        # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐模态容量
+        # ≥ K×world_size——条带切片后每 rank 视图 ≥ K 的等价条件，判定放
+        # 全量保失败路径全 rank 一致（RankSlicedPool 切片前校验同款理由）；
+        # 切片视图供 RealPoolSampler 消费（分布式 = 本 rank 条带切片，
+        # 单进程 = 全池恒等）
+        real_pool = LatentManifest.load(
+            config.reward.real_pool_manifest, kind="real_pool",
+        )
+        real_pool.assert_condition_capacity(
+            config.reward.disc_batch_size_k, dist.world_size,
+        )
+        real_view = RankSlicedPool(real_pool, dist).view()
         update = OnlineUpdate(
             scorer=scorer,
             buffer=ReplayBuffer(config.reward.replay_buffer_capacity),

@@ -11,7 +11,7 @@
 半区需求时（``condition_supply`` 查询面），该步退化为纯 current 半区
 （回放 0 条）、real 侧与退化后批同量匹配，报告带 ``replay_degraded``
 标记落盘——绝不静默回退全池混采或半途截断回放（退化判定的装配期
-防线 = ``assert_replay_supply`` + ``assert_real_capacity``）。
+防线 = ``assert_replay_supply`` + ``LatentManifest.assert_condition_capacity``）。
 
 本类是「一步」原语：``disc_update_interval_n_d`` 的迭代节奏（每 N_d 个
 RL iteration 调用一次 step）由编排方（train 循环，后续 ticket）消费；
@@ -99,17 +99,20 @@ class OnlineUpdate:
                 f" {current_count} 条（batch_size_k={self._batch_size_k}）"
             )
         degraded = self.buffer.condition_supply(modality) < replay_count
-        draw: ReplayDraw | None = None
         if degraded:
             # 退化：纯 current 半区（回放 0 条），real 侧与退化后批同量
             fakes = current_fakes[:current_count]
             real_count = current_count
+            num_replay = num_base_replay = num_recent_replay = 0
         else:
-            draw = self.buffer.sample_replay(
+            draw: ReplayDraw = self.buffer.sample_replay(
                 replay_count, self._generator, modality,
             )
             fakes = torch.cat([current_fakes[:current_count], draw.samples])
             real_count = self._batch_size_k
+            num_replay, num_base_replay, num_recent_replay = (
+                replay_count, draw.num_base, draw.num_recent,
+            )
         reals = self._real_sampler.sample(real_count, modality=modality)
         logits_fake = self.scorer.patch_logits(fakes)
         logits_real = self.scorer.patch_logits(reals)
@@ -123,9 +126,9 @@ class OnlineUpdate:
             loss_real_term=terms.real_term.item(),
             loss_fake_term=terms.fake_term.item(),
             num_current=current_count,
-            num_replay=0 if degraded else replay_count,
-            num_base_replay=0 if draw is None else draw.num_base,
-            num_recent_replay=0 if draw is None else draw.num_recent,
+            num_replay=num_replay,
+            num_base_replay=num_base_replay,
+            num_recent_replay=num_recent_replay,
             modality=modality,
             replay_degraded=degraded,
         )

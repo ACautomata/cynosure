@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.pretrain import (
@@ -43,6 +43,7 @@ from tests.conftest import (
     CliSession,
     FixturePrepareScenario,
     MINIMAL_CONFIG_DICT,
+    RecordingUpdate,
 )
 
 
@@ -674,6 +675,30 @@ class TestPretrainDriverAssembly:
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         with pytest.raises(ValueError, match="fake"):
             PretrainDriver(config, run, device=torch.device("cpu"))
+
+    def test_update_step_receives_per_step_condition(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """AC4：预训练 driver 每步单条件量产、update_step 穿同一步条件
+        （最小诚实形态：量产批与该步更新的条件同源；轮转调度与
+        per-condition AUC 归因归 ADR-0008-04）——替身按步记录条件，
+        步数上限内每步一步更新、条件逐样本落在目标模态集合。"""
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.99,  # 不可达：跑满上限，逐步观测
+            "pretrain_max_steps": 3,
+        })
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        recording = RecordingUpdate(
+            driver.rewards.discriminator,
+            buffer_capacity=config.reward.replay_buffer_capacity,
+        )
+        driver.rewards.update = recording
+        report = driver.run()
+        assert report.steps_completed == 3
+        assert len(recording.modalities) == 3  # 每步一步更新、步步穿参
+        assert set(recording.modalities) <= set(MODALITIES)
 
     def test_rejects_real_pool_below_batch_capacity(
         self, scenario: PretrainScenario,
