@@ -304,6 +304,10 @@ class FidResult:
     冻结记录的落盘形态：每个数字携带识别本次运行所需的全部口径——
     双侧 filelist、模态预处理、采样/几何旗标（``enable_*`` 三个字段
     fork 里默认 None 读作「未记录」，本移植落 config 实际值）。
+    提取侧冻结变量（权重本体 sha256/设备/dtype/双侧缓存目录/
+    ``ignore_existing``）同样直接随结果落盘——缓存指纹可能住在别的
+    根下、也会被换血覆写，单独的结果文件必须自足地建立两读数的
+    可比性（新增字段默认 None，兼容旧结果文件的装载）。
     """
 
     comparison_tag: str
@@ -321,6 +325,12 @@ class FidResult:
     enable_padding: bool | None = None
     enable_center_cropping: bool | None = None
     enable_resampling_spacing: str | None = None
+    radimagenet_weights_sha256: str | None = None
+    device: str | None = None
+    dtype: str | None = None
+    real_features_dir: str | None = None
+    synth_features_dir: str | None = None
+    ignore_existing: bool | None = None
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -432,9 +442,11 @@ class FeatureCacheGuard:
 
     缓存路径 = ``cache_root/<体数据相对路径>.pt``（``cache_root`` 已含
     ``output_root/<modality>/<features_dir>`` 前缀）。fingerprint 覆盖
-    一切影响逐卷特征的口径字段（几何/模态/网络/权重本体/设备/dtype）；
-    目录已有 fingerprint 且与本次不符时**硬错误**——除非
-    ``ignore_existing`` 显式换血（换血同时覆写 fingerprint）。
+    一切影响逐卷特征的口径字段（数据源/几何/模态/网络/权重本体/设备/
+    dtype）；目录已有 fingerprint 且与本次不符时**硬错误**——除非
+    ``ignore_existing`` 显式换血（换血先清残留条目、再覆写 fingerprint，
+    顺序不可换：先换指纹后清残留会让「缩小清单换血 → 放大清单复用」
+    的后续运行看到新指纹而静默装载旧口径特征，中途被打断的换血同理）。
     ``num_images``/filelist 不参与 fingerprint：逐卷特征与取多少卷、
     取哪些卷无关，缓存必须可跨截断复用。
     """
@@ -451,22 +463,32 @@ class FeatureCacheGuard:
         if recorded_path.is_file():
             with recorded_path.open() as file:
                 recorded = json.load(file)
-            if recorded != fingerprint and not ignore_existing:
-                divergent = sorted(
-                    key for key in set(recorded) | set(fingerprint)
-                    if recorded.get(key) != fingerprint.get(key)
-                )
-                raise ValueError(
-                    "特征缓存口径指纹不匹配（upstream-eval-protocol §1.7 "
-                    "缓存陷阱防护）：缓存目录 "
-                    f"{cache_root} 由另一套口径产出，复用会静默给出错误"
-                    f"数字。差异字段: {divergent}。"
-                    "换几何/模态/权重口径后请改 features_dir 或置 "
-                    "ignore_existing=true 强制重提"
-                )
+            if recorded != fingerprint:
+                if not ignore_existing:
+                    divergent = sorted(
+                        key for key in set(recorded) | set(fingerprint)
+                        if recorded.get(key) != fingerprint.get(key)
+                    )
+                    raise ValueError(
+                        "特征缓存口径指纹不匹配（upstream-eval-protocol §1.7 "
+                        "缓存陷阱防护）：缓存目录 "
+                        f"{cache_root} 由另一套口径产出，复用会静默给出错误"
+                        f"数字。差异字段: {divergent}。"
+                        "换几何/模态/权重口径后请改 features_dir 或置 "
+                        "ignore_existing=true 强制重提"
+                    )
+                # 换血：先清旧口径残留条目再发布新指纹。清残后中断的
+                # 最坏情形 = 指纹未写、条目已空 → 下次运行照常硬错误
+                # 提示重提，绝不静默混装两套口径。
+                self._purge_feature_entries()
         cache_root.mkdir(parents=True, exist_ok=True)
         with recorded_path.open("w") as file:
             json.dump(fingerprint, file, indent=2)
+
+    def _purge_feature_entries(self) -> None:
+        """口径换血：清空缓存目录下全部 ``.pt`` 条目（指纹文件保留）。"""
+        for path in sorted(self._cache_root.rglob(f"*{_FEATURE_SUFFIX}")):
+            path.unlink()
 
     def cache_path(self, dataset_root: Path, volume_path: Path) -> Path:
         """体数据路径 → 缓存路径（``.nii.gz`` 后缀换 ``.pt``）。"""
@@ -523,7 +545,7 @@ class MrFidInstrument:
     def run(self, comparison_tag: str = "") -> FidResult:
         """执行一次对比：提取双侧特征 → 逐面 FID → 落盘并返回结果。"""
         config = self._config
-        fingerprint = self._fingerprint()
+        weights_sha256 = self._weights_sha256()
         transforms = self._preprocessing.compose(
             target_shape=config.target_shape,
             resample_spacing=config.resample_spacing,
@@ -535,14 +557,14 @@ class MrFidInstrument:
             filelist=config.real_filelist,
             features_dir=config.real_features_dir,
             transforms=transforms,
-            fingerprint=fingerprint,
+            weights_sha256=weights_sha256,
         )
         synth_xy, synth_yz, synth_zx = self._extract_side(
             dataset_root=config.synth_dataset_root,
             filelist=config.synth_filelist,
             features_dir=config.synth_features_dir,
             transforms=transforms,
-            fingerprint=fingerprint,
+            weights_sha256=weights_sha256,
         )
         frechet = FrechetDistance()
         fid_xy = frechet.score(synth_xy.cpu(), real_xy.cpu())
@@ -569,26 +591,41 @@ class MrFidInstrument:
                 if config.resample_spacing is None
                 else "x".join(str(dim) for dim in config.resample_spacing)
             ),
+            radimagenet_weights_sha256=weights_sha256,
+            device=config.device,
+            dtype=config.dtype,
+            real_features_dir=config.real_features_dir,
+            synth_features_dir=config.synth_features_dir,
+            ignore_existing=config.ignore_existing,
         )
         result.save(config.result_json)
         return result
 
-    def _fingerprint(self) -> dict:
-        """缓存防护指纹：一切影响逐卷特征的口径字段（见类 docstring）。
+    def _weights_sha256(self) -> str | None:
+        """权重本体 sha256（冻结变量 #7 的文件身份）；文件不在（注入
+        替身的测试场景——装载本就不经本运行）记 None，生产路径的默认
+        装配已在构造期强制权重存在。"""
+        weights = self._config.radimagenet_weights
+        if not weights.is_file():
+            return None
+        digest = hashlib.sha256()
+        with weights.open("rb") as file:
+            for chunk in iter(lambda: file.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
-        权重本体项 = 权重文件 sha256；文件不在（注入替身的测试场景——
-        装载本就不经本运行）记 None——指纹仍随设备/几何/口径隔离，
-        生产路径的默认装配已在构造期强制权重存在。
+    def _fingerprint(
+        self, dataset_root: Path, weights_sha256: str | None,
+    ) -> dict:
+        """单侧缓存防护指纹：一切影响逐卷特征的口径字段。
+
+        ``dataset_root`` 把缓存条目绑定到数据源——同一 features_dir 下
+        两个数据根的镜像文件名不再可能互串（否则 real 侧先写缓存后，
+        synth 侧静默装载 real 特征、FID 人为趋零）。
         """
         config = self._config
-        digest = hashlib.sha256()
-        weights_sha256: str | None = None
-        if config.radimagenet_weights.is_file():
-            with config.radimagenet_weights.open("rb") as file:
-                for chunk in iter(lambda: file.read(1 << 20), b""):
-                    digest.update(chunk)
-            weights_sha256 = digest.hexdigest()
         return {
+            "dataset_root": str(Path(dataset_root).resolve()),
             "modality": config.modality,
             "target_shape": list(config.target_shape),
             "resample_spacing": (
@@ -610,9 +647,9 @@ class MrFidInstrument:
         filelist: Path,
         features_dir: str,
         transforms: Compose,
-        fingerprint: dict,
+        weights_sha256: str | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """单侧清单 → 逐卷三平面特征（vstack 后 [总切片数, F]）。"""
+        """单侧清单 → 逐卷三平面特征（vstack 后 [总切片数, F]，CPU）。"""
         if not filelist.is_file():
             raise FileNotFoundError(f"清单文件不存在: {filelist}")
         with filelist.open() as file:
@@ -634,7 +671,7 @@ class MrFidInstrument:
             self._preprocessing.feature_cache_dir(
                 self._config.output_root, features_dir,
             ),
-            fingerprint,
+            self._fingerprint(dataset_root, weights_sha256),
             self._config.ignore_existing,
         )
         dataset = monai.data.Dataset(
@@ -654,9 +691,18 @@ class MrFidInstrument:
             image = batch_data["image"].to(self._device)
             filename = batch_data["image"].meta["filename_or_obj"][0]
             volume_path = Path(filename)
+            # 逐卷特征在提取边界即回 CPU（缓存与累积共用此路径）：
+            # device=cuda 的生产读数若把双侧整栈特征留到距离计算才
+            # 搬运，数百卷 × 三面的 2048 维特征是 GiB 级加速器驻留；
+            # 缓存 .pt 同步落 CPU 形态（跨设备可装载）
             feats = guard.load_or_extract(
                 guard.cache_path(dataset_root, volume_path),
-                lambda: self._slicer.plane_features(image.as_tensor()[0]),
+                lambda: tuple(
+                    plane.cpu()
+                    for plane in self._slicer.plane_features(
+                        image.as_tensor()[0]
+                    )
+                ),
             )
             features_xy.append(feats[0])
             features_yz.append(feats[1])

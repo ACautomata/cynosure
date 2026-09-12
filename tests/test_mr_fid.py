@@ -7,6 +7,7 @@ upstream-eval-protocol §4.3/§7-7）、特征缓存 fingerprint 防护
 双轨隔离）与 CLI fid 子命令。
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -53,6 +54,16 @@ class _ChannelMeanBackbone:
     def forward(self, slices: torch.Tensor) -> torch.Tensor:
         self.forward_calls += 1
         return slices.mean(dim=(2, 3))
+
+
+class _AcceleratorLikeBackbone:
+    """模拟加速器上的骨干：特征以 mps 设备张量返回（本机可用；无 mps
+    的环境跳过——meta 设备不可作此模拟，``.cpu()`` 拷出会被拒绝）。"""
+
+    def forward(self, slices: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            slices.shape[0], 3, dtype=torch.float32, device="mps",
+        )
 
 
 def _valid_config_dict(tmp_path: Path, **overrides) -> dict:
@@ -280,6 +291,37 @@ class TestFeatureCacheGuard:
         # 换血后指纹已覆写：新口径下普通复用放行
         FeatureCacheGuard(tmp_path, self._fingerprint(0.4), False)
 
+    def test_convention_refresh_purges_unselected_stale_entries(self, tmp_path):
+        """ignore_existing 换血必须先清残留条目再发布新指纹：缩小的
+        清单换血后，未选中卷的旧口径 ``.pt`` 若存活，放大清单的后续
+        运行会看到新指纹而静默装载旧口径特征（§1.7 陷阱的换血变体，
+        中途被打断的换血同理）。"""
+        guard_a = FeatureCacheGuard(tmp_path, self._fingerprint(0.5), False)
+        stale = (torch.zeros(2, 4), torch.zeros(2, 4), torch.zeros(2, 4))
+        guard_a.load_or_extract(tmp_path / "v1.pt", lambda: stale)
+        guard_a.load_or_extract(tmp_path / "v2.pt", lambda: stale)
+        # 换口径换血：本次只重提 v1
+        guard_b = FeatureCacheGuard(tmp_path, self._fingerprint(0.4), True)
+        refresh_calls = []
+
+        def refresh_v1():
+            refresh_calls.append(1)
+            fresh = (torch.ones(2, 4), torch.ones(2, 4), torch.ones(2, 4))
+            return fresh
+
+        guard_b.load_or_extract(tmp_path / "v1.pt", refresh_v1)
+        assert refresh_calls == [1]
+        # 新指纹下的普通运行：v2 的旧口径条目必须已被清除、重新提取
+        guard_c = FeatureCacheGuard(tmp_path, self._fingerprint(0.4), False)
+        recompute_calls = []
+
+        def recompute_v2():
+            recompute_calls.append(1)
+            return stale
+
+        guard_c.load_or_extract(tmp_path / "v2.pt", recompute_v2)
+        assert recompute_calls == [1]
+
 
 class TestMrFidInstrument:
     def _instrument(
@@ -376,6 +418,55 @@ class TestMrFidInstrument:
         result = MrFidInstrument(instrument, backbone=_ChannelMeanBackbone()).run()
         assert result.fid_avg == pytest.approx(0.0, abs=1e-9)
 
+    def test_shared_features_dir_across_distinct_roots_rejected(self, tmp_path):
+        """缓存条目绑定数据源：同一 features_dir + 两个数据根时（镜像
+        布局），real 侧先写缓存后 synth 侧若能装载会得到人为趋零的
+        FID——fingerprint 必须含 dataset_root，令这种碰撞显式硬错误。"""
+        config = MrFidConfig.model_validate(_valid_config_dict(
+            tmp_path, real_features_dir="shared", synth_features_dir="shared",
+        ))
+        with pytest.raises(ValueError, match="dataset_root"):
+            MrFidInstrument(config, backbone=_ChannelMeanBackbone()).run()
+
+    def test_result_provenance_records_extraction_freeze_variables(
+        self, tmp_path,
+    ):
+        """provenance 自足性：判定两份读数可否互比的全部冻结输入
+        （权重本体 sha256 / 设备 / dtype / 双侧缓存目录 / ignore_existing）
+        直接随 FidResult 落盘——缓存指纹可能住在别的根下、也会被
+        ignore_existing 换血覆写，单独的结果文件不能依赖它。"""
+        weights = tmp_path / "w.pt"
+        weights.write_bytes(b"fixture-weights-bytes")
+        config = MrFidConfig.model_validate(_valid_config_dict(
+            tmp_path, radimagenet_weights=str(weights),
+        ))
+        result = MrFidInstrument(config, backbone=_ChannelMeanBackbone()).run()
+        assert result.radimagenet_weights_sha256 == hashlib.sha256(
+            b"fixture-weights-bytes"
+        ).hexdigest()
+        assert result.device == "cpu"
+        assert result.dtype == "float32"
+        assert result.real_features_dir == "realfeat"
+        assert result.synth_features_dir == "synthfeat"
+        assert result.ignore_existing is False
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(),
+        reason="mps 不可用的环境无法模拟加速器出口的设备驻留",
+    )
+    def test_features_parked_on_cpu_per_volume(self, tmp_path):
+        """逐卷特征须在缓存/累积前回 CPU：device=cuda 的生产读数若把
+        双侧整栈特征留到距离计算才搬运，数百卷 × 三面的 2048 维特征
+        是 GiB 级加速器驻留（OOM 级）；缓存 ``.pt`` 也必须落 CPU 形态
+        （跨设备可装载）。替身以 mps 设备模拟加速器出口。"""
+        config = MrFidConfig.model_validate(_valid_config_dict(tmp_path))
+        MrFidInstrument(config, backbone=_AcceleratorLikeBackbone()).run()
+        cached = sorted((tmp_path / "features" / "mr").rglob("*.pt"))
+        assert cached
+        for path in cached:
+            feats = torch.load(path, weights_only=True)
+            assert all(t.device.type == "cpu" for t in feats)
+
 
 class TestRadImageNetBackboneContract:
     """装载契约经重构后由 RadImageNetBackbone 承载（原
@@ -434,6 +525,37 @@ class TestFidCli:
     def test_fid_input_contract_violation_exit_2(self, tmp_path, cli):
         """运行时输入契约（清单/权重/缓存指纹）= exit 2，同 train 族口径。"""
         config_path = self._cli_config(tmp_path, radimagenet_weights=str(tmp_path / "no.pt"))
+        result = cli.run("fid", "--config", str(config_path))
+        assert result.code == 2
+        assert "fid 输入契约违反" in result.stderr
+
+    def test_fid_rejects_torchrun_launch(self, tmp_path, cli, monkeypatch):
+        """fid 是单进程仪器：多 rank 各自全量提取会并发覆写同一缓存
+        指纹/特征与结果工件——torchrun 启动显式拒绝（pretrain 同先例）。"""
+        monkeypatch.setenv("RANK", "1")
+        config_path = self._cli_config(tmp_path)
+        result = cli.run("fid", "--config", str(config_path))
+        assert result.code == 2
+        assert "torchrun" in result.stderr
+
+    def test_fid_corrupt_weights_exit_2(self, tmp_path, cli):
+        """损坏/不兼容的权重工件 = 输入契约违反（exit 2）而非裸
+        traceback——prepare/pretrain 装载期同口径。"""
+        weights = tmp_path / "corrupt.pt"
+        weights.write_bytes(b"not-a-torch-archive")
+        config_path = self._cli_config(tmp_path, radimagenet_weights=str(weights))
+        result = cli.run("fid", "--config", str(config_path))
+        assert result.code == 2
+        assert "fid 输入契约违反" in result.stderr
+
+    def test_fid_corrupt_cache_pt_exit_2(self, tmp_path, cli):
+        """执行期的缓存 ``.pt`` 反序列化失败同属输入契约违反：fid 是
+        只读评测，执行无训练态可破坏，损坏缓存的 RuntimeError 面归入
+        契约违反而非裸 traceback。"""
+        config_path = self._cli_config(tmp_path)
+        assert cli.run("fid", "--config", str(config_path)).code == 0
+        cache = next((tmp_path / "features" / "mr").rglob("*.pt"))
+        cache.write_bytes(b"corrupt-payload")
         result = cli.run("fid", "--config", str(config_path))
         assert result.code == 2
         assert "fid 输入契约违反" in result.stderr

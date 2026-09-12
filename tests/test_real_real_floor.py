@@ -58,7 +58,9 @@ def _write_manifest(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-# 6 病例、含同病例多卷/跨格，覆盖半分的病例级语义
+# 6 病例、含同病例多卷/跨格，覆盖半分的病例级语义；MRA 格在 seed 42
+# 下两侧均有病例（p4∈half_a、p5/p6∈half_b）——满足「每格双侧非空」
+# 的展开期契约（生产 manifest 的 MRA 14 病例 2/12 同此约束）
 _MANIFEST_ROWS = [
     _row("T1w/AXIAL", "p1", "s1", "t1w-raw-axi"),
     _row("T1w/AXIAL", "p2", "s2", "t1w-raw-axi"),
@@ -66,6 +68,7 @@ _MANIFEST_ROWS = [
     _row("T1w/SAGITTAL", "p3", "s3", "t1w-raw-sag"),  # p3 同 study 第二卷
     _row("T1w/SAGITTAL", "p4", "s4", "t1w-raw-sag"),
     _row("T1w/SAGITTAL", "p5", "s5", "t1w-raw-sag"),
+    _row("MRA/ALL-PLANES", "p4", "s4", "mra-raw-axi", modality="MRA"),  # p4 第二模态
     _row("MRA/ALL-PLANES", "p5", "s5", "mra-raw-axi", modality="MRA"),  # p5 第二模态
     _row("MRA/ALL-PLANES", "p6", "s6", "mra-raw-axi", modality="MRA"),
 ]
@@ -178,6 +181,47 @@ class TestRealRealFloorSplit:
                 path_template="{nope}/{study_uid}/img/x.nii.gz",
             ).run()
 
+    def test_existing_frozen_output_with_different_inputs_rejected(self, tmp_path):
+        """冻结工件不重算：同目录遇不同 seed/manifest 重跑必须拒绝
+        （否则先前报告的地板数字悄悄换了人群），落盘保持原样。"""
+        out = tmp_path / "floor"
+        manifest = _write_manifest(tmp_path / "m1.csv", _MANIFEST_ROWS)
+        RealRealFloorSplit(manifest, out, seed=42).run()
+        frozen = json.loads((out / "split_record.json").read_text())
+        rows = _MANIFEST_ROWS + [_row("T1w/AXIAL", "p7", "s7", "t1w-raw-axi")]
+        other = _write_manifest(tmp_path / "m2.csv", rows)
+        with pytest.raises(ValueError, match="冻结"):
+            RealRealFloorSplit(other, out, seed=42).run()
+        assert json.loads((out / "split_record.json").read_text()) == frozen
+
+    def test_existing_frozen_output_same_inputs_idempotent(self, tmp_path):
+        """同 seed + 同 manifest 重入同目录 = 冻结工件复用（幂等成功，
+        非重算），清单文件照常补齐。"""
+        manifest = _write_manifest(tmp_path / "m.csv", _MANIFEST_ROWS)
+        out = tmp_path / "floor"
+        first = RealRealFloorSplit(manifest, out, seed=42).run()
+        second = RealRealFloorSplit(manifest, out, seed=42).run()
+        assert second == first
+
+    def test_existing_nonempty_dir_without_record_rejected(self, tmp_path):
+        """非空目录但缺 split_record.json（不是本工具的冻结产物）：
+        拒绝并入落盘，不静默混写。"""
+        out = tmp_path / "floor"
+        out.mkdir()
+        (out / "unrelated.txt").write_text("x")
+        manifest = _write_manifest(tmp_path / "eval_manifest.csv", _MANIFEST_ROWS)
+        with pytest.raises(ValueError, match="冻结产物"):
+            RealRealFloorSplit(manifest, out, seed=42).run()
+
+    def test_stratum_with_empty_side_rejected(self, tmp_path):
+        """某格的全部病例落进同一半时另一侧逐格清单为空——fid 无法
+        消费空清单，必须显式拒绝（换 seed 重分或该格不单独出读数），
+        而非写空文件假成功。"""
+        rows = _MANIFEST_ROWS + [_row("RARE/AXIAL", "p9", "s9", "rare-axi")]
+        manifest = _write_manifest(tmp_path / "eval_manifest.csv", rows)
+        with pytest.raises(ValueError, match="RARE/AXIAL"):
+            RealRealFloorSplit(manifest, tmp_path / "floor", seed=42).run()
+
 
 class TestFloorFeedsMrFid:
     """闭环：地板清单对直接喂 MrFidInstrument（一次地板对比）。"""
@@ -261,3 +305,31 @@ class TestFidFloorCli:
         )
         assert result.code == 0, result.stderr
         assert json.loads((out / "split_record.json").read_text())["seed"] == 20260912
+
+    def test_fid_floor_rerun_with_changed_manifest_exit_2(self, tmp_path, cli):
+        """冻结工件不重算：同目录换 manifest 重跑 = 输入契约违反
+        （exit 2），先前冻结的半分保持原样。"""
+        manifest = _write_manifest(tmp_path / "m1.csv", _MANIFEST_ROWS)
+        out = tmp_path / "floor"
+        assert cli.run(
+            "fid-floor", "--manifest", str(manifest), "--output-dir", str(out),
+        ).code == 0
+        rows = _MANIFEST_ROWS + [_row("T1w/AXIAL", "p7", "s7", "t1w-raw-axi")]
+        other = _write_manifest(tmp_path / "m2.csv", rows)
+        result = cli.run(
+            "fid-floor", "--manifest", str(other), "--output-dir", str(out),
+        )
+        assert result.code == 2
+        assert "fid-floor 输入契约违反" in result.stderr
+
+    def test_fid_floor_rejects_torchrun_launch(self, tmp_path, cli, monkeypatch):
+        """fid-floor 是单进程工具：多 rank 各自半分会并发覆写同一冻结
+        工件——torchrun 启动显式拒绝（pretrain 同先例）。"""
+        monkeypatch.setenv("RANK", "1")
+        manifest = _write_manifest(tmp_path / "eval_manifest.csv", _MANIFEST_ROWS)
+        result = cli.run(
+            "fid-floor", "--manifest", str(manifest),
+            "--output-dir", str(tmp_path / "floor"),
+        )
+        assert result.code == 2
+        assert "torchrun" in result.stderr

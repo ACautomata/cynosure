@@ -423,18 +423,49 @@ class CynosureCli:
             print(f"config 不是合法 JSON: {exc}", file=self._stderr)
             return None
 
+    def _reject_torchrun(self, command: str, consequence: str) -> int | None:
+        """单进程子命令的 torchrun 守卫（pretrain 同先例）：单进程返回
+        None 放行；否则已打印拒绝消息，调用方原样返回。"""
+        env_rank = DistributedContext.env_rank()
+        if env_rank is None:
+            return None
+        print(
+            f"{command} 以单进程执行（{consequence}），"
+            f"拒绝 torchrun 启动（RANK={env_rank}）",
+            file=self._stderr,
+        )
+        return _EXIT_USAGE_ERROR
+
     def _fid(self, args: argparse.Namespace) -> int:
         """裁决性 MR FID 读数（#73 双轨之一）：单一对比的一次执行。
-        装配期失败（权重/清单/缓存口径指纹）= 输入契约违反，exit 2；
-        成功则三面 FID + 均值 stdout 展示，FidResult provenance 落盘。"""
+        装配期与执行期失败（权重/清单/缓存口径指纹/损坏工件的
+        反序列化）= 输入契约违反，exit 2——fid 是只读评测，执行期的
+        RuntimeError 面就是权重与缓存 .pt 的装载失败，与 prepare/
+        pretrain 装载期同口径收窄，不裸 traceback；成功则三面 FID +
+        均值 stdout 展示，FidResult provenance 落盘。"""
+        rejected = self._reject_torchrun(
+            "fid",
+            "多 rank 各自全量提取会并发覆写同一缓存指纹/特征与结果工件",
+        )
+        if rejected is not None:
+            return rejected
         config = self._load_mr_fid_config(args.config)
         if config is None:
             return _EXIT_USAGE_ERROR
         try:
-            result = MrFidInstrument(config).run(
-                comparison_tag=args.comparison_tag,
-            )
-        except (ValueError, FileNotFoundError) as exc:
+            instrument = MrFidInstrument(config)
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"fid 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        try:
+            result = instrument.run(comparison_tag=args.comparison_tag)
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
             print(f"fid 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         print(f"FID XY: {result.fid_xy:.4f}", file=self._stdout)
@@ -452,7 +483,13 @@ class CynosureCli:
     def _fid_floor(self, args: argparse.Namespace) -> int:
         """real-vs-real 地板半分：manifest → 病例级 seed 半分 → 冻结落盘。
         产物（split_record.json + 逐格双侧清单）直接作为 fid 子命令的
-        real/synth 清单输入（每对同格清单 = 一次地板对比）。"""
+        real/synth 清单输入（每对同格清单 = 一次地板对比）；输出目录
+        已有不一致的冻结记录时拒绝（冻结工件不重算）。"""
+        rejected = self._reject_torchrun(
+            "fid-floor", "多 rank 各自半分会并发覆写同一冻结工件",
+        )
+        if rejected is not None:
+            return rejected
         try:
             record = RealRealFloorSplit(
                 manifest_path=args.manifest,

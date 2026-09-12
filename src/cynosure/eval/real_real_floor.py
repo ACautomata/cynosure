@@ -130,14 +130,17 @@ class FloorFilelistWriter:
         self._template = path_template
 
     def write(self, record: SplitFreezeRecord, rows: list[dict[str, str]]) -> list[Path]:
-        """病例半分 + 全部卷行 → 落盘，返回写出的清单路径。"""
+        """病例半分 + 全部卷行 → 落盘，返回写出的清单路径。
+
+        全部清单先展开校验、再统一落盘：某格某侧为空 = 输入契约违反
+        （fid 无法消费空清单），拒绝时不留半套工件。
+        """
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        record.save(self._output_dir / "split_record.json")
-        written: list[Path] = []
+        strata = sorted({row["stratum"] for row in rows})
+        plan: list[tuple[str, list[str]]] = []
         for name, cases in (("a", record.half_a), ("b", record.half_b)):
-            written.append(self._write_lines(f"filelist_half_{name}.txt", cases))
             case_set = set(cases)
-            strata = sorted({row["stratum"] for row in rows})
+            plan.append((f"filelist_half_{name}.txt", cases))
             for stratum in strata:
                 lines = [
                     self._expand(row)
@@ -145,11 +148,18 @@ class FloorFilelistWriter:
                     if row["stratum"] == stratum
                     and row["patient_uid"] in case_set
                 ]
-                written.append(self._write_lines(
+                if not lines:
+                    raise ValueError(
+                        f"格 {stratum} 的 half_{name} 侧无任何卷（该格的"
+                        "全部病例都落在了另一侧）：逐格地板对比缺一侧"
+                        "清单，换 seed 重分或该格不单独出读数"
+                    )
+                plan.append((
                     f"filelist_half_{name}_{self._stratum_token(stratum)}.txt",
                     lines,
                 ))
-        return written
+        record.save(self._output_dir / "split_record.json")
+        return [self._write_lines(filename, lines) for filename, lines in plan]
 
     def _expand(self, row: dict[str, str]) -> str:
         try:
@@ -193,7 +203,13 @@ class RealRealFloorSplit:
         self._output_dir = output_dir
 
     def run(self) -> SplitFreezeRecord:
-        """执行半分并落盘；返回冻结记录（两半名单 + seed + 来源）。"""
+        """执行半分并落盘；返回冻结记录（两半名单 + seed + 来源）。
+
+        输出目录已有冻结记录时的语义：同 seed + 同 manifest（两半名单
+        一致）= 冻结工件复用，幂等成功、照常补齐清单文件；不一致 =
+        硬错误——地板数字是已报告读数的解释锚点，悄悄换人群会让先前
+        的地板失去所指（冻结工件不重算）。
+        """
         rows = self._manifest.volume_rows()
         cases = sorted({row["patient_uid"] for row in rows})
         half_a, half_b = HalvesSplitter().split(cases, self._seed)
@@ -203,8 +219,33 @@ class RealRealFloorSplit:
             half_b=half_b,
             validation_source=str(self._manifest.path),
         )
+        self._guard_frozen_output(record)
         self._writer.write(record, rows)
         return record
+
+    def _guard_frozen_output(self, record: SplitFreezeRecord) -> None:
+        """冻结工件守卫：已有不一致记录（seed 或人群变了）拒绝覆写；
+        非空但缺记录的目录（不是本工具的产物）拒绝并入落盘。"""
+        record_path = self._output_dir / "split_record.json"
+        if record_path.is_file():
+            frozen = SplitFreezeRecord.load(record_path)
+            if (
+                frozen.seed != record.seed
+                or sorted(frozen.half_a) != sorted(record.half_a)
+                or sorted(frozen.half_b) != sorted(record.half_b)
+            ):
+                raise ValueError(
+                    "地板输出目录已有不一致的冻结记录（冻结工件不重算）："
+                    f"{record_path}（seed {frozen.seed}）与本次输入"
+                    f"（seed {record.seed}）的半分人群不同。换目录落盘，"
+                    "或沿用先前冻结的半分"
+                )
+            return
+        if self._output_dir.is_dir() and any(self._output_dir.iterdir()):
+            raise ValueError(
+                f"输出目录已存在且非空但缺 split_record.json（不是本工具"
+                f"的冻结产物，拒绝并入落盘）: {self._output_dir}"
+            )
 
 
 __all__ = [

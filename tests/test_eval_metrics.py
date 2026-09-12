@@ -218,6 +218,33 @@ class TestRadImageNetFeatureExtractor:
         assert batches == [32, 32, 32, 4]  # EXTRACT_BATCH 分块
         assert features.shape == (100, wrapper.feature_dim)
 
+    def test_resize_and_channel_expansion_stay_chunk_bounded(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """缩放与 3 通道复制须逐块进行：全量先 resize + 复制再交给骨干
+        分块，这两步的中间分配随切片总数线性膨胀（生产一个里程碑上千
+        切片 = 数百 MiB 级），把有界前向的内存上限打回 OOM 级。监视
+        interpolate 的逐次批宽，断言分块契约覆盖这两步分配。"""
+        torch.manual_seed(0)
+        backbone = RadImageNetBackbone.build_backbone()
+        weights = tmp_path / "radimagenet_resnet50.pth"
+        torch.save(backbone.state_dict(), weights)
+        extractor = RadImageNetFeatureExtractor(weights)
+        observed: list[int] = []
+        real_interpolate = torch.nn.functional.interpolate
+
+        def spying_interpolate(input, *args, **kwargs):
+            observed.append(input.shape[0])
+            return real_interpolate(input, *args, **kwargs)
+
+        monkeypatch.setattr(
+            torch.nn.functional, "interpolate", spying_interpolate,
+        )
+        features = extractor.extract(torch.randn(40, 1, 64, 64))
+        assert observed
+        assert max(observed) <= RadImageNetBackbone.EXTRACT_BATCH
+        assert features.shape == (40, extractor.feature_dim)
+
 
 class TestOrthoPlane:
     VOLUMES_SHAPE = (3, 8, 6, 4)  # [K, X, Y, Z]

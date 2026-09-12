@@ -175,8 +175,19 @@ class RadImageNetFeatureExtractor:
             raise ValueError(
                 f"切片批须为 [N, 1, H, W]，得到 {tuple(slices.shape)}"
             )
+        features = [
+            self._extract_chunk(slices[start:start + self._backbone.EXTRACT_BATCH])
+            for start in range(0, slices.shape[0], self._backbone.EXTRACT_BATCH)
+        ]
+        return torch.cat(features, dim=0)
+
+    def _extract_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        """单块切片 → 特征（缩放 → 3 通道复制 → 骨干前向）。缩放与
+        复制必须留在块内：提到骨干分块之前会让这两步的中间分配随
+        切片总数线性膨胀（生产一个里程碑上千切片 = 数百 MiB 级），
+        把有界前向的内存上限打回 OOM 级。"""
         resized = torch.nn.functional.interpolate(
-            slices, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
+            chunk, size=(_RADIMAGENET_SLICE_SIZE, _RADIMAGENET_SLICE_SIZE),
             mode="bilinear", align_corners=False,
         )
         channels = resized.repeat(1, _RADIMAGENET_CHANNELS, 1, 1)
