@@ -309,9 +309,12 @@ class FailingAuc:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """pytest-xdist worker 单线程：多 worker 合计已饱和 CPU，各 worker
-    再拉满 OpenMP 线程只会超订阅互抢（集群 128 核跑 4 个全量的实测
-    load 307）。单进程跑不受影响。"""
+    """pytest-xdist worker 线程限额：多 worker 合计贴着物理核数，各自
+    拉满 OpenMP 只会超订阅互抢（集群 128 核跑 4 个全量的实测 load
+    307）。取核数的 1/16（128 核 = 8 线程；核少机器取 1）；单进程跑
+    不受影响。``test_distributed`` 的 spawn rank 从本值继承——跨路径
+    数值等价断言要求两路径同线程数（torch 卷积求和顺序随线程数变）。
+    """
     if hasattr(config, "workerinput"):
-        torch.set_num_threads(1)
+        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
         torch.set_num_interop_threads(1)

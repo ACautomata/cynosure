@@ -95,24 +95,26 @@ class TrainWorldWorker:
 
     def __init__(
         self, rank: int, world: int, port: int, argv: list[str], queue,
+        num_threads: int,
     ) -> None:
         self.rank = rank
         self.world = world
         self.port = port
         self.argv = argv
         self.queue = queue
+        self.num_threads = num_threads
 
     def __call__(self) -> None:
         # spawn 子进程不继承 xdist worker 的线程限制（conftest
         # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
         # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
         # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
-        # 超时）。rank 恒单线程，**必须与单进程参考路径同线程数**——
-        # torch 卷积的求和顺序随线程数变，跨路径数值等价断言
-        # （``_EQUIVALENCE_RTOL``）在两路径同线程数下才自洽（集群实测
-        # rank 8 线程 vs 参考 1 线程 → loss ~1e-6 尺度 7% 相对差超容差；
-        # 本机两路径同为 1 线程 → 绿）。单线程 rank 进程间无 CPU 争抢。
-        torch.set_num_threads(1)
+        # 超时）。``num_threads`` 由主进程 ``torch.get_num_threads()``
+        # 传入——**必须与单进程参考路径同线程数**：torch 卷积的求和
+        # 顺序随线程数变，跨路径数值等价断言（``_EQUIVALENCE_RTOL``）
+        # 在两路径同线程数下才自洽（集群实测 rank 8 线程 vs 参考
+        # 1 线程 → loss ~1e-6 尺度 7% 相对差超容差）。
+        torch.set_num_threads(self.num_threads)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -172,7 +174,10 @@ class SpawnedTrainWorld:
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()
         workers = [
-            TrainWorldWorker(rank, self.world, self.port, self.argv, queue)
+            TrainWorldWorker(
+                rank, self.world, self.port, self.argv, queue,
+                num_threads=torch.get_num_threads(),
+            )
             for rank in range(self.world)
         ]
         processes = [context.Process(target=worker) for worker in workers]
@@ -319,24 +324,19 @@ class GateWorldWorker:
 
     def __init__(
         self, rank: int, world: int, port: int, config_path: Path, queue,
+        num_threads: int,
     ) -> None:
         self.rank = rank
         self.world = world
         self.port = port
         self.config_path = config_path
         self.queue = queue
+        self.num_threads = num_threads
 
     def __call__(self) -> None:
-        # spawn 子进程不继承 xdist worker 的线程限制（conftest
-        # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
-        # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
-        # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
-        # 超时）。rank 恒单线程，**必须与单进程参考路径同线程数**——
-        # torch 卷积的求和顺序随线程数变，跨路径数值等价断言
-        # （``_EQUIVALENCE_RTOL``）在两路径同线程数下才自洽（集群实测
-        # rank 8 线程 vs 参考 1 线程 → loss ~1e-6 尺度 7% 相对差超容差；
-        # 本机两路径同为 1 线程 → 绿）。单线程 rank 进程间无 CPU 争抢。
-        torch.set_num_threads(1)
+        # 与 ``TrainWorldWorker.__call__`` 同理：spawn rank 从主进程
+        # 继承线程数（xdist worker 的限额 + 参考路径一致性）。
+        torch.set_num_threads(self.num_threads)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -518,7 +518,10 @@ class TestGateCollectiveOrder:
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()
         workers = [
-            GateWorldWorker(rank, 2, type(self)._next_port, config_path, queue)
+            GateWorldWorker(
+                rank, 2, type(self)._next_port, config_path, queue,
+                num_threads=torch.get_num_threads(),
+            )
             for rank in range(2)
         ]
         processes = [context.Process(target=worker) for worker in workers]
