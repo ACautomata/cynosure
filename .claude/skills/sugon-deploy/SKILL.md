@@ -22,7 +22,7 @@ sugon-bootstrap 负责，本 skill 不重复；前置不满足时先跑它。
 |---|---|
 | 数据集（`dataset_root`）、公开预训练权重（`unet_ckpt`、`vae_ckpt`、`radimagenet_weights` 等下载件） | `/root/group_data/cynosure/`（团队持久盘，跨实例复用，缺了才下载） |
 | run 目录、checkpoint、`pretrain_report_json`、判别器权重等训练产物 | `/root/private_data/cynosure/`（`deployment.output_root` 默认值） |
-| 代码、pip 包装进系统 site-packages | 系统盘（易失但可重建：git 重拉、pip 重装） |
+| 代码、pip 包装进系统 site-packages | 系统盘（易失但可重建：rsync 重传、pip 重装） |
 
 任何产物落 `/` 或 `/tmp` = 实例一重置全没，等于丢数据。
 
@@ -38,17 +38,21 @@ ssh sugon 'echo "proxy=${https_proxy:-UNSET}"; command -v hy-smi >/dev/null && e
 sugon-bootstrap §4 的 bashrc 注入（bashrc 在易失盘，实例重置后需重注入），
 不满足不继续。
 
-### 2. 代码上集群（git，非 rsync）
+### 2. 代码上集群（rsync）
 
-集群无外网直连，git/pip 全走双 source 代理（前置门已保证）。
+仓库根目录下把本地工作树 rsync 直传到集群（走 ssh 通道，不占集群外网；pip 仍走双 source 代理，前置门已保证）。同步的是工作树本身——未提交改动照传，无需先提交，发布可追溯性由 experiment-release 的「先提交」纪律兜底。`--delete` 使集群目录严格镜像本地，`--exclude` 的模式同时保护集群侧同名文件不被清掉：
 
 ```bash
-ssh sugon 'cd /root/cynosure && git pull'        # 首次:git clone <repo-url> /root/cynosure
-ssh sugon 'cd /root/cynosure && git rev-parse HEAD'
-git rev-parse HEAD                                # 本地比对
+rsync -acv --delete \
+  --exclude .git --exclude .venv --exclude .claude --exclude .remote --exclude scripts \
+  --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache \
+  --exclude '*.egg-info' --exclude dist --exclude build \
+  ./ sugon:/root/cynosure/
 ```
 
-判据：两侧 HEAD 一致（本地有未提交改动先提交，否则集群上跑的不是你看到的代码）。
+判据：`-c` 按逐文件校验和比对（不靠时间戳），命令正常结束、只有统计行即两侧一致——比对工作由同步本身完成。同步完成后重复执行应零文件行，出现文件行即本地又有新改动未传。
+
+首次切换：集群 `/root/cynosure` 若还是旧 git 检出，先 `ssh sugon 'rm -rf /root/cynosure/.git'`（此后该目录只是 rsync 镜像）；实例重置后目录整体消失，rsync 会自动重建。
 
 依赖装进**系统 python**（3.11，DCU torch 唯一宿主）——本地「先激活
 `.venv/`」的惯例到此为止，venv 里没有 DCU torch：
