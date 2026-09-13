@@ -444,7 +444,7 @@ class TestMrFidInstrument:
         weights = tmp_path / "w.pt"
         weights.write_bytes(b"fixture-weights-bytes")
         config = MrFidConfig.model_validate(_valid_config_dict(
-            tmp_path, radimagenet_weights=str(weights),
+            tmp_path, radimagenet_weights=str(weights), device="cpu",
         ))
         result = MrFidInstrument(config, backbone=_ChannelMeanBackbone()).run()
         assert result.radimagenet_weights_sha256 == hashlib.sha256(
