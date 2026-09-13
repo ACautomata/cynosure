@@ -98,7 +98,10 @@ class RadImageNetBackbone:
                 "（config artifacts.radimagenet_weights / mr_fid."
                 "radimagenet_weights；公开发布权重的下载脚本属施工）"
             )
-        self._device = device if device is not None else torch.device("cpu")
+        # 缺省 = 平台检测：有加速设备用加速设备（网络大计算不落 CPU）
+        self._device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu",
+        )
         self._backbone = self.build_backbone().to(self._device)
         topology = self._backbone.state_dict()
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
@@ -166,7 +169,10 @@ class RadImageNetFeatureExtractor:
     def __init__(
         self, weights: Path | str, device: torch.device | None = None,
     ) -> None:
-        self._device = device if device is not None else torch.device("cpu")
+        # 缺省 = 平台检测：有加速设备用加速设备（网络大计算不落 CPU）
+        self._device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu",
+        )
         self._backbone = RadImageNetBackbone(weights, self._device)
         self.feature_dim = self._backbone.feature_dim
 

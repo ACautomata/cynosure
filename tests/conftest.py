@@ -24,6 +24,16 @@ from cynosure.fixtures import Fixture
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.update import UpdateReport
 
+# 测试进程的 torch CPU 线程池固定为 4 线程。缺省值 = 全部物理核
+# （sugon 上 ~56）：集群被他人训练任务占满时，小张量算子（如 MR FID
+# 骨干在 CPU 上的 resnet50 forward，16×16 切片）拆给几十个线程后
+# 层间同步开销远超计算量，OMP 线程自旋空转——实测单测试烧 557 分钟
+# CPU 仍算不完（600 秒墙钟超时）；限 4 线程后 15 秒通过。测试数据
+# 全是小张量，多线程无收益；CPU 算子按输出元素划分、归约顺序固定，
+# 线程数不影响逐位结果。spawn 出的训练 worker 是独立进程，不继承
+# 此限制。
+torch.set_num_threads(4)
+
 
 class SceneCache:
     """训练场景包的跨进程缓存（``FixtureArtifactLibrary`` miss 路径的

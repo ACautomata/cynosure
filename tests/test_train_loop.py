@@ -60,6 +60,10 @@ class TrainingLoopScenario:
     def __init__(self, cli: CliSession, tmp_path: Path) -> None:
         self.cli = cli
         self.tmp_path = tmp_path
+        # 场景根目录自建：调用方可能传尚不存在的子目录（跨 run 对比场景的
+        # tmp_path / f"run{N}"）。旧内联工件构建经 Fixture.write_artifacts
+        # 的 mkdir(parents=True) 隐式保证；#99 工件库化后由本类显式接管。
+        self.tmp_path.mkdir(parents=True, exist_ok=True)
         self.fixture_dir = tmp_path / "fixtures"
         self.run_dir = tmp_path / "run"
         self.config_path = tmp_path / "config.json"

@@ -213,7 +213,9 @@ class TestResumeStateChecklist:
         assert len(recent["modalities"]) == 25
         assert all(m in MODALITIES for m in recent["modalities"])
 
-        # RNG：六条命名流 + 全局 torch/numpy/python（fixture CPU 无 CUDA）
+        # RNG：六条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
+        # 形态：有 CUDA 的环境（集群）经装配期 fork_rng 触发 CUDA RNG
+        # 初始化后捕获全设备 state；无 CUDA 恒 None）
         assert set(state["generators"]) == {
             "rollout", "real_pool", "disc_update",
             "heldout_auc", "fake_shuffle", "base_partition",
@@ -222,7 +224,7 @@ class TestResumeStateChecklist:
             saved.dtype == torch.uint8 for saved in state["generators"].values()
         )
         assert state["rng"]["torch"].dtype == torch.uint8
-        assert state["rng"]["cuda"] is None
+        assert (state["rng"]["cuda"] is not None) == torch.cuda.is_available()
         assert state["rng"]["numpy"]["keys"].shape == (624,)  # MT19937 键数组
         assert len(state["rng"]["python"]["state"]) == 625
 
@@ -521,15 +523,17 @@ class TestResumeGuards:
         assert not (scenario.run_dir / "checkpoints" / "policy_iter2.pt").is_file()
 
     def test_resume_rejects_cuda_availability_mismatch(
-        self, scenario: TrainingLoopScenario,
+        self, scenario: TrainingLoopScenario, monkeypatch,
     ) -> None:
         """落盘含 CUDA RNG、恢复环境无 CUDA（跨设备续训）：静默丢弃 =
-        轨迹静默漂移，显式拒绝（CPU fixture 环境恒无 CUDA，可构造该方向）。"""
+        轨迹静默漂移，显式拒绝。集群执行环境有 CUDA，恢复路径的
+        availability 探测动态 patch 为 False 构造该方向。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         state = scenario.resume_state()
         state["rng"]["cuda"] = [torch.zeros(1, dtype=torch.uint8)]
         torch.save(state, scenario.run_dir / RESUME_STATE)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         result = scenario.resume()
         assert result.code == 2
         assert "CUDA" in result.stderr
