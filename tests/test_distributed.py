@@ -913,7 +913,11 @@ class TestSpawnedUsageContract:
     ) -> None:
         scenario.write_inputs()
         # 损坏 warm-start 产物 checkpoint（train 装配的判别器装载源）→
-        # 装配期对 torch.load 的对称 RuntimeError
+        # 装配期对 torch.load 的对称 RuntimeError。篡改预训练产物前先
+        # fork（写前隔离契约）：write_inputs 的 config 指向共享库，直接
+        # 写库会把损坏传染给本进程后续测试的构造期装载（同变体共享同一
+        # 份 pretrain 工件——本测试之后跑的测试会集体死于损坏 checkpoint）。
+        scenario.fork_pretrained_artifacts()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         checkpoint = (
             Path(data["reward"]["pretrain_report_json"]).parent
