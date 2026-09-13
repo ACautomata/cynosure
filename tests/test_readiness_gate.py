@@ -338,11 +338,14 @@ class TestRecomputeConsistency:
         run = PretrainRun.init(
             pretrain_config, tmp_path / "replay_run",
         )
-        driver = PretrainDriver(pretrain_config, run, device=torch.device("cpu"))
+        # 重演与预训练同一执行设备口径（CLI _prepare_device 同款平台
+        # 检测：集群 = 加速器）——逐位复现要求两侧 driver / 装载同设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        driver = PretrainDriver(pretrain_config, run, device=device)
         # 报告 checkpoint 重载的 scorer == 预训练时的权重（0 步路径 =
         # 冷启动初始权重，seed+6 fork 随同 config seed 确定）
         scorer = report.load_discriminator(
-            config, device=torch.device("cpu"),
+            config, device=device,
         )
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         live = NetworkAssembler.loadable_state_dict(driver.rewards.discriminator)

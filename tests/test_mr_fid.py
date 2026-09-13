@@ -62,7 +62,9 @@ class _AcceleratorLikeBackbone:
     拒绝）。"""
 
     def forward(self, slices: torch.Tensor) -> torch.Tensor:
-        return torch.empty(
+        # 确定性有限值（zeros）：empty 的未初始化内存会出现 NaN/Inf，
+        # 污染下游 FID 谱分解（协方差 NaN）——替身只关心设备驻留语义
+        return torch.zeros(
             slices.shape[0], 3, dtype=torch.float32, device="cuda",
         )
 

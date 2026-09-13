@@ -183,7 +183,9 @@ class TestSequentialRun:
             map_location="cpu",
         )
         for name, value in stage2_trainer.unet.state_dict().items():
-            assert torch.equal(stage1_checkpoint[name], value), name
+            # 集群 GPU 口径下装配的 base′ 张量驻留加速器；checkpoint 已
+            # map_location="cpu"，对比侧对齐设备（逐位语义不变）
+            assert torch.equal(stage1_checkpoint[name], value.cpu()), name
         assert all(
             not p.requires_grad for p in stage2_trainer.unet.parameters()
         )  # base′ 在 stage-2 中冻结
