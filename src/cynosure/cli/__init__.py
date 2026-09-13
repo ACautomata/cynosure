@@ -580,8 +580,9 @@ class CynosureCli:
     def _pretrain(
         self, args: argparse.Namespace, config: CynosureConfig,
     ) -> int:
-        """判别器 warm-start 预训练（ADR-0007）：单进程执行（产物全局
-        唯一），密集步进至 RM readiness gate 达标或步数上限。
+        """判别器 warm-start 预训练（ADR-0007 + ADR-0008-04）：单进程
+        执行（产物全局唯一），per-condition 密集步进至全部轮转条件过线
+        或步数上限（白名单为空不拒跑——报告与 checkpoint 落盘供诊断）。
 
         run 目录默认 = config 的 ``reward.pretrain_report_json`` 所在
         目录（产物位置在 config 里声明，train 上岗按同一路径装载）；
@@ -640,17 +641,28 @@ class CynosureCli:
         except (ValueError, FileNotFoundError) as exc:
             print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR
-        outcome = "已达标" if report.gate_passed else "未达标（步数上限耗尽）"
+        outcome = (
+            "已达标（全部条件过线）" if report.gate_passed
+            else "未达标（步数上限耗尽）"
+        )
+        whitelist = (
+            "、".join(report.gate_whitelist)
+            if report.gate_whitelist else "（空）"
+        )
         print(
             f"预训练完成（group={report.group}，步数 "
             f"{report.steps_completed}/{config.reward.pretrain_max_steps}）：",
             file=self._stdout,
         )
         print(
-            f"  - 最终 held-out AUC: {report.final_heldout_auc:.4f}"
-            f"（门槛 {report.gate_auc}，{outcome}）",
+            f"  - 条件白名单: {whitelist}（门槛 {report.gate_auc}，{outcome}）",
             file=self._stdout,
         )
+        for modality, auc in report.condition_auc.items():
+            print(
+                f"  - held-out AUC[{modality}]: {auc:.4f}",
+                file=self._stdout,
+            )
         print(
             f"  - 判别器 checkpoint: {run.paths.discriminator_ckpt}",
             file=self._stdout,

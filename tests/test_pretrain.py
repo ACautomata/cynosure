@@ -1,10 +1,16 @@
-"""pretrain 子命令端到端与产物契约测试（ticket #58 验收标准聚合）。
+"""pretrain 子命令端到端与产物契约测试（ticket #58/#87 验收标准聚合）。
 
-fixture 合成流：小 pool + 小 fake 集 → 密集步进 → 产物落盘 → 重载 →
-守卫生效；AUC 随步数上升可观测（先例量级）。终止条件（门槛/步数上限）
-双分支、组1/组2 同路径、kind 守卫、预训练事件的回退记账口径由专属
-用例覆盖；真实收敛动力学留给 DCU 实跑（spec「Testing Decisions」：
-fixture 只验判定逻辑与数据流）。
+fixture 合成流：小 pool + 小 fake 集 → per-condition 密集步进 → 产物落盘
+→ 重载 → 守卫生效；AUC 随步数上升可观测（先例量级）。终止语义（全部
+轮转条件过线 / 步数上限）、组1/组2 同路径、kind 守卫、旧格式报告拒绝、
+预训练事件的回退记账口径由专属用例覆盖；真实收敛动力学留给 DCU 实跑
+（spec「Testing Decisions」：fixture 只验判定逻辑与数据流）。
+
+per-condition 步进（ADR-0008-04）分两层锁：**轮转与归因**在端到端用例
+（事件流 modality 逐轮转序断言）；**终止状态机**在替身注入用例（测量 /
+判定 / 更新三 seam 换脚本替身，确认棘轮、部分白名单、复测掉线、耗尽
+补测的语义逐项驱动）。过线判定的支撑度规则本身（CI 下界 / 点估计
+分派）由 test_support_rule 锁，此处锁「判定经 SupportRule 消费」的 seam。
 
 事件类型 × 回退记账口径（ticket #59）分两层锁：本文件锁**口径表**本身
 （三型事件的登记与各自的保留边界、未登记类型的不删语义）；resume seam 上
@@ -70,6 +76,7 @@ def pretrain_event(step: int) -> PretrainEvent:
     """最小合法预训练事件（混存同一 metrics.jsonl 的第二步事件类型）。"""
     return PretrainEvent(
         step=step,
+        modality="t1n",
         loss_discriminator=1.0,
         heldout_auc=0.5,
         buffer_base_occupied=32,
@@ -110,6 +117,7 @@ class TestPretrainEventContract:
         events = artifacts.read_events()
         assert [event["event"] for event in events] == ["iter", "pretrain"]
         assert events[1]["step"] == 0
+        assert events[1]["modality"] == "t1n"  # ADR-0008-04：事件按条件归因
         assert events[1]["heldout_auc"] == pytest.approx(0.5)
 
     def test_rewind_preserves_pretrain_events(self, tmp_path: Path) -> None:
@@ -258,7 +266,8 @@ class PretrainReportScenario:
         fields = {
             "group": "modal-label",
             "latent_shape": tuple(Fixture.LATENT_SHAPE),
-            "final_heldout_auc": 0.72,
+            "condition_auc": {"t1n": 0.72, "t1c": 0.68, "t2w": 0.70, "t2f": 0.66},
+            "gate_whitelist": ["t1n", "t1c", "t2w", "t2f"],
             "steps_completed": 40,
             "gate_auc": 0.65,
             "gate_passed": True,
@@ -295,14 +304,32 @@ class TestPretrainReportGuard:
         with pytest.raises(ValueError):
             PretrainReport.load(path)
 
+    def test_load_rejects_legacy_pooled_format(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """ADR-0008 之前的池化口径报告（final_heldout_auc 单标量）在新
+        schema 下显式拒绝：可读报错点名格式变更与 ADR-0008，而非裸
+        ValidationError——BraTS 线旧报告同此路径。"""
+        data = json.loads(report_scenario.report().model_dump_json())
+        del data["condition_auc"]
+        del data["gate_whitelist"]
+        data["final_heldout_auc"] = 0.72
+        path = report_scenario.report_dir / "legacy.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ValueError, match="ADR-0008") as exc_info:
+            PretrainReport.load(path)
+        assert "final_heldout_auc" in str(exc_info.value)
+
     def test_report_roundtrip(self, report_scenario: PretrainReportScenario) -> None:
-        """报告落盘 → 装载无损（含口径指纹全字段）。"""
+        """报告落盘 → 装载无损（含 per-condition 口径与条件白名单）。"""
         report = report_scenario.report()
         path = report_scenario.write(report)
         loaded = PretrainReport.load(path)
         assert loaded.model_dump() == report.model_dump()
         assert loaded.kind == "pretrain_report"
         assert loaded.gate_passed is True
+        assert loaded.condition_auc == report.condition_auc
+        assert loaded.gate_whitelist == report.gate_whitelist
         assert loaded.provenance.channel_stats_sha256 == report.provenance.channel_stats_sha256
 
     def test_load_discriminator_restores_saved_weights(
@@ -414,9 +441,11 @@ class TestPretrainEndToEnd:
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：fixture 合成流上 pretrain 端到端跑通并产出工件（checkpoint
-        + 报告），报告含最终 held-out AUC 与完整口径指纹。"""
-        # 门槛 0.01 恒达标：判定逻辑走「AUC 达阈值」分支且零步终止（判定
-        # 分支的专属用例；「密集步进」路径见 dense-steps 用例）
+        + 报告），报告含 per-condition AUC 与条件白名单、完整口径指纹。"""
+        # 门槛 0.01 恒达标：全部条件首测即过线、换批复测确认 → 4 个轮转
+        # 确认步零更新终止（判定分支的专属用例；「密集步进」路径见
+        # dense-steps 用例）。fixture held-out 每条件 4 卷 < 支撑度界 20
+        # → 判定走 bootstrap CI 下界口径（CI 下界 ≥ 0.01 恒真）
         scenario.write_config(reward={"pretrain_gate_auc": 0.01})
         result = scenario.pretrain()
         assert result.code == 0, result.stderr
@@ -430,7 +459,11 @@ class TestPretrainEndToEnd:
         assert report.gate_auc == pytest.approx(0.01)
         assert report.gate_passed is True
         assert report.steps_completed == 0
-        assert 0.0 <= report.final_heldout_auc <= 1.0
+        assert report.gate_whitelist == list(MODALITIES)
+        assert set(report.condition_auc) == set(MODALITIES)
+        assert all(0.0 <= auc <= 1.0 for auc in report.condition_auc.values())
+        # 确认步无更新 → 无事件（「事件数 == 完成步数」不变量的零步退化）
+        assert scenario.events() == []
         provenance = report.provenance
         assert Path(provenance.real_pool_manifest) == Path(
             scenario.config().reward.real_pool_manifest
@@ -510,13 +543,13 @@ class TestPretrainEndToEnd:
     def test_dense_steps_terminate_at_gate_or_cap(
         self, scenario: PretrainScenario,
     ) -> None:
-        """AC：终止条件 = AUC 达阈值或步数上限（两者皆配置化）——每步
-        落盘预训练事件（判别字段 + loss/AUC/buffer 占用），事件流 AUC
-        随密集步进上升（实测轨迹：head5 ≈ 0.53 → tail5 ≈ 0.61，12 步；
-        disc_lr 提高是 fixture 加速，判定逻辑与生产同一条）。
+        """AC：终止语义 = 全部条件最近一次 per-condition AUC 过线或步数
+        上限——每步落盘预训练事件（判别字段 + 条件 + loss/AUC/buffer
+        占用），事件流 AUC 随密集步进按条件可归因。
 
-        阈值 0.99 不可达：走满步数上限分支（「AUC 达阈值」分支由 0.01
-        恒达标用例覆盖——两者共用同一个判定点）。"""
+        阈值 0.99 不可达：走满步数上限分支（白名单空仍落盘报告 +
+        checkpoint 供诊断——拒跑由 train gate 把守，诊断产物不丢；
+        「全部条件过线」分支由 0.01 恒达标用例覆盖）。"""
         scenario.write_config(reward={
             "pretrain_gate_auc": 0.99,
             "pretrain_max_steps": 12,
@@ -527,27 +560,48 @@ class TestPretrainEndToEnd:
         assert result.code == 0, result.stderr
         report = scenario.report()
         events = scenario.events()
-        # 判定逻辑不变量：达标步不发事件 → 事件数 == 完成步数；步号连续
+        # 判定逻辑不变量：确认过线步不发事件 → 事件数 == 完成步数；步号连续
         assert len(events) == report.steps_completed == 12
         assert [event["step"] for event in events] == list(range(12))
         assert all(event["event"] == "pretrain" for event in events)
         assert all("loss_discriminator" in event for event in events)
+        # per-condition 轮转：每步条件 = 轮转条件集的 step % n（目标模态
+        # 均匀轮转，ADR-0008 决策 3）——事件流按条件可归因
+        assert [event["modality"] for event in events] == [
+            MODALITIES[step % len(MODALITIES)] for step in range(12)
+        ]
         # 曲线的操作者可见面：终点报出指标流路径与事件数（离线查看收敛
         # 曲线、校准门槛阈值的数据源）
         assert f"{len(events)} 条 pretrain 事件" in result.stdout
+        # 白名单空仍落盘报告 + checkpoint（诊断产物不丢）
+        assert report.gate_whitelist == []
         assert report.gate_passed is False
-        # 判定与报告值的一致性（走满路径：落盘 checkpoint 的补测值 < 门槛）
-        assert report.final_heldout_auc < report.gate_auc
-        # 密集步进拉动 AUC（平滑口径：首尾各 3 步均值；单步 patch 级 AUC
-        # 在 fixture 小批量下噪声大）
-        aucs = [event["heldout_auc"] for event in events]
-        assert sum(aucs[-3:]) / 3 > sum(aucs[:3]) / 3
+        assert (scenario.run_dir_path() / "checkpoints" /
+                "pretrain_discriminator.pt").is_file()
+        # 耗尽路径：未过线条件逐个补测（与落盘 checkpoint 同快照）→ 报告
+        # dict 覆盖全部轮转条件，值 < 门槛
+        assert set(report.condition_auc) == set(MODALITIES)
+        assert all(auc < report.gate_auc for auc in report.condition_auc.values())
+        # 密集步进拉动 AUC（条件化口径）：判别力建立按条件分化——fixture
+        # 判别器对不同序列的判别力基线不同，池化口径的「整体上升」断言
+        # 被取代为「至少一个条件在其自身事件子序列上呈上升趋势」（单步
+        # patch 级 AUC 在 fixture 小批量下噪声大，阈值 0.05 隔离噪声）
+        rises = 0
+        for modality in MODALITIES:
+            series = [
+                event["heldout_auc"] for event in events
+                if event["modality"] == modality
+            ]
+            if series[-1] > series[0] + 0.05:
+                rises += 1
+        assert rises >= 1
 
     def test_cross_modal_group_uses_same_path(
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：组1/组2 走同一条路径，仅 config 不同（组2 fake 走
-        ControlNet 条件分布）。"""
+        ControlNet 条件分布）；轮转条件集 = 有序对清单的目标端去重
+        （12 全组合对 → 四目标端全部在集）。"""
         scenario.write_config(
             group="cross-modal", reward={"pretrain_gate_auc": 0.01},
         )
@@ -555,6 +609,7 @@ class TestPretrainEndToEnd:
         assert result.code == 0, result.stderr
         report = scenario.report()
         assert report.group == "cross-modal"
+        assert sorted(report.gate_whitelist) == sorted(MODALITIES)
 
 
 class TestPretrainCliGuards:
@@ -676,16 +731,16 @@ class TestPretrainDriverAssembly:
         with pytest.raises(ValueError, match="fake"):
             PretrainDriver(config, run, device=torch.device("cpu"))
 
-    def test_update_step_receives_per_step_condition(
+    def test_rotation_steps_round_robin(
         self, scenario: PretrainScenario,
     ) -> None:
-        """AC4：预训练 driver 每步单条件量产、update_step 穿同一步条件
-        （最小诚实形态：量产批与该步更新的条件同源；轮转调度与
-        per-condition AUC 归因归 ADR-0008-04）——替身按步记录条件，
-        步数上限内每步一步更新、条件逐样本落在目标模态集合。"""
+        """AC：per-condition 均匀轮转——每步条件 = 轮转条件集的
+        ``step % n``，update_step 穿同一步条件（确定性轮转不耗 RNG；
+        ADR-0008 决策 3 的调度形态）——替身按步记录条件，步数上限内
+        每步一步更新、条件按轮转序循环。"""
         scenario.write_config(reward={
             "pretrain_gate_auc": 0.99,  # 不可达：跑满上限，逐步观测
-            "pretrain_max_steps": 3,
+            "pretrain_max_steps": 6,
         })
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
@@ -696,9 +751,10 @@ class TestPretrainDriverAssembly:
         )
         driver.rewards.update = recording
         report = driver.run()
-        assert report.steps_completed == 3
-        assert len(recording.modalities) == 3  # 每步一步更新、步步穿参
-        assert set(recording.modalities) <= set(MODALITIES)
+        assert report.steps_completed == 6
+        assert recording.modalities == [
+            MODALITIES[step % len(MODALITIES)] for step in range(6)
+        ]
 
     def test_rejects_real_pool_below_batch_capacity(
         self, scenario: PretrainScenario,
@@ -731,3 +787,193 @@ class TestPretrainDriverAssembly:
             PretrainDriver(config, run, device=torch.device("cpu"))
         message = str(exc_info.value)
         assert "disc_batch_size_k" in message  # 可读：点名条件、可用量与 knob
+
+    def test_rejects_rotation_target_without_heldout(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """ADR-0008-04 装配守卫：轮转条件集某条件的 held-out 无条目 →
+        fail-fast（per-condition AUC 归因无米下锅；首步 rollout 之前
+        拒绝，报错点名缺条目的条件）。"""
+        starved_heldout = scenario.tmp_path / "starved_heldout.json"
+        starved_heldout.write_text(json.dumps({
+            "kind": "heldout_real",
+            "encoder": "starved-fixture",
+            "latent_shape": [4, 16, 16, 8],
+            "split_seed": 0,
+            "split_sizes": {"val": 9},
+            "entries": [
+                {
+                    "case_id": f"case-{modality}-{index}",
+                    "modality": modality,
+                    "latent": f"latents/{modality}-{index}.pt",
+                    "spacing": [100.0, 100.0, 100.0],
+                }
+                for modality in ("t1n", "t1c", "t2w")  # t2f 缺条目
+                for index in range(3)
+            ],
+        }), encoding="utf-8")
+        scenario.write_config(reward={
+            "heldout_real_manifest": str(starved_heldout),
+        })
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "starved_run")
+        with pytest.raises(ValueError, match="t2f") as exc_info:
+            PretrainDriver(config, run, device=torch.device("cpu"))
+        assert "held-out" in str(exc_info.value)
+
+
+class ScriptedClusters:
+    """卷级聚类替身：携带条件名与固定点估计的哑观测（ScriptedSupport
+    按 ``modality`` 查判定脚本；``pooled_auc`` 原样透传）。"""
+
+    def __init__(self, modality: str, point_estimate: float) -> None:
+        self.modality = modality
+        self._point_estimate = point_estimate
+
+    def pooled_auc(self) -> float:
+        return self._point_estimate
+
+
+class ScriptedAuc:
+    """HeldOutAuc 替身：按条件脚本返回点估计（记录测量次序供断言）；
+    容量查询恒充足（守卫路径由真实 manifest 用例覆盖）。"""
+
+    def __init__(self, values: dict[str, float]) -> None:
+        self.values = values
+        self.measurements: list[str] = []
+
+    def compute_volume_clusters(self, fake_latents, modality=None):
+        assert modality is not None
+        self.measurements.append(modality)
+        return ScriptedClusters(modality, self.values[modality])
+
+    def condition_volume_count(self, modality) -> int:
+        return 4
+
+
+class ScriptedSupport:
+    """SupportRule 替身：每条件一个判定脚本队列（逐次弹出，耗尽后重复
+    末值——「首测过、复测掉」的序列 = [True, False]），记录判定次序。"""
+
+    def __init__(self, plan: dict[str, list[bool]]) -> None:
+        self.plan = {modality: list(seq) for modality, seq in plan.items()}
+        self.verdicts: list[tuple[str, bool]] = []
+
+    def passes(self, point_estimate: float, clusters) -> bool:
+        seq = self.plan[clusters.modality]
+        verdict = seq.pop(0) if len(seq) > 1 else seq[0]
+        self.verdicts.append((clusters.modality, verdict))
+        return verdict
+
+
+class TestPretrainRotationStateMachine:
+    """终止状态机替身用例（ADR-0008-04 决策 3 的判定语义）：测量
+    （ScriptedAuc）/ 支撑度判定（ScriptedSupport）/ 更新（RecordingUpdate）
+    三 seam 换脚本替身，确认棘轮、部分白名单、复测掉线、耗尽补测的
+    语义逐项驱动。base 分区 seeding 与事件落盘走真实路径。"""
+
+    @pytest.fixture
+    def scripted(self, scenario: PretrainScenario):
+        """替身驱动的 driver 工厂：config 定死不可达门槛，三 seam 注入。"""
+        def factory(
+            values: dict[str, float], plan: dict[str, list[bool]],
+            max_steps: int = 8,
+        ) -> tuple[PretrainDriver, ScriptedAuc, ScriptedSupport, RecordingUpdate]:
+            scenario.write_config(reward={
+                "pretrain_gate_auc": 0.99,
+                "pretrain_max_steps": max_steps,
+            })
+            config = scenario.config()
+            run = PretrainRun.init(config, scenario.tmp_path / "state_run")
+            driver = PretrainDriver(config, run, device=torch.device("cpu"))
+            recording = RecordingUpdate(
+                driver.rewards.discriminator,
+                buffer_capacity=config.reward.replay_buffer_capacity,
+            )
+            auc = ScriptedAuc(values)
+            support = ScriptedSupport(plan)
+            driver.rewards.update = recording
+            driver.rewards.auc = auc
+            driver._support = support
+            return driver, auc, support, recording
+        return factory
+
+    def test_all_conditions_confirmed_stops_early(
+        self, scripted, scenario: PretrainScenario,
+    ) -> None:
+        """全部条件确认过线即停（决策 3 终止语义）：每条件首测过线 →
+        换批复测确认 → 棘轮入白名单；全部入列终止，零更新零事件。"""
+        values = {modality: 0.8 for modality in MODALITIES}
+        plan = {modality: [True] for modality in MODALITIES}
+        driver, auc, support, recording = scripted(values, plan)
+        report = driver.run()
+        assert report.gate_passed is True
+        assert report.steps_completed == 0
+        assert report.gate_whitelist == list(MODALITIES)
+        assert report.condition_auc == {modality: 0.8 for modality in MODALITIES}
+        assert recording.received == []  # 确认步不更新
+        assert driver._run.read_events() == []  # 无更新即无事件
+        # 测量次序：每条件「首测 + 复测」成对、按轮转序推进
+        assert auc.measurements == [
+            modality
+            for modality in MODALITIES
+            for _ in range(2)
+        ]
+        assert len(support.verdicts) == 8  # 每条件两次判定
+
+    def test_partial_whitelist_on_step_exhaustion(
+        self, scripted,
+    ) -> None:
+        """步数耗尽 → 白名单 = 已确认者：唯一过线条件的确认发生在首步，
+        其余条件轮转测量不过线照常更新；已确认条件后续轮转仍测量 +
+        更新（棘轮不撤销、报告值保留确认时的两次较小者）；未确认条件
+        耗尽后逐个补测（与 checkpoint 同快照）。"""
+        values = {
+            "t1n": 0.8, "t1c": 0.4, "t2w": 0.4, "t2f": 0.4,
+        }
+        plan = {
+            "t1n": [True], "t1c": [False], "t2w": [False], "t2f": [False],
+        }
+        driver, auc, support, recording = scripted(values, plan, max_steps=8)
+        report = driver.run()
+        assert report.gate_passed is False
+        assert report.gate_whitelist == ["t1n"]
+        assert report.steps_completed == 7  # t1n 确认步无更新，其余 7 步更新
+        assert report.condition_auc["t1n"] == pytest.approx(0.8)
+        assert report.condition_auc["t1c"] == pytest.approx(0.4)
+        assert report.condition_auc["t2w"] == pytest.approx(0.4)
+        assert report.condition_auc["t2f"] == pytest.approx(0.4)
+        # 测量：step0 测 t1n（首测+复测）；steps 1-7 更新步各一次首测
+        # （t1n 已确认的轮转步只测不判）；耗尽补测 t1c/t2w/t2f 各一次
+        assert auc.measurements == [
+            "t1n", "t1n",                       # step0：首测 + 复测
+            "t1c", "t2w", "t2f", "t1n",         # 轮转 steps 1-4
+            "t1c", "t2w", "t2f",                # 轮转 steps 5-7
+            "t1c", "t2w", "t2f",                # 耗尽补测（t1n 已确认不补）
+        ]
+        # 已确认条件照常参与轮转更新
+        assert recording.modalities == [
+            MODALITIES[step % len(MODALITIES)] for step in range(1, 8)
+        ]
+
+    def test_confirm_failure_continues_updating(
+        self, scripted,
+    ) -> None:
+        """复测掉线不确认：首测过线换批复测不过 → 该条件不入白名单、
+        本步照常更新落事件（事件 AUC = 首测值）——单批贴线越过被
+        非确定性拒绝的池化语义按条件化保留。"""
+        values = {"t1n": 0.9, "t1c": 0.4, "t2w": 0.4, "t2f": 0.4}
+        plan = {
+            "t1n": [True, False],  # 首测过、复测掉
+            "t1c": [False], "t2w": [False], "t2f": [False],
+        }
+        driver, auc, support, recording = scripted(values, plan, max_steps=4)
+        report = driver.run()
+        assert report.gate_passed is False
+        assert report.gate_whitelist == []
+        assert report.steps_completed == 4
+        events = driver._run.read_events()
+        assert [event["modality"] for event in events] == [
+            "t1n", "t1c", "t2w", "t2f",
+        ]
+        assert events[0]["heldout_auc"] == pytest.approx(0.9)  # 首测值落事件

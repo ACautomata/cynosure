@@ -466,9 +466,9 @@ class RewardConfig(BaseModel):
     )
     pretrain_gate_auc: float = SpecField(
         "tunable", "ADR-0007",
-        "RM readiness gate 门槛阈值：预训练 held-out AUC 达标即终止、train 上岗"
-        "硬检查同源（暂定 0.65，T13 实测 chance 带 ≈ 0.5±0.02；用预训练曲线"
-        "校准后定版）",
+        "RM readiness gate 门槛阈值：预训练 per-condition held-out AUC 的"
+        "过线判定与 train 上岗检查同源（暂定 0.65，T13 实测 chance 带 ≈ "
+        "0.5±0.02；MR-RATE 预训练曲线校准后定版——ADR-0008 决策 6）",
         default=0.65, gt=0.0, lt=1.0,
     )
     gate_support_min_volumes: int = SpecField(

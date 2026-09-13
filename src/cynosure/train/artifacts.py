@@ -105,10 +105,16 @@ class PretrainEvent(BaseModel):
     event: Literal["pretrain"] = "pretrain"
     step: int
     """预训练步号（0 起；每步 = 一批 fake 量产 + 一次判别器单步更新）。"""
+    modality: str
+    """本步条件（目标模态，轮转条件集的 ``step % n`` 项）——预训练
+    事件按条件归因 held-out AUC（ADR-0008-04：阈值校准数据面的条件
+    轴；iter 事件同款归因字段）。"""
     loss_discriminator: float
     heldout_auc: float
-    """本步更新前测得的 held-out AUC（与在线期 iter 事件同快照口径：
-    更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。"""
+    """本步更新前测得的 held-out AUC：该条件 held-out 全量卷的池化点
+    估计（与在线期 iter 事件同「更新前快照」测量时点——更新后测同一
+    fake 批会把 in-sample 拟合计入 AUC；但 real 侧采样面不同——iter
+    事件走 min(fake 批量, 池) 下采样，跨相数值不可直接比较，ADR-0008-04）。"""
     buffer_base_occupied: int
     """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
     buffer_recent_occupied: int

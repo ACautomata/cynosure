@@ -86,6 +86,7 @@ def prepend_pretrain_events(run_dir: Path, steps: int) -> list[dict]:
     for step in range(steps):
         artifacts.append_event(PretrainEvent(
             step=step,
+            modality="t1n",
             loss_discriminator=1.0,
             heldout_auc=0.5 + step * 0.01,
             buffer_base_occupied=32,

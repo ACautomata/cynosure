@@ -317,14 +317,15 @@ class TestRecomputeConsistency:
     ) -> None:
         """重演预训练的测量（同 seed 同 RNG 流 → 同 fake 批）：报告
         checkpoint 装载的 scorer 与预训练时权重逐位一致（同 scorer
-        快照），其对同一批 fake 的重算值与报告 ``final_heldout_auc``
+        快照），其对同一批 fake 的重算值与报告 ``condition_auc``
         逐位一致——门槛不信任报告旧值，但重算必须能复现报告值
-        （重算与预训练测量是同一份 HeldOutAuc.compute 口径）。
+        （重算与预训练测量是同一份口径）。
 
-        gate=0.01 恒 0 步达标：报告值 = 达标测量与复测（两批独立
-        测量取小——producer 侧成功判据对单批测量噪声鲁棒）中较小者；
-        消耗序确定（ADR-0008-01：base 分区按每条件配额量产 → 本步
-        条件采样 → 单条件量产测量批 → 复测批）。"""
+        gate=0.01 恒 0 步达标：报告值 = 轮转条件集首条件的达标测量与
+        复测（两批独立测量取小——producer 侧成功判据对单批测量噪声
+        鲁棒）中较小者；消耗序确定（ADR-0008-01：base 分区按每条件
+        配额量产 → ADR-0008-04：轮转条件集首条件 → 单条件量产测量批
+        → 复测批）。"""
         scenario = GateScenario(cli, tmp_path)
         scenario.write_inputs()
         result = scenario.pretrain(pretrain_gate_auc=0.01)
@@ -350,20 +351,21 @@ class TestRecomputeConsistency:
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         live = NetworkAssembler.loadable_state_dict(driver.rewards.discriminator)
         assert all(torch.equal(restored[key], live[key]) for key in restored)
-        # 消耗序重演：先 base 分区（每条件配额量产）、再本步条件采样 +
-        # 单条件量产测量批、再复测批（同条件）→ 同流同批；报告值 =
-        # 两次独立测量的较小者
+        # 消耗序重演（per-condition 口径，ADR-0008-04）：先 base 分区
+        # （每条件配额量产）、再轮转条件集首条件（确定性轮转不耗 RNG）
+        # 的单条件量产测量批、再复测批（同条件）→ 同流同批；报告值 =
+        # 该条件两次独立测量的较小者（全量卷池化点估计口径）
         quota = base_condition_quota(pretrain_config.reward.replay_buffer_capacity)
         driver.rollout.base_partition_samples(quota)
         batch = pretrain_config.reward.pretrain_fake_batch
-        _, modality = driver.policy.conditions.sample()
-        first = driver.rewards.auc.compute(
-            driver.rollout.base_partition_samples({modality: batch})[0],
-        )
-        second = driver.rewards.auc.compute(
-            driver.rollout.base_partition_samples({modality: batch})[0],
-        )
-        assert report.final_heldout_auc == pytest.approx(
+        target = driver.policy.conditions.targets()[0]
+        first = driver.rewards.auc.compute_volume_clusters(
+            driver.rollout.base_partition_samples({target: batch})[0], target,
+        ).pooled_auc()
+        second = driver.rewards.auc.compute_volume_clusters(
+            driver.rollout.base_partition_samples({target: batch})[0], target,
+        ).pooled_auc()
+        assert report.condition_auc[target] == pytest.approx(
             min(first, second), rel=0.0, abs=0.0,
         )
 
@@ -497,7 +499,8 @@ class TestAssemblyCombinationGuard:
         report = PretrainReport(
             group="modal-label",
             latent_shape=(4, 16, 16, 8),
-            final_heldout_auc=0.72,
+            condition_auc={"t1n": 0.72},
+            gate_whitelist=["t1n"],
             steps_completed=40,
             gate_auc=0.65,
             gate_passed=True,
