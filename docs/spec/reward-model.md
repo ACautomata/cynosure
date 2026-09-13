@@ -38,6 +38,33 @@
 - **fake 缓冲**：封顶 **FIFO 回放缓冲** = base 时期样本（初始冻结 policy 产出）+ 近期 policy 样本，按 **50% 当前 / 50% 回放** 混合采样。real 侧固定训练集 latent，不漂。理由：防止判别器随 policy 变好而**灾难性遗忘**「明显假」长什么样，稳定在线训练、抗漂移（GAN-RL 标准做法；代价仅是显存里存数百~数千个小 latent）。
 - **梯度门控（ADR-0008）**：条件不在 RM readiness 白名单（见下节）→ 该 iteration 跳过 policy 更新，rollout、fake 入 buffer、判别器更新照常——拒绝在 RM 无分辨率的样本上做策略梯度（不引入第二重 reward、KL 或参考模型）。白名单动态恢复：该条件在线 per-condition AUC 的 EMA 越 enter 阈值（暂定 0.55）恢复更新、跌破 exit 阈值（暂定 0.52）重新门控。盲条件的组内标准化噪声梯度（std+1e-8 尺度不变 + clamp ±5）由此道防线拦截。
 
+## 理论定性：对抗博弈与时间尺度分离
+
+> 回应「判别器逐 iteration 在线更新 ⇒ policy 面对的 reward 时变 ⇒ 非平稳、违背 RL 环境不变性」的质疑。本节钉死定性、理论出处与稳定性标准；不改变任何机制裁决。
+
+- **环境不变，动的是对手**。RL 意义上的环境 = 真实数据分布（Real sample pool / Held-out real 全程冻结）+ 去噪动力学（Anchor 轨迹 + 单步 SDE 扰动），全程不变。判别器不是环境的一部分——它是对「latent 相对固定真实分布的真实度」这一固定目标的学习估计器，同时是博弈的另一方。把它划进环境才会导出「非平稳 ⇒ 违背理论」；理论据此换轨：不适用单智能体 MDP 收敛定理，适用双人博弈收敛理论（two-timescale）。
+- **博弈必须双方都动**。本系统结构上是 GAN：LSGAN 判别器 vs 被其分数经 GRPO 驱动的 policy。判别器在线移动（Online update）不是对平稳性的违背，而是博弈成立的必要条件——静止判别器必然被 exploit（Reward hacking）。
+- **非平稳只以 iteration 间阶跃存在**。iteration 内全部 rollout 由同一判别器快照打分（更新序：rollout → 打分 → policy 更新 → 判别器更新；held-out AUC 同样在判别器更新前测），组内 advantage 同尺可比；GRPO 组内标准化使 reward 尺度漂移不进 advantage。每个 policy 更新步面对的都是平稳子问题。
+
+### 理论出处
+
+- **数学地基**：Borkar (1997) two-time-scale stochastic approximation——快变量视慢变量为准静态、收敛到条件不动点；慢变量跟随粗粒化诱导 ODE；学习率比值条件保证尺度分离。同一框架给出 actor-critic（critic 快、actor 慢）的收敛证明。
+- **GAN 应用**：Heusel et al., *GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium*, NeurIPS 2017（arXiv:1706.08500，FID 亦出自该文）——判别器与生成器各用独立学习率，mild assumptions 下证明局部收敛到 stationary local Nash equilibrium，判别器放快时间尺度。
+
+### 定理给了什么、不给什么
+
+- **给**：设计原则——判别器的有效时间尺度（步数 × 学习率 × 收缩率）应快于 policy，使打分所见的判别器近似「当前 policy 下的收敛判别器」；诊断透镜——分离坍塌的签名 = policy 追打过期判别器（hacking）或双侧震荡，由 held-out AUC / 过拟合分叉监控（ADR-0009）检测。
+- **不给**：全局收敛保证（定理是局部的，要求均衡处博弈 Jacobian 的谱条件）；对常数学习率实践的字面覆盖（定理假设学习率退火）；对本管线的字面覆盖（GRPO-clip ≠ SGDA、LSGAN ≠ 原始 minimax、Adam 扩展靠 heavy-ball 论证）。结论：**two-timescale 是设计原则与诊断透镜，不是收敛证书**。
+
+### 稳定性标准（scope 声明）
+
+工程级标准：不追求研究级收敛证明，要求**失效可检测、可恢复**。检测仪器外生于判别器——held-out AUC、过拟合分叉监控（ADR-0009）、milestone FID、裁决性 FID；恢复路径已备案——EMA 锚（ADR-0001 升级项）、Diffusion-GAN 式 timestep 条件增强（ADR-0009 升级路径）。
+
+### 开放项
+
+- **有效时间尺度对账**：D:G 名义更新比 1:|M|（`disc_update_interval_n_d=1`，policy 侧每 iteration 共 |M| 个逐 k 优化器步）。初步 lr 质量核算：`disc_lr=5e-5` vs `policy_lr=2e-6`（25×），即使 |M|=10 判别器仍快 ~2.5×——**分离方向大概率已满足**（lr 质量只是收缩率的粗糙代理，结论随 profile 复核）。`N_d`/|M|/任一 lr 变动须重算；若方向反转，two-timescale 原则指向提高 `disc_update_interval_n_d` 优先于动 policy 侧。
+- ADR-0009 噪声注入与 EMA 锚已裁决未落码，落地条件见各自 ADR。
+
 ## Warm-start 预训练与 RM readiness gate（ADR-0007 / ADR-0008）
 
 T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不足——100 iter 全程徘徊 chance 带，advantage 信号近噪声。ADR-0007 修订 ADR-0001 的「在线从零」：RL 启动前新增判别器**密集预训练**，产物作为在线更新的初始权重。
