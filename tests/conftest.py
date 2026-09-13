@@ -7,7 +7,9 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +23,60 @@ from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIE
 from cynosure.fixtures import Fixture
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.update import UpdateReport
+
+
+class SceneCache:
+    """训练场景包的跨进程缓存（``FixtureArtifactLibrary`` miss 路径的
+    持久层）：网络工件 + 合成数据集 + prepare 三工件 + pretrain 产物
+    全部由固定 seed 决定——同场景参数下跨进程重建是纯冗余（``pytest
+    -n`` 的每个 worker 都是独立进程，进程内缓存互不可见；单进程重跑
+    pytest 同样吃不到上一进程的产物）。命中即整包 ``copytree`` 出库：
+    库目录的消费语义（只读 + fork 篡改）不受影响。
+
+    并发（pytest-xdist 多 worker 共享缓存目录）：``store`` 以唯一临时
+    目录构建后原子 ``rename`` 提交，最终目录存在即完整，读侧无锁。
+    """
+
+    ROOT = Path(tempfile.gettempdir()) / "cynosure-scene-cache"
+
+    _namespace: str | None = None
+
+    @classmethod
+    def key(cls, *parts: object) -> str:
+        """场景参数 → 缓存键（入参须 JSON 可序列化；集合型先排序归一）。
+
+        键掺 src 树内容指纹：场景产物依赖整条 prepare/pretrain 代码
+        路径，任何源码改动都使旧缓存失效（否则修 bug 的测试会吃到旧
+        代码的产物）。指纹每进程只算一次。"""
+        if cls._namespace is None:
+            digest = hashlib.sha256()
+            root = Path(__file__).resolve().parent.parent / "src" / "cynosure"
+            for source in sorted(root.rglob("*.py")):
+                digest.update(str(source.relative_to(root)).encode())
+                digest.update(source.read_bytes())
+            cls._namespace = digest.hexdigest()[:12]
+        return hashlib.sha256(
+            json.dumps([cls._namespace, *parts], sort_keys=True, default=list).encode(),
+        ).hexdigest()[:16]
+
+    @classmethod
+    def load(cls, key: str) -> Path | None:
+        cached = cls.ROOT / key
+        return cached if cached.is_dir() else None
+
+    @classmethod
+    def store(cls, key: str, source: Path) -> None:
+        """构建缓存包（原子提交；已存在则放弃自己的副本用现成的）。"""
+        final = cls.ROOT / key
+        if final.exists():
+            return
+        cls.ROOT.mkdir(parents=True, exist_ok=True)
+        staging = cls.ROOT / f".staging-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(source, staging)
+            os.replace(staging, final)  # 同盘 rename 原子
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 @dataclass
@@ -265,6 +321,11 @@ class FixtureArtifactLibrary:
     复用——场景搭建的 prepare/pretrain 重建成本从每测试一次降为每变体
     一次（集群全量按小时计的执行成本由此收敛）。
 
+    构建结果同时落 ``SceneCache``（跨进程盘上缓存）：进程内缓存随进程
+    消亡——``pytest -n`` 的每个 worker 独立冷启动，单进程重跑同样吃
+    不到上一进程的产物；盘上层让首个构建者建、其余 worker 与后续 run
+    整包 copytree 恢复（键掺 src 树内容指纹，任何源码改动自动失效）。
+
     缓存键 = 场景变体全签名（组 × 采样日程 × seed × reward 覆写）：键内
     变体的产物与逐测试重建**逐位一致**（构建流程与原 write_inputs 相同）。
     ``sde_eta`` 例外——η 不影响预训练的 anchor 确定性 rollout，不进键。
@@ -302,7 +363,8 @@ class FixtureArtifactLibrary:
         reward: dict | None = None,
     ) -> Path:
         """返回该场景变体的工件目录（缺则构建：网络工件 → prepare →
-        预训练 warm-start，流程与原逐测试 write_inputs 逐行一致）。"""
+        预训练 warm-start，流程与原逐测试 write_inputs 逐行一致）；
+        进程内 miss 先查 ``SceneCache`` 盘上缓存，命中整包恢复、免重建。"""
         signature = (
             group, num_steps, tuple(sorted(train_steps)), seed,
             tuple(sorted((reward or {}).items())),
@@ -312,6 +374,13 @@ class FixtureArtifactLibrary:
             return cached
         token = hashlib.md5(repr(signature).encode()).hexdigest()[:8]
         fixture_dir = cls._library_root() / f"shared_fixtures_{token}"
+        disk_key = SceneCache.key("fixture-library", *signature)
+        disk_cached = SceneCache.load(disk_key)
+        if disk_cached is not None:
+            shutil.rmtree(fixture_dir, ignore_errors=True)
+            shutil.copytree(disk_cached, fixture_dir)
+            cls._cache[signature] = fixture_dir
+            return fixture_dir
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(fixture_dir)
@@ -337,6 +406,7 @@ class FixtureArtifactLibrary:
         )
         result = cli.run("pretrain", "--config", str(pretrain_path))
         assert result.code == 0, result.stderr
+        SceneCache.store(disk_key, fixture_dir)
         cls._cache[signature] = fixture_dir
         return fixture_dir
 
@@ -396,3 +466,15 @@ class RecordingUpdate:
             modality=modality,
             replay_degraded=self._replay_degraded,
         )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """pytest-xdist worker 线程限额：多 worker 合计贴着物理核数，各自
+    拉满 OpenMP 只会超订阅互抢（集群 128 核跑 4 个全量的实测 load
+    307）。取核数的 1/16（128 核 = 8 线程；核少机器取 1）；单进程跑
+    不受影响。``test_distributed`` 的 spawn rank 从本值继承——跨路径
+    数值等价断言要求两路径同线程数（torch 卷积求和顺序随线程数变）。
+    """
+    if hasattr(config, "workerinput"):
+        torch.set_num_threads(max(1, (os.cpu_count() or 16) // 16))
+        torch.set_num_interop_threads(1)

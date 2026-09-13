@@ -162,7 +162,7 @@ _Avoid_: 对照组、基准线
 _Avoid_: L1
 
 **Milestone evaluation（里程碑评测）**:
-按里程碑间隔（默认每 50 iteration）在 train 循环内触发的解码评测——VAE 解码当前 policy 采样到像素域算 FID/KID，结果以 `milestone` 事件写入训练指标流。解码只发生在里程碑路径，不进逐 iteration 训练循环。
+按里程碑间隔（默认每 50 iteration）在 train 循环内触发的解码评测——VAE 解码当前 policy 采样到像素域算 FID/KID，结果以 `milestone` 事件写入训练指标流。解码只发生在里程碑路径，不进逐 iteration 训练循环。解码前向冻结为 fp16 autocast 口径（官方 NV-Generate-CTMR utils_infer 同款；不得换 bf16——与官方口径输出差 ~6.8e-02；生产 config `norm_float16=true` 下纯 fp32 前向对 fp32 conv 抛 dtype 错，无条件包 autocast、不分设备分支），出口统一上浮 fp32 供指标/落盘消费。
 _Avoid_: 定期评测、周期评测
 
 **Adjudication FID（裁决性 FID 读数）**:
