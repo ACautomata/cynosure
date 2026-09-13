@@ -230,10 +230,16 @@ class CrossPathEquivalence:
     ——后者的输入是落盘状态本身，不含重算面。"""
 
     def __init__(
-        self, rtol: float, float_atol: float = 1e-8, tensor_atol: float = 1e-7,
+        self, rtol: float, float_atol: float = 1e-8,
+        degenerate_atol: float = 1e-5, tensor_atol: float = 1e-7,
     ) -> None:
         self.rtol = rtol
         self.float_atol = float_atol
+        # 组内标准化 advantage 的批量均值在构造上恒等 0：首个 policy 步
+        # ratio≡1（更新前 π_new = π_old）→ loss = −mean(A) ≈ 0，事件里
+        # 记录的只是浮点消去残差（~1e-6、符号随跨路径 1-2 ulp 前向噪声
+        # 随机）。对这类「零构造量」相对比较无意义，绝对带兜底。
+        self.degenerate_atol = degenerate_atol
         self.tensor_atol = tensor_atol
 
     def trajectories(self, left: list[dict], right: list[dict]) -> None:
@@ -246,14 +252,16 @@ class CrossPathEquivalence:
                 a, b = first[key], second[key]
                 if isinstance(a, float) and isinstance(b, float):
                     assert math.isclose(
-                        a, b, rel_tol=self.rtol, abs_tol=self.float_atol,
+                        a, b, rel_tol=self.rtol,
+                        abs_tol=max(self.float_atol, self.degenerate_atol),
                     ), f"{key}: {a} vs {b}"
                 elif isinstance(a, dict) and isinstance(b, dict):
                     assert set(a) == set(b)
                     for name in a:
                         assert math.isclose(
                             a[name], b[name],
-                            rel_tol=self.rtol, abs_tol=self.float_atol,
+                            rel_tol=self.rtol,
+                            abs_tol=max(self.float_atol, self.degenerate_atol),
                         ), f"{key}:{name}: {a[name]} vs {b[name]}"
                 else:
                     assert a == b, f"{key}: {a!r} vs {b!r}"
@@ -370,7 +378,11 @@ class GateWorldWorker:
         auc = rewards.auc if self.rank == 0 else FailingAuc()
         gate = ReadinessGate(config, auc, dist)  # type: ignore[arg-type]
         torch.manual_seed(0)  # 各 rank 同 fake 批（重算输入一致）
-        fakes = torch.randn(2, *config.latent_shape)
+        # fake 批随本 rank 设备（生产 = policy rollout 产物，与本卡
+        # 判别器同源对齐）：GPU 集群上 scorer 统计量 buffer 在
+        # cuda:LOCAL_RANK，CPU 张量直喂会触发设备守卫、把健康 rank 的
+        # 重算也变成「重算失败」，冒充集合序错位。
+        fakes = torch.randn(2, *config.latent_shape, device=dist.local_device())
         try:
             measured = gate.check(fakes)
         except ValueError as exc:
