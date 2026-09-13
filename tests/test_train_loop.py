@@ -83,7 +83,7 @@ class TrainingLoopScenario:
         warm-start 装载走形态分派的逐位还原路径）。工件对本场景只读；
         要篡改预训练产物的测试先 ``fork_pretrained_artifacts``。"""
         self.fixture_dir = FixtureArtifactLibrary.artifacts_dir(
-            self.cli, self.tmp_path, group,
+            self.cli, group,
             num_steps=num_steps, train_steps=frozenset(train_steps),
             seed=seed, reward=reward,
         )

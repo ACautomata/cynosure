@@ -34,7 +34,7 @@ class DiagnosticScenario:
         # 一次、进程内只读共享（η 不影响预训练的 anchor 确定性 rollout，
         # 不进缓存键）；warm-start 前置（ADR-0007）由库承担
         fixture_dir = FixtureArtifactLibrary.artifacts_dir(
-            self._cli, self._tmp_path, "modal-label", seed=seed,
+            self._cli, "modal-label", seed=seed,
         )
         config = Fixture().config(fixture_dir)
         config.policy.sde_eta = eta

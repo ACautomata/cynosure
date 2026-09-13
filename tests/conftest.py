@@ -6,6 +6,8 @@ import copy
 import hashlib
 import io
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -265,6 +267,13 @@ class FixtureArtifactLibrary:
     变体的产物与逐测试重建**逐位一致**（构建流程与原 write_inputs 相同）。
     ``sde_eta`` 例外——η 不影响预训练的 anchor 确定性 rollout，不进键。
 
+    库目录放系统临时目录下的**进程私有**位置（PID 后缀），有意游离于
+    pytest 的编号 tmp 体系之外：并行 pytest 进程创建更高编号目录时的
+    GC（保留最近 3 个编号）会 rm-rf 掉低编号 run 的整个 tmp 树（集群
+    实录：并行的 ``pytest -n 16`` 删掉了正在跑的全量的库，缓存命中的
+    读取撞上一批截断/缺失文件）。命中时仍校验锚文件存在——外部删除
+    不可感知时退化为重建而非带病返回。
+
     工件目录对消费方**只读**；要篡改/删除预训练产物的测试先 fork 成
     私有副本（场景的 ``fork_pretrained_artifacts``），写共享目录即跨
     测试污染。"""
@@ -272,10 +281,17 @@ class FixtureArtifactLibrary:
     _cache: dict[tuple, Path] = {}
 
     @classmethod
+    def _library_root(cls) -> Path:
+        root = Path(tempfile.gettempdir()) / (
+            f"cynosure-fixture-library-{os.getpid()}"
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @classmethod
     def artifacts_dir(
         cls,
         cli: CliSession,
-        work_dir: Path,
         group: str,
         *,
         num_steps: int = 3,
@@ -290,16 +306,16 @@ class FixtureArtifactLibrary:
             tuple(sorted((reward or {}).items())),
         )
         cached = cls._cache.get(signature)
-        if cached is not None:
+        if cached is not None and (cached / "unet.pt").is_file():
             return cached
         token = hashlib.md5(repr(signature).encode()).hexdigest()[:8]
-        fixture_dir = work_dir / f"shared_fixtures_{token}"
+        fixture_dir = cls._library_root() / f"shared_fixtures_{token}"
         fixture = Fixture()
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（test_reward_fixture 先例）
         fixture.write_artifacts(fixture_dir)
         FixturePrepareScenario(
-            cli, fixture.config(fixture_dir, group=group), work_dir,
-        ).run(work_dir / f"prepare_config_{token}.json")
+            cli, fixture.config(fixture_dir, group=group), cls._library_root(),
+        ).run(cls._library_root() / f"prepare_config_{token}.json")
         # 预训练 warm-start 前置（ADR-0007）：reward 覆写在预训练**之前**
         # 生效——如 SN 启用时预训练产物即谱归一化形态；轻量五元组只降
         # 低本步执行成本（rationale 集中在 PretrainLightweightReward）
@@ -313,7 +329,7 @@ class FixtureArtifactLibrary:
         pretrain_config.experiment.group = (
             "modal-label" if group == "sequential" else group
         )
-        pretrain_path = work_dir / f"pretrain_config_{token}.json"
+        pretrain_path = cls._library_root() / f"pretrain_config_{token}.json"
         pretrain_path.write_text(
             pretrain_config.model_dump_json(indent=2), encoding="utf-8",
         )
