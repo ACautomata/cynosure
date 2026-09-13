@@ -97,7 +97,7 @@ RM readiness gate 的产物：预训练后逐条件判定的「判别器在该�
 _Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
 
 **Online update（在线更新）**:
-reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking。
+reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
 _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 
 **条件匹配采样（Condition-matched sampling）**:
@@ -110,7 +110,23 @@ _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 _Avoid_: 无条件回放（旧裸 latent FIFO 口径，已被带标签 FIFO 取代）
 
 **Reward hacking（奖励攻击）**:
-policy 学会骗过判别器拿高分，而非真正提升样本质量。
+policy 学会骗过判别器拿高分，而非真正提升样本质量——静止判别器的必然结局（见 对抗博弈）。
+
+**Environment（环境）**:
+RL 意义上 policy 之外的固定世界：真实数据分布（Real sample pool / Held-out real，全程冻结）与去噪动力学。Reward model 不属于环境——它是对该分布的判别器与估计器，属博弈一方（见 对抗博弈）。
+_Avoid_: 环境漂移、非平稳环境（把判别器划进环境的口径）
+
+**Adversarial game（对抗博弈）**:
+policy 与 reward model 的关系定性：判别器与被其分数经 GRPO 驱动的 policy 构成双人博弈。判别器持续移动（Online update）是博弈成立的必要条件——静止判别器必然被 exploit；收敛性依据 two-timescale 随机逼近（Borkar 1997；TTUR, Heusel et al. 2017），不依赖单智能体 MDP 的平稳性假设。
+_Avoid_: 时变 reward、非平稳 MDP（同上）
+
+**Two-timescale separation（时间尺度分离）**:
+对抗博弈收敛的工程条件：判别器的有效时间尺度（步数 × 学习率 × 收缩率）应快于 policy，使打分所见的判别器近似「当前 policy 下的收敛判别器」。分离坍塌的签名 = policy 追打过期判别器（Reward hacking）或双侧震荡。
+_Avoid_: 学习率比例（有效时间尺度不止 lr）
+
+**Piecewise-stationary scoring（分段平稳打分）**:
+iteration 内全部 rollout 由同一判别器快照打分（打分先于该 iteration 的判别器更新），组内 advantage 同尺可比；非平稳性只以 iteration 间阶跃形态存在，每个 policy 更新步面对平稳子问题。
+_Avoid_: 边训边打、中途换尺
 
 **Group（组）/ Advantage（优势）**:
 GRPO 中共享同一初始噪声的 G 条 rollout 为一组；advantage 是该组内标准化后的 reward。
