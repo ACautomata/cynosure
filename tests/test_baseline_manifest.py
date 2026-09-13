@@ -17,6 +17,11 @@ from cynosure.train import BaselineManifest
 from tests.conftest import MINIMAL_CONFIG_DICT, CliSession
 from tests.test_train_loop import TrainingLoopScenario
 
+# 整文件大轮次：baseline/resample 全量 rollout 批（含跨 seed 重放）——
+# 标记 gpu：CPU 环境自动跳过（conftest 执行环境分派），验证职责由集群
+# GPU 口径全量承担（仓库纪律：测试一律上集群）。
+pytestmark = [pytest.mark.gpu]
+
 
 class ManifestRun:
     """一次训练 run 的 manifest 观测面（BaselineManifest 工件装载）。"""
