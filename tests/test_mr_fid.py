@@ -57,12 +57,13 @@ class _ChannelMeanBackbone:
 
 
 class _AcceleratorLikeBackbone:
-    """模拟加速器上的骨干：特征以 mps 设备张量返回（本机可用；无 mps
-    的环境跳过——meta 设备不可作此模拟，``.cpu()`` 拷出会被拒绝）。"""
+    """模拟加速器上的骨干：特征以 cuda 设备张量返回（无加速设备的
+    环境由 gpu 标记跳过——meta 设备不可作此模拟，``.cpu()`` 拷出会被
+    拒绝）。"""
 
     def forward(self, slices: torch.Tensor) -> torch.Tensor:
         return torch.empty(
-            slices.shape[0], 3, dtype=torch.float32, device="mps",
+            slices.shape[0], 3, dtype=torch.float32, device="cuda",
         )
 
 
@@ -327,6 +328,11 @@ class TestMrFidInstrument:
     def _instrument(
         self, tmp_path, backbone=None, **overrides,
     ) -> MrFidInstrument:
+        # 替身骨干（微秒级、纯逻辑）平台无关：显式钉 CPU，断言不随执行
+        # 平台漂移；真网络测试（TestRadImageNetBackboneContract /
+        # TestFidCli）不传 device，吃缺省平台检测——有加速设备即上
+        # 加速设备
+        overrides.setdefault("device", "cpu")
         config = MrFidConfig.model_validate(_valid_config_dict(tmp_path, **overrides))
         return MrFidInstrument(config, backbone=backbone)
 
@@ -450,15 +456,12 @@ class TestMrFidInstrument:
         assert result.synth_features_dir == "synthfeat"
         assert result.ignore_existing is False
 
-    @pytest.mark.skipif(
-        not torch.backends.mps.is_available(),
-        reason="mps 不可用的环境无法模拟加速器出口的设备驻留",
-    )
+    @pytest.mark.gpu  # 加速器出口模拟需真实加速设备（DCU/CUDA）
     def test_features_parked_on_cpu_per_volume(self, tmp_path):
         """逐卷特征须在缓存/累积前回 CPU：device=cuda 的生产读数若把
         双侧整栈特征留到距离计算才搬运，数百卷 × 三面的 2048 维特征
         是 GiB 级加速器驻留（OOM 级）；缓存 ``.pt`` 也必须落 CPU 形态
-        （跨设备可装载）。替身以 mps 设备模拟加速器出口。"""
+        （跨设备可装载）。替身以 cuda 设备模拟加速器出口。"""
         config = MrFidConfig.model_validate(_valid_config_dict(tmp_path))
         MrFidInstrument(config, backbone=_AcceleratorLikeBackbone()).run()
         cached = sorted((tmp_path / "features" / "mr").rglob("*.pt"))
@@ -468,6 +471,7 @@ class TestMrFidInstrument:
             assert all(t.device.type == "cpu" for t in feats)
 
 
+@pytest.mark.gpu  # 真 RadImageNet-ResNet50 forward：网络大计算，GPU 专属
 class TestRadImageNetBackboneContract:
     """装载契约经重构后由 RadImageNetBackbone 承载（原
     RadImageNetFeatureExtractor 测试同源，本处只冒烟委托关系与
@@ -489,6 +493,7 @@ class TestRadImageNetBackboneContract:
         return MrFidInstrument(config)
 
 
+@pytest.mark.gpu  # 端到端走默认装配（真 RadImageNet 骨干）：网络大计算，GPU 口径
 class TestFidCli:
     def _cli_config(self, tmp_path: Path, **overrides) -> Path:
         torch.manual_seed(0)

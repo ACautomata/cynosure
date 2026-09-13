@@ -62,9 +62,15 @@ _MODEL_NAMES = Literal["radimagenet_resnet50"]
 数字不可互比）。"""
 
 _EXTRACT_DEVICES = Literal["cpu", "cuda", "mps"]
-"""特征提取设备白名单。冻结变量 #8：设备浮点差异会进特征值，每次对比
-必须在 config 显式声明并随 FidResult 落盘（torch-dcu 上 ``cuda`` 为
-别名，与上游脚本同语义）。"""
+"""特征提取设备白名单。冻结变量 #8：设备浮点差异会进特征值，跨机器
+互比时必须在 config 显式声明同设备；实际解析结果随 FidResult 落盘
+（torch-dcu 上 ``cuda`` 为别名，与上游脚本同语义）。"""
+
+
+def _default_extract_device() -> str:
+    """缺省设备 = 平台检测：有 DCU/CUDA 加速设备就用加速设备（0 号
+    卡），网络大计算不落到 CPU；仅无加速设备的环境回退 CPU。"""
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 _SUBTRACT_MEAN = [0.406, 0.456, 0.485]
 """通道翻转后的 ImageNet 均值（标准序 [0.485, 0.456, 0.406] 配合
@@ -165,8 +171,9 @@ class MrFidConfig(BaseModel):
     )
     device: _EXTRACT_DEVICES = SpecField(
         "运行时", "upstream-eval-protocol §5.1",
-        "特征提取设备（冻结变量 #8：设备浮点差异会进特征值）",
-        default="cpu",
+        "特征提取设备（冻结变量 #8：设备浮点差异会进特征值；缺省平台"
+        "检测——有加速设备用加速设备，无则回退 CPU）",
+        default_factory=_default_extract_device,
     )
     dtype: Literal["float32"] = SpecField(
         "定死", "upstream-eval-protocol §5.1",
