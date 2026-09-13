@@ -42,3 +42,10 @@ testpaths = ["tests"]
 # hidden 标记，Python 3.14 site 模块跳过 hidden .pth，editable 安装因此静默失效；
 # pythonpath 让 pytest 不依赖 .pth 也能从 src/ 导入本包（对正常 editable 无冲突）。
 pythonpath = ["src"]
+markers = [
+    # 大轮次测试（多 iteration 训练 / torchrun 多进程 / 像素域解码评测）的
+    # 执行环境分派标记：无 CUDA 环境自动跳过（conftest
+    # pytest_collection_modifyitems），验证职责由集群 GPU 口径全量承担
+    # （仓库纪律：测试一律上集群）。
+    "gpu: 大轮次测试，要求显卡执行（CPU 环境跳过）",
+]

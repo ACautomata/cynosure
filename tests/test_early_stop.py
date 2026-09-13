@@ -12,6 +12,11 @@ from cynosure.config import CynosureConfig
 from cynosure.train.earlystop import EarlyStopJudge, EarlyStopVerdict
 from tests.conftest import MINIMAL_CONFIG_DICT
 
+# 整文件大轮次：早停语义需跑到多 iteration 触发判定——标记 gpu：CPU
+# 环境自动跳过（conftest 执行环境分派），验证职责由集群 GPU 口径全量
+# 承担（仓库纪律：测试一律上集群）。
+pytestmark = [pytest.mark.gpu]
+
 
 class SyntheticStream:
     """合成指标流构造器：iter / milestone 事件的紧凑工厂。"""
