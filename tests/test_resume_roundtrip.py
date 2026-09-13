@@ -32,6 +32,11 @@ from cynosure.train.policy import GroupPolicy
 from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
 
+# 整文件大轮次：每个场景 2-3 次完整训练（截断 train + resume + baseline
+# 重放）——标记 gpu：CPU 环境自动跳过（conftest 执行环境分派），验证
+# 职责由集群 GPU 口径全量承担（仓库纪律：测试一律上集群）。
+pytestmark = [pytest.mark.gpu]
+
 RESUME_STATE = "checkpoints/resume_state.pt"
 
 
