@@ -59,9 +59,25 @@ from tests.test_train_loop import TrainingLoopScenario
 # （仓库纪律：测试一律上集群）。
 pytestmark = [pytest.mark.gpu]
 
-_WORKER_JOIN_TIMEOUT_S = 600.0
+_WORKER_JOIN_TIMEOUT_S = 3600.0
 """单次 spawn train 的 worker join 上限（秒）：worker 死锁时测试显式
-失败而非无限挂起。"""
+失败而非无限挂起。成功路径的墙钟由 fixture train 时长决定（rank 恒
+单线程、集群实测单 rank ~10 分钟级——CPU 栈 + 多会话并行分核，本机
+~2 分钟），单线程 rank 进程间无 CPU 争抢（128 核 ≫ 并行 rank 数），
+上限取实测 6 倍余量；死锁互等才吃满上限。"""
+
+
+def _worker_port_base() -> int:
+    """TCPStore 端口基址按 xdist worker 序号分带：类级端口游标是
+    **进程内**的，``pytest -n`` 下各 worker 进程独立 import、都从同一
+    基址起跑，并行跑多个分布式测试即互相 EADDRINUSE（集群全量 -n 16
+    实测 9 failed 同根因）——每 worker 独占一段端口带避让；单进程跑
+    （无 ``PYTEST_XDIST_WORKER``）回到历史基址 29730，行为不变。
+    29730..31230 位于 Linux 默认临时端口段（32768+）之下，不与系统
+    动态端口冲突。"""
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    return 29730 + (int(worker[2:]) if worker else 0) * 100
+
 
 _EQUIVALENCE_RTOL = 1e-2
 """跨路径等价性检查的数值容差：分布式路径（FSDP + 梯度检查点重算）
@@ -84,14 +100,26 @@ class TrainWorldWorker:
 
     def __init__(
         self, rank: int, world: int, port: int, argv: list[str], queue,
+        num_threads: int,
     ) -> None:
         self.rank = rank
         self.world = world
         self.port = port
         self.argv = argv
         self.queue = queue
+        self.num_threads = num_threads
 
     def __call__(self) -> None:
+        # spawn 子进程不继承 xdist worker 的线程限制（conftest
+        # pytest_configure 只在 pytest 进程生效）：不设限则每 rank 拉满
+        # OMP 线程（=核数），``pytest -n`` 下多 worker 同刻 spawn 出的
+        # 几十个 rank 即几十倍超订阅（集群 -n 16 实测集体饿到 join
+        # 超时）。``num_threads`` 由主进程 ``torch.get_num_threads()``
+        # 传入——**必须与单进程参考路径同线程数**：torch 卷积的求和
+        # 顺序随线程数变，跨路径数值等价断言（``_EQUIVALENCE_RTOL``）
+        # 在两路径同线程数下才自洽（集群实测 rank 8 线程 vs 参考
+        # 1 线程 → loss ~1e-6 尺度 7% 相对差超容差）。
+        torch.set_num_threads(self.num_threads)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -126,8 +154,9 @@ class SpawnedTrainWorld:
     """torchrun 语义的本地多进程 world（fixture CPU gloo）：spawn 起
     world 个 ``TrainWorldWorker`` 并行跑 ``train``，收集全 rank 结果。"""
 
-    _next_port = 29730
-    """TCPStore 端口游标（world 间串行递增，避 TIME_WAIT 冲突）。"""
+    _next_port = _worker_port_base()
+    """TCPStore 端口游标（world 间串行递增，避 TIME_WAIT 冲突；基址
+    按 xdist worker 分带，见 ``_worker_port_base``）。"""
 
     def __init__(
         self, config_path: Path, run_dir: Path, world: int,
@@ -150,7 +179,10 @@ class SpawnedTrainWorld:
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()
         workers = [
-            TrainWorldWorker(rank, self.world, self.port, self.argv, queue)
+            TrainWorldWorker(
+                rank, self.world, self.port, self.argv, queue,
+                num_threads=torch.get_num_threads(),
+            )
             for rank in range(self.world)
         ]
         processes = [context.Process(target=worker) for worker in workers]
@@ -297,14 +329,19 @@ class GateWorldWorker:
 
     def __init__(
         self, rank: int, world: int, port: int, config_path: Path, queue,
+        num_threads: int,
     ) -> None:
         self.rank = rank
         self.world = world
         self.port = port
         self.config_path = config_path
         self.queue = queue
+        self.num_threads = num_threads
 
     def __call__(self) -> None:
+        # 与 ``TrainWorldWorker.__call__`` 同理：spawn rank 从主进程
+        # 继承线程数（xdist worker 的限额 + 参考路径一致性）。
+        torch.set_num_threads(self.num_threads)
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),
@@ -486,7 +523,10 @@ class TestGateCollectiveOrder:
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()
         workers = [
-            GateWorldWorker(rank, 2, type(self)._next_port, config_path, queue)
+            GateWorldWorker(
+                rank, 2, type(self)._next_port, config_path, queue,
+                num_threads=torch.get_num_threads(),
+            )
             for rank in range(2)
         ]
         processes = [context.Process(target=worker) for worker in workers]
