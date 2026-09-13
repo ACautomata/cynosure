@@ -83,6 +83,12 @@ class ReplayStore(Protocol):
         """两区占用的按条件观测面（每目标模态 × 两区条目数）。"""
         ...
 
+    def condition_supply(self, modality: Modality) -> int:
+        """该条件当前的全部回放候选数（两区合计）——Online update 的
+        回放退化判定查询面（候选 < 回放半区需求 → 该步退化纯 current
+        半区，ADR-0008-03），与 ``sample_replay`` 同走条件过滤。"""
+        ...
+
     def base_samples(self) -> list[ReplayEntry]:
         """base 分区当前内容快照（只读观测面，条目带目标模态标签）。"""
         ...
@@ -191,6 +197,12 @@ class ReplayBuffer:
             base=self._modality_counts(self._base),
             recent=self._modality_counts(self._recent),
         )
+
+    def condition_supply(self, modality: Modality) -> int:
+        """该条件当前的全部回放候选数（两区合计——退化判定查询面，
+        ADR-0008-03）。"""
+        base_pool, recent_pool = self._condition_candidates(modality)
+        return len(base_pool) + len(recent_pool)
 
     def base_samples(self) -> list[ReplayEntry]:
         """base 分区当前内容快照（只读观测面，条目带目标模态标签）。"""

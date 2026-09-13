@@ -372,8 +372,9 @@ class GranularGrpoTrainer:
             )
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
             # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）；
-            # 本 iteration 的目标模态随 fake 批穿入——回放按条件过滤
-            # （ADR-0008 决策 2），real 侧条件匹配归 ADR-0008-03
+            # 本 iteration 的目标模态随 fake 批穿入——回放与 real 两侧均按
+            # 条件匹配（ADR-0008 决策 1/2/3），该条件回放不足的退化步带
+            # 标记落盘（观测面扩展）
             report = (
                 self.rewards.update_step(record.new_fakes, record.modality)
                 if iteration % update_interval == 0 else None
@@ -396,6 +397,9 @@ class GranularGrpoTrainer:
                 ),
                 buffer_replay_fraction=(
                     report.num_replay / batch_size_k if report else 0.0
+                ),
+                buffer_replay_degraded=(
+                    report.replay_degraded if report else False
                 ),
                 buffer_base_occupied=zone_sizes.base,
                 buffer_recent_occupied=zone_sizes.recent,

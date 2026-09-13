@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.pretrain import (
@@ -43,6 +43,7 @@ from tests.conftest import (
     CliSession,
     FixturePrepareScenario,
     MINIMAL_CONFIG_DICT,
+    RecordingUpdate,
 )
 
 
@@ -674,3 +675,59 @@ class TestPretrainDriverAssembly:
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         with pytest.raises(ValueError, match="fake"):
             PretrainDriver(config, run, device=torch.device("cpu"))
+
+    def test_update_step_receives_per_step_condition(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """AC4：预训练 driver 每步单条件量产、update_step 穿同一步条件
+        （最小诚实形态：量产批与该步更新的条件同源；轮转调度与
+        per-condition AUC 归因归 ADR-0008-04）——替身按步记录条件，
+        步数上限内每步一步更新、条件逐样本落在目标模态集合。"""
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.99,  # 不可达：跑满上限，逐步观测
+            "pretrain_max_steps": 3,
+        })
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        recording = RecordingUpdate(
+            driver.rewards.discriminator,
+            buffer_capacity=config.reward.replay_buffer_capacity,
+        )
+        driver.rewards.update = recording
+        report = driver.run()
+        assert report.steps_completed == 3
+        assert len(recording.modalities) == 3  # 每步一步更新、步步穿参
+        assert set(recording.modalities) <= set(MODALITIES)
+
+    def test_rejects_real_pool_below_batch_capacity(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """ADR-0008-03 装配守卫：逐 (全池, 模态) real 容量 < K → fail-fast
+        可读报错（driver 经 assemble_rewards 与 train 同一条装配缝——
+        守卫先于任何 rollout/更新执行）。"""
+        small_pool = scenario.tmp_path / "starved_pool.json"
+        small_pool.write_text(json.dumps({
+            "kind": "real_pool",
+            "encoder": "starved-fixture",
+            "latent_shape": [4, 16, 16, 8],
+            "split_seed": 0,
+            "split_sizes": {"train": 12},
+            "entries": [
+                {
+                    "case_id": f"case-{modality}-{index}",
+                    "modality": modality,
+                    "latent": f"latents/{modality}-{index}.pt",
+                    "spacing": [100.0, 100.0, 100.0],
+                }
+                for modality in ("t1n", "t1c", "t2w", "t2f")
+                for index in range(3)  # 每模态 3 条 < K=4
+            ],
+        }), encoding="utf-8")
+        scenario.write_config(reward={"real_pool_manifest": str(small_pool)})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "capacity_run")
+        with pytest.raises(ValueError, match="容量不足") as exc_info:
+            PretrainDriver(config, run, device=torch.device("cpu"))
+        message = str(exc_info.value)
+        assert "disc_batch_size_k" in message  # 可读：点名条件、可用量与 knob
