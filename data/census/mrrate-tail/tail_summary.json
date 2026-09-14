@@ -1,0 +1,103 @@
+{
+  "issue": "cynosure#141",
+  "threshold_voxels": 16384000,
+  "threshold_rule": "encode 豁免 = resize 后影像体素数 <= 320*320*160；严格 > 走滑窗（【上游】utils.py:787-817 dynamic_infer，影像单通道）",
+  "resize_formula": "逐轴 max(round(a/128),1)*128，round=Python half-to-even（【上游】diff_model_create_training_data.py:77-89,247-249）",
+  "metadata_source": "/data72/junran/mrrate_replay/metadata/batch[00-27]_metadata.csv，splits.csv 同目录",
+  "total_metadata_rows": 705254,
+  "flag_excluded_rows": 0,
+  "array_shape_parse_fail_rows": 0,
+  "census_rows": 705254,
+  "over_total": 433255,
+  "over_share_pct": 61.4325,
+  "over_by_split": {
+    "train": {
+      "n": 638345,
+      "n_over": 391895,
+      "over_share_pct": 61.3924
+    },
+    "val": {
+      "n": 27003,
+      "n_over": 16546,
+      "over_share_pct": 61.2747
+    },
+    "test": {
+      "n": 39906,
+      "n_over": 24814,
+      "over_share_pct": 62.1811
+    }
+  },
+  "voxel_percentiles": {
+    "p50": 18874368,
+    "p90": 56623104,
+    "p99": 134217728,
+    "p99.9": 268435456,
+    "max": 268435456
+  },
+  "img_voxel_sum": 18615705272320,
+  "latent_voxel_sum": 290870394880,
+  "top_over_grids": [
+    {
+      "grid": "512x512x128",
+      "n": 194085
+    },
+    {
+      "grid": "384x384x128",
+      "n": 67196
+    },
+    {
+      "grid": "256x256x256",
+      "n": 40889
+    },
+    {
+      "grid": "512x384x128",
+      "n": 23337
+    },
+    {
+      "grid": "512x512x256",
+      "n": 22890
+    },
+    {
+      "grid": "768x768x128",
+      "n": 18359
+    },
+    {
+      "grid": "384x384x256",
+      "n": 15836
+    },
+    {
+      "grid": "384x384x384",
+      "n": 12370
+    },
+    {
+      "grid": "1024x1024x128",
+      "n": 12108
+    },
+    {
+      "grid": "384x256x256",
+      "n": 11421
+    },
+    {
+      "grid": "640x640x128",
+      "n": 7980
+    },
+    {
+      "grid": "768x640x128",
+      "n": 2781
+    }
+  ],
+  "distinct_grids": 38,
+  "modalities_seen": [
+    "FLAIR",
+    "MRA",
+    "SWI",
+    "T1w",
+    "T2w"
+  ],
+  "planes_seen": [
+    "AXIAL",
+    "CORONAL",
+    "OBLIQUE",
+    "SAGITTAL"
+  ]
+}
