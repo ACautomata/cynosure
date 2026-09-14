@@ -131,6 +131,12 @@ class HeldOutAuc:
             if modality is not None else self._real_sampler.size
         )
 
+    def condition_volume_count(self, modality: Modality) -> int:
+        """该条件的 held-out 卷数（条目数；装配守卫的查询面——预训练
+        per-condition 轮转要求条件集每条件 held-out 非空，缺条目的
+        条件在装配期显式拒绝而非首步测量时才炸，ADR-0008-04）。"""
+        return self._pool_size(modality)
+
     def compute(
         self, fake_latents: torch.Tensor, modality: Modality | None = None,
     ) -> float:
@@ -138,9 +144,10 @@ class HeldOutAuc:
 
         real 侧按 ``modality`` 过滤（本 iteration 采样的目标序列）后无放
         回采样 min(fake 批量, 该序列 held-out 条目数) 条；缺省 None 为
-        全池混采（在线期 iter 事件按序列归因；全池口径的消费方 = 诊断
-        与预训练 RM readiness gate——预训练 fake 批跨条件混合，无单一
-        目标序列可归因）。fake 侧全量参与。
+        全池混采（在线期 iter 事件按序列归因；全池口径的消费方 = train
+        侧 readiness gate 重算与诊断——预训练测量已迁 per-condition
+        全量卷口径，见 ``compute_volume_clusters``，ADR-0008-04）。fake
+        侧全量参与。
         """
         pool_size = self._pool_size(modality)
         count = min(fake_latents.shape[0], pool_size)

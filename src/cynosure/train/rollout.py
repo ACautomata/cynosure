@@ -107,6 +107,12 @@ class ConditionSampler(Protocol):
         ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流。"""
         ...
 
+    def targets(self) -> tuple[Modality, ...]:
+        """本组条件分布的目标端全集（ADR-0008-04：预训练 per-condition
+        轮转调度的条件枚举——集合知识归条件分布自身，driver 不从
+        config 复制按组分派；顺序确定性，轮转序由此而来）。"""
+        ...
+
 
 class ModalLabelConditionSampler:
     """组1 条件分布：四序列均匀采样（experiment-design「条件分布按组定义」）。
@@ -153,6 +159,11 @@ class ModalLabelConditionSampler:
             label=torch.tensor([label], device=self._device),
             spacing=torch.tensor([CONDITION_SPACING_X1E2], device=self._device),
         )
+
+    def targets(self) -> tuple[Modality, ...]:
+        """组1 目标端全集 = 四序列固定序（experiment-design 的条件分布
+        定义；轮转序 = 此序，确定性）。"""
+        return tuple(MODALITIES)
 
 
 class SourceLatentPool:
@@ -252,6 +263,12 @@ class CrossModalConditionSampler:
         pair_index = int(torch.randint(len(candidates), (1,), generator=stream))
         source_modality, _ = candidates[pair_index]
         return self._condition_for(source_modality, target, stream)
+
+    def targets(self) -> tuple[Modality, ...]:
+        """组2 目标端全集 = 有序对清单的目标端去重保序（cross_modal_pairs
+        可配置：清单不产的目标端不在预训练轮转集——条件分布不产的
+        条件不参与 per-condition 归因）。"""
+        return tuple(dict.fromkeys(target for _, target in self._pairs))
 
     def _condition_for(
         self,

@@ -1,15 +1,23 @@
-"""判别器 warm-start 预训练 driver（ADR-0007：预训练 + 继续在线更新）。
+"""判别器 warm-start 预训练 driver（ADR-0007：预训练 + 继续在线更新；
+ADR-0008 决策 3：per-condition 步进与终止）。
 
-密集步进循环：每步以 base policy 冻结 rollout 量产一批 fake（复用回放
-缓冲 base 分区采样入口——批量分块、独立随机流、输出归一到 pool 存储
-域）→ 以更新前快照测 held-out AUC（与在线期 iter 事件同口径：更新后测
-同一 fake 批会把 in-sample 拟合计入 AUC）→ 达 RM readiness gate 即复测
-确认（换新一批再测：train 侧 gate 按独立采样对同一阈值重算，单批贴线
-越过会被非确定性拒绝——两次独立测量都达标才终止，报告值取两次较小者）
-否则以在线期同款 ``OnlineUpdate.step`` 原语更新一步（预训练期无「当前
-policy」，混采语义退化为 base fake 库内采样；real 侧口径与在线期一致）
-→ 预训练事件落盘。步数上限耗尽仍未达标时补测一次落盘权重的 AUC
-（报告 ``final_heldout_auc`` 与 checkpoint 同快照）。
+密集步进循环：每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态
+均匀轮转，确定性不耗 RNG）→ 以 base policy 冻结 rollout 量产**该条件**
+fake 批（复用回放缓冲 base 分区采样入口——批量分块、独立随机流、输出
+归一到 pool 存储域）→ 以更新前快照测该条件 held-out AUC（held-out 侧
+按同条件过滤、全量卷池化点估计；更新后测同一 fake 批会把 in-sample
+拟合计入 AUC）→ 支撑度规则判定过线（``SupportRule.passes``：该条件
+held-out 卷数 < 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008 决策
+6 / #85）→ 首测过线换新批复测确认：两次独立测量都过线该条件入白名单
+（单批贴线越过被非确定性拒绝），报告值取两次较小者，确认步不更新
+（无更新即无事件）→ 未确认则以在线期同款 ``OnlineUpdate.step`` 原语
+更新一步（预训练期无「当前 policy」，混采语义退化为 base fake 库内
+采样；real 侧同条件匹配）。已入白名单的条件不再复测（棘轮：复测确认
+已拦住单批噪声，后续掉线由在线期白名单动态恢复机制兜底）。终止 =
+全部条件最近一次确认过线即停；``pretrain_max_steps`` 耗尽 → 白名单 =
+已确认者，未确认条件逐个对落盘权重补测（报告值与 checkpoint 同快照）。
+白名单为空不拒跑——报告与 checkpoint 照常落盘供诊断（拒跑由 train
+gate 把守，不丢诊断产物）。
 
 单进程执行（World-1 退化路径）：``DistributedContext.bootstrap()`` 在
 无 torchrun 环境下不初始化进程组、集合通信恒等，产物全局唯一——多 rank
@@ -35,6 +43,7 @@ from cynosure.pretrain.artifacts import (
     PretrainRun,
 )
 from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
+from cynosure.reward.support import SupportRule
 from cynosure.train.artifacts import PretrainEvent
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
@@ -101,6 +110,29 @@ class PretrainDriver:
             # 抽取数随缓冲容量/批量配置变化，不漂移其余抽样流
             base_generator=generators["base_partition"],
         )
+        # 过线判定原语（ADR-0008-04 消费 ADR-0008-02/#85 的支撑度规则）：
+        # bootstrap 的随机性独立派生（seed+7——六流注册表之外，预训练不
+        # 参与续训、判定可复现性由 seed 纯函数保证；进注册表反而令续训
+        # 状态清单失配）
+        self._support = SupportRule(
+            threshold=reward.pretrain_gate_auc,
+            support_bound=reward.gate_support_min_volumes,
+            generator=torch.Generator().manual_seed(
+                dist.derive_seed(config.schedule.seed + 7),
+            ),
+        )
+        # 轮转条件集守卫：每条件 held-out 非空（per-condition AUC 归因的
+        # 前提——缺条目的条件在装配期显式拒绝，而非首步测量时才炸）
+        starved = [
+            target for target in self._policy.conditions.targets()
+            if self._rewards.auc.condition_volume_count(target) < 1
+        ]
+        if starved:
+            raise ValueError(
+                f"held-out real 缺条件 {starved} 的条目（per-condition 步进"
+                "要求轮转条件集每条件 held-out 非空——AUC 测量按条件归因"
+                f"无米下锅；heldout_real_manifest={reward.heldout_real_manifest}）"
+            )
 
     @property
     def policy(self) -> GroupPolicy:
@@ -119,17 +151,21 @@ class PretrainDriver:
         return self._rollout
 
     def run(self) -> PretrainReport:
-        """密集步进至 RM readiness gate 达标（复测确认：两次独立测量都
-        达标，报告值取两次较小者——producer 侧成功判据对单批测量噪声
-        鲁棒，train 侧按独立采样的重算不再与非确定性拒绝耦合）或步数
-        上限，产出判别器 checkpoint 与预训练报告（产物全局唯一：单进程
-        唯一写者）。
+        """密集步进至全部轮转条件过线（ADR-0008 决策 3 的 per-condition
+        终止语义）或步数上限，产出判别器 checkpoint 与预训练报告（产物
+        全局唯一：单进程唯一写者）。
 
-        每步先采一个条件、量产该条件的 fake 批（ADR-0008-03 的最小诚实
-        形态：update_step 的回放按本步条件过滤，混采量产批没有诚实标签
-        可穿；轮转调度与 per-condition AUC 归因归 ADR-0008-04）。"""
+        每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态均匀轮转），
+        量产该条件 fake 批、real 同条件匹配、AUC 归因该条件；首测过线
+        （``SupportRule.passes``）换新批复测确认——两次独立测量都过线才
+        入白名单（producer 侧成功判据对单批测量噪声鲁棒，train 侧按独立
+        采样的重算不再与非确定性拒绝耦合），报告值取两次较小者。已入
+        白名单的条件不再复测（棘轮：复测确认已拦住单批噪声，在线期的
+        掉线由白名单动态恢复机制兜底）；``pretrain_max_steps`` 耗尽 →
+        白名单 = 已确认者、未确认条件对落盘权重补测。白名单为空仍落盘
+        全部产物（拒跑由 train gate 把守）。"""
         reward = self._config.reward
-        gate = reward.pretrain_gate_auc
+        targets = self._policy.conditions.targets()
         self._policy.eval_phase()  # 冻结 base 的 rollout（执行序第 1 相口径）
         self._rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         # buffer base 分区由冻结初始 policy 产出按每条件配额填充（与在线期
@@ -137,28 +173,31 @@ class PretrainDriver:
         quota = base_condition_quota(reward.replay_buffer_capacity)
         base_fakes, base_modalities = self._rollout.base_partition_samples(quota)
         self._rewards.seed_base(base_fakes, base_modalities)
+        confirmed: dict[Modality, float] = {}
         steps_completed = 0
         gate_passed = False
-        final_auc = 0.0
-        modality: Modality | None = None
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
-            _, modality = self._policy.conditions.sample()
+            modality = targets[step % len(targets)]
             fakes = self._measurement_batch(modality)
-            auc = self._rewards.auc.compute(fakes)  # 更新前快照（在线期口径）
-            if auc >= gate:
-                # 达标不复停（复测确认语义见 run() docstring）
-                confirm = self._rewards.auc.compute(
-                    self._measurement_batch(modality),
+            clusters = self._rewards.auc.compute_volume_clusters(fakes, modality)
+            auc = clusters.pooled_auc()  # 更新前快照（在线期口径）
+            if modality not in confirmed and self._support.passes(auc, clusters):
+                confirm = self._rewards.auc.compute_volume_clusters(
+                    self._measurement_batch(modality), modality,
                 )
-                if confirm >= gate:
-                    final_auc = min(auc, confirm)  # 保守口径：两次取小
-                    gate_passed = True
-                    break
+                confirm_auc = confirm.pooled_auc()
+                if self._support.passes(confirm_auc, confirm):
+                    confirmed[modality] = min(auc, confirm_auc)  # 保守口径：两次取小
+                    if len(confirmed) == len(targets):
+                        gate_passed = True  # 全部条件过线：终止
+                        break
+                    continue  # 本条件已确认：本步不更新（无更新即无事件）
             update = self._rewards.update_step(fakes, modality)
             zones = self._rewards.buffer.zone_sizes()
             self._run.append_event(PretrainEvent(
                 step=step,
+                modality=modality,
                 loss_discriminator=update.loss_discriminator,
                 heldout_auc=auc,
                 buffer_base_occupied=zones.base,
@@ -166,18 +205,20 @@ class PretrainDriver:
                 lr=reward.disc_lr,
                 elapsed_s=time.monotonic() - started,
             ))
-            steps_completed = step + 1
+            steps_completed += 1  # 更新步计数（确认步占步号但不更新不事件）
+        reported = dict(confirmed)
         if not gate_passed:
-            # 步数上限耗尽：补测落盘权重的 held-out AUC（循环内最后一次
-            # 测得值属于更新前的上一份权重，与 checkpoint 不同快照）。
-            # 条件用循环最后一步的采样值——补测批与循环批同条件，不引入
-            # 第三个条件口径（pretrain_max_steps ≥ 1 config ge=1 保证，
-            # 走到此处循环至少执行一步，modality 非空）
-            assert modality is not None
-            final_auc = self._rewards.auc.compute(
-                self._measurement_batch(modality),
-            )
-        return self._finalize(steps_completed, final_auc, gate_passed)
+            # 步数上限耗尽：未确认条件逐个对落盘权重补测（循环内最后一次
+            # 测得值属于更新前的上一份权重，与 checkpoint 不同快照；
+            # 已确认条件的报告值 = 确认时的两次较小者，保留不覆盖）
+            for target in targets:
+                if target not in reported:
+                    reported[target] = self._rewards.auc.compute_volume_clusters(
+                        self._measurement_batch(target), target,
+                    ).pooled_auc()
+        return self._finalize(
+            steps_completed, reported, list(confirmed), gate_passed,
+        )
 
     def _measurement_batch(self, modality: Modality) -> torch.Tensor:
         """单条件量产一批 fake（gate 测量/复测/补测共用入口）：update_step
@@ -188,11 +229,16 @@ class PretrainDriver:
         )[0]
 
     def _finalize(
-        self, steps_completed: int, final_auc: float, gate_passed: bool,
+        self,
+        steps_completed: int,
+        condition_auc: dict[Modality, float],
+        whitelist: list[Modality],
+        gate_passed: bool,
     ) -> PretrainReport:
         """产物落盘：判别器 checkpoint（可装载 state_dict，与训练期产物
-        checkpoint 同构）+ 预训练报告（kind 标识 + 最终 held-out AUC +
-        数据口径指纹）。"""
+        checkpoint 同构）+ 预训练报告（kind 标识 + per-condition held-out
+        AUC + 条件白名单 + 数据口径指纹）。白名单为空同样落盘——报告与
+        checkpoint 是失败预训练的诊断产物，不丢。"""
         torch.save(
             NetworkAssembler.loadable_state_dict(self._rewards.discriminator),
             self._run.paths.discriminator_ckpt,
@@ -206,7 +252,8 @@ class PretrainDriver:
         report = PretrainReport(
             group=self._config.experiment.group,
             latent_shape=self._config.latent_shape,
-            final_heldout_auc=final_auc,
+            condition_auc=condition_auc,
+            gate_whitelist=whitelist,
             steps_completed=steps_completed,
             gate_auc=reward.pretrain_gate_auc,
             gate_passed=gate_passed,

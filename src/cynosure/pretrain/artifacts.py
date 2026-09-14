@@ -4,9 +4,10 @@
   ``checkpoints/`` + 预训练报告）——与 train run 目录同惯例（不静默覆盖、
   唯一写者；单进程执行下 rank 0 独写退化为直写），但工件集最小：无
   Baseline manifest、无采样体（预训练不产出像素体，评测相不参与）；
-- **PretrainReport**：预训练报告契约（kind 标识 + 最终 held-out AUC +
-  数据口径指纹）与守卫重载入口——kind 不符 / 缺报告即拒绝装载
-  （守卫哲学），判别器形态指纹对照后经 netbuild 严格装载路径还原。
+- **PretrainReport**：预训练报告契约（kind 标识 + per-condition held-out
+  AUC + 条件白名单 + 数据口径指纹）与守卫重载入口——kind 不符 / 缺报告 /
+  旧格式（池化口径单标量，ADR-0008 之前）即拒绝装载（守卫哲学），判别器
+  形态指纹对照后经 netbuild 严格装载路径还原。
 
 判别器 checkpoint 与训练期产物同构（``NetworkAssembler.loadable_state_dict``
 的可装载 state_dict；spectral norm 启用时携带参数化状态，装载面按形态
@@ -23,9 +24,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import BaseModel, ConfigDict, PrivateAttr, ValidationError
 
-from cynosure.config import CynosureConfig
+from cynosure.config import CynosureConfig, Modality
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.scorer import RewardScorer
@@ -65,9 +66,10 @@ class PretrainProvenance(BaseModel):
 class PretrainReport(BaseModel):
     """判别器预训练报告（run 目录 ``pretrain_report.json`` 契约）。
 
-    ``final_heldout_auc`` = 落盘 checkpoint 权重的 held-out AUC（达标
-    路径与门槛同快照——达标判定测得即落盘；步数耗尽路径在最后一次
-    更新后补测），报告值与工件可复现对照。
+    per-condition 口径（ADR-0008 决策 5）：``condition_auc`` = 每条件
+    最终 held-out AUC，``gate_whitelist`` = 条件白名单——池化口径的
+    ``final_heldout_auc`` 单标量已成历史格式，``load()`` 对其显式拒绝
+    （BraTS 线旧报告同此路径），报告值与工件可复现对照。
     """
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -80,17 +82,28 @@ class PretrainReport(BaseModel):
     """预训练组别（组1 modal-label / 组2 cross-modal；fake 分布不同的
     归因轴）。"""
     latent_shape: tuple[int, int, int, int]
-    final_heldout_auc: float
+    condition_auc: dict[Modality, float]
+    """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计）：
+    白名单内条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
+    确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
+    它是确认时刻的测量记录，上岗判定本就不信任报告旧值而由 train
+    侧重算）；未过线条件 = 步数耗尽后对落盘 checkpoint 权重的补测值
+    （同快照可对照）。"""
+    gate_whitelist: list[Modality]
+    """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
+    轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
+    （拒跑由 train gate 把守，诊断产物不丢）。"""
     steps_completed: int
-    """完成的判别器更新步数（达标路径 = 达标前的步数；步数上限路径 =
-    上限值）。"""
+    """完成的判别器更新步数（全部条件确认过线的终止路径 = 确认前的
+    更新步数；步数上限路径 = 上限值减去其中的确认步——确认步不更新）。"""
     gate_auc: float
     """本次预训练采用的门槛阈值（报告留痕：阈值可配置，跨 run 可比性
     以报告值为准）。"""
     gate_passed: bool
-    """上岗判据是否通过：两次独立测量（达标测量 + 换批复测）都达门槛
-    且报告值取两次较小者（False = 步数上限耗尽或复测始终掉线仍未确认，
-    checkpoint 仍落盘供诊断；上岗与否由 train 侧重算判定）。"""
+    """终止成功判据是否通过：全部轮转条件都经「首测 + 换批复测」两次
+    独立测量确认过线（False = 步数上限耗尽——白名单可能非空，已确认
+    者仍在名单内；checkpoint 仍落盘供诊断，上岗与否由 train 侧重算
+    判定）。"""
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对本报告文件所在目录；可装载
     state_dict，与训练期产物 checkpoint 同构）。"""
@@ -98,13 +111,30 @@ class PretrainReport(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> "PretrainReport":
-        """装载并校验报告：缺报告 / kind 不符即拒绝（守卫哲学）。"""
+        """装载并校验报告：缺报告 / kind 不符 / 旧格式即拒绝（守卫哲学）。
+
+        ADR-0008 之前的池化口径（``final_heldout_auc`` 单标量）在
+        ``extra=forbid`` 下本会以裸 ValidationError 拒绝——检出该字段
+        名后改抛指向格式变更的可读报错（schema 断代显式可见，不静默
+        误装也不留难懂的原始报错）。"""
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(
                 f"预训练报告缺失（缺报告 = 未预训练，拒绝装载）: {path}"
             )
-        report = cls.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            report = cls.model_validate(raw)
+        except ValidationError as exc:
+            if isinstance(raw, dict) and "final_heldout_auc" in raw:
+                raise ValueError(
+                    "预训练报告为 ADR-0008 之前的池化口径格式"
+                    "（final_heldout_auc 单标量）：per-condition 报告契约"
+                    "（condition_auc dict + gate_whitelist 白名单）自 "
+                    "ADR-0008 起生效，旧报告显式拒绝装载（BraTS 线旧报告"
+                    "同此路径）——请以当前版本重新预训练产出"
+                ) from exc
+            raise
         report._path = path
         return report
 
