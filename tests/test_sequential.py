@@ -22,6 +22,17 @@ from tests.test_train_loop import TrainingLoopScenario
 # 承担（仓库纪律：测试一律上集群）。
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]  # slow：默认跳过（--run-slow 显式全量）
 
+_XFAIL_GROUP_GUARD = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#113 组别等值守卫：stage-2（cross-modal config）装载期消费 "
+        "modal-label 报告被显式拒绝（测试基建的两阶段共享单份报告属跨组 "
+        "消费）；#116（序贯 stage-2 报告路径绑定）交付合法的 stage 级报告"
+        "消费路径后须拆除本标记——strict xfail 在路径就绪时以 XPASS 报错 "
+        "强制拆除"
+    ),
+)
+
 
 @pytest.fixture
 def scenario(cli, tmp_path: Path) -> TrainingLoopScenario:
@@ -49,6 +60,7 @@ class TestStagePlan:
         assert plan[1].config.artifacts.unet_ckpt == expected_base
         assert config.artifacts.unet_ckpt != expected_base  # 原 config 未被改写
 
+    @_XFAIL_GROUP_GUARD
     def test_plan_skips_stage1_with_existing_product(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -115,6 +127,7 @@ class TestStagePlan:
 class TestSequentialRun:
     """CLI 端到端：两阶段顺序执行、产物布局、事件流按 stage 归因。"""
 
+    @_XFAIL_GROUP_GUARD
     def test_single_run_executes_both_stages_in_order(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -131,6 +144,7 @@ class TestSequentialRun:
         assert (checkpoints / "stage2_policy_iter1.pt").is_file()
         assert (checkpoints / "stage2_discriminator_iter1.pt").is_file()
 
+    @_XFAIL_GROUP_GUARD
     def test_stage1_product_is_trained_base_loadable(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -149,6 +163,7 @@ class TestSequentialRun:
             for name, value in initial.items()
         )
 
+    @_XFAIL_GROUP_GUARD
     def test_stage2_policy_loads_as_controlnet(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -165,6 +180,7 @@ class TestSequentialRun:
         ))
         assert any(p.requires_grad for p in reloaded.parameters())
 
+    @_XFAIL_GROUP_GUARD
     def test_stage2_trainer_assembles_base_prime_weights(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -190,6 +206,7 @@ class TestSequentialRun:
             not p.requires_grad for p in stage2_trainer.unet.parameters()
         )  # base′ 在 stage-2 中冻结
 
+    @_XFAIL_GROUP_GUARD
     def test_skip_stage1_via_config_runs_stage2_only(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -217,6 +234,7 @@ class TestStageIndependence:
     """AC「每组判别器与 Replay buffer 独立（互不串扰）」：组3 两阶段在
     同一次运行内也各持独立判别器与 buffer。"""
 
+    @_XFAIL_GROUP_GUARD
     def test_stage_discriminators_train_independently(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -237,6 +255,7 @@ class TestStageIndependence:
             for name in stage1_disc
         )
 
+    @_XFAIL_GROUP_GUARD
     def test_stage2_buffer_seeded_fresh_not_from_stage1_fakes(
         self, scenario: TrainingLoopScenario,
     ) -> None:

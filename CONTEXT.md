@@ -85,8 +85,8 @@ RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool�
 _Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）
 
 **RM readiness gate（RM 上岗门槛）**:
-RL 启动的硬前置：判别器预训练后按条件报告 held-out AUC，过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。
-_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）、池化达标（全池单一标量口径，已被按条件取代）
+RL 启动的硬前置：判别器预训练后按条件报告 held-out AUC，过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。上岗口径含组别绑定（#113）：预训练报告的 group 与消费 config 的组别严格等值——warm-start 装载守卫（assert_data_provenance）对照，跨组消费显式拒绝、无逃生门（组间 fake 分布不同，per-condition 判定只在本组分布上测量；组3 序贯 stage-2 的同路径消费随 #116 的 stage 级报告路径绑定才合法）。
+_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）、池化达标（全池单一标量口径，已被按条件取代）、跨组上岗（报告组别 ≠ 消费组别的装载——守卫期即拒绝，非 gate 白名单判定对象）
 
 **支撑度规则（Support rule）**:
 门槛判定的统计形态（ADR-0008 决策 6）：条件 held-out 卷数 < 支撑度界（暂定 20，config `reward.gate_support_min_volumes`）时，该条件过线判据从池化点估计改为 bootstrap CI 下界 ≥ 门槛——重采样单元是卷级聚类（每卷一组 patch 分数整卷进出；patch 级打散把同卷强相关 patch 当独立观测、低估 CI 宽度），重复数与分位固化在 `cynosure.reward.support`。MRA ≈ 16 卷命中（bootstrap 判定）、T2w ≈ 67 卷不命中（点估计判定）。

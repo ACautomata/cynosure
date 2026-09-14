@@ -14,10 +14,14 @@ run，由逐 iteration 门控（ADR-0008 决策 7/8 的门控消费票）兜底�
 ``load_discriminator``，装配期），各 rank 读同一报告天然一致——
 ADR-0007 时代的 all_gather 集体裁决随之废止。
 
-已知边界：报告组别（fake 分布的归因轴）暂不与消费组对照——序贯两
-阶段共享单一 ``pretrain_report_json`` 路径的既有工作流本就跨组消费
-（组3 以 modal-label 报告喂 stage-2，fixture 先例）；按阶段绑定的
-报告路径随后续票交付，届时对照在装配期收口。
+组别绑定语义（#113 起收口）：报告组别（fake 分布的归因轴）与消费
+config 组别在 warm-start 装载守卫严格等值对照
+（``PretrainReport.assert_data_provenance``，先于 latent 形状与口径
+指纹对照）——跨组消费显式拒绝、无逃生门，本 gate 只见同组报告。
+组3 序贯 stage-2 的合法消费路径（按阶段绑定的 stage-2 报告路径，
+消费 cross-modal 报告）由 #116 交付；此前序贯 stage-2 在装载期即
+被拒，测试以 strict xfail 哨兵记账（路径就绪时 XPASS 报错强制
+拆除标记）。
 
 放行动作同时是运行时白名单的生效点：判定与 train 循环的逐 iteration
 查询消费同一 ``ConditionWhitelist`` 实例（RewardCoordinator 持有），

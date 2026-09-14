@@ -430,6 +430,11 @@ class FixtureArtifactLibrary:
         if reward:
             config.reward = config.reward.model_copy(update=reward)
         pretrain_config = PretrainLightweightReward.apply(config)
+        # 序贯降级（#113 注释）：组3 两阶段共享此单份报告——stage-1
+        # （modal-label config）同组消费通过等值守卫；stage-2（cross-modal
+        # config）消费它在装载期被显式拒绝（跨组消费无逃生门）。stage 级
+        # 报告映射（stage-2 消费 cross-modal 报告）随 #116 交付，届时本
+        # 降级与 test_sequential 的 xfail 哨兵一并拆除。
         pretrain_config.experiment.group = (
             "modal-label" if group == "sequential" else group
         )
