@@ -5,9 +5,9 @@
   唯一写者；单进程执行下 rank 0 独写退化为直写），但工件集最小：无
   Baseline manifest、无采样体（预训练不产出像素体，评测相不参与）；
 - **PretrainReport**：预训练报告契约（kind 标识 + per-condition held-out
-  AUC + 条件白名单 + 数据口径指纹）与守卫重载入口——kind 不符 / 缺报告 /
-  旧格式（池化口径单标量，ADR-0008 之前）即拒绝装载（守卫哲学），判别器
-  形态指纹对照后经 netbuild 严格装载路径还原。
+  AUC + 条件白名单 + 数据口径指纹）与守卫重载入口——组别不符 / kind 不符
+  / 缺报告 / 旧格式（池化口径单标量，ADR-0008 之前）即拒绝装载（守卫哲学），
+  判别器形态指纹对照后经 netbuild 严格装载路径还原。
 
 判别器 checkpoint 与训练期产物同构（``NetworkAssembler.loadable_state_dict``
 的可装载 state_dict；spectral norm 启用时携带参数化状态，装载面按形态
@@ -87,7 +87,10 @@ class PretrainReport(BaseModel):
     kind: Literal["pretrain_report"] = "pretrain_report"
     group: str
     """预训练组别（组1 modal-label / 组2 cross-modal；fake 分布不同的
-    归因轴）。"""
+    归因轴）。装载守卫与消费 config 的组别严格等值对照（
+    ``assert_data_provenance``，#113）：per-condition AUC 与条件白名单
+    在本组 fake 分布上测量，跨组消费是显式拒绝的错误、无配置开关可
+    绕过。"""
     latent_shape: tuple[int, int, int, int]
     condition_auc: dict[Modality, float]
     """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计）：
@@ -149,14 +152,26 @@ class PretrainReport(BaseModel):
     def assert_data_provenance(self, config: CynosureConfig) -> None:
         """当前 config 的数据口径与报告对照：不匹配即拒绝。
 
-        latent 形状先行对照（纯内存比较）：口径指纹与判别器形态指纹都
-        不覆盖分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的
-        fake 静默通过 gate 并把错位数据带进在线更新。real pool /
-        held-out manifest / channel stats 任一文件内容与预训练时的指纹
-        不符（manifest 重建、统计量换源）都让上岗判别力与预训练报告
-        脱钩——warm-start 装载前显式拒绝，不给静默错位留缝（判别器
-        形态指纹的对照在 ``load_discriminator``）。
+        组别对照先行（纯内存比较）：group 是 fake 分布的归因轴，
+        per-condition AUC 与条件白名单都在预训练组别自己的 fake 分布上
+        测量——跨组消费是口径错位而非可配置语义，显式拒绝、无逃生门
+        （#113；组3 序贯 stage-2 的合法消费路径由 stage-2 报告路径绑定
+        交付，#116）。随后 latent 形状对照（纯内存比较）：口径指纹与
+        判别器形态指纹都不覆盖分辨率——全卷积 scorer 可用旧 shape 的
+        real 评新 shape 的 fake 静默通过 gate 并把错位数据带进在线更新。
+        real pool / held-out manifest / channel stats 任一文件内容与预训
+        练时的指纹不符（manifest 重建、统计量换源）都让上岗判别力与预
+        训练报告脱钩——warm-start 装载前显式拒绝，不给静默错位留缝
+        （判别器形态指纹的对照在 ``load_discriminator``）。
         """
+        if config.experiment.group != self.group:
+            raise ValueError(
+                f"预训练报告组别不符：报告 {self.group}，当前 config "
+                f"{config.experiment.group}（预训练与上岗须同组别口径——"
+                "per-condition AUC 与条件白名单是在预训练组别自己的 fake "
+                "分布上测量的，跨组消费是显式拒绝的错误，无配置开关可"
+                "绕过）"
+            )
         if tuple(config.latent_shape) != self.latent_shape:
             raise ValueError(
                 f"latent 形状不符：报告 {list(self.latent_shape)}，"

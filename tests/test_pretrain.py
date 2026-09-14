@@ -324,6 +324,49 @@ class TestPretrainReportGuard:
             PretrainReport.load(path)
         assert "final_heldout_auc" in str(exc_info.value)
 
+    def _guard_aligned_report(self, report_scenario: PretrainReportScenario):
+        """数据口径指纹全部对齐（real pool / held-out manifest 落盘 + 真
+        digest）的报告——守卫测试中唯一的拒绝来源即被测对照本身。"""
+        Path(report_scenario.config.reward.real_pool_manifest).write_text("[]")
+        Path(report_scenario.config.reward.heldout_real_manifest).write_text("[]")
+        report = report_scenario.report()
+        return report.model_copy(update={
+            "provenance": report.provenance.model_copy(update={
+                "real_pool_manifest_sha256": PretrainProvenance.digest(
+                    Path(report_scenario.config.reward.real_pool_manifest),
+                ),
+                "heldout_manifest_sha256": PretrainProvenance.digest(
+                    Path(report_scenario.config.reward.heldout_real_manifest),
+                ),
+            }),
+        })
+
+    def test_group_mismatch_rejected(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """报告组别 ≠ 消费 config 组别（组1/组2 独立 run 的跨组消费）：
+        装载期显式拒绝（#113）——per-condition AUC 与条件白名单是在预
+        训练组别自己的 fake 分布上测量的，跨组上岗是口径错位而非可配置
+        语义（无逃生门）。判别性构造：数据口径指纹全部对齐，拒绝只能
+        来自组别对照；报错含两侧组别值与「同组别口径」的可读指引。"""
+        report = self._guard_aligned_report(report_scenario)
+        report_scenario.config.experiment.group = "cross-modal"
+        with pytest.raises(ValueError) as exc_info:
+            report.assert_data_provenance(report_scenario.config)
+        message = str(exc_info.value)
+        assert "组别" in message
+        assert "modal-label" in message  # 报告侧组别值
+        assert "cross-modal" in message  # config 侧组别值
+        assert "同组别" in message  # 预训练与上岗须同组别口径的指引
+
+    def test_group_match_passes(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """同组别消费：守卫全链（组别 → latent → 三工件指纹）照常通过，
+        行为与守卫落地前完全一致（#113 AC：同组消费逐字节不变）。"""
+        report = self._guard_aligned_report(report_scenario)
+        report.assert_data_provenance(report_scenario.config)
+
     def test_report_roundtrip(self, report_scenario: PretrainReportScenario) -> None:
         """报告落盘 → 装载无损（含 per-condition 口径与条件白名单）。"""
         report = report_scenario.report()
