@@ -286,7 +286,7 @@ class GranularGrpoTrainer:
 
     @property
     def rng(self) -> TrainingRngStreams:
-        """六条命名 RNG 流注册表（续训状态机按名保存/恢复的枚举面）。"""
+        """七条命名 RNG 流注册表（续训状态机按名保存/恢复的枚举面）。"""
         return self.runtime.rng
 
     @property

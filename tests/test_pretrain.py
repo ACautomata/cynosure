@@ -44,6 +44,7 @@ from cynosure.train import (
     RewindAccounting,
     RunArtifacts,
 )
+from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -727,6 +728,32 @@ class TestPretrainDriverAssembly:
         decay = driver.rewards.update.optimizer.param_groups[0]["weight_decay"]
         assert decay == pytest.approx(config.reward.disc_weight_decay)
         assert decay == pytest.approx(config.policy.policy_weight_decay)
+
+    def test_inherits_noise_injection_via_shared_assembly(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """AC（ADR-0009-α，issue #104）：预训练 driver 零改动获得噪声
+        注入——装配缝把 ``disc_noise`` 专属流接进同一更新原语（在线与
+        预训练两阶段同一注入点、同一 knobs；world-1 下 derive_seed 恒等，
+        噪声流 initial_seed 与注册表 seed+8 派生一致即接线证据）。"""
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "noise_assembly_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        registry = TrainingRngStreams(config.schedule.seed)
+        assert (
+            driver.rewards.update._noise_generator.initial_seed()
+            == registry.disc_noise.initial_seed()
+        )
+        # 带噪入口随 config σ_max 生效（默认 0.2 > 0）；打分入口不动
+        assert config.reward.disc_noise_sigma_max > 0.0
+        latents = torch.randn(2, *config.latent_shape)
+        probe = torch.Generator().manual_seed(
+            registry.disc_noise.initial_seed(),
+        )
+        state_before = probe.get_state().clone()
+        driver.rewards.update.scorer.training_patch_logits(latents, probe)
+        assert not torch.equal(probe.get_state(), state_before)
 
     def test_cross_modal_conditions_from_controlnet_path(
         self, scenario: PretrainScenario,

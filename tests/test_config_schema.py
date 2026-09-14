@@ -54,6 +54,9 @@ class TestValidConfigs:
         assert config.reward.gating_enter_auc == pytest.approx(0.55)
         assert config.reward.gating_exit_auc == pytest.approx(0.52)
         assert config.reward.gating_ema_span == 8
+        # 训练期噪声注入（ADR-0009 决策 3，issue #104）：σ_max 暂定 0.2——
+        # MR-RATE 预训练曲线校准后定版；σ_max = 0 是唯一关闭形态
+        assert config.reward.disc_noise_sigma_max == pytest.approx(0.2)
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
@@ -507,6 +510,16 @@ class TestRejection:
         data["policy"] = {"sde_s_max": 1.0}
         with pytest.raises(ValidationError):
             CynosureConfig.model_validate(data)
+
+    def test_noise_sigma_non_negative(self, valid_config_dict: dict) -> None:
+        """disc_noise_sigma_max 非负（ADR-0009）：σ_max = 0 是唯一关闭
+        形态（回归锚），负值无语义、拒绝而非静默钳零。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["disc_noise_sigma_max"] = -0.1
+        with pytest.raises(ValidationError):
+            CynosureConfig.model_validate(data)
+        data["reward"]["disc_noise_sigma_max"] = 0.0
+        CynosureConfig.model_validate(data)  # 零强度合法：唯一关闭形态
 
     def test_sbatch_fields_are_gone_after_platform_migration(
         self, valid_config_dict: dict,

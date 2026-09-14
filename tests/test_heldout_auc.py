@@ -27,6 +27,33 @@ def scenario(tmp_path) -> UpdateScenario:
     return UpdateScenario(tmp_path)
 
 
+class TestAucStaysCleanUnderNoiseInjection:
+    """ADR-0009-α 路径分流不变量在 held-out AUC 端到端面的覆盖：AUC
+    经 ``_chunked_logits`` 分块拼接消费干净域 ``patch_logits``——σ_max
+    开关前后同一输入的 AUC 逐位一致（reward 标量与 patch logit 图的
+    入口级对比见 test_reward_scorer，此处补 AUC 消费端）。"""
+
+    def test_auc_identical_across_sigma_switch(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """σ_max = 0 与 σ_max = 0.2 两个 scorer，同 held-out 工件、同
+        fake 批、同 generator：AUC 逐位一致（打分仪器不被注入污染）。"""
+        manifest_path = HeldOutPoolWriter(
+            tmp_path, {modality: 2 for modality in MODALITIES},
+        ).write()
+        manifest = LatentManifest.load(manifest_path, kind="heldout_real")
+        fakes = scenario.fakes(8)
+        results = []
+        for sigma_max in (0.0, 0.2):
+            auc = HeldOutAuc(
+                heldout_manifest=manifest,
+                scorer=scenario.scorer(sigma_max=sigma_max),
+                generator=scenario.generator(1),
+            )
+            results.append(auc.compute(fakes, modality="t2w"))
+        assert results[0] == results[1]
+
+
 class HeldOutPoolWriter:
     """直写最小 heldout_real 工件（manifest + latent 文件）：latent 按序列
     填常数（t1n → 1.0、其余序列 → 2.0），real 侧条目的序列身份可从输入

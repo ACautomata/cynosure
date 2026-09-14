@@ -3,7 +3,7 @@
 
 config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 （RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、六条命名 RNG 流（TrainingRngStreams 注册表）、数值
+（RolloutPhase）、七条命名 RNG 流（TrainingRngStreams 注册表）、数值
 口径（AmpContext，定义在 policy/numerics——train 与 eval 共用的 import
 环安全位，此处 re-export 保持既有消费面）与分布式运行时
 （DistributedContext + EventMerger）。trainer 只面对本 Facade
@@ -99,7 +99,7 @@ class TrainingRuntime:
         run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
         覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
         dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
-        # seed 的 rank 派生：六条流的演化各 rank 独立（rollout 数据多样性
+        # seed 的 rank 派生：七条流的演化各 rank 独立（rollout 数据多样性
         # 来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性前提。
         # 判别器冷启动初始化不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
         # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；named() 的
@@ -245,6 +245,10 @@ class TrainingRuntime:
             ),
             config=config.reward,
             generator=generators["disc_update"],
+            # 训练期噪声注入的专属随机流（ADR-0009-α）：与回放抽样等
+            # 训练采样流不交叉——σ_max 取值不漂移其余流的序列；σ_max = 0
+            # 时该流零消耗（回归锚）。预训练 driver 经本装配缝自动同口径
+            noise_generator=generators["disc_noise"],
         )
         auc = HeldOutAuc(
             heldout_manifest=LatentManifest.load(

@@ -25,7 +25,7 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.sampler import RealPoolSampler
-from cynosure.reward.scorer import RewardScorer
+from cynosure.reward.scorer import LatentScorer, RewardScorer
 from cynosure.reward.update import OnlineUpdate
 
 SHAPE = (4, 16, 16, 8)
@@ -92,6 +92,37 @@ class RecordingRealSampler:
         return torch.zeros(count, *self._shape)
 
 
+class RecordingNoiseScorer:
+    """测试仪器：委托真 scorer 并记录 training_patch_logits 的调用序列
+    （ADR-0009-α 对称性观测缝：real 与 fake 两侧同入口、同 generator）。"""
+
+    def __init__(self, inner: LatentScorer) -> None:
+        self._inner = inner
+        self.noise_entries: list[tuple[tuple[int, ...], torch.Generator]] = []
+        """(输入形状, generator 对象) 的调用序列。"""
+
+    @property
+    def discriminator(self):
+        return self._inner.discriminator
+
+    def patch_logits(self, latents: torch.Tensor) -> torch.Tensor:
+        return self._inner.patch_logits(latents)
+
+    def reward(self, latents: torch.Tensor) -> torch.Tensor:
+        return self._inner.reward(latents)
+
+    def discriminator_terms(
+        self, logits_real: torch.Tensor, logits_fake: torch.Tensor,
+    ):
+        return self._inner.discriminator_terms(logits_real, logits_fake)
+
+    def training_patch_logits(
+        self, latents: torch.Tensor, generator: torch.Generator,
+    ) -> torch.Tensor:
+        self.noise_entries.append((tuple(latents.shape), generator))
+        return self._inner.training_patch_logits(latents, generator)
+
+
 class UpdateScenario:
     """OnlineUpdate 单元场景：pool 工件 + fixture 判别器 + 满 buffer。"""
 
@@ -111,7 +142,9 @@ class UpdateScenario:
             source_manifest="real_pool.json",
         )
 
-    def scorer(self) -> RewardScorer:
+    def scorer(
+        self, sigma_max: float | None = None,
+    ) -> RewardScorer:
         config = self.config
         return RewardScorer(
             NetworkArtifact(
@@ -120,7 +153,7 @@ class UpdateScenario:
                 ),
                 checkpoint=config.artifacts.discriminator_ckpt,
             ),
-            config.reward,
+            self.reward_config(sigma_max),
             self.stats(),
         )
 
@@ -130,8 +163,22 @@ class UpdateScenario:
     def fakes(self, count: int, seed: int = 3) -> torch.Tensor:
         return torch.randn(count, *SHAPE, generator=self.generator(seed))
 
+    def reward_config(self, sigma_max: float | None = None):
+        """reward config 或其 σ_max 覆盖视图（噪声注入的口径开关：
+        None = config 默认；0.0 = 回归锚场景；>0 = 注入场景）。"""
+        if sigma_max is None:
+            return self.config.reward
+        return self.config.reward.model_copy(
+            update={"disc_noise_sigma_max": sigma_max},
+        )
+
     def update(
-        self, real_sampler: RealPoolSampler | RecordingRealSampler | None = None,
+        self,
+        real_sampler: RealPoolSampler | RecordingRealSampler | None = None,
+        *,
+        sigma_max: float | None = None,
+        scorer: LatentScorer | None = None,
+        noise_generator: torch.Generator | None = None,
     ) -> tuple[OnlineUpdate, ReplayBuffer]:
         buffer = ReplayBuffer(self.config.reward.replay_buffer_capacity)
         buffer.fill_base(
@@ -141,20 +188,29 @@ class UpdateScenario:
         buffer.push(self.fakes(12, seed=22), "t2w")  # 预填 recent：混采即可 1+1
         pool = LatentManifest.load(self.pool_path, kind="real_pool")
         update = OnlineUpdate(
-            scorer=self.scorer(),
+            scorer=(
+                scorer if scorer is not None else self.scorer(sigma_max)
+            ),
             buffer=buffer,
             real_sampler=(
                 real_sampler if real_sampler is not None
                 else RealPoolSampler(pool, self.generator(5))
             ),
-            config=self.config.reward,
+            config=self.reward_config(sigma_max),
             generator=self.generator(6),
+            noise_generator=(
+                noise_generator if noise_generator is not None
+                else self.generator(7)
+            ),
         )
         return update, buffer
 
     def depleted_condition_update(
-        self, modality: str,
+        self,
+        modality: str,
         real_sampler: RealPoolSampler | RecordingRealSampler | None = None,
+        *,
+        sigma_max: float | None = None,
     ) -> tuple[OnlineUpdate, ReplayBuffer]:
         """该条件回放候选耗尽的场景（退化路径专用）：base 全部另一条件
         填充、recent 不动——``condition_supply(modality)`` = 0 <
@@ -166,14 +222,15 @@ class UpdateScenario:
         )
         pool = LatentManifest.load(self.pool_path, kind="real_pool")
         update = OnlineUpdate(
-            scorer=self.scorer(),
+            scorer=self.scorer(sigma_max),
             buffer=buffer,
             real_sampler=(
                 real_sampler if real_sampler is not None
                 else RealPoolSampler(pool, self.generator(5))
             ),
-            config=self.config.reward,
+            config=self.reward_config(sigma_max),
             generator=self.generator(6),
+            noise_generator=self.generator(7),
         )
         assert buffer.condition_supply(modality) == 0
         return update, buffer
@@ -479,3 +536,92 @@ class TestLossDecreases:
         half = len(losses) // 2
         assert losses[-1] < losses[0]
         assert sum(losses[half:]) / half < sum(losses[:half]) / half
+
+
+class TestTrainingNoiseInjection:
+    """训练期对称噪声注入的更新链路面（ADR-0009 决策 1-3，issue #104）。
+
+    OnlineUpdate 的参数更新前向走带噪入口（training_patch_logits），
+    real 与 fake 两侧同一入口、同一 generator（对称性 = 同一采样机制、
+    同分布）；σ_max = 0 时噪声流零消耗（回归锚），σ_max > 0 时同 seed
+    双场景逐位可重放（确定性口径与既有 update 流一致）。
+    """
+
+    def test_zero_sigma_consumes_no_noise_rng(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """回归锚：σ_max = 0 的 step 不消耗噪声流（噪声采样不发生——
+        全链路与无注入代码逐位一致，噪声 generator 状态是观测面）。"""
+        noise_generator = torch.Generator().manual_seed(7)
+        state_before = noise_generator.get_state().clone()
+        update, _ = scenario.update(
+            sigma_max=0.0, noise_generator=noise_generator,
+        )
+        update.step(scenario.fakes(12), "t2w")
+        assert torch.equal(noise_generator.get_state(), state_before)
+
+    def test_positive_sigma_consumes_noise_rng(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """σ_max > 0 的 step 消耗噪声流（两侧带噪前向各采样一次）。"""
+        noise_generator = torch.Generator().manual_seed(7)
+        state_before = noise_generator.get_state().clone()
+        update, _ = scenario.update(
+            sigma_max=0.2, noise_generator=noise_generator,
+        )
+        update.step(scenario.fakes(12), "t2w")
+        assert not torch.equal(noise_generator.get_state(), state_before)
+
+    def test_real_and_fake_share_the_noise_entry(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """对称性（ADR-0009 决策 1）：real 与 fake 两侧的带噪前向同入口、
+        同 generator 对象——同一采样机制、同分布（替换身记录调用序列）。"""
+        recording = RecordingNoiseScorer(scenario.scorer(sigma_max=0.2))
+        noise_generator = torch.Generator().manual_seed(7)
+        update, _ = scenario.update(
+            scorer=recording, sigma_max=0.2,
+            noise_generator=noise_generator,
+        )
+        update.step(scenario.fakes(12), "t2w")
+        assert len(recording.noise_entries) == 2  # fake 侧 + real 侧各一次
+        fake_shape, fake_generator = recording.noise_entries[0]
+        real_shape, real_generator = recording.noise_entries[1]
+        assert fake_generator is noise_generator  # 同一注入流对象
+        assert fake_shape[0] == 4  # 混采批（K=4：当前半区 2 + 回放 2）
+        assert real_shape[0] == 4  # real 批与混采批同量（K=4）
+        assert fake_shape[1:] == real_shape[1:]  # 同 latent 形状
+
+    def test_positive_sigma_changes_loss_trajectory(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """注入生效：σ_max = 0.2 与 σ_max = 0 的同 seed 场景 loss 轨迹
+        分离（带噪前向真实进入参数更新的梯度路径）。"""
+        noisy_losses = [
+            update.step(scenario.fakes(12), "t2w").loss_discriminator
+            for update in [scenario.update(sigma_max=0.2)[0]]
+            for _ in range(3)
+        ]
+        clean_losses = [
+            update.step(scenario.fakes(12), "t2w").loss_discriminator
+            for update in [scenario.update(sigma_max=0.0)[0]]
+            for _ in range(3)
+        ]
+        assert noisy_losses != clean_losses
+
+    def test_positive_sigma_replays_identically(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """注入开启下同 seed 双场景 loss 轨迹逐位一致（噪声 RNG 流的
+        确定性重放口径与既有 update 流一致）。"""
+        first, _ = scenario.update(sigma_max=0.2)
+        second, _ = scenario.update(sigma_max=0.2)
+        losses_first = [
+            first.step(scenario.fakes(12), "t2w").loss_discriminator
+            for _ in range(3)
+        ]
+        losses_second = [
+            second.step(scenario.fakes(12), "t2w").loss_discriminator
+            for _ in range(3)
+        ]
+        assert losses_first == losses_second

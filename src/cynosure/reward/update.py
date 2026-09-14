@@ -53,6 +53,12 @@ class OnlineUpdate:
 
     fake 源由调用方注入（生产 = 当前 policy rollout 输出；fixture = 预置
     固定 latent 批）——fake 侧与生产解耦，更新管线完全同一。
+
+    参数更新前向走 scorer 的训练专用带噪入口（ADR-0009-α：real/fake 两侧
+    逐样本对称噪声注入，打分路径不动）；噪声采样经 ``noise_generator``
+    注入的专属随机流（TrainingRngStreams 的 ``disc_noise`` 流——与回放
+    抽样等训练采样流不交叉，σ_max 取值不漂移其余流的序列），σ_max = 0
+    时该流零消耗（回归锚：全链路与无注入逐位一致）。
     """
 
     def __init__(
@@ -62,6 +68,7 @@ class OnlineUpdate:
         real_sampler: RealSampling,
         config: RewardConfig,
         generator: torch.Generator,
+        noise_generator: torch.Generator,
     ) -> None:
         self.scorer = scorer
         self.buffer = buffer
@@ -74,6 +81,7 @@ class OnlineUpdate:
         )
         self._real_sampler = real_sampler
         self._generator = generator
+        self._noise_generator = noise_generator
         self._batch_size_k = config.disc_batch_size_k
         self._current_fraction = config.replay_current_fraction
 
@@ -114,8 +122,15 @@ class OnlineUpdate:
                 replay_count, draw.num_base, draw.num_recent,
             )
         reals = self._real_sampler.sample(real_count, modality=modality)
-        logits_fake = self.scorer.patch_logits(fakes)
-        logits_real = self.scorer.patch_logits(reals)
+        # 参数更新前向 = 训练专用带噪入口（ADR-0009-α）：real/fake 两侧
+        # 同一入口、同一噪声流（对称性 = 同一采样机制、同分布）；打分
+        # 路径（patch_logits / reward / AUC）不经过本入口、恒干净域
+        logits_fake = self.scorer.training_patch_logits(
+            fakes, self._noise_generator,
+        )
+        logits_real = self.scorer.training_patch_logits(
+            reals, self._noise_generator,
+        )
         terms = self.scorer.discriminator_terms(logits_real, logits_fake)
         self.optimizer.zero_grad()
         terms.total.backward()
