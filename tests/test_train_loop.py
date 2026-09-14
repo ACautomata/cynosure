@@ -38,6 +38,7 @@ from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.buffer import ReplayEntry, base_condition_quota
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import GranularGrpoTrainer, RewardCoordinator, RunArtifacts
+from cynosure.train.whitelist import ConditionWhitelist
 from cynosure.train.rollout import (
     CrossModalConditionSampler,
     ModalLabelConditionSampler,
@@ -882,6 +883,7 @@ class TestDiscriminatorSideOrchestration:
         coordinator = RewardCoordinator(
             update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
             generator=torch.Generator().manual_seed(11),
+            whitelist=ConditionWhitelist.unrestricted(),  # 本测试不触白名单
         )
         fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
         coordinator.update_step(fakes, "t2w")

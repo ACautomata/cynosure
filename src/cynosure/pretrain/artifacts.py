@@ -86,9 +86,10 @@ class PretrainReport(BaseModel):
     """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计）：
     白名单内条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
     确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
-    它是确认时刻的测量记录，上岗判定本就不信任报告旧值而由 train
-    侧重算）；未过线条件 = 步数耗尽后对落盘 checkpoint 权重的补测值
-    （同快照可对照）。"""
+    它是确认时刻的测量记录，上岗判定直接信任报告值，数据口径漂移由
+    装载期指纹对照把守，ADR-0008 决策 5）；未过线条件 = 步数耗尽后对
+    落盘 checkpoint 权重的补测值（同快照可对照，白名单空时拒绝报错的
+    实测值来源）。"""
     gate_whitelist: list[Modality]
     """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
     轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
@@ -102,8 +103,8 @@ class PretrainReport(BaseModel):
     gate_passed: bool
     """终止成功判据是否通过：全部轮转条件都经「首测 + 换批复测」两次
     独立测量确认过线（False = 步数上限耗尽——白名单可能非空，已确认
-    者仍在名单内；checkpoint 仍落盘供诊断，上岗与否由 train 侧重算
-    判定）。"""
+    者仍在名单内；checkpoint 仍落盘供诊断，上岗与否由 train 侧读报告
+    白名单判定，ADR-0008 决策 5）。"""
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对本报告文件所在目录；可装载
     state_dict，与训练期产物 checkpoint 同构）。"""

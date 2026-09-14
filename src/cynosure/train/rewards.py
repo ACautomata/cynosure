@@ -17,18 +17,23 @@ from cynosure.config import Modality
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayStore
 from cynosure.reward.update import OnlineUpdate, UpdateReport
+from cynosure.train.whitelist import ConditionWhitelist
 
 
 class RewardCoordinator:
-    """判别器侧动作面（种植/更新/AUC）的单点持有。"""
+    """判别器侧动作面（种植/更新/AUC）与条件白名单的单点持有。"""
 
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
         generator: torch.Generator,
+        whitelist: ConditionWhitelist,
     ) -> None:
         self.update = update
         self.auc = auc
         self._generator = generator
+        # 条件白名单（ADR-0008 决策 5 的 gate 产物）：readiness gate 判定
+        # 与 train 循环逐 iteration 门控查询（门控消费票）的同源消费面
+        self.whitelist = whitelist
 
     @property
     def buffer(self) -> "ReplayStore":

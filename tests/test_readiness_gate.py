@@ -1,29 +1,29 @@
-"""RM readiness gate（ADR-0007）：train 入口的上岗硬检查。
+"""RM readiness gate（ADR-0008 决策 5）：train 入口的白名单上岗检查。
 
-验收面（issue #60）：
+验收面（issue #88）：
 
-- warm-start 接入：train 判别器装配从预训练报告守卫重载（权重 =
-  预训练产物，非随机初始化）；
-- preflight 重算 AUC 双分支：达标放行（fixture 低阈值 + 自产小产物）、
-  人为低于阈值拒绝（可读报错含实测值与阈值 + run 目录回滚）；
-- AUC 重算一致性：同 scorer 快照、同 fake 批的重算值与报告记录值逐位
-  一致（重算与预训练测量是同一份 HeldOutAuc.compute 口径）；
-- 守卫拒绝：缺报告 / kind 不符 / 工件损坏 / 口径指纹不匹配；
-- resume 跳过门槛（续训状态已含判别器全量状态）；字段引入前的旧 run
-  快照续训被 schema 拒绝；
+- gate 读 per-condition 报告 + 条件白名单：白名单空 → 拒绝启动（报错
+  含各条件 per-condition 实测值，沿 preflight 失败语义由 CLI 干净报错
+  + 回滚 run 目录）；非空 → 放行，未过线条件不阻塞 run；
+- 启动期池化重算语义废止：gate 不再逐 rank 重算 AUC（ADR-0007 重算
+  代码路径清理）；数据口径漂移由 warm-start 装载的指纹对照把守；
+- 运行时白名单接线：train 循环的逐 iteration 查询面（RewardCoordinator.
+  whitelist）与 gate 判定同源（同一报告产出）；resume 占位全放行；
+- resume 跳过 gate（续训状态已含判别器全量状态，恢复点不重查白名单）；
+- warm-start 接入与守卫拒绝（缺报告 / kind 不符 / 工件损坏 / 口径
+  指纹 / latent 形状）沿既有语义不变；
 - 端到端：fixture CLI train 以 warm-start 起跑，iter 事件 heldout_auc
-  从门槛之上起步。
+  从报告门槛之上起步。
 """
 
 import json
-import re
 import shutil
 from pathlib import Path
 
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.config import MODALITIES, ConfigLoader, CynosureConfig
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
@@ -43,48 +43,17 @@ from cynosure.train import (
 )
 from cynosure.train.gate import ReadinessGate
 from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.whitelist import ConditionWhitelist
 from tests.conftest import (
     CliResult,
     CliSession,
-    FailingAuc,
     FixturePrepareScenario,
     PretrainLightweightReward,
 )
 
 FIXTURE_GATE = 0.51
 """fixture 低阈值（Fixture.config 声明）：chance 带上沿之上、fixture
-预训练小产物可达——门槛判定逻辑的专属取值（生产默认 0.65 不变）。"""
-
-REJECT_GATE = 0.99
-"""人为不可达阈值：把重算值压在阈值之下的拒绝分支驱动值。"""
-
-
-class StubAuc:
-    """HeldOutAuc 的判定替身：固定实测值、记录调用（重算口径的观测面）。"""
-
-    def __init__(self, value: float) -> None:
-        self.value = value
-        self.calls: list[tuple[int, str | None]] = []
-
-    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
-        self.calls.append((fake_latents.shape[0], modality))
-        return self.value
-
-
-class SplitVerdictDist:
-    """DistributedContext 的集合裁决替身：本地判定结果取自提交物，
-    ``peer_errors`` 预置对端（rank 1..N）的本地判定结果。"""
-
-    rank = 0
-
-    def __init__(self, peer_errors: list[str | None]) -> None:
-        self._peer_errors = peer_errors
-
-    def all_gather(self, items: list) -> list[list]:
-        received = [items[0]]
-        for source, error in enumerate(self._peer_errors, start=1):
-            received.append({"rank": source, "error": error})
-        return [[entry] for entry in received]
+预训练小产物可达——预训练过线判定的专属取值（生产默认 0.65 不变）。"""
 
 
 class GateScenario:
@@ -118,7 +87,7 @@ class GateScenario:
 
         轻量五元组与 gate 0.60 留 margin 的 rationale 集中在
         ``PretrainLightweightReward``（conftest）；显式
-        ``reward_overrides`` 可覆盖（如重演用例的 gate=0.01）。"""
+        ``reward_overrides`` 可覆盖（如白名单空用例的 gate=0.99）。"""
         config = PretrainLightweightReward.apply(
             ConfigLoader.load(self.config_path),
         )
@@ -128,10 +97,10 @@ class GateScenario:
         path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
         return self.cli.run("pretrain", "--config", str(path))
 
-    def train(self) -> CliResult:
+    def train(self, run_dir: Path | None = None) -> CliResult:
         return self.cli.run(
             "train", "--config", str(self.config_path),
-            "--run-dir", str(self.run_dir),
+            "--run-dir", str(run_dir if run_dir is not None else self.run_dir),
         )
 
     def resume(self) -> CliResult:
@@ -149,6 +118,15 @@ class GateScenario:
         config = ConfigLoader.load(self.config_path)
         return PretrainReport.load(Path(config.reward.pretrain_report_json))
 
+    def rewrite_report(self, **fields) -> None:
+        """篡改报告字段（白名单/实测值的语义构造用）：报告经 load()
+        之外的路径改写——测试直写 JSON 后由下一次装载校验。"""
+        config = ConfigLoader.load(self.config_path)
+        path = Path(config.reward.pretrain_report_json)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.update(fields)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
     def events(self) -> list[dict]:
         artifacts = RunArtifacts(RunArtifacts.layout(self.run_dir))
         return artifacts.read_events()
@@ -161,7 +139,7 @@ def scenario(cli: CliSession, tmp_path: Path) -> GateScenario:
 
 @pytest.fixture
 def pretrained(scenario: GateScenario) -> GateScenario:
-    """已完成预训练的场景（fixture 低阈值，重算达标）。"""
+    """已完成预训练的场景（fixture 低阈值，白名单非空）。"""
     scenario.write_inputs()
     result = scenario.pretrain()
     assert result.code == 0, result.stderr
@@ -236,7 +214,8 @@ class TestWarmStartAssembly:
     ) -> None:
         """口径指纹不匹配（预训练后换了 channel stats 来源）：装载期
         拒绝——判别器的输入标准化口径与预训练不同一，静默放行会让
-        上岗判别力与预训练报告值脱钩。"""
+        上岗判别力与预训练报告值脱钩。gate 直接信任报告值后，指纹
+        对照是数据口径漂移的唯一把守（ADR-0008-05：重算复核废止）。"""
         config = ConfigLoader.load(pretrained.config_path)
         stats_path = Path(config.reward.channel_stats_json)
         stats = ChannelStats.model_validate(
@@ -269,13 +248,16 @@ class TestWarmStartAssembly:
 
 
 class TestGateVerdict:
-    """preflight 重算 AUC 双分支（fixture 双分支判定专属测试）。"""
+    """白名单上岗判定的端到端双分支（CLI 全链）。"""
 
-    def test_fixture_low_threshold_passes_and_train_starts_above_gate(
+    def test_whitelist_nonempty_passes_and_train_starts_above_gate(
         self, pretrained: GateScenario,
     ) -> None:
-        """达标放行：fixture 低阈值 + 自产小产物 → train 成功，iter 事件
-        heldout_auc 从门槛之上起步（T14 的「一眼确认非冷启动形态」）。"""
+        """非空放行：白名单非空（fixture 低阈值预训练全条件过线）→
+        train 成功，iter 事件 heldout_auc 从报告门槛之上起步（warm-start
+        的观测面：冷启动形态徘徊 chance 带 ~0.5±0.02，预训练产物显著
+        出带）。"""
+        assert pretrained.report().gate_whitelist  # 前置：名单非空
         result = pretrained.train()
         assert result.code == 0, result.stderr
         events = pretrained.events()
@@ -283,43 +265,56 @@ class TestGateVerdict:
         assert iter_events, result.stderr
         first_auc = iter_events[0]["heldout_auc"]
         assert first_auc >= FIXTURE_GATE
-        # 门槛之上的起步是 warm-start 的观测面：冷启动形态徘徊 chance 带
-        # （~0.5±0.02），预训练产物显著出带
         report = pretrained.report()
         assert first_auc >= report.gate_auc
 
-    def test_gate_below_threshold_rejects_with_readable_error(
-        self, pretrained: GateScenario,
+    def test_empty_whitelist_rejects_with_per_condition_readings(
+        self, scenario: GateScenario,
     ) -> None:
-        """拒绝分支：人为抬阈值到不可达 → 可读报错含实测值与阈值 +
-        run 目录回滚（沿用 preflight 失败语义；拒绝发生在 Baseline
-        采样等昂贵启动动作之前，未产出工件的目录整体删除）。"""
-        pretrained.patch_reward(pretrain_gate_auc=REJECT_GATE)
-        result = pretrained.train()
+        """白名单空 → 拒绝启动：报错含各条件 per-condition 实测值与
+        报告路径，沿 preflight 失败语义（CLI 干净报错 + 回滚未产出
+        工件的 run 目录）。预训练侧白名单空照常落盘（诊断产物不丢，
+        ADR-0008-04），拒跑由本 gate 把守。"""
+        scenario.write_inputs()
+        # gate=0.99 不可达：走满步数上限，白名单空（报告 + checkpoint
+        # 落盘供诊断，pretrain 本身 exit 0——#87 语义）
+        assert scenario.pretrain(pretrain_gate_auc=0.99).code == 0
+        report = scenario.report()
+        assert report.gate_whitelist == []
+        result = scenario.train()
         assert result.code == 2
         assert "RM readiness gate" in result.stderr
-        # 实测值与阈值都在报错里（AC「含实测值与阈值」）：从消息提取
-        # 重算值，断言其低于阈值且在 AUC 值域内
-        match = re.search(
-            r"held-out AUC (\d\.\d{4}) < 门槛 0\.9900", result.stderr,
+        assert "条件白名单为空" in result.stderr
+        for modality, value in report.condition_auc.items():
+            assert f"held-out AUC[{modality}]: {value:.4f}" in result.stderr
+        assert not scenario.run_dir.exists()  # 未产出工件 → 已回滚
+
+    def test_conditions_below_gate_do_not_block_run(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """非空放行不看实测值：名单只含一个条件、名单外条件实测值
+        低于门槛——run 照常启动（未过线条件不阻塞，逐 iteration 门控
+        兜底由门控消费票接管）。"""
+        pretrained.rewrite_report(
+            gate_whitelist=["t1n"],
+            condition_auc={"t1n": 0.70, "t1c": 0.30, "t2w": 0.30, "t2f": 0.30},
         )
-        assert match, result.stderr
-        measured = float(match.group(1))
-        assert 0.0 < measured < REJECT_GATE
-        assert not pretrained.run_dir.exists()  # 未产出工件 → 已回滚
+        result = pretrained.train()
+        assert result.code == 0, result.stderr
 
 
-class TestRecomputeConsistency:
-    """AUC 重算一致性：同 scorer 快照 + 同 fake 批的重算值 = 报告记录值。"""
+class TestReportReproduction:
+    """报告值的测量可复现性：gate 直接信任报告值（重算复核废止），
+    报告 ``condition_auc`` 与同 seed 重演测量逐位一致是信任的测量学
+    依据。"""
 
-    def test_gate_recomputation_reproduces_reported_auc(
+    def test_reported_auc_reproduces_replayed_measurement(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """重演预训练的测量（同 seed 同 RNG 流 → 同 fake 批）：报告
         checkpoint 装载的 scorer 与预训练时权重逐位一致（同 scorer
-        快照），其对同一批 fake 的重算值与报告 ``condition_auc``
-        逐位一致——门槛不信任报告旧值，但重算必须能复现报告值
-        （重算与预训练测量是同一份口径）。
+        快照），其对同一批 fake 的测量与报告 ``condition_auc``
+        逐位一致。
 
         gate=0.01 恒 0 步达标：报告值 = 轮转条件集首条件的达标测量与
         复测（两批独立测量取小——producer 侧成功判据对单批测量噪声
@@ -369,71 +364,137 @@ class TestRecomputeConsistency:
             min(first, second), rel=0.0, abs=0.0,
         )
 
-    def test_readiness_gate_uses_full_pool_modality_free_recompute(self) -> None:
-        """重算口径 = 全池混采（modality=None，与预训练 gate 同口径）：
-        fixture 预训练 fake 批跨条件混合、无单一目标序列可归因。"""
-        auc = StubAuc(0.7)
-        config = _minimal_gate_config()
-        gate = ReadinessGate(config, auc, SplitVerdictDist([]))
-        fakes = torch.zeros(3, 4, 16, 16, 8)
-        assert gate.check(fakes) == pytest.approx(0.7)
-        assert auc.calls == [(3, None)]
-
 
 class TestGateVerdictUnit:
-    """判定单测（注入替身）：阈值边界与集合裁决。"""
+    """判定单测（真实值对象注入）：白名单空/非空的分支与报错内容。"""
 
-    def test_measured_at_threshold_passes(self) -> None:
-        config = _minimal_gate_config()
-        gate = ReadinessGate(config, StubAuc(0.65), SplitVerdictDist([]))
-        assert gate.check(torch.zeros(1, 4, 16, 16, 8)) == pytest.approx(0.65)
-
-    def test_measured_below_threshold_raises_with_values(self) -> None:
-        config = _minimal_gate_config()
-        gate = ReadinessGate(config, StubAuc(0.437), SplitVerdictDist([]))
-        with pytest.raises(ValueError, match=r"0\.437.*0\.65") as exc_info:
-            gate.check(torch.zeros(1, 4, 16, 16, 8))
-        assert "RM readiness gate" in str(exc_info.value)
-
-    def test_peer_rank_failure_rejects_collectively(self) -> None:
-        """任一 rank 的重算失败 = 全体一致拒绝（分布式下各 rank base fake
-        独立演化——本 rank 达标不代表全体达标，分歧退出会让其余 rank 停在
-        集合操作）。"""
-        config = _minimal_gate_config()
-        gate = ReadinessGate(
-            config, StubAuc(0.9), SplitVerdictDist(["rank 1 失败详情"]),
-        )
-        with pytest.raises(ValueError, match="rank 1"):
-            gate.check(torch.zeros(1, 4, 16, 16, 8))
-
-    def test_artifact_read_failure_converges_to_collective_rejection(
+    def test_empty_whitelist_rejects_with_readings_and_report_path(
         self,
     ) -> None:
-        """本地重算的非 ValueError 异常（held-out manifest 条目缺失 =
-        FileNotFoundError；损坏 = 反序列化异常）也收敛为 local_error 进
-        集体裁决——捕窄会让失败 rank 先于 all_gather 退出、其余 rank
-        永等在集合操作（拒绝方退出、通过方挂死）。"""
-        config = _minimal_gate_config()
-        gate = ReadinessGate(config, FailingAuc(), SplitVerdictDist([]))
-        with pytest.raises(ValueError, match="held-out latent 缺失"):
-            gate.check(torch.zeros(1, 4, 16, 16, 8))
+        """白名单空 → ValueError：含各条件实测值（:4f 格式）与报告
+        路径（诊断入口）。"""
+        whitelist = ConditionWhitelist.from_report(_report(
+            whitelist=[], condition_auc={"t1n": 0.4321, "t2w": 0.5123},
+        ))
+        gate = ReadinessGate(_minimal_gate_config(), whitelist)
+        with pytest.raises(ValueError) as exc_info:
+            gate.check()
+        message = str(exc_info.value)
+        assert "RM readiness gate" in message
+        assert "条件白名单为空" in message
+        assert "held-out AUC[t1n]: 0.4321" in message
+        assert "held-out AUC[t2w]: 0.5123" in message
+        assert "report.json" in message
+
+    def test_nonempty_whitelist_passes_ignoring_readings(self) -> None:
+        """非空放行：判定只看名单成员——名单外条件的实测值再低也
+        不阻塞（未过线条件不阻塞 run）。"""
+        whitelist = ConditionWhitelist.from_report(_report(
+            whitelist=["t2w"],
+            condition_auc={"t1n": 0.30, "t2w": 0.70},
+        ))
+        gate = ReadinessGate(_minimal_gate_config(), whitelist)
+        gate.check()  # 不抛
+
+
+class TestConditionWhitelist:
+    """条件白名单值对象：来源收口与查询面。"""
+
+    def test_from_report_carries_members_and_readings(self) -> None:
+        report = _report(
+            whitelist=["t2w", "t1n"],
+            condition_auc={"t1n": 0.72, "t2w": 0.66, "t2f": 0.40},
+        )
+        whitelist = ConditionWhitelist.from_report(report)
+        assert whitelist.members == ("t2w", "t1n")  # 报告产出序
+        assert whitelist.measured == {
+            "t1n": 0.72, "t2w": 0.66, "t2f": 0.40,
+        }
+
+    def test_contains_is_membership_query(self) -> None:
+        whitelist = ConditionWhitelist.from_report(
+            _report(whitelist=["t1n"], condition_auc={"t1n": 0.72}),
+        )
+        assert "t1n" in whitelist
+        assert "t2w" not in whitelist
+
+    def test_unrestricted_covers_every_modality(self) -> None:
+        """resume 占位 = 全条件放行（恢复点不重查白名单）。"""
+        whitelist = ConditionWhitelist.unrestricted()
+        assert len(whitelist) == len(MODALITIES)
+        assert all(modality in whitelist for modality in MODALITIES)
+        assert whitelist.measured == {}
+
+    def test_empty_report_whitelist_is_empty_object(self) -> None:
+        whitelist = ConditionWhitelist.from_report(
+            _report(whitelist=[], condition_auc={"t1n": 0.40}),
+        )
+        assert len(whitelist) == 0
+        assert "t1n" not in whitelist
+
+
+class TestRuntimeWhitelist:
+    """运行时白名单接线：train 循环的逐 iteration 查询面与 gate 判定
+    消费同一来源（门控消费票的消费面在本票交付）。"""
+
+    def test_train_whitelist_wired_from_report(
+        self, pretrained: GateScenario,
+    ) -> None:
+        config = ConfigLoader.load(pretrained.config_path)
+        artifacts = RunArtifacts.init(config, pretrained.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts, device=torch.device("cpu"))
+        whitelist = trainer.rewards.whitelist
+        report = pretrained.report()
+        assert set(whitelist.members) == set(report.gate_whitelist)
+        assert whitelist.measured == report.condition_auc
+
+    def test_gated_conditions_queryable_before_run(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """名单外条件（人为移出名单的低实测值条件）经查询面可见——
+        门控票逐 iteration 查询的形态预演。"""
+        pretrained.rewrite_report(
+            gate_whitelist=["t1n"],
+            condition_auc={"t1n": 0.70, "t1c": 0.30, "t2w": 0.30, "t2f": 0.30},
+        )
+        config = ConfigLoader.load(pretrained.config_path)
+        artifacts = RunArtifacts.init(config, pretrained.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts, device=torch.device("cpu"))
+        whitelist = trainer.rewards.whitelist
+        assert "t1n" in whitelist
+        for modality in ("t1c", "t2w", "t2f"):
+            assert modality not in whitelist
+
+    def test_resume_whitelist_is_unrestricted(
+        self, pretrained: GateScenario,
+    ) -> None:
+        """resume 装配（报告不装载）的白名单占位全放行：恢复点不重查
+        白名单，逐 iteration 查询面照常在位（名单的跨 run 持久化随
+        门控消费票交付）。"""
+        config = ConfigLoader.load(pretrained.config_path)
+        artifacts = RunArtifacts.init(config, pretrained.run_dir)
+        trainer = GranularGrpoTrainer(
+            config, artifacts, device=torch.device("cpu"), resume=True,
+        )
+        whitelist = trainer.rewards.whitelist
+        assert all(modality in whitelist for modality in MODALITIES)
 
 
 class TestResumeSkipsGate:
-    """resume 跳过门槛：续训状态已含判别器全量状态。"""
+    """resume 跳过 gate：续训状态已含判别器全量状态，恢复点不重查
+    白名单。"""
 
-    def test_resume_passes_gate_that_new_run_would_fail(
+    def test_resume_skips_gate_that_new_run_would_fail(
         self, pretrained: GateScenario,
     ) -> None:
-        """门槛与续训的语义分叉：阈值抬到不可达并同步改写原 run 的
-        config 快照（续训对账一致）——resume 放行（续训状态已含判别器
-        全量状态，门槛若在 resume 路径执行，重算值 < 0.99 必拒）。"""
+        """门槛与续训的语义分叉：报告白名单清空（新 run 若走 gate 必
+        拒）——resume 放行（恢复点不重查白名单），同报告的新 run
+        拒绝启动。"""
         assert pretrained.train().code == 0
-        pretrained.patch_reward(pretrain_gate_auc=REJECT_GATE)
-        snapshot = pretrained.run_dir / "config.json"
-        data = json.loads(snapshot.read_text(encoding="utf-8"))
-        data["reward"]["pretrain_gate_auc"] = REJECT_GATE
-        snapshot.write_text(json.dumps(data), encoding="utf-8")
+        pretrained.rewrite_report(gate_whitelist=[])
+        rejected = pretrained.train(pretrained.run_dir.parent / "run2")
+        assert rejected.code == 2
+        assert "条件白名单为空" in rejected.stderr
         assert pretrained.resume().code == 0
 
     def test_legacy_run_snapshot_rejected_for_resume(
@@ -496,25 +557,8 @@ class TestAssemblyCombinationGuard:
         resume=True（实际调用图不可达本组合），本守卫收口 API 层的直接
         调用——拒绝发生在消费报告内容与装配链之前（占位 sha256 不经
         校验）。"""
-        report = PretrainReport(
-            group="modal-label",
-            latent_shape=(4, 16, 16, 8),
-            condition_auc={"t1n": 0.72},
-            gate_whitelist=["t1n"],
-            steps_completed=40,
-            gate_auc=0.65,
-            gate_passed=True,
-            discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
-            provenance=PretrainProvenance(
-                real_pool_manifest="real_pool.json",
-                real_pool_manifest_sha256="0" * 64,
-                heldout_manifest="heldout_real.json",
-                heldout_manifest_sha256="0" * 64,
-                channel_stats="stats.json",
-                channel_stats_sha256="0" * 64,
-                discriminator_config="disc.json",
-                discriminator_config_sha256="0" * 64,
-            ),
+        report = _report(
+            whitelist=["t1n"], condition_auc={"t1n": 0.72},
         )
         with pytest.raises(ValueError, match="互斥"):
             TrainingRuntime.assemble_rewards(
@@ -527,8 +571,35 @@ class TestAssemblyCombinationGuard:
             )
 
 
+def _report(
+    whitelist: list[str], condition_auc: dict[str, float],
+) -> PretrainReport:
+    """单测轻量报告（schema 合法即可，不触盘上工件）。"""
+    return PretrainReport(
+        group="modal-label",
+        latent_shape=(4, 16, 16, 8),
+        condition_auc=condition_auc,
+        gate_whitelist=whitelist,
+        steps_completed=40,
+        gate_auc=0.65,
+        gate_passed=bool(whitelist),
+        discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
+        provenance=PretrainProvenance(
+            real_pool_manifest="real_pool.json",
+            real_pool_manifest_sha256="0" * 64,
+            heldout_manifest="heldout_real.json",
+            heldout_manifest_sha256="0" * 64,
+            channel_stats="stats.json",
+            channel_stats_sha256="0" * 64,
+            discriminator_config="disc.json",
+            discriminator_config_sha256="0" * 64,
+        ),
+    )
+
+
 def _minimal_gate_config() -> CynosureConfig:
-    """ReadinessGate 单测的最小 config（只消费 pretrain_gate_auc）。"""
+    """ReadinessGate 单测的最小 config（只消费 pretrain_report_json 的
+    报错路径展示）。"""
     data = {
         "experiment": {"group": "modal-label"},
         "latent_shape": [4, 16, 16, 8],

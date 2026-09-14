@@ -146,8 +146,8 @@ class PretrainDriver:
 
     @property
     def rollout(self) -> RolloutPhase:
-        """rollout 封装（base fake 量产的公开面——RM readiness gate
-        重算口径的消耗序重演消费它）。"""
+        """rollout 封装（base fake 量产的公开面——报告值与同 seed 重演
+        测量的可复现性验证消费它，ADR-0008-04）。"""
         return self._rollout
 
     def run(self) -> PretrainReport:

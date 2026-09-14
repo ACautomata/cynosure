@@ -47,6 +47,7 @@ from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import RolloutPhase
 from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.whitelist import ConditionWhitelist
 
 __all__ = ["AMP_DTYPES", "AmpContext", "TrainingRuntime"]
 
@@ -252,7 +253,15 @@ class TrainingRuntime:
             generator=generators["heldout_auc"],
             device=amp.device,
         )
-        return RewardCoordinator(update, auc, generators["fake_shuffle"])
+        # 条件白名单（ADR-0008 决策 5）：train 新 run = 报告白名单（gate
+        # 产物）+ 实测快照；resume/预训练冷启动 = 全条件放行占位（恢复
+        # 点不重查白名单；driver 自产 per-condition 判定不消费本名单）
+        whitelist = (
+            ConditionWhitelist.from_report(report)
+            if report is not None
+            else ConditionWhitelist.unrestricted()
+        )
+        return RewardCoordinator(update, auc, generators["fake_shuffle"], whitelist)
 
     @staticmethod
     def _assemble_scorer(

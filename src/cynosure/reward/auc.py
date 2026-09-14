@@ -144,10 +144,10 @@ class HeldOutAuc:
 
         real 侧按 ``modality`` 过滤（本 iteration 采样的目标序列）后无放
         回采样 min(fake 批量, 该序列 held-out 条目数) 条；缺省 None 为
-        全池混采（在线期 iter 事件按序列归因；全池口径的消费方 = train
-        侧 readiness gate 重算与诊断——预训练测量已迁 per-condition
-        全量卷口径，见 ``compute_volume_clusters``，ADR-0008-04）。fake
-        侧全量参与。
+        全池混采（在线期 iter 事件按序列归因；全池口径仅供诊断——train
+        启动期的池化重算已废止，上岗判定读报告条件白名单，ADR-0008
+        决策 5；预训练测量走 per-condition 全量卷口径，见
+        ``compute_volume_clusters``，ADR-0008-04）。fake 侧全量参与。
         """
         pool_size = self._pool_size(modality)
         count = min(fake_latents.shape[0], pool_size)
