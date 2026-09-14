@@ -386,6 +386,7 @@ class TestSingleIterationLoop:
             )
 
     @pytest.mark.gpu  # 里程碑节奏需 3 iteration 训练
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_milestone_iteration_forces_checkpoint(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -409,6 +410,7 @@ class TestSingleIterationLoop:
         assert (checkpoints / "policy_iter3.pt").is_file()
 
     @pytest.mark.gpu  # 5 步 rollout 日程（本机实测 72s，大轮次）
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_multi_step_schedule_runs_independent_updates(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1025,6 +1027,7 @@ class TestDevicePlacement:
         for first, second in zip(weights[0], weights[1]):
             assert torch.equal(first, second)
 
+    @pytest.mark.slow  # 集群实测 ~109s：同权重两次完整前向的 CPU 对照
     def test_scoring_inputs_carry_no_stray_cpu_tensors(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1113,6 +1116,7 @@ class TestBaseSeedingIsolation:
     """base 分区种子生成与训练 rollout 的 RNG 流隔离。"""
 
     @pytest.mark.gpu  # 双容量 × 完整场景训练（流隔离对比）
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_capacity_change_does_not_shift_rollout_stream(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1171,6 +1175,7 @@ class TestLogProbConsistency:
             assert pair["recorded"] == pair["recomputed"]  # 同权重逐位一致
 
     @pytest.mark.gpu  # |M|=2 的 5 步日程 × dump 重放（本机实测 78s）
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_multi_step_pairs_cover_every_train_step(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1223,6 +1228,7 @@ class TestRewardDomainNormalization:
         return record, scored
 
     @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_scored_fakes_match_replay_domain(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -1234,6 +1240,7 @@ class TestRewardDomainNormalization:
         assert torch.equal(torch.cat(scored), record.new_fakes)
 
     @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
+    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
     def test_scale_only_affects_reward_side_not_rollout(
         self, scenario: TrainingLoopScenario,
     ) -> None:

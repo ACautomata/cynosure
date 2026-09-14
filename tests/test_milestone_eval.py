@@ -40,7 +40,7 @@ from tests.test_train_loop import TrainingLoopScenario
 # 整文件大轮次：里程碑像素域解码评测（VAE decode + FID/KID/SSIM 批量
 # 前向）——标记 gpu：CPU 环境自动跳过（conftest 执行环境分派），验证
 # 职责由集群 GPU 口径全量承担（仓库纪律：测试一律上集群）。
-pytestmark = [pytest.mark.gpu]
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]  # slow：默认跳过（--run-slow 显式全量）
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "cynosure"
 

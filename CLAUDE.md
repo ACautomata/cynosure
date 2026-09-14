@@ -23,7 +23,7 @@ pip install -e .            # 以可编辑模式安装本项目（hatchling 后�
 
 - 所有测试一律上集群执行：sugon 实例的真实 DCU/DTK 加速卡栈（`ssh sugon`）。集群上用系统 python（DCU torch 唯一宿主），`.venv/` 惯例到本机为止。
 - 同步走 **rsync**：本地工作树直传 `sugon:/root/cynosure/`（未提交改动照传，无需先提交）；命令、排除清单与完成判据见 sugon-deploy 的「代码上集群」一节。
-- 验证以集群上仓库根目录的 `pytest` 全绿为准；本机执行不计数。缺 pytest 时装进系统 python。
+- 测试分两档：日常开发 `pytest` 默认跳过 `slow` 标记的特别耗时测试（多 iteration 完整训练 / torchrun 多进程 / 像素域解码评测 / 满步数真实 rollout 的状态机轮次）；全量验证以集群上仓库根目录的 `pytest --run-slow` 全绿为准，本机执行不计数。缺 pytest 时装进系统 python。
 - 集群级打底（SSH 别名、双 source、DCU 依赖陷阱）见用户级 **sugon-bootstrap** skill；部署与训练全流程见项目 **sugon-deploy** skill。
 
 ## Agent skills

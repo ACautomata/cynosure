@@ -20,7 +20,7 @@ from tests.test_train_loop import TrainingLoopScenario
 # 整文件大轮次：baseline/resample 全量 rollout 批（含跨 seed 重放）——
 # 标记 gpu：CPU 环境自动跳过（conftest 执行环境分派），验证职责由集群
 # GPU 口径全量承担（仓库纪律：测试一律上集群）。
-pytestmark = [pytest.mark.gpu]
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]  # slow：默认跳过（--run-slow 显式全量）
 
 
 class ManifestRun:

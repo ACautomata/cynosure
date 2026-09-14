@@ -751,6 +751,7 @@ class TestPretrainDriverAssembly:
         with pytest.raises(ValueError, match="fake"):
             PretrainDriver(config, run, device=torch.device("cpu"))
 
+    @pytest.mark.slow  # 集群实测 ~590s：driver.run() 满步数轮转 × 每步真实 rollout
     def test_rotation_steps_round_robin(
         self, scenario: PretrainScenario,
     ) -> None:
@@ -918,6 +919,7 @@ class TestPretrainRotationStateMachine:
             return driver, auc, support, recording
         return factory
 
+    @pytest.mark.slow  # 集群实测 ~474s：满条件轮转 × 每步真实 rollout
     def test_all_conditions_confirmed_stops_early(
         self, scripted, scenario: PretrainScenario,
     ) -> None:
@@ -941,6 +943,7 @@ class TestPretrainRotationStateMachine:
         ]
         assert len(support.verdicts) == 8  # 每条件两次判定
 
+    @pytest.mark.slow  # 集群实测 ~694s：耗尽补测轮转 × 每步真实 rollout
     def test_partial_whitelist_on_step_exhaustion(
         self, scripted,
     ) -> None:
@@ -976,6 +979,7 @@ class TestPretrainRotationStateMachine:
             MODALITIES[step % len(MODALITIES)] for step in range(1, 8)
         ]
 
+    @pytest.mark.slow  # 集群实测 ~528s：复测掉线轮转 × 每步真实 rollout
     def test_confirm_failure_continues_updating(
         self, scripted,
     ) -> None:
