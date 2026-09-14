@@ -389,6 +389,7 @@ class FixtureArtifactLibrary:
         if disk_cached is not None:
             shutil.rmtree(fixture_dir, ignore_errors=True)
             shutil.copytree(disk_cached, fixture_dir)
+            cls._normalize_whitelist(fixture_dir)  # 旧盘缓存的白名单同样归一
             cls._cache[signature] = fixture_dir
             return fixture_dir
         fixture = Fixture()
@@ -416,9 +417,26 @@ class FixtureArtifactLibrary:
         )
         result = cli.run("pretrain", "--config", str(pretrain_path))
         assert result.code == 0, result.stderr
+        cls._normalize_whitelist(fixture_dir)
         SceneCache.store(disk_key, fixture_dir)
         cls._cache[signature] = fixture_dir
         return fixture_dir
+
+    @staticmethod
+    def _normalize_whitelist(fixture_dir: Path) -> None:
+        """库场景的条件白名单归一为全条件放行（幂等，构建与缓存命中的
+        恢复副本上都执行）：轻量预训练的真实白名单是概率性的部分名单
+        （如 22 步只确认 2/4 条件）——逐 iteration 梯度门控（ADR-0008
+        决策 7，issue #89）落码后，名单外条件的 policy 更新被跳过，
+        既有循环测试的 policy loss 断言会随条件采样摇。归一 = 门控不
+        触发的场景前置；门控/白名单语义的专项测试 fork 私有 report
+        （``fork_pretrained_artifacts``）后显式收窄名单。盘上缓存
+        （SceneCache）不回写——归一只发生在进程私有的恢复副本上。"""
+        report_path = fixture_dir / "pretrain_run" / "pretrain_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report["gate_whitelist"] != list(MODALITIES):
+            report["gate_whitelist"] = list(MODALITIES)
+            report_path.write_text(json.dumps(report), encoding="utf-8")
 
 
 class RecordingScorer:

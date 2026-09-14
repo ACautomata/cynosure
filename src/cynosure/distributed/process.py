@@ -16,9 +16,12 @@ seed 派生含 rank 偏移：各 rank 的六条命名 RNG 流独立演化（roll
 
 import datetime
 import os
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
+
+_T = TypeVar("_T")
 
 _RANK_SEED_STRIDE = 1_000_000
 """rank 间 seed 派生的间隔步长（远大于流内偏移 +0..+6，防流间碰撞）。"""
@@ -167,6 +170,18 @@ class DistributedContext:
         )
         dist.broadcast(flag, src=0)
         return bool(flag.item())
+
+    def broadcast_object(self, value: _T) -> _T:
+        """rank 0 的对象广播到所有 rank（门控状态快照的全 rank 镜像：
+        判定单点在 rank 0、各 rank 状态字面一致——「任 rank 不得私自
+        跳过/恢复」的同步原语）。所有 rank 都须调用本方法（集合操作）；
+        rank 0 的 ``value`` 生效，其余 rank 传 None 占位（被覆盖）。
+        单进程恒等返回传入值。"""
+        if not self._distributed:
+            return value
+        box = [value]
+        dist.broadcast_object_list(box, src=0)
+        return box[0]
 
     def destroy(self) -> None:
         """进程组销毁（CLI 层 finally 调用；单进程恒等）。"""

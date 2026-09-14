@@ -63,6 +63,13 @@ class IterEvent(BaseModel):
     同量匹配，批减半而两个占比字段仍按 K 分母记账）——正常混采步与
     N_d 跳过的 iteration 均为 False，占比 0 的两种成因靠本标记区分
     （观测面扩展：事件契约可扩不可改名）。"""
+    policy_gated: bool = False
+    """policy 更新门控标记（ADR-0008 决策 7）：全 rank 集体门控决定——
+    任一 rank 的目标条件不在（动态）白名单，本 iteration 全体跳过
+    policy 更新（loss 无 policy_step_* 项；rollout / fake 入 buffer /
+    判别器更新照常）。单 rank 下退化为「本 iteration 的目标条件不在
+    白名单」。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度。
+    False = 正常更新步。观测面扩展：事件契约可扩不可改名。"""
     buffer_base_occupied: int
     """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
     buffer_recent_occupied: int

@@ -4,9 +4,13 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
 
     每 iteration（每 rank，同卡交替）：
       1. eval() + no_grad —— Rollout 与打分（RolloutPhase）
+      1.5 梯度门控（ADR-0008 决策 7/8）：held-out AUC 测得后喂入动态
+         白名单（EMA 滞回判定，rank 0 单点判定 + 快照广播的全 rank
+         集体口径）；目标条件不在名单 → 本 iteration 跳过 policy
+         更新（rollout / fake 入 buffer / 判别器更新照常）
       2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次，
          FSDP 梯度 allreduce）；判别器 Online update（本 rank fake +
-         pool 切片 + 回放混采，DDP 梯度 allreduce）
+         pool 切片 + 回放混采，DDP 梯度 allreduce，门控不影响其节奏）
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
@@ -359,17 +363,34 @@ class GranularGrpoTrainer:
             record = self.loop.run_iteration()
             if self._dump:
                 pairs.extend(self.loop.consistency_pairs(record, iteration))
-            self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
-            loss_terms = self.loop.update_policy(record)
             # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
             # 判别器快照（更新后测同一 fake 批会把 in-sample 拟合计入 AUC，
             # 联合 hacking 签名失真）；real 侧按本 iteration 采样的目标
-            # 序列过滤（per-target-sequence 归因，#40）
+            # 序列过滤（per-target-sequence 归因，#40）。测量先行于门控
+            # 判定——本 iteration 的 rollout 样本分辨率不足即不做策略梯度
             heldout_auc = self.rewards.heldout_auc(
                 record.new_fakes, record.modality,
             )
+            # 门控观测（ADR-0008 决策 8）：AUC 流喂入动态白名单——rank 0
+            # 更新 EMA 并滞回判定（越 enter 恢复 / 跌破 exit 重新门控），
+            # 门控状态快照广播镜像全体。返回值 = 全 rank 集体门控决定
+            # （任一 rank 的条件被门控 → 全体跳过：policy 更新的 FSDP
+            # 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等
+            # 死锁——任 rank 不得私自跳过/恢复）
+            policy_gated = self.rewards.gating.observe(
+                record.modality, heldout_auc,
+            )
+            # 梯度门控（ADR-0008 决策 7）：目标条件不在白名单 → 跳过本
+            # iteration 的 policy 更新（不引入第二重 reward/KL/参考模型）；
+            # rollout、fake 入 buffer、判别器更新、iter 事件照常——被门控
+            # 条件的判别器持续受训，是其建立判别力、白名单得以恢复的前提
+            self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
+            loss_terms: dict[str, float] = {}
+            if not policy_gated:
+                loss_terms = self.loop.update_policy(record)
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
-            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器）；
+            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器；
+            # 门控不影响判别器节奏）；
             # 本 iteration 的目标模态随 fake 批穿入——回放与 real 两侧均按
             # 条件匹配（ADR-0008 决策 1/2/3），该条件回放不足的退化步带
             # 标记落盘（观测面扩展）
@@ -390,6 +411,7 @@ class GranularGrpoTrainer:
                 intra_group_reward_std=record.intra_group_reward_std,
                 heldout_auc=heldout_auc,
                 loss=loss_terms,
+                policy_gated=policy_gated,
                 buffer_current_fraction=(
                     report.num_current / batch_size_k if report else 0.0
                 ),

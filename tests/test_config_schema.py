@@ -48,6 +48,12 @@ class TestValidConfigs:
         assert config.reward.gate_support_min_volumes == 20
         assert config.reward.pretrain_max_steps >= 1
         assert config.reward.pretrain_fake_batch >= 1
+        # 动态门控（ADR-0008 决策 8，issue #89）：默认开启，enter/exit/
+        # EMA 跨度三 knob 暂定值——MR-RATE 预训练曲线校准后定版
+        assert config.reward.gating_dynamic_recovery is True
+        assert config.reward.gating_enter_auc == pytest.approx(0.55)
+        assert config.reward.gating_exit_auc == pytest.approx(0.52)
+        assert config.reward.gating_ema_span == 8
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10

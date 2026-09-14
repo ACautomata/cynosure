@@ -17,6 +17,7 @@ from cynosure.config import Modality
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayStore
 from cynosure.reward.update import OnlineUpdate, UpdateReport
+from cynosure.train.gating import DynamicWhitelist
 from cynosure.train.whitelist import ConditionWhitelist
 
 
@@ -26,14 +27,24 @@ class RewardCoordinator:
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
         generator: torch.Generator,
-        whitelist: ConditionWhitelist,
+        gating: DynamicWhitelist,
     ) -> None:
         self.update = update
         self.auc = auc
         self._generator = generator
-        # 条件白名单（ADR-0008 决策 5 的 gate 产物）：readiness gate 判定
-        # 与 train 循环逐 iteration 门控查询（门控消费票）的同源消费面
-        self.whitelist = whitelist
+        # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：readiness
+        # gate 判定与 train 循环逐 iteration 门控查询的同源消费面
+        # （经 whitelist 快照视图）；名单变更（EMA 动态恢复）由它以
+        # 快照替换驱动，判定为全 rank 集体口径
+        self.gating = gating
+
+    @property
+    def whitelist(self) -> ConditionWhitelist:
+        """条件白名单当前快照（ADR-0008 决策 5 的接线面）：readiness
+        gate 的上岗判定与循环侧 ``modality in whitelist`` 逐 iteration
+        查询读同一来源——动态恢复变更名单后，查询面即时见到新快照
+        （上岗名单与更新开关永不分叉）。"""
+        return self.gating.whitelist
 
     @property
     def buffer(self) -> "ReplayStore":

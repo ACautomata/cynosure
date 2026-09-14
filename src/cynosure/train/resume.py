@@ -72,13 +72,18 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 3
+RESUME_STATE_FORMAT_VERSION = 4
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
 侧）——分区各存 {latents, modalities} 成对清单；旧格式（裸 latent
 分区）条目不带来源标签，恢复后回放采样无法按条件过滤，被版本对账
-显式拒绝（跨口径续训不可恢复）。"""
+显式拒绝（跨口径续训不可恢复）。
+v4：+ 门控状态（ADR-0008 决策 7/8 的落盘侧）——动态白名单的当前名单
+成员与 per-condition EMA 状态随分片落盘，恢复逐位复原（门控决定是
+训练轨迹的一部分：名单不一致会让部分 iteration 的 policy 更新有无
+分叉，续训 roundtrip 的逐位一致不变式因此必须覆盖它）；旧 v3 分片
+无门控状态可回填，被版本对账显式拒绝。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -93,6 +98,7 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "rng",
     "lr",
     "ema",
+    "gating",
 )
 
 _ALLOWED_CONFIG_DRIFT: frozenset[tuple[str, ...]] = frozenset(
@@ -298,6 +304,9 @@ class ResumeStore:
         self._restore_buffer(trainer, state["replay_buffer"])
         self._restore_generators(trainer, state["generators"])
         self._restore_global_rng(state["rng"])
+        # 门控状态逐位复原（v4）：恢复点的（动态）白名单与 per-condition
+        # EMA 随全清单回归——后续门控决定从恢复点确定性续写
+        trainer.rewards.gating.adopt(state["gating"])
         return state["iteration"]
 
     def _capture(
@@ -336,6 +345,9 @@ class ResumeStore:
                 "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
             },
             "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）
+            # 门控状态（v4）：动态白名单当前成员 + per-condition EMA
+            # （ADR-0008 决策 7/8；恢复逐位复原的落盘侧）
+            "gating": trainer.rewards.gating.state(),
         }
 
     @staticmethod
@@ -388,9 +400,10 @@ class ResumeStore:
         if version != RESUME_STATE_FORMAT_VERSION:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 v{RESUME_STATE_FORMAT_VERSION}"
-                "（Replay buffer 条目带目标模态标签，ADR-0008），得到 "
-                f"{version!r}——跨口径续训不可恢复（旧分片条目不带来源标签，"
-                "恢复后回放采样无法按条件过滤）；请从产物 checkpoint 重启新 run"
+                "（Replay buffer 条目带目标模态标签 + 门控状态随分片落盘，"
+                f"ADR-0008），得到 {version!r}——跨口径续训不可恢复（旧分片"
+                "条目不带来源标签、门控状态无落盘面，恢复后回放采样无法按"
+                "条件过滤、门控决定无法逐位复原）；请从产物 checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
         if missing:

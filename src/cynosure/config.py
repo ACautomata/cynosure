@@ -500,6 +500,47 @@ class RewardConfig(BaseModel):
         "train 上岗门槛的守卫装载源，预训练 run 目录产物）。必填无默认——"
         "RL 不带 warm-start 工件在 schema 层就无法启动",
     )
+    gating_dynamic_recovery: bool = SpecField(
+        "tunable", "ADR-0008",
+        "白名单动态恢复（ADR-0008 决策 8）：在线 per-condition AUC 流驱动 "
+        "EMA 滞回判定，名单自动进出；false = 静态白名单降级路径（名单恒为"
+        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）",
+        default=True,
+    )
+    gating_enter_auc: float = SpecField(
+        "tunable", "ADR-0008",
+        "动态恢复 enter 阈值（暂定 0.55，MR-RATE 预训练曲线校准后定版）："
+        "gated 条件的 EMA(held-out AUC) 越过此线即恢复该条件的 policy 更新"
+        "（判别力出带的自动上岗）",
+        default=0.55, gt=0.0, lt=1.0,
+    )
+    gating_exit_auc: float = SpecField(
+        "tunable", "ADR-0008",
+        "动态恢复 exit 阈值（暂定 0.52，MR-RATE 预训练曲线校准后定版）："
+        "名单内条件的 EMA(held-out AUC) 跌破此线即重新门控（拒绝在 RM "
+        "无分辨率的样本上做策略梯度）",
+        default=0.52, gt=0.0, lt=1.0,
+    )
+    gating_ema_span: int = SpecField(
+        "tunable", "ADR-0008",
+        "动态恢复的 EMA 跨度（暂定 8 iter，MR-RATE 预训练曲线校准后定版）："
+        "per-condition AUC 的指数移动平均时间尺度（α = 2/(span+1)），"
+        "观测流的平滑窗口——抑制单次测量的噪声进出",
+        default=8, ge=1,
+    )
+
+    @model_validator(mode="after")
+    def _gating_hysteresis_band(self) -> "RewardConfig":
+        """动态门控的滞回带形状：exit < enter（滞回带非空，防名单在
+        阈值线上的进出抖动）且两者都在 chance（0.5）之上——AUC ≤ 0.5
+        即判别器无分辨率，不存在「过线恢复」语义。"""
+        enter, exit_ = self.gating_enter_auc, self.gating_exit_auc
+        if not 0.5 < exit_ < enter < 1.0:
+            raise ValueError(
+                f"动态门控阈值须 0.5 < exit < enter < 1.0（滞回带非空、"
+                f"均在 chance 之上），得到 enter={enter} exit={exit_}"
+            )
+        return self
 
     @field_validator("replay_current_fraction")
     @classmethod

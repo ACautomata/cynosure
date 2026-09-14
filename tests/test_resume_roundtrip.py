@@ -176,12 +176,16 @@ class TestResumeStateChecklist:
     """AC 2：续训状态清单完整覆盖（spec #15 续训状态全清单）。"""
 
     def test_state_covers_full_checklist(self, scenario: TrainingLoopScenario) -> None:
+        # 门控用静态白名单（动态恢复关闭）：名单逐位恒定、无观测记录，
+        # 不叠加在线测量的恢复语义（其决定论覆盖在 test_gating）；动态
+        # 开启的形态见 test_train_loop.TestGradientGating
         scenario.write_inputs()
+        scenario.patch_config(reward={"gating_dynamic_recovery": False})
         assert scenario.train().code == 0
         state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 3
+        assert state["format_version"] == 4
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
         assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
@@ -236,6 +240,13 @@ class TestResumeStateChecklist:
         }
         # EMA 条件项槽（升级项未交付，恒 None）
         assert state["ema"] is None
+
+        # 门控状态（v4，ADR-0008 决策 7/8）：动态白名单当前成员 +
+        # per-condition EMA（恢复逐位复原的落盘面）
+        state = scenario.resume_state()
+        assert set(state["gating"]) == {"members", "ema"}
+        assert state["gating"]["members"] == list(MODALITIES)
+        assert state["gating"]["ema"] == {}
 
     def test_ema_enabled_rejected_as_undelivered_upgrade(
         self, scenario: TrainingLoopScenario,
@@ -335,6 +346,19 @@ class TestNoopResumeIntegrity:
         assert result.code == 0
         assert calls["resample"] == 0
         assert "2 iteration" in result.stdout
+
+    def test_noop_resume_preserves_gating_state(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """恢复点已达标的续训不重放任何观测：门控状态（名单成员 +
+        per-condition EMA）逐位保留——续训 roundtrip 的落盘侧不变式。"""
+        scenario.write_inputs()
+        scenario.patch_config(schedule={"max_iterations": 2})
+        assert scenario.train().code == 0
+        saved_gating = scenario.resume_state()["gating"]
+        assert saved_gating["ema"]  # 动态恢复开启：两 iteration 的观测流
+        assert scenario.resume().code == 0
+        assert scenario.resume_state()["gating"] == saved_gating
 
     def test_noop_resume_preserves_existing_diagnostic(
         self, scenario: TrainingLoopScenario,
