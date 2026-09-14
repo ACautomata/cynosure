@@ -10,9 +10,9 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
-    train 启动时：RM readiness gate 硬检查（per-rank base 分区由冻结
-    初始 policy 生成后、按当前 run 数据口径重算 held-out AUC，不过线
-    拒绝开跑并回滚——ADR-0007；续训恢复时跳过，resume 状态已含判别器
+    train 启动时：RM readiness gate 硬检查（读预训练报告的条件白名单，
+    白名单空拒绝开跑并回滚——ADR-0008 决策 5，启动期池化重算语义
+    废止；续训恢复时跳过，resume 状态已含判别器
     全量状态）；Baseline manifest
     条目采样落盘只在 rank 0（冻结只采一次，续训恢复时同样跳过——恢复点
     policy 已非初始权重）；到达里程碑间隔时触发评测相的解码评测 →
@@ -232,11 +232,10 @@ class GranularGrpoTrainer:
             self.stage_tag.checkpoint_prefix,
             self.runtime.dist,
         )
-        # RM readiness gate（ADR-0007）：启动期的上岗硬检查——重算口径
-        # 与分布式裁决原语在此装配（resume 跳过检查，见 run）
-        self.readiness = ReadinessGate(
-            config, self.runtime.rewards.auc, self.runtime.dist,
-        )
+        # RM readiness gate（ADR-0008 决策 5）：启动期的上岗硬检查——
+        # 判定读运行时白名单（报告产物，RewardCoordinator 接线），resume
+        # 跳过检查（见 run）
+        self.readiness = ReadinessGate(config, self.runtime.rewards.whitelist)
         # 评测相（Baseline 采样 / 里程碑解码评测 / RL 后重采）；测试可注入替身。
         # manifest 由本侧从 run 目录装载注入（eval 不反向依赖 train 契约模块）：
         # 组3 stage-2 各自重读盘上 manifest，天然含 stage-1 已回写的样本路径。
@@ -296,23 +295,20 @@ class GranularGrpoTrainer:
         """数值口径（device + autocast dtype）。"""
         return self.runtime.amp
 
-    def seed_base_partition(self) -> torch.Tensor:
+    def seed_base_partition(self) -> None:
         """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
         （未参与任何梯度步）rollout 产出按每条件配额填满 per-rank base
         分区（spec 补钉 + ADR-0008-01：每条件配额量产、条目带目标模态
-        标签；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。
-        返回量产的样本批（RM readiness gate 重算的 fake 侧输入——同
-        一批量产既是 buffer 种子又是门槛重算口径，不二次消耗 RNG 流）。"""
+        标签；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。"""
         quota = base_condition_quota(
             self.config.reward.replay_buffer_capacity,
         )
         base_fakes, modalities = self.loop.base_partition_samples(quota)
         self.rewards.seed_base(base_fakes, modalities)
-        return base_fakes
 
     def run(self) -> int:
-        """训练主循环：base 分区自动生成 → RM readiness gate（ADR-0007，
-        resume 跳过）→ Baseline 采样（rank 0，冻结
+        """训练主循环：base 分区自动生成 → RM readiness gate 白名单检查
+        （ADR-0008 决策 5，resume 跳过）→ Baseline 采样（rank 0，冻结
         初始 policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停
         判定）→ RL 后重采（rank 0）→ checkpoint 与续训状态落盘。
         恢复语义由构造的 ``resume`` 单点声明（装配与执行共用同一开关，
@@ -339,13 +335,15 @@ class GranularGrpoTrainer:
         self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         if not resume:
-            base_fakes = self.seed_base_partition()
-            # RM readiness gate（ADR-0007）：warm-start 产物按当前 run
-            # 数据口径（本 rank base fake 批 + held-out real）重算 AUC，
-            # 不过线拒绝开跑——在 Baseline 采样等昂贵启动动作之前。
+            # RM readiness gate（ADR-0008 决策 5）：预训练报告的条件白
+            # 名单为空即拒绝开跑（报错含各条件实测值，沿 preflight 失败
+            # 语义回滚）；非空放行、未过线条件不阻塞 run（逐 iteration
+            # 门控兜底，门控消费票）。判定只读报告产物（重算废止，无需
+            # 样本输入），前置在 base 分区量产等昂贵启动动作之前。
             # resume 跳过：续训状态已含判别器全量状态（恢复点判别器
-            # 已在岗），门槛只把守「从预训练产物开跑」的新 run
-            self.readiness.check(base_fakes)
+            # 已在岗），恢复点不重查白名单
+            self.readiness.check()
+            self.seed_base_partition()
             # Baseline 采样（冻结只采一次：更新开始前的当前权重即初始
             # policy）。policy 采样前向是 FSDP 集合操作，全 rank 对称
             # 参与；样本落盘与 manifest 回写是 rank 0 独写产物契约

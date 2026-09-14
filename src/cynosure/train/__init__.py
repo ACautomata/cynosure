@@ -47,12 +47,14 @@ from cynosure.train.trainer import (
     TrainingDiagnostic,
     TrainingLogProbPair,
 )
+from cynosure.train.whitelist import ConditionWhitelist
 
 __all__ = [
     "REWIND_ACCOUNTING",
     "AmpContext",
     "BaselineManifest",
     "ConditionSampler",
+    "ConditionWhitelist",
     "CrossModalConditionSampler",
     "EarlyStopJudge",
     "EarlyStopVerdict",

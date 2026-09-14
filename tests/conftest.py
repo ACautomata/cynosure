@@ -421,17 +421,6 @@ class FixtureArtifactLibrary:
         return fixture_dir
 
 
-class FailingAuc:
-    """HeldOutAuc 的失败替身（readiness gate / 分布式集合序用例共用）：
-    以非 ValueError 的工件读盘异常失败——manifest 条目缺失/损坏与
-    latent 文件缺失是同一失败面（本地异常先于任何前向进入 gate 的
-    裁决输入）。rank 间不同的文件系统状态不可在共享盘上构造，替身是
-    「本 rank 重算失败」的确定性载体。"""
-
-    def compute(self, fake_latents: torch.Tensor, modality=None) -> float:
-        raise FileNotFoundError("held-out latent 缺失: heldout_latents/003.pt")
-
-
 class RecordingScorer:
     """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""
 

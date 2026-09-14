@@ -14,11 +14,11 @@ rank fake + Real sample pool 切片更新，梯度经标准 DDP allreduce 平均
 「各 rank 相同权重上的确定性幂迭代」逐位一致，广播是语义空操作。幂
 迭代只在 train 相前向就地推进，而推进点只有在线更新（各 rank 前向
 次数对称、权重经梯度 allreduce 逐位一致）；打分与监控前向恒 eval 相
-（``RewardCoordinator``），不推进。而**打开时会引入一个隐藏的集合
-点**：首次前向触发一次跨 rank 广播，启动期集合裁决（RM readiness
-gate）的失败 rank 会绕过前向直奔 all_gather，其余 rank 卡在那次广播
-里互等（实测 world=2 死锁）。关闭后 no_grad 前向是纯本地计算：失败
-rank 与健康 rank 都必然抵达显式裁决点。
+（``RewardCoordinator``），不推进。而**打开时会引入一个前向内的
+隐藏集合点**：首次前向触发一次跨 rank 广播，把「纯本地的打分/监控
+前向」（held-out AUC 通道等 no_grad 观测面）与进程组健康耦合——
+广播卡住即全体观测面卡住。关闭后 no_grad 前向是纯本地计算，集合
+通信只发生在显式的更新步（梯度 allreduce）。
 """
 
 import inspect

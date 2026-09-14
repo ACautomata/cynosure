@@ -262,6 +262,10 @@ class PretrainReportScenario:
             discriminator_config_sha256=PretrainProvenance.digest(
                 self.config.artifacts.discriminator_config_json
             ),
+            discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
+            discriminator_ckpt_sha256=PretrainProvenance.digest(
+                self.ckpt_path,
+            ),
         )
         fields = {
             "group": "modal-label",
@@ -353,6 +357,22 @@ class TestPretrainReportGuard:
         other = report_scenario.tmp_path / "other_discriminator_config.json"
         other.write_text('{"spatial_dims": 3, "channels": 8}', encoding="utf-8")
         report_scenario.config.artifacts.discriminator_config_json = other
+        report = PretrainReport.load(report_scenario.report_path)
+        with pytest.raises(ValueError, match="指纹"):
+            report.load_discriminator(report_scenario.config)
+
+    def test_load_discriminator_rejects_checkpoint_substitution(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """盘上 checkpoint 与报告实测的那份不符（同形态换权重）：装载期
+        拒绝——报告的白名单与 per-condition 实测值只对预训练落盘的这份
+        权重负责；启动期重算废止后（ADR-0008 决策 5），「测量对象 =
+        装载对象」由 checkpoint 内容指纹对照把守。"""
+        report_scenario.write(report_scenario.report())
+        state = report_scenario.loadable_state()
+        key = next(k for k, v in state.items() if v.is_floating_point())
+        state[key] = state[key] + 0.5
+        torch.save(state, report_scenario.ckpt_path)
         report = PretrainReport.load(report_scenario.report_path)
         with pytest.raises(ValueError, match="指纹"):
             report.load_discriminator(report_scenario.config)
