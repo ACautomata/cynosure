@@ -593,6 +593,8 @@ def _report(
             channel_stats_sha256="0" * 64,
             discriminator_config="disc.json",
             discriminator_config_sha256="0" * 64,
+            discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
+            discriminator_ckpt_sha256="0" * 64,
         ),
     )
 

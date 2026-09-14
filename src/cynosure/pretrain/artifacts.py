@@ -56,6 +56,13 @@ class PretrainProvenance(BaseModel):
     channel_stats_sha256: str
     discriminator_config: str
     discriminator_config_sha256: str
+    discriminator_ckpt: str
+    """判别器 checkpoint 路径（相对预训练 run 目录，与报告同款相对形）。"""
+    discriminator_ckpt_sha256: str
+    """checkpoint 内容指纹：报告的白名单与 per-condition 实测值只对预
+    训练落盘的这份权重负责——启动期重算废止（ADR-0008 决策 5）后，
+    「测量对象 = 装载对象」由装载期指纹对照把守（同形态换权重显式
+    拒绝，见 ``PretrainReport.load_discriminator``）。"""
 
     @staticmethod
     def digest(path: Path) -> str:
@@ -181,10 +188,14 @@ class PretrainReport(BaseModel):
     def load_discriminator(
         self, config: CynosureConfig, device: torch.device | None = None,
     ) -> RewardScorer:
-        """按报告守卫重载判别器：形态指纹对照 → checkpoint 严格装载。
+        """按报告守卫重载判别器：形态指纹对照 → checkpoint 指纹对照 →
+        checkpoint 严格装载。
 
         形态指纹不符（预训练与当前 config 的判别器网络配置不同）显式
-        拒绝——strict 装载对同 shape 异配置会静默通过，指纹是那层守卫。
+        拒绝——strict 装载对同 shape 异配置会静默通过，指纹是那层守卫；
+        checkpoint 指纹不符（盘上权重 ≠ 报告实测的那份）同此——白名单
+        与实测值的绑定对象是预训练落盘的 checkpoint，不是「该路径下
+        此刻的任何权重」。
         """
         if self._path is None:
             raise ValueError(
@@ -205,12 +216,22 @@ class PretrainReport(BaseModel):
                 f"config 网络配置 {current[:12]}…（预训练与装载的网络形态"
                 "须一致）"
             )
+        checkpoint = self._path.parent / self.discriminator_ckpt
+        observed = PretrainProvenance.digest(checkpoint)
+        if observed != self.provenance.discriminator_ckpt_sha256:
+            raise ValueError(
+                "判别器 checkpoint 指纹不符：报告 "
+                f"{self.provenance.discriminator_ckpt_sha256[:12]}…，盘上 "
+                f"{observed[:12]}…（报告的白名单与 per-condition 实测值只"
+                "对预训练落盘的这份权重负责——启动期重算废止后，同形态换"
+                "权重无其他检查可拦，装载期显式拒绝）"
+            )
         scorer = RewardScorer(
             NetworkArtifact(
                 config=NetworkAssembler.load_json(
                     config.artifacts.discriminator_config_json,
                 ),
-                checkpoint=self._path.parent / self.discriminator_ckpt,
+                checkpoint=checkpoint,
             ),
             config.reward,
             ChannelStats.load(config.reward.channel_stats_json),

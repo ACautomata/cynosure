@@ -237,11 +237,18 @@ class PretrainDriver:
     ) -> PretrainReport:
         """产物落盘：判别器 checkpoint（可装载 state_dict，与训练期产物
         checkpoint 同构）+ 预训练报告（kind 标识 + per-condition held-out
-        AUC + 条件白名单 + 数据口径指纹）。白名单为空同样落盘——报告与
-        checkpoint 是失败预训练的诊断产物，不丢。"""
+        AUC + 条件白名单 + 数据口径指纹，含 checkpoint 内容指纹——报告的
+        白名单与实测值只对落盘这份权重负责，装载面按指纹对照，
+        ``load_discriminator``）。白名单为空同样落盘——报告与 checkpoint
+        是失败预训练的诊断产物，不丢。"""
         torch.save(
             NetworkAssembler.loadable_state_dict(self._rewards.discriminator),
             self._run.paths.discriminator_ckpt,
+        )
+        discriminator_relative = (
+            self._run.paths.discriminator_ckpt.relative_to(
+                self._run.paths.root,
+            ).as_posix()
         )
         discriminator_config = self._config.artifacts.discriminator_config_json
         if discriminator_config is None:
@@ -257,9 +264,7 @@ class PretrainDriver:
             steps_completed=steps_completed,
             gate_auc=reward.pretrain_gate_auc,
             gate_passed=gate_passed,
-            discriminator_ckpt=self._run.paths.discriminator_ckpt.relative_to(
-                self._run.paths.root,
-            ).as_posix(),
+            discriminator_ckpt=discriminator_relative,
             provenance=PretrainProvenance(
                 real_pool_manifest=str(reward.real_pool_manifest),
                 real_pool_manifest_sha256=PretrainProvenance.digest(
@@ -276,6 +281,10 @@ class PretrainDriver:
                 discriminator_config=str(discriminator_config),
                 discriminator_config_sha256=PretrainProvenance.digest(
                     discriminator_config,
+                ),
+                discriminator_ckpt=discriminator_relative,
+                discriminator_ckpt_sha256=PretrainProvenance.digest(
+                    self._run.paths.discriminator_ckpt,
                 ),
             ),
         )

@@ -9,9 +9,15 @@ run，由逐 iteration 门控（ADR-0008 决策 7/8 的门控消费票）兜底�
 上岗判定直接信任报告值：ADR-0007 的「池化单标量逐 rank 重算」启动期
 语义随本票废止——重算的全池混采口径两向皆错（ADR-0008 决策 5），且
 启动期测量的噪声让门槛判定在噪声带内摇摆；数据口径漂移由 warm-start
-装载的指纹对照把守（``PretrainReport.assert_data_provenance``，装配
-期），各 rank 读同一报告天然一致——ADR-0007 时代的 all_gather 集体
-裁决随之废止。
+装载的指纹对照把守（数据工件与判别器形态、checkpoint 内容的装载期
+指纹对照，``PretrainReport.assert_data_provenance`` /
+``load_discriminator``，装配期），各 rank 读同一报告天然一致——
+ADR-0007 时代的 all_gather 集体裁决随之废止。
+
+已知边界：报告组别（fake 分布的归因轴）暂不与消费组对照——序贯两
+阶段共享单一 ``pretrain_report_json`` 路径的既有工作流本就跨组消费
+（组3 以 modal-label 报告喂 stage-2，fixture 先例）；按阶段绑定的
+报告路径随后续票交付，届时对照在装配期收口。
 
 放行动作同时是运行时白名单的生效点：判定与 train 循环的逐 iteration
 查询消费同一 ``ConditionWhitelist`` 实例（RewardCoordinator 持有），
