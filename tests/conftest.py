@@ -156,18 +156,41 @@ def cli() -> CliSession:
     return CliSession()
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """``--run-slow`` 全量开关：slow 标记（特别耗时大轮次）默认跳过，
+    日常开发只跑轻量子集；显式要求时才整包运行。"""
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="运行 slow 标记的特别耗时测试（默认跳过；全量验证用）",
+    )
+
+
 def pytest_collection_modifyitems(config, items) -> None:
-    """``gpu`` 标记的执行环境分派：无 CUDA 环境自动跳过大轮次测试——
-    CPU 口径（本机 / 集群 ``CUDA_VISIBLE_DEVICES=""``）只跑轻量子集，
-    验证职责由集群 GPU 口径全量承担（仓库纪律：测试一律上集群）。"""
-    if torch.cuda.is_available():
-        return
+    """标记的两条正交分派轴：
+
+    ``gpu``（环境轴）——无 CUDA 环境自动跳过大轮次测试：CPU 口径（本机 /
+    集群 ``CUDA_VISIBLE_DEVICES=""``）只跑轻量子集，验证职责由集群 GPU
+    口径全量承担（仓库纪律：测试一律上集群）。
+
+    ``slow``（成本轴）——默认跳过特别耗时测试（多 iteration 完整训练 /
+    torchrun 多进程 / 像素域解码评测等小时级轮次），``--run-slow`` 显式
+    全量才运行；日常开发不为一轮完整训练买单。"""
     skip_gpu = pytest.mark.skip(
         reason="gpu 标记（大轮次测试）：CPU 环境跳过，由集群 GPU 口径全量覆盖",
     )
+    skip_slow = (
+        None if config.getoption("--run-slow")
+        else pytest.mark.skip(
+            reason="slow 标记（特别耗时）：默认跳过，--run-slow 显式全量时运行",
+        )
+    )
     for item in items:
-        if "gpu" in item.keywords:
+        if not torch.cuda.is_available() and "gpu" in item.keywords:
             item.add_marker(skip_gpu)
+        if skip_slow is not None and "slow" in item.keywords:
+            item.add_marker(skip_slow)
 
 
 # 12 个有序 src→tgt 对（脑 MRI 四序列，每序列作 anchor、其余三序列为目标）

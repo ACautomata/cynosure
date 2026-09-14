@@ -11,7 +11,8 @@ cynosure 为 MAISI 3D latent rectified-flow 医学影像 checkpoint 设计并实
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-pytest                     # 本地测试入口（CLI seam + fixture + 静态零依赖检查）
+pytest                     # 本地测试入口（CLI seam + fixture + 静态零依赖检查；默认跳过 slow 大轮次）
+pytest --run-slow          # 全量（含 slow 大轮次：完整训练 / torchrun 多进程 / 像素域评测）
 ```
 
 CLI：
