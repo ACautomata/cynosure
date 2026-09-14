@@ -43,6 +43,7 @@ from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train.artifacts import RunArtifacts
+from cynosure.train.gating import DynamicWhitelist
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import RolloutPhase
@@ -253,15 +254,21 @@ class TrainingRuntime:
             generator=generators["heldout_auc"],
             device=amp.device,
         )
-        # 条件白名单（ADR-0008 决策 5）：train 新 run = 报告白名单（gate
-        # 产物）+ 实测快照；resume/预训练冷启动 = 全条件放行占位（恢复
-        # 点不重查白名单；driver 自产 per-condition 判定不消费本名单）
-        whitelist = (
-            ConditionWhitelist.from_report(report)
-            if report is not None
-            else ConditionWhitelist.unrestricted()
+        # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：train 新 run =
+        # 报告白名单起步（gate 产物）+ 实测快照；resume/预训练冷启动 =
+        # 全条件放行占位（恢复点不重查白名单，恢复应用时分片的门控状态
+        # 整体覆写；driver 自产 per-condition 判定不消费本名单）。EMA
+        # 动态恢复（决策 8）的名单变更在训练循环内经 observe 驱动
+        gating = DynamicWhitelist(
+            initial=(
+                ConditionWhitelist.from_report(report)
+                if report is not None
+                else ConditionWhitelist.unrestricted()
+            ),
+            config=config.reward,
+            dist=dist,
         )
-        return RewardCoordinator(update, auc, generators["fake_shuffle"], whitelist)
+        return RewardCoordinator(update, auc, generators["fake_shuffle"], gating)
 
     @staticmethod
     def _assemble_scorer(

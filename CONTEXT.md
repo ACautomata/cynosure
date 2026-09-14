@@ -93,8 +93,12 @@ _Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机�
 _Avoid_: 小支撑的点估计直接过线、patch 级 bootstrap、换被估计量（两口径同为池化 AUC，只差判据形态）
 
 **条件白名单（Condition whitelist）**:
-RM readiness gate 的产物：预训练后逐条件判定的「判别器在该条件上有分辨率」清单。RL 期间它是 policy 更新的按条件开关——名单内正常更新，名单外只跑 rollout 与判别器更新，待其在线判别力出带自动恢复。
+RM readiness gate 的产物：预训练后逐条件判定的「判别器在该条件上有分辨率」清单。RL 期间它是 policy 更新的按条件开关（消费见 梯度门控）——名单内正常更新，名单外只跑 rollout 与判别器更新。名单不是静态产物：动态恢复（EMA 滞回）驱动名单进出——gated 条件的在线 per-condition held-out AUC 经 EMA 平滑越过 enter 阈值即恢复更新，名单内条件跌破 exit 阈值即重新门控（enter/exit/EMA 跨度三 knob 进 config、暂定值待校准；可配置关闭，静态白名单为降级路径）。门控决定全 rank 集体口径（rank 0 判定 + broadcast），门控状态随续训分片落盘逐位复原。
 _Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
+
+**梯度门控（Gradient gating）**:
+白名单的按 iteration 消费（ADR-0008 决策 7）：目标条件不在名单 → 该 iteration 跳过 policy 更新——rollout、fake 入 buffer、判别器更新、iter 事件照常。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度（GRPO 无效样本不参与 advantage 的既有实践），不引入第二重 reward、KL 或参考模型。被门控条件的判别器持续受训——其建立判别力是白名单动态恢复的前提。门控决定是全 rank 集体口径：任一 rank 的条件被门控即全体跳过（policy 更新的 FSDP 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等死锁）；iter 事件以 policy_gated 标记区分门控 iteration（loss 缺 policy 项）。名单恢复由 条件白名单 词条的动态恢复机制驱动。
+_Avoid_: 条件过滤（判别器侧条件匹配采样，另一概念）
 
 **Online update（在线更新）**:
 reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
