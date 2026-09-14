@@ -160,8 +160,9 @@ AMP fp16 → `SlidingWindowInferer(roi_size=[320,320,160], sw_batch_size=1, mode
 - **存储**：
   - 若形状以 256×256×128 为主（T1/FLAIR/SWI/MRA axial 的中位情形）：fp32 **≈ 2.8 TB**，fp16 ≈ 1.4 TB。
   - 若长尾（细间距/大 FOV）占相当比例：fp32 **3–6 TB**，fp16 1.5–3 TB。
+  - **⟶ #141 普查已定案（推翻"256×256×128 为主"假设，落地在"长尾相当比例"档）**：256×256×128 只占 38%，全语料 resize 后 latent 体素总和 290.9×10⁹ → fp16 ≈ **2.33 TB**（whole-brain 侧；skull-stripped 翻倍）。见 `research/mrrate-tail-census.md` §5。
   - 对照：原始 zip 整库 **8.1 TB**（下完即可删，不驻留）。
-- **算力（上限参考）**：1,330,742 × 1 s ≈ **370 GPU·h**（A100，取 256×256×128 档）；若平均按 2 s 估 → **~740 GPU·h**。DCU 上按实测折减（经验系数 2× 计 → 740–1500 GPU·h）。
+- **算力（上限参考）**：1,330,742 × 1 s ≈ **370 GPU·h**（A100，取 256×256×128 档）；若平均按 2 s 估 → **~740 GPU·h**。DCU 上按实测折减（经验系数 2× 计 → 740–1500 GPU·h）。**⟶ #141 普查后此估算整体偏低**：61% 卷在滑窗档（【上游】`docs/performance.md`：512×512×128 档 6–8 s/卷），须按网格分桶重估，见 `research/mrrate-tail-census.md` §5。
 - **排期**：8 卡 A100 约 **2 天**（按 370 GPU·h）；DCU 8 卡按 2× 折减约 **4 天**。**单一 512³ 档不可能出现**（全按该档算要 1.1 万 GPU·h，与中位 FOV 表不符）。
 - **真瓶颈很可能不是 GPU 而是 I/O**：8.1 TB 下载 + 解压 + 1.33M 个小文件读写（inode/元数据压力）。建议按 shard 打包（每 shard ~1k latents），不要散文件直存。
 - **本地承载**：cynosure 侧「manifest + latent 工件对」在 1.33M 量级下**必须分片 manifest**（单文件会到 GB 级），且按模态分层（T2w 669 / MRA 157 与 T1w 54,511 差三个量级，分层不当会让小模态在 shuffle 中消失）。
@@ -170,6 +171,8 @@ AMP fp16 → `SlidingWindowInferer(roi_size=[320,320,160], sw_batch_size=1, mode
 ### 5.3 先用元数据做零下载普查（推荐先做）
 
 `metadata/batchXX_metadata.csv` 逐 series 带 `array_shape` / `array_spacing_mm` / `array_fov_mm` / `acquisition_plane` / `Patient'sAge` / `FieldStrength_T` / `Manufacturer`。因为 resize 逐轴取整、`Orientationd` 只置换，**latent 形状的多重集与体素总量可从 `array_shape` 直接算出**——不下载任何影像就能得到：① latent 形状精确分布与体素总和（→ 精确存储/算力）；② 原生 spacing 分布（校验 §4.2 假设）；③ §6 计数口径的定案。团队已有这份元数据（【fork】`scripts/spine_filter.py:36-42` 的标定就是跑它）。
+
+> **已完成两笔（勿重复规划）**：① 评估集普查（留出池抽样 + 交叉计数，`data/eval/mrrate-baseline/`，#78/#91）；② 全语料 **>16.38M 长尾普查**（#141，`research/mrrate-tail-census.md` + `data/census/mrrate-tail/`）：705,254 卷中 **61.43%**（433,255 卷）resize 后体素数超 encode 豁免阈值（中位数 18.87M 已超界）——上游 v1 的主干编码路径本来就是滑窗。上列三项中尚未做的只剩 native spacing 分布（原 ②，校验 §4.2）。
 
 ---
 
