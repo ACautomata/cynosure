@@ -788,6 +788,54 @@ class TestCrossModalPairSampling:
             )
         assert seen == set(MODALITIES)  # 各源序列的接线都被真实走到
 
+    def test_condition_source_label_matches_source_modality(
+        self, tmp_path: Path,
+    ) -> None:
+        """组2 条件采样产出双 label（issue #115）：source_label = 源序列
+        token、label = 目标序列 token，各自与 latent 的源/目标模态对齐
+        （源 latent 可从张量内容反查序列，label 映射互为印证）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        seen: set[tuple[str, str]] = set()
+        for _ in range(48):
+            condition, target = sampler.sample()
+            source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+            assert condition.source_label is not None
+            assert int(condition.source_label[0].item()) == (
+                FIXTURE_MODALITY_MAPPING[source]
+            )
+            assert int(condition.label[0].item()) == FIXTURE_MODALITY_MAPPING[target]
+            seen.add((source, target))
+        assert seen <= {
+            (src, tgt) for src, tgt in product(MODALITIES, repeat=2) if src != tgt
+        }
+        assert any(source != target for source, target in seen)
+
+    def test_sample_target_source_label_matches_fixed_target(self, tmp_path: Path) -> None:
+        """配额量产（ADR-0008-01）同样产双 label：source_label 随采中的
+        源序列走、label 恒为指定目标端 token（与 sample 同一构造点）。"""
+        torch.manual_seed(0)
+        self._write_identifiable_pool(tmp_path)
+        sampler = self._sampler(tmp_path, seed=0)
+        source_marker = {
+            float(index): modality for index, modality in enumerate(MODALITIES)
+        }
+        for target in MODALITIES:
+            for _ in range(12):
+                condition = sampler.sample_target(target)
+                source = source_marker[condition.source_latent[0, 0, 0, 0, 0].item()]
+                assert condition.source_label is not None
+                assert int(condition.source_label[0].item()) == (
+                    FIXTURE_MODALITY_MAPPING[source]
+                )
+                assert int(condition.label[0].item()) == (
+                    FIXTURE_MODALITY_MAPPING[target]
+                )
+
     def test_pool_missing_modality_rejected(self, tmp_path: Path) -> None:
         """源影像库缺任一序列 = 组2 条件分布不可用：显式拒绝。"""
         manifest_path = self._write_identifiable_pool(tmp_path)

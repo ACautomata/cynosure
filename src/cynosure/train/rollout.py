@@ -208,11 +208,12 @@ class SourceLatentPool:
 class CrossModalConditionSampler:
     """组2 条件分布：四序列 12 有序 src→tgt 对均匀采样（experiment-design）。
 
-    条件 c = (源影像 latent, 目标序列 label, spacing)——两个条件都带
-    （policy-modeling 章 MDP）；源影像 latent 按源序列从 SourceLatentPool
-    均匀抽取，scale_factor 缩放发生在组2 采样场（条件的唯一缩放点）；
-    spacing 为源影像条目的 manifest per-case 侧车值（issue #46：条件来自
-    数据而非写死常量，与源 latent 同条目同源）。
+    条件 c = (源影像 latent, 源序列 label, 目标序列 label, spacing)——
+    两个 label 位各收其职（issue #115：ControlNet 收源、UNet 收目标）；
+    源影像 latent 按源序列从 SourceLatentPool 均匀抽取，scale_factor 缩放
+    发生在组2 采样场（条件的唯一缩放点）；spacing 为源影像条目的 manifest
+    per-case 侧车值（issue #46：条件来自数据而非写死常量，与源 latent 同
+    条目同源）——源 latent、源 spacing、源 label 同源于同一源模态条目。
     ``pairs`` 来自 config（cross_modal_pairs 可配置），不设代码内副本。"""
 
     def __init__(
@@ -278,18 +279,24 @@ class CrossModalConditionSampler:
     ) -> RolloutCondition:
         """按 (源序列, 目标序列) 构造组2 条件：源影像 latent 按源序列
         均匀抽取；per-case spacing 与源 latent 同条目同源（manifest 侧车，
-        issue #46），控制网络条件路径的消费端取值。"""
+        issue #46），控制网络条件路径的消费端取值；双 label 按 (源, 目标)
+        对同时产出（issue #115：源 label 随 ControlNet、目标 label 随
+        UNet），三个源位与 label 同源于同一 (源, 目标) 对。"""
         source_index = int(torch.randint(
             self._pool.size(source_modality), (1,), generator=stream,
         ))
-        label = self._mapping.label(target_modality)
         return RolloutCondition(
-            label=torch.tensor([label], device=self._device),
+            label=torch.tensor(
+                [self._mapping.label(target_modality)], device=self._device,
+            ),
             spacing=torch.tensor(
                 [self._pool.spacing(source_modality, source_index)],
                 device=self._device,
             ),
             source_latent=self._pool.latent(source_modality, source_index).unsqueeze(0),
+            source_label=torch.tensor(
+                [self._mapping.label(source_modality)], device=self._device,
+            ),
         )
 
 

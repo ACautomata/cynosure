@@ -123,9 +123,12 @@ class BareConditionField:
 
     双条件（policy-modeling 章 MDP 条件 c）：源影像 latent × scale_factor
     （ControlNet 的 controlnet_cond；缩放唯一发生地在构造参数
-    ``source_latent_scale_factor``）+ 目标序列 modality token（ControlNet
-    与 UNet 的 class label 同源）。ControlNet 的 ``conditioning_scale``
-    保持 MONAI 默认 1.0（基座行为；与源 latent 缩放是两个正交旋钮）。"""
+    ``source_latent_scale_factor``）+ modality token。class label 各收其职
+    （issue #115）：ControlNet 收**源**模态 label——解读源影像的模态先验，
+    残差按源模态分化；UNet 收**目标**模态 label——生成目标模态的
+    模态先验。源模态身份信息由源 latent 隐式携带不够，label embedding 是
+    显式的模态先验通道。ControlNet 的 ``conditioning_scale`` 保持 MONAI
+    默认 1.0（基座行为；与源 latent 缩放是两个正交旋钮）。"""
 
     def __init__(
         self,
@@ -175,11 +178,19 @@ class BareConditionField:
         timesteps: int,
         condition: RolloutCondition,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        """ControlNet 残差：(down_block_res_samples, mid_block_res_sample)。"""
+        """ControlNet 残差：(down_block_res_samples, mid_block_res_sample)。
+        class label 收源模态 token（issue #115 各收其职）；源位缺席 =
+        装配契约违例，显式拒绝。"""
         if condition.source_latent is None:
             raise ValueError(
                 "组2 采样场需要源影像 latent 条件（RolloutCondition."
                 "source_latent）：缺失即跨模态对齐静默失效"
+            )
+        if condition.source_label is None:
+            raise ValueError(
+                "组2 采样场需要源模态 label 条件（RolloutCondition."
+                "source_label）：缺失即 ControlNet 退回目标 label 的同源"
+                "错位语义（issue #115 已裁定各收其职）"
             )
         down_residuals, mid_residual = self._controlnet(
             x=x,
@@ -187,7 +198,7 @@ class BareConditionField:
                 (batch,), timesteps, dtype=torch.int64, device=x.device,
             ),
             controlnet_cond=condition.source_latent * self._scale_factor,
-            class_labels=condition.label,
+            class_labels=condition.source_label,
         )
         return tuple(down_residuals), mid_residual
 

@@ -41,7 +41,8 @@ class EntryConditionResolver:
         """条目 → (rollout 条件, 目标序列名)。组2 的源影像条件按锁定
         病例整条装载——latent 与 per-case spacing 同条目同源（issue #46
         侧车；与训练侧 CrossModalConditionSampler 同一原则），缩放发生
-        在采样场。"""
+        在采样场；双 label 按 (源, 目标) 条目对产出（issue #115：源
+        label 随 ControlNet、目标 label 随 UNet）。"""
         if isinstance(entry.condition, str):
             return self._label_condition(entry.condition), entry.condition
         source_modality, target_modality = entry.condition
@@ -56,6 +57,9 @@ class EntryConditionResolver:
                 ),
                 source_latent=self._pool.load_latent(source_entry).unsqueeze(0).to(
                     self._device,
+                ),
+                source_label=torch.tensor(
+                    [self._mapping.label(source_modality)], device=self._device,
                 ),
             ),
             target_modality,

@@ -1,9 +1,12 @@
 """组条件 c：MDP state ``s_t = (c, t, x_t)`` 里的条件（policy-modeling 章）。
 
-组1 = (modality label, spacing)；组2 再带源影像 latent（ControlNet 条件，
-乘 scale_factor 发生在组2 采样场——条件的唯一缩放点）。同批 rollout 的
-条件共享：label/spacing/源 latent 允许 batch=1 广播（广播由采样场负责），
-spacing（体素间距 ×1e2）恒传（基座 ``include_spacing_input=true``）。
+组1 = (modality label, spacing)；组2 再带源影像 latent 与源模态 label
+（ControlNet 条件，乘 scale_factor 发生在组2 采样场——条件的唯一缩放
+点）。双 label 各收其职（issue #115）：目标模态 token 随 UNet 前向、源
+模态 token 随 ControlNet 前向（组1 无源模态位，源 label 为 ``None``）。
+同批 rollout 的条件共享：label/spacing/源位允许 batch=1 广播（广播由
+采样场负责），spacing（体素间距 ×1e2）恒传（基座
+``include_spacing_input=true``）。
 """
 
 import json
@@ -24,17 +27,24 @@ import 环安全位——train/eval 两侧条件组装共同依赖。"""
 
 @dataclass(frozen=True)
 class RolloutCondition:
-    """一条 rollout 的采样条件：模态标签 token + 体素间距（+ 组2 的源影像 latent）。"""
+    """一条 rollout 的采样条件：目标模态标签 token + 体素间距（+ 组2 的
+    源影像 latent 与源模态标签）。"""
 
     label: torch.Tensor
-    """modality token（int64），形状 [B]；同批共享时可为 [1]。"""
+    """目标模态 token（int64），形状 [B]；同批共享时可为 [1]。UNet 前向
+    的 class label（组1/组2 共用）。"""
 
     spacing: torch.Tensor
     """体素间距 ×1e2，形状 [B, 3]；同批共享时可为 [1, 3]。"""
 
     source_latent: torch.Tensor | None = None
-    """组2 双条件之一：源影像 latent（[B, C, D, H, W]，ControlNet 条件的
+    """组2 源位之一：源影像 latent（[B, C, D, H, W]，ControlNet 条件的
     缩放前形态）；组1 为 ``None``。与 label/spacing 同 batch（构造即校验）。"""
+
+    source_label: torch.Tensor | None = None
+    """组2 源位之二：源模态 token（int64），形状 [B]；组1 为 ``None``。
+    ControlNet 前向的 class label（issue #115 各收其职：ControlNet 解读
+    源影像，残差按源模态分化；UNet 保持目标 label）。"""
 
     def __post_init__(self) -> None:
         if self.label.shape[0] != self.spacing.shape[0]:
@@ -50,6 +60,14 @@ class RolloutCondition:
                 f"条件 batch 不符：label {self.label.shape[0]} vs source_latent "
                 f"{self.source_latent.shape[0]}"
             )
+        if (
+            self.source_label is not None
+            and self.source_label.shape[0] != self.label.shape[0]
+        ):
+            raise ValueError(
+                f"条件 batch 不符：label {self.label.shape[0]} vs source_label "
+                f"{self.source_label.shape[0]}"
+            )
 
     def broadcast_to(self, batch: int) -> "RolloutCondition":
         """同批 rollout 的条件共享：batch=1 的条件广播到整批
@@ -59,10 +77,15 @@ class RolloutCondition:
                 self.source_latent.expand(batch, *self.source_latent.shape[1:])
                 if self.source_latent is not None else None
             )
+            source_label = (
+                self.source_label.expand(batch, *self.source_label.shape[1:])
+                if self.source_label is not None else None
+            )
             return RolloutCondition(
                 label=self.label.expand(batch, *self.label.shape[1:]),
                 spacing=self.spacing.expand(batch, *self.spacing.shape[1:]),
                 source_latent=source_latent,
+                source_label=source_label,
             )
         if self.label.shape[0] != batch:
             raise ValueError(
@@ -93,5 +116,6 @@ class ModalityMapping:
         return cls({str(key): int(value) for key, value in data.items()})
 
     def label(self, modality: str) -> int:
-        """序列的 modality token（组1 条件分支的 class label）。"""
+        """序列的 modality token（组1 条件与组2 双 label 的共同取数点：
+        目标/源模态 token 都从本映射查表，杜绝代码内副本漂移）。"""
         return self._labels[modality]
