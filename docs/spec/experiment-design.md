@@ -25,6 +25,31 @@
 - **训练规模**：每组默认 **~200–500 iteration**（先跑 50 iter sanity 再扩），rollout = 条件组 × G=12 方向；三组共用同一量级保证横向可比。实际吞吐以 `orchestration.md` 的 rollout profile 为准。
 - **判别器**：每组 RL 各自独立的在线判别器与回放缓冲（判别器在线跟踪当前 policy 的 fake 分布，跨组/跨阶段不复用）。
 
+## 条件词表口径（MR-RATE 换域线，#119）
+
+地图 #67 的 MR-RATE 上游域 RL 后训练基线与本页 BraTS 三组矩阵**共用同一基座**（rflow-mr-brain_v1），条件口径两套并存、经 `experiment.dataset` **互斥激活**（schema 层二选一，改动词表值即字段级拒绝）：
+
+| 口径 | 数据集字段 | 模态词表 | token 映射 | 条件单位 |
+|---|---|---|---|---|
+| BraTS（本页矩阵，行为不变） | `BraTS2023`（默认） | 四序列 t1n/t1c/t2w/t2f | 29/34/30/31（工件装载，`artifacts.modality_mapping_json`） | 组1 = 序列；组2 = 12 有序对 |
+| MR-RATE（地图 #67） | `MR-RATE` | 五模态 t1w/t2w/flair/swi/mra | whole-brain 9/10/11/20/16 + skull-stripped 29–33 | 11 生成条件（#81 白名单） |
+
+MR-RATE 词表四要素全部入 config schema（`experiment.conditioning` 段，`src/cynosure/config.py` 的 `MrRateConditioning`）：
+
+- **模态集**：t1w/t2w/flair/swi/mra 五模态（#81 swap 探针五 token 全 responsive 的证明面）；
+- **token 映射**：whole-brain `t1w/t2w/flair/swi/mra → 9/10/11/20/16`，**上游权威**（NV-Generate-CTMR `configs/modality_mapping.json`，`research/mrrate-data-spec.md` §3.4）；
+- **序列词表**：每序列**双条目**——whole-brain（官方直发）+ skull-stripped（29–33，现场 derive：官方只发 `img/` + `seg/`）；skull-stripped 条目属 prepare 数据链的双产形态；
+- **生成条件分组**：11 个 (模态, 平面) 格 = #81 终审白名单全量（9 读数格欠训、0 饱和、0 标签存疑）：T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。分组 token 恒为 whole-brain 条目（#81 swap 生成口径，skull-stripped 码不进生成分组）。
+
+schema 语义（与 BraTS 线的隔离保证）：
+
+- **缺省自动填充**：MR config 不必抄录词表，`conditioning` 缺席时 schema 以定死默认值填充（单一来源）；
+- **互斥携带即拒**：BraTS config 携带 `conditioning` 段即拒绝（拼错 dataset 时两套口径静默共存比显式拒绝危险）；MR-RATE 词表字段改值（含分组集合偏离白名单）即字段级拒绝；
+- **无共享可变状态**：词表容器经 `default_factory` 每实例独立构造，同进程先后加载互不污染；
+- **MR-RATE 线只定义组1**：上游无 MR ControlNet，非 modal-label 组别即拒绝（跨模态/序贯是 BraTS 语义）。
+
+**装载层交付边界（#119）**：本段口径只到 schema 校验。词表的运行时消费——RolloutCondition 组装（组条件 label 取数）、prepare 数据链（双条目序列的装载与编码）、预训练 per-condition 分组（ADR-0008 的按条件统计键）——由地图 #67 的后续施工票接线；BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
+
 ## 对照基线（no-RL）
 
 - **组1 基线** = 冻结 base UNet @ CFG=10；**组2 基线** = 冻结 base UNet + 冻结预训练 ControlNet。
