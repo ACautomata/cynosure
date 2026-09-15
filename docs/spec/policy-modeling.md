@@ -20,7 +20,7 @@ policy 的采样分布必须**逐组复刻基座（NV-Generate-CTMR 各阶段推
 - **action** `a_t = x_{t+1} ~ π_θ(x_{t+1} | s_t)`——单步 SDE 高斯核的采样输出（velocity 只决定该高斯的均值，不是 action 本身）。
 - **条件 c 按组**：
   - 组1（模态标签条件）：`c = (modality label, spacing)`；
-  - 组2（跨模态影像条件）：`c = (源影像 latent × scale_factor [ControlNet 条件], modality label, spacing)`——**两个条件都带**；
+  - 组2（跨模态影像条件）：`c = (源影像 latent, 源模态标签, 目标模态标签, spacing)`——**条件全带、两路模态标签各收其职**（#115）：ControlNet 收**源**模态标签（解读源影像的模态先验——源模态身份靠源 latent 隐式携带不够，标签 embedding 是显式通道）、UNet 收**目标**模态标签（生成目标模态的模态先验）；源 latent / 源标签 / spacing 同源于同一源模态条目，组1 无源位（源标签缺席）；源 latent 的 ×scale_factor 缩放是采样场的事（条件的唯一缩放点）；
   - 组3（序贯）：先组1 后组2，各自沿用。
 
 ## Policy = 按组对齐基座 CFG 的采样场
@@ -28,7 +28,7 @@ policy 的采样分布必须**逐组复刻基座（NV-Generate-CTMR 各阶段推
 | 实验组 | 基座推理 CFG | RL policy 采样场 | log-prob 场 |
 |---|---|---|---|
 | 组1 模态标签 | **10.0** | **CFG=10 组合场**：batch=2 单次前向 `chunk(2)`，序 [cond, uncond]，uncond=全零 label | 组合场 `v_cfg` |
-| 组2 跨模态 | **0.0**（基座代码强制 `cfg==0`） | **裸条件单前向**：frozen base UNet + trainable ControlNet，ControlNet 残差每次前向都参与 | 单前向 velocity |
+| 组2 跨模态 | **0.0**（基座代码强制 `cfg==0`） | **裸条件单前向**：frozen base UNet + trainable ControlNet，ControlNet 残差每次前向都参与（两路模态标签各收其职：ControlNet 收源模态、UNet 收目标模态，#115） | 单前向 velocity |
 | 组3 序贯 | 继承各阶段 | 随所训阶段套用上面两行 | — |
 
 - 组1 组合公式与 batch 组织逐字复刻基座：`v_cfg = v_uncond + 10·(v_cond − v_uncond)`。
@@ -77,7 +77,7 @@ GRPO ratio 的 π_new/π_old 均在**各自组的采样场**上重算：组1 每
 2. **第 k 步 SDE 核**替换 `step()`，产生 G 个方向（组内共享 anchor：条件分支一次 forward batch=1 再 repeat G，`v_uncond` 全组一次评估——G²RPO 效率技巧）；
 3. 各方向 **ODE 续跑到 x_0**（确定性）；
 4. 终点 latent 交 reward model 打分（latent 域、不经 decoder，见 `reward-model.md`）；
-5. 组2：**仅训 ControlNet**，base UNet 冻结；`ControlNetMaisi` 每步产出 `(down_block_res_samples, mid_block_res_sample)` 注入 UNet（条件 = 源影像 latent × scale_factor）。
+5. 组2：**仅训 ControlNet**，base UNet 冻结；`ControlNetMaisi` 每步产出 `(down_block_res_samples, mid_block_res_sample)` 注入 UNet（ControlNet 条件 = 源影像 latent × scale_factor；两路模态标签各收其职（#115）——ControlNet 的前向收**源**模态标签、UNet 保持**目标**模态标签）。
 
 ## MGAI 30 步适配
 
