@@ -88,8 +88,11 @@ class MaisiLatentEncoder:
 
     数值口径：CUDA 上 fp16 autocast（上游 create_training_data 同款；
     上游 config ``norm_float16=true`` 使纯 fp32 前向 dtype mismatch
-    崩溃——autocast 是结构性必需，非省显存优化），CPU 纯 fp32（fixture
-    与本地测试路径）。
+    崩溃——autocast 是结构性必需，非省显存优化），CPU 纯 fp32 仅限
+    fixture 替身——真实 MAISI 的 ``MaisiGroupNorm3D`` 无条件输出 fp16
+    （autoencoderkl_maisi.py），CPU autocast 又只认 bf16，**真体整前向
+    结构上只在加速卡上成立**（#143 集群实测：CPU 纯 fp32 撞 conv dtype
+    校验，CPU bf16 报 autocast::prioritize 错）。
 
     编排（上游 ``dynamic_infer`` 同语义分派，#143）：单样本空间体素数
     ≤ roi 元素数（影像空间阈值 [320,320,160]，prod=16.38M）恒整前向
