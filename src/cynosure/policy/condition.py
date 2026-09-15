@@ -57,8 +57,9 @@ class RolloutCondition:
             )
         if self.source_latent is None and self.source_label is not None:
             raise ValueError(
-                "组1 条件构造携带源模态 label（RolloutCondition.source_label）："
-                "源 label 是组2 专属位，须与源影像 latent 同齐同缺"
+                "条件源位不齐：source_label 在场而 source_latent 缺席"
+                "（源位须同齐同缺——组1 双位缺席、组2 双位齐备；"
+                "组2 构造漏传 source_latent 亦落本分支）"
                 "（issue #117 源位一致性 contract）"
             )
         if self.label.shape[0] != self.spacing.shape[0]:

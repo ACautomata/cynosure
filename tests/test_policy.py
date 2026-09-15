@@ -482,9 +482,10 @@ class TestBareConditionField:
         assert torch.allclose(grouped, expanded, rtol=1e-4, atol=2e-5)
 
 
-class TestRolloutConditionSourceLatent:
-    """组2 条件扩展：source_latent/source_label 与 label/spacing 同 batch
-    约束与广播；组1 条件源位（latent/label）恒为 None。"""
+class TestRolloutConditionSourceSlots:
+    """组2 条件的源位（source_latent/source_label）：与 label/spacing 的
+    同 batch 约束、广播，以及构造期源位一致性 contract（同齐同缺，issue
+    #117）；组1 条件源位恒双缺。"""
 
     def test_group1_condition_source_slots_are_none(self) -> None:
         """组1 条件（label + spacing）无源影像自由度：source_latent 与
