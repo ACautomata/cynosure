@@ -179,8 +179,9 @@ class BareConditionField:
         condition: RolloutCondition,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """ControlNet 残差：(down_block_res_samples, mid_block_res_sample)。
-        class label 收源模态 token（issue #115 各收其职）；源位缺席 =
-        装配契约违例，显式拒绝。"""
+        class label 收源模态 token（issue #115 各收其职）；下方两个缺席
+        拒绝分支在构造期源位一致性 contract（issue #117）之下运行时不可达
+        ——保留为类型收窄与纵深防御，合法构造不可能携带半源位条件。"""
         if condition.source_latent is None:
             raise ValueError(
                 "组2 采样场需要源影像 latent 条件（RolloutCondition."
