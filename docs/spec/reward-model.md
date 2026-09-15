@@ -86,12 +86,12 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 | `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `buffer_current_fraction` / `buffer_replay_fraction` / `buffer_replay_degraded` / `policy_gated`（ADR-0008 决策 7）/ `train_pairwise_acc`（ADR-0009-β，N_d 跳过为 null）/ `overfit_divergence_ema`（ADR-0009-β，N_d 跳过为 null）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
 | `milestone` | 里程碑解码评测（train 循环） | `iteration` / `stage` / `fid` / `kid` / `ssim` / `mae` / `psnr` / `criteria_summary` / `early_stop` / `early_stop_reason` | 以完成数记账：保留完成数 ≤ 恢复点（评测与恢复点 checkpoint 同批产出） |
 | `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `modality`（本步条件，ADR-0008 per-condition 步进）/ `heldout_auc`（本步条件的 AUC）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | **不参与回退**：全量保留 |
-| `overfit_alert` | 过拟合分叉报警（train 循环，ADR-0009 决策 4/5；越线 rank 产出、随 iter 事件同归并序） | `iteration` / `stage` / `rank` / `modality` / `divergence_ema`（分叉值）/ `train_pairwise_acc` / `heldout_auc` | 以 0-based iteration 号记账：保留号 < 恢复点（回退重执行重发；预训练相告警 γ 落地后登记 EXEMPT 口径） |
+| `overfit_alert` | 过拟合分叉报警（RL 相：train 循环，ADR-0009 决策 4/5，越线 rank 产出、随 iter 事件同归并序；预训练相：warm-start driver，ADR-0009-γ，随 pretrain 事件之后写出） | `iteration`（RL 相 = iteration 号；预训练相 = 预训练步号）/ `stage` / `rank` / `phase`（相判别：`rl` 缺省 / `pretrain`，ADR-0009-γ）/ `modality` / `divergence_ema`（分叉值）/ `train_pairwise_acc` / `heldout_auc` | **按相分轨**：RL 相以 0-based iteration 号记账（保留号 < 恢复点，回退重执行重发）；预训练相不参与回退：全量保留（与 `pretrain` 事件同口径——预训练执行史没有对应的 checkpoint 可重放） |
 
 - **预训练事件排除在回退口径外的理由**：warm-start 执行史没有对应的 checkpoint 可重放，按任何边界删都是永久丢失——预训练收敛曲线断点、RM readiness gate 的阈值校准（`pretrain_gate_auc` 定版）失去数据基础。
 - **曲线的读法**：`heldout_auc` 一律是「本步更新**前**」的快照（与在线期 iter 事件同口径：更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。终止那两次测量（达标跨界测量 + 换批复测 / 步数耗尽后的补测）不进事件流——报告的 `final_heldout_auc` = 跨界测量与复测中的较小者（与落盘 checkpoint 同快照），离线画预训练收敛曲线时两端拼读。
 - **登记表 = 删除的准入名单**：回退只对表内口径为删除的轴做判定，表外（未登记 / 新增未声明）的事件类型一律保留——宁可留痕不可误删。
-- **同流混存的口径**：流的类型契约不假设一份流里有哪几型事件——当前 CLI 布局下 warm-start 与 RL 各在自己 run 目录（pretrain 写 `pretrain_report_json` 所在目录，train 另建 run 目录），两者分居两流；同流时（warm-start 历史并入 RL run 流）续训回退只重写恢复点之后的 RL 半截执行史，预训练事件**逐字**保留（真 `--resume` 回退路径的专属用例锁死）。
+- **同流混存的口径**：流的类型契约不假设一份流里有哪几型事件——当前 CLI 布局下 warm-start 与 RL 各在自己 run 目录（pretrain 写 `pretrain_report_json` 所在目录，train 另建 run 目录），两者分居两流；同流时（warm-start 历史并入 RL run 流）续训回退只重写恢复点之后的 RL 半截执行史，预训练事件**逐字**保留（真 `--resume` 回退路径的专属用例锁死）；预训练相 `overfit_alert` 告警（`phase="pretrain"`）与预训练事件同口径逐字保留——其步号轴与 RL 的 iteration 轴不同，按 RL 相口径记账会在恢复点 0 的边界上误删步号 0 的告警。
 
 
 ## KL / 稳定性锚定

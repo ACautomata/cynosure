@@ -12,7 +12,14 @@ held-out 卷数 < 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008
 （单批贴线越过被非确定性拒绝），报告值取两次较小者，确认步不更新
 （无更新即无事件）→ 未确认则以在线期同款 ``OnlineUpdate.step`` 原语
 更新一步（预训练期无「当前 policy」，混采语义退化为 base fake 库内
-采样；real 侧同条件匹配）。已入白名单的条件不再复测（棘轮：复测确认
+采样；real 侧同条件匹配）。每个更新步同时消费与在线**同一**过拟合
+分叉监控组件、同一 config knobs（ADR-0009-γ：共享装配缝挂进
+``RewardCoordinator`` 的 ``OverfitMonitor``——train 侧干净域复算准确率
+与本步更新前 held-out AUC 合成分叉观测，per-condition EMA 自下而上
+越线落预训练相 ``overfit_alert`` 事件（``phase="pretrain"``，EXEMPT
+记账——预训练执行史全量保留）；只报警不动作，确认步不更新不观测）——
+per-condition 分叉监控在 RM readiness gate 之前的预训练相即暴露稀疏
+模态（MRA）记忆化。已入白名单的条件不再复测（棘轮：复测确认
 已拦住单批噪声，后续掉线由在线期白名单动态恢复机制兜底）。终止 =
 全部条件最近一次确认过线即停；``pretrain_max_steps`` 耗尽 → 白名单 =
 已确认者，未确认条件逐个对落盘权重补测（报告值与 checkpoint 同快照）。
@@ -44,7 +51,7 @@ from cynosure.pretrain.artifacts import (
 )
 from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
 from cynosure.reward.support import SupportRule
-from cynosure.train.artifacts import PretrainEvent
+from cynosure.train.artifacts import OverfitAlertEvent, PretrainEvent
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import RolloutPhase
@@ -194,6 +201,17 @@ class PretrainDriver:
                         break
                     continue  # 本条件已确认：本步不更新（无更新即无事件）
             update = self._rewards.update_step(fakes, modality)
+            # 过拟合分叉观测（ADR-0009-γ）：与在线同一监控组件、同一
+            # knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor，
+            # 阈值/跨度同源于 config.reward.overfit_*）——train 侧干净域
+            # 复算准确率（随更新报告上行）与本步更新前 held-out AUC 合成
+            # 分叉观测，per-condition EMA 越线即落预训练相告警（确认步
+            # 不更新不观测；报警不动作，人工裁决——口径同在线）
+            reading = self._rewards.overfit.observe(
+                modality,
+                train_pairwise_acc=update.train_pairwise_acc,
+                heldout_auc=auc,
+            )
             zones = self._rewards.buffer.zone_sizes()
             self._run.append_event(PretrainEvent(
                 step=step,
@@ -205,6 +223,19 @@ class PretrainDriver:
                 lr=reward.disc_lr,
                 elapsed_s=time.monotonic() - started,
             ))
+            if reading.alerted:
+                # 预训练相告警排本步 pretrain 事件之后（与在线侧「iter
+                # 后随告警」同构的写出序）；``phase="pretrain"`` 是回退
+                # 记账的 EXEMPT 分轨轴——预训练执行史全量保留（预训练相
+                # 的 ``iteration`` 记本步步号）
+                self._run.append_event(OverfitAlertEvent(
+                    iteration=step,
+                    phase="pretrain",
+                    modality=modality,
+                    divergence_ema=reading.divergence,
+                    train_pairwise_acc=update.train_pairwise_acc,
+                    heldout_auc=auc,
+                ))
             steps_completed += 1  # 更新步计数（确认步占步号但不更新不事件）
         reported = dict(confirmed)
         if not gate_passed:
