@@ -57,6 +57,11 @@ class TestValidConfigs:
         # 训练期噪声注入（ADR-0009 决策 3，issue #104）：σ_max 暂定 0.2——
         # MR-RATE 预训练曲线校准后定版；σ_max = 0 是唯一关闭形态
         assert config.reward.disc_noise_sigma_max == pytest.approx(0.2)
+        # 过拟合分叉监控（ADR-0009 决策 4/5，issue #105）：EMA 跨度与
+        # ADR-0008 的 EMA(AUC) 跨度同值口径（8）、报警阈值暂定 0.2——
+        # MR-RATE 预训练曲线校准后定版
+        assert config.reward.overfit_ema_span == 8
+        assert config.reward.overfit_alert_divergence == pytest.approx(0.2)
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
@@ -105,6 +110,31 @@ class TestRejection:
     @staticmethod
     def _locations_with_messages(exc: ValidationError) -> list[tuple[tuple, str]]:
         return [(err["loc"], err["msg"]) for err in exc.errors()]
+
+    def test_overfit_alert_threshold_outside_unit_interval_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """分叉报警阈值（ADR-0009 决策 5）须在开区间 (0,1)：0 = 任何正
+        分叉即报警（测量噪声淹没报警面）、1 = 永不越线（哑区），均不合法。"""
+        for bad in (0.0, -0.2, 1.0, 1.5):
+            data = copy.deepcopy(valid_config_dict)
+            data["reward"]["overfit_alert_divergence"] = bad
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("reward", "overfit_alert_divergence") in self._locations(
+                exc_info.value,
+            )
+
+    def test_overfit_ema_span_rejects_non_positive(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """分叉 EMA 跨度（ADR-0009 决策 4）须为正整数（0 会除零、负数
+        无平滑语义）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["overfit_ema_span"] = 0
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward", "overfit_ema_span") in self._locations(exc_info.value)
 
     def test_missing_required_field_is_field_level_error(self) -> None:
         data = copy.deepcopy(MINIMAL_CONFIG_DICT)

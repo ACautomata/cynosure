@@ -72,7 +72,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 5
+RESUME_STATE_FORMAT_VERSION = 6
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -86,7 +86,11 @@ v4：+ 门控状态（ADR-0008 决策 7/8 的落盘侧）——动态白名单�
 无门控状态可回填，被版本对账显式拒绝。
 v5：generators 清单 + ``disc_noise`` 流（ADR-0009-α 判别器训练期噪声
 注入的专属随机流）——命名流注册表结构一变即清单失配，旧 v4 分片缺
-该流状态、恢复后噪声序列无从续写，被版本对账显式拒绝。"""
+该流状态、恢复后噪声序列无从续写，被版本对账显式拒绝。
+v6：+ 过拟合分叉监控状态（ADR-0009-β）——per-condition 分叉 EMA 随
+分片落盘，恢复逐位复原（分叉 EMA 进 iter 事件、进续训 roundtrip 的
+逐位轨迹比对，状态不落盘即恢复后的指标流与告警序列失真）；旧 v5
+分片无该状态可回填，被版本对账显式拒绝。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -102,6 +106,7 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "lr",
     "ema",
     "gating",
+    "overfit",
 )
 
 _ALLOWED_CONFIG_DRIFT: frozenset[tuple[str, ...]] = frozenset(
@@ -310,6 +315,9 @@ class ResumeStore:
         # 门控状态逐位复原（v4）：恢复点的（动态）白名单与 per-condition
         # EMA 随全清单回归——后续门控决定从恢复点确定性续写
         trainer.rewards.gating.adopt(state["gating"])
+        # 分叉监控状态逐位复原（v6）：per-condition 分叉 EMA 随全清单
+        # 回归——恢复后的分叉读数与告警序列从恢复点确定性续写
+        trainer.rewards.overfit.adopt(state["overfit"])
         return state["iteration"]
 
     def _capture(
@@ -351,6 +359,9 @@ class ResumeStore:
             # 门控状态（v4）：动态白名单当前成员 + per-condition EMA
             # （ADR-0008 决策 7/8；恢复逐位复原的落盘侧）
             "gating": trainer.rewards.gating.state(),
+            # 分叉监控状态（v6）：per-condition 分叉 EMA（ADR-0009 决策 4；
+            # 按 rank 独立、随本 rank 分片落盘）
+            "overfit": trainer.rewards.overfit.state(),
         }
 
     @staticmethod
@@ -404,11 +415,11 @@ class ResumeStore:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 "
                 f"v{RESUME_STATE_FORMAT_VERSION}"
-                "（门控状态随分片落盘 + 七条命名 RNG 流含判别器噪声"
-                "注入流，ADR-0008/0009），得到 "
-                f"{version!r}——跨口径续训不可恢复（旧分片的门控与噪声"
-                "流状态无落盘面，恢复后门控决定与噪声序列无法逐位"
-                "续写）；请从产物 checkpoint 重启新 run"
+                "（门控与分叉监控状态随分片落盘 + 七条命名 RNG 流含判别器"
+                "噪声注入流，ADR-0008/0009），得到 "
+                f"{version!r}——跨口径续训不可恢复（旧分片的门控、噪声流"
+                "与分叉监控状态无落盘面，恢复后门控决定、噪声序列与"
+                "分叉读数无法逐位续写）；请从产物 checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
         if missing:

@@ -28,6 +28,7 @@ from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import IterationLoop, PretrainEvent, RunArtifacts
+from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.policy import GroupPolicy
 from tests.conftest import RunTrajectory
 from tests.test_train_loop import TrainingLoopScenario
@@ -185,7 +186,7 @@ class TestResumeStateChecklist:
         state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 5
+        assert state["format_version"] == RESUME_STATE_FORMAT_VERSION
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
         assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
@@ -217,6 +218,14 @@ class TestResumeStateChecklist:
         assert recent["latents"].shape == (25, 4, 16, 16, 8)
         assert len(recent["modalities"]) == 25
         assert all(m in MODALITIES for m in recent["modalities"])
+
+        # 分叉监控状态（v6，ADR-0009-β）：per-condition 分叉 EMA——单
+        # iteration 单条件观测（首条观测置值、count=1）
+        assert set(state["overfit"]) == {"ema"}
+        assert len(state["overfit"]["ema"]) == 1
+        divergence = next(iter(state["overfit"]["ema"].values()))
+        assert divergence["count"] == 1
+        assert isinstance(divergence["value"], float)
 
         # RNG：七条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
         # 形态：有 CUDA 的环境（集群）经装配期 fork_rng 触发 CUDA RNG

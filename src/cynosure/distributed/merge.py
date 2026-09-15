@@ -9,14 +9,18 @@ rank 独立 → 事件数值各 rank 不同），gather 到 rank 0 后按源 ran
 = world-1 退化（gather 恒等、直写）。
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from cynosure.distributed.process import DistributedContext
 
 if TYPE_CHECKING:
     # 运行时不依赖 train 包（cynosure.train 的初始化会拉起本包，反向
     # import 造成包级循环）：事件与产物契约的类型仅作注解
-    from cynosure.train.artifacts import IterEvent, RunArtifacts
+    from cynosure.train.artifacts import (
+        IterEvent,
+        OverfitAlertEvent,
+        RunArtifacts,
+    )
 
 
 class EventMerger:
@@ -28,9 +32,13 @@ class EventMerger:
         self._context = context
         self._artifacts = artifacts
 
-    def emit(self, event: "IterEvent") -> None:
-        """本 rank 的 iteration 事件提交归并（rank 0 追加写出）。"""
-        gathered = self._context.gather([event])
+    def emit(self, events: Sequence["IterEvent | OverfitAlertEvent"]) -> None:
+        """本 rank 的 iteration 事件提交归并（rank 0 按 rank 序追加写出）。
+
+        事件清单内序保持：同 iteration 的 ``overfit_alert`` 排在本 rank
+        iter 事件之后——归并序 = (iteration, rank, 清单内序)，分叉告警
+        与其数值来源（本 rank iter 事件的两侧读数）相邻可读。"""
+        gathered = self._context.gather(list(events))
         if self._context.rank == 0:
             for source in gathered:
                 for item in source:

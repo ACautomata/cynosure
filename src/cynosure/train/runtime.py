@@ -39,6 +39,7 @@ from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
+from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
@@ -272,7 +273,10 @@ class TrainingRuntime:
             config=config.reward,
             dist=dist,
         )
-        return RewardCoordinator(update, auc, generators["fake_shuffle"], gating)
+        return RewardCoordinator(
+            update, auc, generators["fake_shuffle"], gating,
+            overfit=OverfitMonitor(config.reward),
+        )
 
     @staticmethod
     def _assemble_scorer(

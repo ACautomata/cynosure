@@ -11,6 +11,8 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
       2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次，
          FSDP 梯度 allreduce）；判别器 Online update（本 rank fake +
          pool 切片 + 回放混采，DDP 梯度 allreduce，门控不影响其节奏）
+         随步做 train 侧干净域复算与 per-condition 分叉观测（ADR-0009-β，
+         越线落 overfit_alert 事件、只报警不动作）
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
@@ -51,6 +53,7 @@ from cynosure.train.artifacts import (
     BaselineManifest,
     IterEvent,
     MilestoneEvent,
+    OverfitAlertEvent,
     POLICY_CHECKPOINT_TEMPLATE,
     RunArtifacts,
 )
@@ -398,11 +401,35 @@ class GranularGrpoTrainer:
                 self.rewards.update_step(record.new_fakes, record.modality)
                 if iteration % update_interval == 0 else None
             )
+            # 过拟合分叉观测（ADR-0009 决策 4/5）：train 侧干净域复算准确
+            # 率（随更新报告上行）与同 iteration 的 held-out AUC（更新前
+            # 快照）合成分叉观测——per-condition EMA 递推、上升沿越线判定。
+            # 只报警不动作：越线仅落 overfit_alert 事件（人工裁决），白名单
+            # 与 σ 不被联动；分叉按 rank 独立计算（监控器无集合通信），
+            # EMA 状态随续训分片落盘（恢复逐位复原）
+            divergence_ema: float | None = None
+            alert_event: OverfitAlertEvent | None = None
             if report is not None:
                 loss_terms["discriminator"] = report.loss_discriminator
+                reading = self.rewards.overfit.observe(
+                    record.modality,
+                    train_pairwise_acc=report.train_pairwise_acc,
+                    heldout_auc=heldout_auc,
+                )
+                divergence_ema = reading.divergence
+                if reading.alerted:
+                    alert_event = OverfitAlertEvent(
+                        iteration=iteration,
+                        stage=self.stage_tag.stage,
+                        rank=dist.rank,
+                        modality=record.modality,
+                        divergence_ema=reading.divergence,
+                        train_pairwise_acc=report.train_pairwise_acc,
+                        heldout_auc=heldout_auc,
+                    )
             batch_size_k = self.config.reward.disc_batch_size_k
             zone_sizes = self.rewards.buffer.zone_sizes()
-            self.runtime.merger.emit(IterEvent(
+            events: list[IterEvent | OverfitAlertEvent] = [IterEvent(
                 iteration=iteration,
                 stage=self.stage_tag.stage,
                 rank=dist.rank,
@@ -423,9 +450,17 @@ class GranularGrpoTrainer:
                 ),
                 buffer_base_occupied=zone_sizes.base,
                 buffer_recent_occupied=zone_sizes.recent,
+                train_pairwise_acc=(
+                    report.train_pairwise_acc if report else None
+                ),
+                overfit_divergence_ema=divergence_ema,
                 lr=self.config.policy.policy_lr,
                 elapsed_s=time.monotonic() - started,
-            ))
+            )]
+            if alert_event is not None:
+                # 告警排本 rank iter 事件之后（归并序 = iter 后随同 rank 告警）
+                events.append(alert_event)
+            self.runtime.merger.emit(events)
             completed = iteration + 1
             milestone_due = completed % self.config.schedule.milestone_interval == 0
             if (

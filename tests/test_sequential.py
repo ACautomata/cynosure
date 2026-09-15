@@ -151,8 +151,13 @@ class TestSequentialRun:
         events = scenario.events()
         # stage-1 与 stage-2 各一 iteration，顺序排列、stage 字段区分
         # （stage-2 能开跑 = cross-modal 报告通过 readiness gate 与
-        # warm-start 组别守卫——两阶段各自消费同组报告）
-        assert [(event["stage"], event["iteration"]) for event in events] == [(1, 0), (2, 0)]
+        # warm-start 组别守卫——两阶段各自消费同组报告）；指标流另含
+        # overfit_alert（同带 stage/iteration 归因轴），按事件类型取
+        # iter 序列后再对账阶段顺序
+        iter_events = [event for event in events if event["event"] == "iter"]
+        assert [
+            (event["stage"], event["iteration"]) for event in iter_events
+        ] == [(1, 0), (2, 0)]
         checkpoints = scenario.run_dir / "checkpoints"
         # stage-1 产物（无前缀 = 与独立组1 run 同布局，可作 stage1_run_dir 复用）
         assert (checkpoints / "policy_iter1.pt").is_file()
@@ -239,7 +244,11 @@ class TestSequentialRun:
         )
         assert result.code == 0, result.stderr
         events = RunArtifacts(RunArtifacts.layout(second_run)).read_events()
-        assert [event["stage"] for event in events] == [2]
+        # 指标流另含 overfit_alert（同带 stage 字段），按事件类型取 iter
+        # 序列：只有 stage-2 的 iteration 事件
+        assert [
+            event["stage"] for event in events if event["event"] == "iter"
+        ] == [2]
         assert (second_run / "checkpoints" / "stage2_policy_iter1.pt").is_file()
 
 
@@ -276,7 +285,11 @@ class TestStageIndependence:
         回放占比 50% 即可用）。"""
         scenario.write_inputs(group="sequential")
         assert scenario.train().code == 0
-        stage1_event, stage2_event = scenario.events()
+        # 指标流另含 overfit_alert（同带 iteration 归因轴），按事件类型
+        # 取 iter 序列：两阶段各一
+        stage1_event, stage2_event = [
+            event for event in scenario.events() if event["event"] == "iter"
+        ]
         assert stage1_event["buffer_recent_occupied"] == 25
         assert stage2_event["buffer_recent_occupied"] == 25  # 全新 buffer，非 50
         assert stage2_event["buffer_base_occupied"] == 32  # stage-2 自行生成的 base 分区

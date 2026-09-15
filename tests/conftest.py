@@ -530,6 +530,7 @@ class RecordingUpdate:
             num_recent_replay=0,
             modality=modality,
             replay_degraded=self._replay_degraded,
+            train_pairwise_acc=0.5,
         )
 
 

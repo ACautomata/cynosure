@@ -23,6 +23,7 @@ from cynosure.distributed import DistributedContext, RankSlicedPool
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
+from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer, RewardScorer
@@ -94,18 +95,28 @@ class RecordingRealSampler:
 
 class RecordingNoiseScorer:
     """测试仪器：委托真 scorer 并记录 training_patch_logits 的调用序列
-    （ADR-0009-α 对称性观测缝：real 与 fake 两侧同入口、同 generator）。"""
+    （ADR-0009-α 对称性观测缝：real 与 fake 两侧同入口、同 generator）
+    与 patch_logits 的调用序列（ADR-0009-β 干净域复算观测缝：入口、
+    调用时 grad 开关与输入批）。"""
 
     def __init__(self, inner: LatentScorer) -> None:
         self._inner = inner
         self.noise_entries: list[tuple[tuple[int, ...], torch.Generator]] = []
         """(输入形状, generator 对象) 的调用序列。"""
+        self.clean_entries: list[tuple[tuple[int, ...], bool]] = []
+        """patch_logits 的 (输入形状, 调用时 grad 是否开启) 序列。"""
+        self.clean_batches: list[torch.Tensor] = []
+        """patch_logits 的输入批序列（干净域复算的重放对账原料）。"""
 
     @property
     def discriminator(self):
         return self._inner.discriminator
 
     def patch_logits(self, latents: torch.Tensor) -> torch.Tensor:
+        self.clean_entries.append(
+            (tuple(latents.shape), torch.is_grad_enabled()),
+        )
+        self.clean_batches.append(latents)
         return self._inner.patch_logits(latents)
 
     def reward(self, latents: torch.Tensor) -> torch.Tensor:
@@ -625,3 +636,70 @@ class TestTrainingNoiseInjection:
             for _ in range(3)
         ]
         assert losses_first == losses_second
+
+
+class TestCleanDomainRecompute:
+    """train 侧干净域复算（ADR-0009-β，issue #105）：每判别器步用干净域
+    输入 no_grad 复算一次 pairwise 准确率、随单步更新报告上行——不复用
+    loss 伴生量（带噪输入使训练批任务天然更难、系统性低估分叉）。
+
+    估计量与 held-out AUC 同一 Mann-Whitney pairwise 占比（不同采样
+    平面），分叉 = 两侧之差才有「同尺可比」的语义。"""
+
+    def test_report_carries_train_pairwise_accuracy(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """报告带 train pairwise 准确率，值 = 干净域 patch logit 的
+        Mann-Whitney 占比（σ_max=0 时训练前向与干净前向逐位一致、
+        optimizer 冻结使复算时刻权重可离线重放——报告值与同批同权重的
+        独立重放对账）。"""
+        recording = RecordingNoiseScorer(scenario.scorer(sigma_max=0.0))
+        update, _ = scenario.update(scorer=recording, sigma_max=0.0)
+        update.optimizer.step = lambda: None  # 冻结权重：复算值可离线重放
+        report = update.step(scenario.fakes(12), "t2w")
+        assert 0.0 <= report.train_pairwise_acc <= 1.0
+        real_batch, fake_batch = recording.clean_batches  # 记录序 = real 先
+        expected = HeldOutAuc.auc_from_scores(
+            recording.patch_logits(real_batch).flatten(),
+            recording.patch_logits(fake_batch).flatten(),
+        )
+        assert report.train_pairwise_acc == pytest.approx(expected)
+
+    def test_recompute_uses_clean_entry_without_grad(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """复算走干净域打分入口（patch_logits，非带噪训练入口）且在
+        no_grad 下进行（AUC/准确率非可微、永不 backward——带图前向会
+        白保留全部激活图）。"""
+        recording = RecordingNoiseScorer(scenario.scorer(sigma_max=0.2))
+        update, _ = scenario.update(scorer=recording, sigma_max=0.2)
+        update.step(scenario.fakes(12), "t2w")
+        assert len(recording.clean_entries) == 2  # fake 侧 + real 侧各一次
+        assert not any(
+            grad_on for _, grad_on in recording.clean_entries
+        )  # 两次复算全在 no_grad 下
+        fake_shape, _ = recording.clean_entries[0]
+        real_shape, _ = recording.clean_entries[1]
+        assert fake_shape[0] == 4  # 混采批（K=4）
+        assert real_shape[0] == 4  # real 批同量
+
+    def test_train_accuracy_is_independent_of_noise_sigma(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """复算值与 σ_max 无关（干净域口径）：同 seed 双场景下 σ=0 与
+        σ=0.2 的报告准确率逐位一致——训练前向带噪不改变监控读数。"""
+        clean, _ = scenario.update(sigma_max=0.0)
+        noisy, _ = scenario.update(sigma_max=0.2)
+        fakes = scenario.fakes(12)
+        clean_acc = clean.step(fakes, "t2w").train_pairwise_acc
+        noisy_acc = noisy.step(fakes, "t2w").train_pairwise_acc
+        assert clean_acc == noisy_acc
+
+    def test_degraded_step_still_reports_accuracy(
+        self, scenario: UpdateScenario,
+    ) -> None:
+        """退化步（纯 current 半区）同样复算上行（退化不改观测面）。"""
+        update, _ = scenario.depleted_condition_update("t2w")
+        report = update.step(scenario.fakes(12), "t2w")
+        assert report.replay_degraded is True
+        assert 0.0 <= report.train_pairwise_acc <= 1.0

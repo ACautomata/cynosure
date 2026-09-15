@@ -16,18 +16,20 @@ import torch
 from cynosure.config import Modality
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayStore
+from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate, UpdateReport
 from cynosure.train.gating import DynamicWhitelist
 from cynosure.train.whitelist import ConditionWhitelist
 
 
 class RewardCoordinator:
-    """判别器侧动作面（种植/更新/AUC）与条件白名单的单点持有。"""
+    """判别器侧动作面（种植/更新/AUC/分叉监控）与条件白名单的单点持有。"""
 
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
         generator: torch.Generator,
         gating: DynamicWhitelist,
+        overfit: OverfitMonitor,
     ) -> None:
         self.update = update
         self.auc = auc
@@ -37,6 +39,11 @@ class RewardCoordinator:
         # （经 whitelist 快照视图）；名单变更（EMA 动态恢复）由它以
         # 快照替换驱动，判定为全 rank 集体口径
         self.gating = gating
+        # 过拟合分叉监控器（ADR-0009 决策 4/5）：per-condition 分叉 EMA
+        # 的 rank 本地单点——train 循环逐判别器步喂入两侧干净域读数、
+        # 消费越线判定落 overfit_alert 事件；按 rank 独立（无集合通信），
+        # 报警不动作（白名单与 σ 不被它联动）
+        self.overfit = overfit
 
     @property
     def whitelist(self) -> ConditionWhitelist:

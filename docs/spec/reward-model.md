@@ -83,9 +83,10 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 
 | 事件类型 | 产出方 | 字段 | 回退（rewind）记账口径 |
 |---|---|---|---|
-| `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `buffer_current_fraction` / `buffer_replay_fraction` / `buffer_replay_degraded` / `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
+| `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `buffer_current_fraction` / `buffer_replay_fraction` / `buffer_replay_degraded` / `policy_gated`（ADR-0008 决策 7）/ `train_pairwise_acc`（ADR-0009-β，N_d 跳过为 null）/ `overfit_divergence_ema`（ADR-0009-β，N_d 跳过为 null）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
 | `milestone` | 里程碑解码评测（train 循环） | `iteration` / `stage` / `fid` / `kid` / `ssim` / `mae` / `psnr` / `criteria_summary` / `early_stop` / `early_stop_reason` | 以完成数记账：保留完成数 ≤ 恢复点（评测与恢复点 checkpoint 同批产出） |
 | `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `modality`（本步条件，ADR-0008 per-condition 步进）/ `heldout_auc`（本步条件的 AUC）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | **不参与回退**：全量保留 |
+| `overfit_alert` | 过拟合分叉报警（train 循环，ADR-0009 决策 4/5；越线 rank 产出、随 iter 事件同归并序） | `iteration` / `stage` / `rank` / `modality` / `divergence_ema`（分叉值）/ `train_pairwise_acc` / `heldout_auc` | 以 0-based iteration 号记账：保留号 < 恢复点（回退重执行重发；预训练相告警 γ 落地后登记 EXEMPT 口径） |
 
 - **预训练事件排除在回退口径外的理由**：warm-start 执行史没有对应的 checkpoint 可重放，按任何边界删都是永久丢失——预训练收敛曲线断点、RM readiness gate 的阈值校准（`pretrain_gate_auc` 定版）失去数据基础。
 - **曲线的读法**：`heldout_auc` 一律是「本步更新**前**」的快照（与在线期 iter 事件同口径：更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。终止那两次测量（达标跨界测量 + 换批复测 / 步数耗尽后的补测）不进事件流——报告的 `final_heldout_auc` = 跨界测量与复测中的较小者（与落盘 checkpoint 同快照），离线画预训练收敛曲线时两端拼读。
