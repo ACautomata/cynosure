@@ -27,6 +27,21 @@ class TestFixtureConfig:
             config = Fixture().config(tmp_path, group=group)  # type: ignore[arg-type]
             assert config.experiment.group == group
 
+    def test_sequential_fixture_config_binds_stage2_report(
+        self, tmp_path: Path,
+    ) -> None:
+        """组3 fixture config 的 stage-2 报告绑定（#116）：指向工件库序贯
+        变体的第二份预训练产物（cross-modal 报告）；非序贯组不携带绑定。"""
+        config = Fixture().config(tmp_path, group="sequential")
+        assert config.experiment.stage2_pretrain_report_json == (
+            tmp_path / "pretrain_run_stage2" / "pretrain_report.json"
+        )
+        assert (
+            Fixture().config(tmp_path, group="cross-modal")
+            .experiment.stage2_pretrain_report_json
+            is None
+        )
+
     def test_cross_modal_fixture_config_carries_controlnet_artifacts(
         self, tmp_path: Path,
     ) -> None:

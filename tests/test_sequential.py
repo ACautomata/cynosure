@@ -3,7 +3,8 @@
 
 验收面：两阶段顺序执行、stage-1 产物正确传入 stage-2、经 config 指定
 既有 stage-1 产物路径跳过 stage-1、每组判别器与 Replay buffer 独立
-（互不串扰的断言）。
+（互不串扰的断言）、stage 级报告绑定（#116：stage-1 消费 modal-label
+报告、stage-2 消费 cross-modal 报告——消费异组报告被组别等值守卫拒绝）。
 """
 
 import json
@@ -21,17 +22,6 @@ from tests.test_train_loop import TrainingLoopScenario
 # 环境自动跳过（conftest 执行环境分派），验证职责由集群 GPU 口径全量
 # 承担（仓库纪律：测试一律上集群）。
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]  # slow：默认跳过（--run-slow 显式全量）
-
-_XFAIL_GROUP_GUARD = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#113 组别等值守卫：stage-2（cross-modal config）装载期消费 "
-        "modal-label 报告被显式拒绝（测试基建的两阶段共享单份报告属跨组 "
-        "消费）；#116（序贯 stage-2 报告路径绑定）交付合法的 stage 级报告"
-        "消费路径后须拆除本标记——strict xfail 在路径就绪时以 XPASS 报错 "
-        "强制拆除"
-    ),
-)
 
 
 @pytest.fixture
@@ -59,8 +49,17 @@ class TestStagePlan:
         expected_base = scenario.run_dir / "checkpoints" / "policy_iter1.pt"
         assert plan[1].config.artifacts.unet_ckpt == expected_base
         assert config.artifacts.unet_ckpt != expected_base  # 原 config 未被改写
+        # stage 级报告绑定重写（#116）：stage-1 消费 top-level 报告
+        # （modal-label），stage-2 消费绑定路径（cross-modal），不继承
+        assert plan[0].config.reward.pretrain_report_json == (
+            config.reward.pretrain_report_json
+        )
+        assert plan[1].config.reward.pretrain_report_json == (
+            config.experiment.stage2_pretrain_report_json
+        )
+        assert plan[0].config.experiment.stage2_pretrain_report_json is None
+        assert plan[1].config.experiment.stage2_pretrain_report_json is None
 
-    @_XFAIL_GROUP_GUARD
     def test_plan_skips_stage1_with_existing_product(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -112,6 +111,11 @@ class TestStagePlan:
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["experiment"]["group"] = "sequential"  # 组3 config + 误指的 stage1_run_dir
         data["experiment"]["stage1_run_dir"] = str(scenario.run_dir)
+        # stage-2 报告绑定（#116 schema 必填；本用例拒绝发生在计划期的
+        # stage1_run_dir 组别先验检查，绑定路径不被消费）
+        data["experiment"]["stage2_pretrain_report_json"] = (
+            str(scenario.fixture_dir / "pretrain_run_stage2" / "pretrain_report.json")
+        )
         (tmp_path / "wrong_group_stage1.json").write_text(
             json.dumps(data), encoding="utf-8",
         )
@@ -127,14 +131,27 @@ class TestStagePlan:
 class TestSequentialRun:
     """CLI 端到端：两阶段顺序执行、产物布局、事件流按 stage 归因。"""
 
-    @_XFAIL_GROUP_GUARD
     def test_single_run_executes_both_stages_in_order(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         scenario.write_inputs(group="sequential")
+        # 库场景 stage 级报告映射（#116）：两份预训练产物各阶段一份，
+        # cross-modal 报告由 pretrain driver 真跑产出（非 stub）
+        stage2_report = json.loads(
+            (scenario.fixture_dir / "pretrain_run_stage2" / "pretrain_report.json")
+            .read_text(encoding="utf-8"),
+        )
+        stage1_report = json.loads(
+            (scenario.fixture_dir / "pretrain_run" / "pretrain_report.json")
+            .read_text(encoding="utf-8"),
+        )
+        assert stage2_report["group"] == "cross-modal"
+        assert stage1_report["group"] == "modal-label"
         assert scenario.train().code == 0, scenario.stderr
         events = scenario.events()
         # stage-1 与 stage-2 各一 iteration，顺序排列、stage 字段区分
+        # （stage-2 能开跑 = cross-modal 报告通过 readiness gate 与
+        # warm-start 组别守卫——两阶段各自消费同组报告）
         assert [(event["stage"], event["iteration"]) for event in events] == [(1, 0), (2, 0)]
         checkpoints = scenario.run_dir / "checkpoints"
         # stage-1 产物（无前缀 = 与独立组1 run 同布局，可作 stage1_run_dir 复用）
@@ -144,7 +161,6 @@ class TestSequentialRun:
         assert (checkpoints / "stage2_policy_iter1.pt").is_file()
         assert (checkpoints / "stage2_discriminator_iter1.pt").is_file()
 
-    @_XFAIL_GROUP_GUARD
     def test_stage1_product_is_trained_base_loadable(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -163,7 +179,6 @@ class TestSequentialRun:
             for name, value in initial.items()
         )
 
-    @_XFAIL_GROUP_GUARD
     def test_stage2_policy_loads_as_controlnet(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -180,7 +195,6 @@ class TestSequentialRun:
         ))
         assert any(p.requires_grad for p in reloaded.parameters())
 
-    @_XFAIL_GROUP_GUARD
     def test_stage2_trainer_assembles_base_prime_weights(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -206,7 +220,6 @@ class TestSequentialRun:
             not p.requires_grad for p in stage2_trainer.unet.parameters()
         )  # base′ 在 stage-2 中冻结
 
-    @_XFAIL_GROUP_GUARD
     def test_skip_stage1_via_config_runs_stage2_only(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -234,7 +247,6 @@ class TestStageIndependence:
     """AC「每组判别器与 Replay buffer 独立（互不串扰）」：组3 两阶段在
     同一次运行内也各持独立判别器与 buffer。"""
 
-    @_XFAIL_GROUP_GUARD
     def test_stage_discriminators_train_independently(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -255,7 +267,6 @@ class TestStageIndependence:
             for name in stage1_disc
         )
 
-    @_XFAIL_GROUP_GUARD
     def test_stage2_buffer_seeded_fresh_not_from_stage1_fakes(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -270,3 +281,31 @@ class TestStageIndependence:
         assert stage2_event["buffer_recent_occupied"] == 25  # 全新 buffer，非 50
         assert stage2_event["buffer_base_occupied"] == 32  # stage-2 自行生成的 base 分区
         assert stage2_event["buffer_replay_fraction"] == pytest.approx(0.5)
+
+
+class TestStage2ReportBinding:
+    """stage 级报告绑定（#116）：stage-2 消费 cross-modal 预训练报告；
+    绑定误指 stage-1 的 modal-label 报告时被 #113 组别等值守卫在装载期
+    拒绝，报错指引 stage2_pretrain_report_json 配置面。"""
+
+    def test_stage2_pointing_at_stage1_report_rejected_by_group_guard(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """stage-2 绑定误指 stage-1 报告：stage-1（同组消费）照常完成，
+        stage-2（cross-modal config 装载 modal-label 报告）被组别等值
+        守卫拒绝——跨组消费无逃生门，不静默继承也不换报告续跑；报错
+        指引绑定配置面与两侧组别值。"""
+        scenario.write_inputs(group="sequential")
+        stage1_report = (
+            scenario.fixture_dir / "pretrain_run" / "pretrain_report.json"
+        )
+        scenario.patch_config(experiment={
+            "stage2_pretrain_report_json": str(stage1_report),
+        })
+        result = scenario.train()
+        assert result.code == 2
+        assert "组别" in result.stderr  # 守卫拒绝语义
+        assert "modal-label" in result.stderr  # 报告侧组别值
+        assert "cross-modal" in result.stderr  # stage-2 消费侧组别值
+        assert "stage2_pretrain_report_json" in result.stderr  # 指引配置面
+        assert "Traceback" not in result.stderr  # 干净报错，非裸 traceback

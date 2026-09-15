@@ -431,20 +431,35 @@ class FixtureArtifactLibrary:
         if reward:
             config.reward = config.reward.model_copy(update=reward)
         pretrain_config = PretrainLightweightReward.apply(config)
-        # 序贯降级（#113 注释）：组3 两阶段共享此单份报告——stage-1
-        # （modal-label config）同组消费通过等值守卫；stage-2（cross-modal
-        # config）消费它在装载期被显式拒绝（跨组消费无逃生门）。stage 级
-        # 报告映射（stage-2 消费 cross-modal 报告）随 #116 交付，届时本
-        # 降级与 test_sequential 的 xfail 哨兵一并拆除。
-        pretrain_config.experiment.group = (
-            "modal-label" if group == "sequential" else group
-        )
-        pretrain_path = cls._library_root() / f"pretrain_config_{token}.json"
-        pretrain_path.write_text(
-            pretrain_config.model_dump_json(indent=2), encoding="utf-8",
-        )
-        result = cli.run("pretrain", "--config", str(pretrain_path))
-        assert result.code == 0, result.stderr
+        # stage 级报告映射（#116）：序贯变体真跑**两份**预训练——stage-1
+        # 消费 modal-label 报告（pretrain_run/）、stage-2 消费 cross-modal
+        # 报告（pretrain_run_stage2/；driver 已按 config 完全参数化，同
+        # 一条路径仅 config 不同）；单阶段组沿用本组一份
+        if group == "sequential":
+            pretrain_jobs = [
+                ("modal-label", fixture_dir / "pretrain_run"),
+                ("cross-modal", fixture_dir / "pretrain_run_stage2"),
+            ]
+        else:
+            pretrain_jobs = [(group, fixture_dir / "pretrain_run")]
+        for job_group, run_dir in pretrain_jobs:
+            job = pretrain_config.model_copy(deep=True)
+            job.experiment.group = job_group
+            # 序贯编排字段（stage1_run_dir / stage2_pretrain_report_json）
+            # 只对组3 有语义：预训练 job 是单阶段组别 config，不携带
+            job.experiment.stage1_run_dir = None
+            job.experiment.stage2_pretrain_report_json = None
+            job.reward.pretrain_report_json = str(
+                run_dir / "pretrain_report.json",
+            )
+            pretrain_path = cls._library_root() / (
+                f"pretrain_config_{token}_{job_group}.json"
+            )
+            pretrain_path.write_text(
+                job.model_dump_json(indent=2), encoding="utf-8",
+            )
+            result = cli.run("pretrain", "--config", str(pretrain_path))
+            assert result.code == 0, result.stderr
         cls._normalize_whitelist(fixture_dir)
         SceneCache.store(disk_key, fixture_dir)
         cls._cache[signature] = fixture_dir
@@ -458,13 +473,18 @@ class FixtureArtifactLibrary:
         决策 7，issue #89）落码后，名单外条件的 policy 更新被跳过，
         既有循环测试的 policy loss 断言会随条件采样摇。归一 = 门控不
         触发的场景前置；门控/白名单语义的专项测试 fork 私有 report
-        （``fork_pretrained_artifacts``）后显式收窄名单。盘上缓存
-        （SceneCache）不回写——归一只发生在进程私有的恢复副本上。"""
-        report_path = fixture_dir / "pretrain_run" / "pretrain_report.json"
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        if report["gate_whitelist"] != list(MODALITIES):
-            report["gate_whitelist"] = list(MODALITIES)
-            report_path.write_text(json.dumps(report), encoding="utf-8")
+        （``fork_pretrained_artifacts``）后显式收窄名单。序贯变体的两份
+        报告（stage-1 modal-label + stage-2 cross-modal，#116）一并归一
+        ——两阶段的目标端词汇表同为四序列（组2 轮转集 = 有序对清单的
+        目标端去重）。盘上缓存（SceneCache）不回写——归一只发生在进程
+        私有的恢复副本上。"""
+        for report_path in sorted(
+            fixture_dir.glob("pretrain_run*/pretrain_report.json"),
+        ):
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report["gate_whitelist"] != list(MODALITIES):
+                report["gate_whitelist"] = list(MODALITIES)
+                report_path.write_text(json.dumps(report), encoding="utf-8")
 
 
 class RecordingScorer:
