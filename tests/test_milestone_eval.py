@@ -149,6 +149,28 @@ class PatchRecordingVae(torch.nn.Module):
 class TestLatentDomainAndSlidingWindow:
     """生产解码器的两域归位与滑窗编排（官方 NV-Generate-CTMR 同策略）。"""
 
+    def _inject_recording_vae(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> tuple[PatchRecordingVae, NetworkArtifact]:
+        """替身分派测试的共用装配缝：写输入、装载 fixture VAE 工件、把
+        decode 模块的 ``NetworkAssembler`` 换成记录替身工厂（滑窗/豁免
+        分派的运行时观测面）。"""
+        scenario.write_inputs()
+        vae = PatchRecordingVae()
+        config = ConfigLoader.load(scenario.config_path)
+        artifact = NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
+            checkpoint=config.artifacts.vae_ckpt,
+        )
+
+        def assembled(unused_artifact):
+            return vae
+
+        monkeypatch.setattr(
+            "cynosure.eval.decode.NetworkAssembler", SimpleNamespace(vae=assembled),
+        )
+        return vae, artifact
+
     def _decoder(
         self,
         scenario: TrainingLoopScenario,
@@ -178,25 +200,11 @@ class TestLatentDomainAndSlidingWindow:
     def test_large_latents_slide_window_small_ones_go_whole(
         self, scenario: TrainingLoopScenario, monkeypatch,
     ) -> None:
-        """官方 dynamic_infer 小体豁免语义：单样本元素数 ≤ roi 元素数
-        → 整前向（fixture 夹具尺寸恒走此路）；超出 → SlidingWindowInferer
-        按 roi 分块前向（sw_batch_size=1 高斯聚合）。"""
-        scenario.write_inputs()
-        vae = PatchRecordingVae()
-        config = ConfigLoader.load(scenario.config_path)
-        artifact = NetworkArtifact(
-            config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
-            checkpoint=config.artifacts.vae_ckpt,
-        )
-
-        def assembled(unused_artifact):
-            # 装配缝替换：真 VAE → 记录替身（滑窗行为的运行时观测面）
-            return vae
-
-        monkeypatch.setattr(
-            "cynosure.eval.decode.NetworkAssembler", SimpleNamespace(vae=assembled),
-        )
-        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048
+        """官方 dynamic_infer 小体豁免语义：单样本单通道空间体素数
+        ≤ roi 元素数 → 整前向（fixture 夹具尺寸恒走此路）；超出 →
+        SlidingWindowInferer 按 roi 分块前向（sw_batch_size=1 高斯聚合）。"""
+        vae, artifact = self._inject_recording_vae(scenario, monkeypatch)
+        latents = torch.randn(1, 4, 16, 16, 8)  # 单通道 16×16×8 = 2048
         LatentDecoder(artifact, torch.device("cpu"), 1.0, (48, 48, 48), 0.5).decode(latents)
         assert vae.patch_shapes == [(1, 4, 16, 16, 8)]  # 豁免：一次整前向
 
@@ -206,6 +214,33 @@ class TestLatentDomainAndSlidingWindow:
             max(shape[2:]) <= 8 for shape in vae.patch_shapes[1:]
         )  # 每个窗口的空间维 ≤ roi（豁免前向不计）
         assert tuple(sliding.shape) == (1, 1, 64, 64, 32)  # 4× 上采样拼合完整
+
+    def test_exemption_boundary_single_channel_voxel_count(
+        self, scenario: TrainingLoopScenario, monkeypatch,
+    ) -> None:
+        """豁免边界替身测试（issue #142）：判定 = 单样本**单通道**空间
+        体素数（官方 NV-Generate-CTMR ``dynamic_infer`` 判定式逐字同构），
+        prod(roi) = 48³ = 110,592。边界两侧量级各一例，断言分派：
+        - 恰在边界（单通道 64×64×27 = 110,592，含 `<=` 等值点）→ 整前向
+          一次——含 4 通道的旧 numel 口径下同一 latent（numel 442,368）
+          走 4 窗滑窗，分派翻转锁定在等值点；
+        - 严格超出（单通道 56³ = 175,616 > 110,592）→ 滑窗分块。
+        边界例各维不取 48³ 本身：roi == 图像尺寸时 MONAI 滑窗退化为
+        单窗整前向，patch 形状观测面不可区分两分派。"""
+        vae, artifact = self._inject_recording_vae(scenario, monkeypatch)
+        decoder = LatentDecoder(artifact, torch.device("cpu"), 1.0, (48, 48, 48), 0.5)
+
+        vae.patch_shapes.clear()
+        decoded = decoder.decode(torch.randn(1, 4, 64, 64, 27))
+        assert vae.patch_shapes == [(1, 4, 64, 64, 27)]  # 豁免：恰在边界，一次整前向
+        assert tuple(decoded.shape) == (1, 1, 256, 256, 108)  # 4× 上采样完整拼合
+
+        vae.patch_shapes.clear()
+        decoder.decode(torch.randn(1, 4, 56, 56, 56))
+        assert len(vae.patch_shapes) > 1  # 滑窗：分块发生
+        assert all(
+            max(shape[2:]) <= 48 for shape in vae.patch_shapes
+        )  # 每个窗口的空间维 ≤ roi
 
 
 class TestFp16AutocastDecoding:
@@ -237,7 +272,7 @@ class TestFp16AutocastDecoding:
         """小体豁免整前向路径：``norm_float16=true`` 下解码不再抛 dtype 错，
         输出逐元素有限、出口上浮 fp32（下游指标/落盘契约）。"""
         scenario.write_inputs()
-        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048 ≤ 48³ → 整前向
+        latents = torch.randn(1, 4, 16, 16, 8)  # 单通道 2048 ≤ 48³ → 整前向
         decoded = LatentDecoder(
             self._norm_float16_artifact(scenario), torch.device("cpu"),
             1.0, (48, 48, 48), 0.5,
@@ -252,7 +287,7 @@ class TestFp16AutocastDecoding:
         """滑窗路径（生产大体积语义）：超出豁免阈值的 latent 分块解码
         不抛 dtype 错，输出逐元素有限、出口上浮 fp32。"""
         scenario.write_inputs()
-        latents = torch.randn(1, 4, 16, 16, 8)  # numel 2048 > 8³ → 滑窗
+        latents = torch.randn(1, 4, 16, 16, 8)  # 单通道 2048 > 8³ → 滑窗
         decoded = LatentDecoder(
             self._norm_float16_artifact(scenario), torch.device("cpu"),
             1.0, (8, 8, 8), 0.5,

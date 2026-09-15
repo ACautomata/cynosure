@@ -38,10 +38,14 @@ class LatentDecoder:
     同一语义）。生产因子随基座 checkpoint 核对（config
     ``policy.latent_scale_factor``）；fixture 取中性 1.0（除法恒等）。
 
-    解码编排（官方 NV-Generate-CTMR 同策略）：单样本元素数 ≤ roi 元素数
-    时整前向（官方 ``dynamic_infer`` 小体豁免——fixture 夹具尺寸恒走
-    此路）；否则 ``SlidingWindowInferer`` 按 latent 空间 roi 高斯加权
-    分块解码（``sw_batch_size=1``、``mode="gaussian"``，官方口径）。
+    解码编排（官方 NV-Generate-CTMR ``dynamic_infer`` 判定式逐字同构）：
+    单样本**单通道空间体素数**（``torch.numel(images[0:1, 0:1, ...])``）
+    ≤ roi 元素数时整前向（官方小体豁免——fixture 夹具尺寸恒走此路）；
+    否则 ``SlidingWindowInferer`` 按 latent 空间 roi 高斯加权分块解码
+    （``sw_batch_size=1``、``mode="gaussian"``，官方口径）。#142 修正：
+    修正前误用含通道因子的 numel（4 通道 latent 的豁免边界缩 4 倍），
+    单通道空间体素数 ∈ (27,648, 110,592] 的中等体 latent 由滑窗回归
+    上游同边界整前向。
     """
 
     def __init__(
@@ -89,7 +93,7 @@ class LatentDecoder:
         scaled = latents / self._latent_scale_factor
         with torch.no_grad():
             with torch.autocast(self._device.type, dtype=torch.float16):
-                if scaled[0].numel() <= math.prod(self._roi_size):
+                if torch.numel(scaled[0:1, 0:1, ...]) <= math.prod(self._roi_size):
                     decoded = self._vae.decode(scaled)
                 else:
                     decoded = SlidingWindowInferer(
