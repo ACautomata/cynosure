@@ -637,9 +637,9 @@ class ScheduleConfig(BaseModel):
         "tunable", "本 spec 补钉",
         "VAE 解码滑动窗口的 latent 空间 roi（三轴；官方 NV-Generate-CTMR "
         "config_infer 的 autoencoder_sliding_window_infer_size = [48,48,48]）"
-        "——生产大体积（256³ 级）整前向解码是 OOM 级分配；单样本元素数 "
-        "≤ roi 元素数时整前向（官方 dynamic_infer 小体豁免语义，fixture "
-        "恒走此路）",
+        "——生产大体积（256³ 级）整前向解码是 OOM 级分配；单样本单通道"
+        "空间体素数 ≤ roi 元素数时整前向（官方 dynamic_infer 小体豁免"
+        "语义，issue #142 单通道口径修正，fixture 恒走此路）",
         default=[48, 48, 48],
     )
     decode_overlap: float = SpecField(
