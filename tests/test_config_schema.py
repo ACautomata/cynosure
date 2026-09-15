@@ -567,6 +567,28 @@ class TestPreprocessingSchema:
             CynosureConfig.model_validate(data)
         assert ("preprocessing", "resize_base") in self._locations(exc_info.value)
 
+    def test_encode_sliding_window_defaults_anchor_nvidia(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """encode 滑窗参数锚 NVIDIA（#143）：roi [320,320,160] 影像空间、
+        overlap 0.4（create_training_data 锚，T12 复核探针复核后交付）。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.preprocessing.encode_roi_size == [320, 320, 160]
+        assert config.preprocessing.encode_overlap == 0.4
+
+    def test_encode_overlap_out_of_range_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """encode overlap 域 [0, 1)：越界（≥1 或负）在 schema 拒绝。"""
+        for bad in (1.0, -0.1, 1.5):
+            data = copy.deepcopy(valid_config_dict)
+            data["preprocessing"] = {"encode_overlap": bad}
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("preprocessing", "encode_overlap") in self._locations(
+                exc_info.value,
+            )
+
     @staticmethod
     def _locations(exc: ValidationError) -> list[tuple]:
         return [err["loc"] for err in exc.errors()]

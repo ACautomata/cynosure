@@ -13,6 +13,8 @@ import nibabel as nib
 import numpy as np
 import pytest
 import torch
+from monai.data.utils import dense_patch_slices
+from monai.inferers.inferer import SlidingWindowInferer
 
 from cynosure.config import CynosureConfig, MODALITIES, ConfigLoader
 from cynosure.fixtures import Fixture
@@ -420,7 +422,8 @@ class TestPrepareInputGuard:
 class MeanPoolEncoderTwin:
     """AutoencoderKlMaisi.encode 的均值池化替身（4× 空间压缩语义）：记录每次
     encode 调用的输入形状（整前向豁免的运行时观测面），返回 (z_mu, z_sigma)
-    二元组与真实 encode 同构。"""
+    二元组与真实 encode 同构。z_sigma 恒零：b 语义下 z = μ_blend，豁免与
+    滑窗两路输出的确定性对照面。"""
 
     def __init__(self) -> None:
         self.encode_shapes: list[tuple[int, ...]] = []
@@ -437,6 +440,30 @@ class MeanPoolEncoderTwin:
             batch.repeat(1, 4, 1, 1, 1), kernel_size=4, stride=4,
         )  # 单通道 → 4 latent 通道（VAE latent_channels=4 同构）
         return latent, torch.zeros_like(latent)
+
+
+class SigmaFieldEncoderTwin:
+    """非均匀 z_sigma 替身（b 语义滑窗拼合的判别面）：μ = 均值池化、
+    σ = 1 + |μ|（非负、随输入强度场非均匀）。z_sigma 恒零或恒定时
+    「拼 μ/σ 后单次采样」与「逐窗采样拼 z」的输出不可区分；非均匀 σ 使
+    错误拼合在经验方差上留痕——b 语义下逐 voxel 经验 std 跟随 σ_blend
+    （接缝带与体心均匀），a 语义逐窗采样在多窗覆盖区收缩 g=√(Σw²)/Σw。"""
+
+    def __init__(self) -> None:
+        self.encode_shapes: list[tuple[int, ...]] = []
+
+    def to(self, device: torch.device) -> "SigmaFieldEncoderTwin":
+        return self
+
+    def eval(self) -> "SigmaFieldEncoderTwin":
+        return self
+
+    def encode(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.encode_shapes.append(tuple(batch.shape))
+        z_mu = torch.nn.functional.avg_pool3d(
+            batch.repeat(1, 4, 1, 1, 1), kernel_size=4, stride=4,
+        )
+        return z_mu, 1.0 + z_mu.abs()
 
 
 class TestMaisiLatentEncoder:
@@ -519,14 +546,14 @@ class TestMaisiLatentEncoder:
         with pytest.raises(ValueError, match="影像体须为"):
             encoder.encode(torch.randn(2, 1, 64, 64, 32))  # 带 batch 维
 
-    def test_whole_forward_within_threshold_large_rejected(
+    def test_whole_forward_within_threshold_sliding_beyond(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """官方 dynamic_infer 小体豁免语义：单样本元素数 ≤ 阈值元素数
-        → 整前向（BraTS [1,1,256,256,128]=8.39M ≤ 影像空间阈值
-        [320,320,160]，生产恒走此路）；超过 → 显式拒绝而非滑窗
-        （MONAI SlidingWindowInferer 对下采样 encoder 拼合通道错乱，
-        静默错误比显式失败危险）。"""
+        """上游 dynamic_infer 小体豁免语义（#143 错误契约变更）：单样本
+        空间体素数 ≤ 阈值元素数 → 恰一次整前向（等号侧含——BraTS
+        [1,1,256,256,128]=8.39M ≤ 影像空间阈值 [320,320,160]，生产恒走
+        此路）；超过 → 窗口序列而非显式拒绝（MONAI 1.6 z_scale 路径对
+        下采样网络逐格拼合，T12 复核探针推翻原裁决）。"""
         artifact = self.artifact(tmp_path)
         image = torch.randn(self.ENCODE_INPUT_SHAPE)
 
@@ -539,10 +566,191 @@ class TestMaisiLatentEncoder:
         assert twin.encode_shapes == [(1, 1, 64, 64, 32)]  # 豁免：一次整前向
         assert tuple(latent.shape) == self.LATENT_SHAPE
 
-        small_threshold = self.encoder(artifact, roi_size=(32, 32, 32))
-        with pytest.raises(ValueError, match="整前向豁免阈值"):
-            small_threshold.encode(image)
-        assert len(twin.encode_shapes) == 1  # 拒绝路径不产生前向
+        # 等号边界：空间体素数 == prod(roi) 仍属豁免侧（≤ 判定式）
+        equal = self.encoder(artifact, roi_size=(64, 64, 32))
+        equal.encode(image)
+        assert twin.encode_shapes[-1] == (1, 1, 64, 64, 32)  # 仍一次整前向
+
+        # 超界：走窗口序列（不再 raise），输出形状契约不变
+        sliding = self.encoder(artifact, roi_size=(32, 32, 32))
+        latent = sliding.encode(image, noise_seed=42)
+        assert len(twin.encode_shapes) > 2  # 多窗分块发生
+        assert all(
+            shape == (1, 1, 32, 32, 32) for shape in twin.encode_shapes[2:]
+        )  # 每窗空间维 = clamp 后 roi（豁免前向不计）
+        assert tuple(latent.shape) == self.LATENT_SHAPE
+
+    def test_sliding_b_semantics_stores_blended_posterior_sample(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """b 语义（#143）：滑窗拼合 z_mu/z_sigma 后用单一内容寻址种子
+        采样一次——encoder 输出与「MONAI 滑窗直调替身 + 单次 seeded eps」
+        逐位相等。逐窗采样拼 z（NVIDIA a 语义，本仓记录在案偏离）的
+        实现把 eps 流按窗分配，输出不等于 blend + 单 eps，此断言可检出。"""
+        artifact = self.artifact(tmp_path)
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+        roi, overlap, seed = (32, 32, 32), 0.4, 7
+
+        twin = SigmaFieldEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+        latent = self.encoder(
+            artifact, roi_size=roi, overlap=overlap,
+        ).encode(image, noise_seed=seed)
+
+        with torch.no_grad():  # 对照面：MONAI 滑窗作为规格 oracle
+            z_mu, z_sigma = SlidingWindowInferer(
+                roi_size=list(roi), sw_batch_size=1, progress=False,
+                mode="gaussian", overlap=overlap,
+            )(inputs=image.unsqueeze(0), network=twin.encode)
+        eps = torch.randn(
+            z_mu.shape, generator=torch.Generator().manual_seed(seed),
+        )
+        expected = (z_mu + eps * z_sigma).squeeze(0)
+        assert torch.equal(latent, expected)
+
+    def test_sliding_rerun_zero_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """重跑零漂移幂等（#143）：同 checkpoint、同 seed 的新实例经滑窗
+        路径编码逐位相等——拼合后的单次采样不引入窗口枚举序 RNG 依赖
+        （对照上游 a 语义：换窗口枚举序即换 eps 流位）；换种子换样本。"""
+        artifact = self.artifact(tmp_path)
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+
+        first = SigmaFieldEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: first),
+        )
+        encoder_a = self.encoder(artifact, roi_size=(32, 32, 32))
+        second = SigmaFieldEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: second),
+        )
+        encoder_b = self.encoder(artifact, roi_size=(32, 32, 32))
+
+        assert torch.equal(
+            encoder_a.encode(image, noise_seed=42),
+            encoder_b.encode(image, noise_seed=42),
+        )
+        assert torch.equal(
+            encoder_a.encode(image, noise_seed=42),
+            encoder_a.encode(image, noise_seed=42),
+        )  # 同实例重跑逐位
+        assert not torch.equal(
+            encoder_a.encode(image, noise_seed=42),
+            encoder_a.encode(image, noise_seed=43),
+        )  # 内容寻址：换种子换后验样本
+
+    def test_sliding_seam_variance_uniform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """接缝带方差与体心均匀（#143 b 语义验收面）：非均匀 z_sigma 替身
+        下，多 seed 经验 std 逐 voxel 跟随 σ_blend（相对偏差均值 ≤ 3%），
+        接缝带/体心的方差比与 σ_blend 的同构——「逐窗采样拼 z」的 a 语义
+        在多窗覆盖区以 g=√(Σw²)/Σw < 1 收缩，偏差量级足以越出容差。"""
+        artifact = self.artifact(tmp_path)
+        roi, overlap = (32, 32, 32), 0.4
+        depth, height, width = 64, 64, 32
+        # 确定性非均匀强度场：对角梯度使 μ ∈ [0,1] 连续变化 → σ 非均匀
+        grid_d = torch.linspace(0.0, 1.0, depth).view(depth, 1, 1)
+        grid_h = torch.linspace(0.0, 1.0, height).view(1, height, 1)
+        grid_w = torch.linspace(0.0, 1.0, width).view(1, 1, width)
+        image = ((grid_d + grid_h + grid_w) / 3.0).unsqueeze(0)  # [1, D, H, W]
+
+        twin = SigmaFieldEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+        encoder = self.encoder(artifact, roi_size=roi, overlap=overlap)
+        seeds = list(range(48))
+        samples = torch.stack([
+            encoder.encode(image, noise_seed=seed) for seed in seeds
+        ])  # [K, 4, D/4, H/4, W/4]
+        # 替身 4 通道同值：取通道 0 降维，掩码与统计量同网格
+        std_empirical = samples.std(dim=0, unbiased=True)[0]
+
+        with torch.no_grad():  # σ_blend：MONAI 滑窗规格 oracle
+            _, z_sigma = SlidingWindowInferer(
+                roi_size=list(roi), sw_batch_size=1, progress=False,
+                mode="gaussian", overlap=overlap,
+            )(inputs=image.unsqueeze(0), network=twin.encode)
+        sigma_blend = z_sigma[0, 0]
+
+        # 前提：替身 σ 场确非均匀（否则 a/b 语义不可区分，测试失效）
+        assert sigma_blend.std() / sigma_blend.mean() >= 0.1
+        # b 语义：经验 std 逐 voxel 跟随 σ_blend（48 seed 的 std 估计噪声
+        # ~10%，跨 voxel 聚合后 ~0.2%；a 语义多窗区收缩 15-25% 越出容差）
+        deviation = ((std_empirical / sigma_blend) - 1.0).mean()
+        assert abs(deviation) <= 0.03
+        # 接缝带（≥2 窗覆盖）与体心（单窗）方差比 = σ_blend 的同构比
+        band, center = self._seam_masks(
+            (depth, height, width), roi, overlap,
+        )
+        empirical_ratio = (
+            std_empirical[band].mean() / std_empirical[center].mean()
+        )
+        oracle_ratio = (
+            sigma_blend[band].mean() / sigma_blend[center].mean()
+        )
+        assert abs(empirical_ratio / oracle_ratio - 1.0) <= 0.05
+
+    @staticmethod
+    def _seam_masks(
+        grid: tuple[int, int, int],
+        roi: tuple[int, int, int],
+        overlap: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """latent 网格上的（接缝带, 体心）掩码：窗口切片按 MONAI scan
+        interval 公式与 z_scale 写入坐标（int(start·z)）落 latent 网格，
+        被 ≥2 窗覆盖的 voxel 为接缝带、恰 1 窗为体心。"""
+        clamped = [min(r, s) for r, s in zip(roi, grid)]
+        interval = [
+            r if r == s else max(int(r * (1.0 - overlap)), 1)
+            for r, s in zip(clamped, grid)
+        ]
+        slices = dense_patch_slices(grid, clamped, interval)
+        latent_grid = tuple(size // 4 for size in grid)
+        coverage = torch.zeros(latent_grid)
+        for window in slices:
+            latent_window = tuple(
+                slice(int(s.start // 4), int(s.stop // 4))
+                for s in window
+            )
+            coverage[latent_window] += 1
+        return coverage >= 2, coverage == 1
+
+    def test_window_layout_nvidia_scan_semantics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """窗口布局符合 NVIDIA 语义（#143）：overlap 派生 scan interval
+        （int(roi·(1−overlap))，roi==维时整轴单窗）的窗口序列；roi 逐轴
+        clamp 到影像尺寸先于布局计算（超界轴不产窗）。overlap=0 退化为
+        精确平铺（ceil 网格），0.4（NVIDIA 锚）为重叠扫描。"""
+        artifact = self.artifact(tmp_path)
+        image = torch.randn(self.ENCODE_INPUT_SHAPE)
+
+        def window_count(roi: tuple[int, int, int], overlap: float) -> int:
+            twin = MeanPoolEncoderTwin()
+            monkeypatch.setattr(
+                "cynosure.reward.encoder.NetworkAssembler",
+                SimpleNamespace(vae=lambda unused_artifact: twin),
+            )
+            self.encoder(artifact, roi_size=roi, overlap=overlap).encode(image)
+            return len(twin.encode_shapes)
+
+        interval = (19, 19, 32)  # int(32·0.6)、int(32·0.6)、roi==维
+        expected = len(dense_patch_slices((64, 64, 32), (32, 32, 32), interval))
+        assert window_count((32, 32, 32), 0.4) == expected
+        # roi 超 W 轴影像尺寸：clamp 到 (32,32,32) 先于布局，布局不变形
+        assert window_count((32, 32, 64), 0.4) == expected
+        # overlap=0：精确平铺，ceil(64/32)²·ceil(32/32) = 4 窗
+        assert window_count((32, 32, 32), 0.0) == 4
 
     def test_invalid_roi_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="roi"):
@@ -581,6 +789,35 @@ class TestPrepareEncoderDispatch:
         encoder = PreparePipeline.build_encoder(config, torch.device("cpu"))
         assert isinstance(encoder, MaisiLatentEncoder)
         assert encoder.name == "autoencoderkl_maisi"
+
+    def test_sliding_params_flow_from_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """encode 滑窗 roi/overlap 经既有 spec 字段通道贯通（#143，与
+        decode 的 decode_roi_size/decode_overlap 同构）：config 注入
+        直达生产编码器的窗口布局（fixture 与生产同链验证、参数可追溯）。"""
+        artifacts = Fixture().write_artifacts(tmp_path / "fixtures")
+
+        def window_count(overlap: float) -> int:
+            data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+            data["artifacts"]["vae_ckpt"] = str(artifacts.vae_ckpt)
+            data["artifacts"]["vae_config_json"] = str(artifacts.vae_config_json)
+            data["preprocessing"] = {
+                "encode_roi_size": [32, 32, 32],
+                "encode_overlap": overlap,
+            }
+            config = CynosureConfig.model_validate(data)
+            twin = MeanPoolEncoderTwin()
+            monkeypatch.setattr(
+                "cynosure.reward.encoder.NetworkAssembler",
+                SimpleNamespace(vae=lambda unused_artifact: twin),
+            )
+            encoder = PreparePipeline.build_encoder(config, torch.device("cpu"))
+            encoder.encode(torch.randn(1, 64, 64, 32))
+            return len(twin.encode_shapes)
+
+        assert window_count(0.0) == 4  # overlap=0 精确平铺 ceil(64/32)²·1
+        assert window_count(0.4) == 9  # overlap=0.4 NVIDIA 锚重叠扫描
 
     def test_production_without_vae_config_rejected(self, tmp_path: Path) -> None:
         """vae_config_json 缺失（None）的生产 config：装配源不存在的

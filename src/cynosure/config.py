@@ -590,6 +590,20 @@ class PreprocessingConfig(BaseModel):
         "显式声明）",
         default=UPSTREAM_RESIZE_BASE, ge=1,
     )
+    encode_roi_size: list[int] = SpecField(
+        "定死", "data-preparation + T12 复核探针",
+        "VAE 编码滑动窗口的影像空间 roi（三轴；NVIDIA create_training_data 锚 "
+        "[320,320,160]）——单样本空间体素数 ≤ roi 元素数时整前向豁免（上游 "
+        "dynamic_infer 同语义，BraTS [1,1,256,256,128] 恒走此路）；超出时 roi "
+        "逐轴 clamp 到影像尺寸后走 SlidingWindowInferer（b 语义，#143）",
+        default=[320, 320, 160],
+    )
+    encode_overlap: float = SpecField(
+        "定死", "data-preparation + T12 复核探针",
+        "VAE 编码滑动窗口的重叠比（NVIDIA create_training_data 锚 0.4）。"
+        "mode 定死 gaussian、sw_batch_size 定死 1（上游口径）",
+        default=0.4, ge=0.0, lt=1.0,
+    )
 
 
 class ScheduleConfig(BaseModel):
