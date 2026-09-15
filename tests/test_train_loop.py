@@ -42,6 +42,7 @@ from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.buffer import ReplayEntry, base_condition_quota
+from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
     DynamicWhitelist,
@@ -50,6 +51,7 @@ from cynosure.train import (
     RunArtifacts,
 )
 from cynosure.train.whitelist import ConditionWhitelist
+from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.rollout import (
     CrossModalConditionSampler,
     ModalLabelConditionSampler,
@@ -280,6 +282,51 @@ class TestSingleIterationLoop:
         event = scenario.events()[0]
         assert event["buffer_replay_degraded"] is False
         assert event["buffer_replay_fraction"] == pytest.approx(0.5)
+
+    def test_iter_event_carries_overfit_divergence_observations(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ADR-0009-β：iter 事件观测面扩展——train 侧干净域 pairwise 准确率
+        与 per-condition 分叉 EMA 随判别器步落盘（随单步更新报告上行；
+        rank 本地读数、随 iter 事件同归并序，可扩不可改名）。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        event = scenario.events()[0]
+        acc = event["train_pairwise_acc"]
+        divergence = event["overfit_divergence_ema"]
+        assert acc is not None and 0.0 <= acc <= 1.0  # 干净域 pairwise 占比
+        assert divergence is not None and -1.0 < divergence < 1.0
+        # 分叉首观测 = train acc − held-out AUC（EMA 首观测置值）
+        assert divergence == pytest.approx(acc - event["heldout_auc"])
+
+    def test_discriminator_skip_leaves_divergence_fields_absent(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """N_d 跳过的 iteration（无判别器步、无复算）分叉观测字段为
+        None——「无观测」与「观测为 0」不靠对方推断。"""
+        scenario.write_inputs()
+        scenario.set_schedule(max_iterations=2)
+        scenario.patch_config(reward={"disc_update_interval_n_d": 2})
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        first, second = scenario.events()
+        assert first["train_pairwise_acc"] is not None
+        assert first["overfit_divergence_ema"] is not None
+        assert second["train_pairwise_acc"] is None  # N_d 跳过：无判别器步
+        assert second["overfit_divergence_ema"] is None
+
+    def test_default_threshold_emits_no_overfit_alert(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """默认报警阈值下 fixture 单 iteration 无告警（健康判别器两侧同
+        估计量、分叉贴 0）——报警面的静默侧在循环层贯通（越线触发路径
+        由 test_overfit 的边界单测与事件契约测试收口）。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        assert [
+            event for event in scenario.events()
+            if event["event"] == "overfit_alert"
+        ] == []
 
     def test_discriminator_update_interval_n_d_is_consumed(
         self, scenario: TrainingLoopScenario,
@@ -592,8 +639,12 @@ class TestCrossModalLoop:
         result = scenario.train()
         assert result.code == 0, result.stderr
         events = scenario.events()
-        assert [event["event"] for event in events] == ["iter"]
-        event = events[0]
+        # 断言面取 iter 事件（本测试的契约 = 组2 全链路绿 + iter 事件内容）：
+        # 流里可能顺带有 overfit_alert——fixture 判别器在小 real 池上
+        # 天然记忆化（ADR-0009-β 的监控面），其触发不属本测试锁定范围
+        iter_events = [event for event in events if event["event"] == "iter"]
+        assert len(iter_events) == 1
+        event = iter_events[0]
         assert event["modality"] in MODALITIES  # 目标序列归因轴（12 对的目标端）
         assert event["intra_group_reward_std"] > 0.0  # CFG=0 场的组内方差非退化
         assert "policy_step_1" in event["loss"]
@@ -973,6 +1024,7 @@ class TestDiscriminatorSideOrchestration:
                 _reward_config_for_gating(),
                 DistributedContext(0, 1, False),
             ),
+            overfit=OverfitMonitor(_reward_config_for_gating()),
         )
         fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
         coordinator.update_step(fakes, "t2w")
@@ -1387,9 +1439,9 @@ class TestGradientGating:
             iter_events[-1]["buffer_recent_occupied"]
             > iter_events[0]["buffer_recent_occupied"]
         )
-        # 门控状态随续训分片落盘（v4）：静态名单逐位恒定、无观测记录
+        # 门控状态随续训分片落盘（v4 起）：静态名单逐位恒定、无观测记录
         state = scenario.resume_state()
-        assert state["format_version"] == 4
+        assert state["format_version"] == RESUME_STATE_FORMAT_VERSION
         assert state["gating"]["members"] == ["t1n"]
         assert state["gating"]["ema"] == {}
 

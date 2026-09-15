@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from cynosure.config import Modality, RewardConfig
+from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayDraw, ReplayStore
 from cynosure.reward.sampler import RealSampling
 from cynosure.reward.scorer import LatentScorer
@@ -46,6 +47,12 @@ class UpdateReport:
     replay_degraded: bool
     """回放退化标记（ADR-0008 决策 2）：该条件回放候选不足半区需求，
     本步退化为纯 current 半区（回放 0 条、real 侧与退化后批同量）。"""
+    train_pairwise_acc: float
+    """train 侧干净域 pairwise 准确率（ADR-0009-β 决策 4）：本步更新批
+    上的干净域 no_grad 复算——更新前快照（参数未动）与同 iteration 的
+    held-out AUC（更新前测得）同刻，per-condition 分叉 =
+    EMA(train pairwise acc − held-out AUC) 的 train 侧原料。估计量与
+    held-out AUC 同一 Mann-Whitney pairwise 占比（不同采样平面）。"""
 
 
 class OnlineUpdate:
@@ -122,6 +129,10 @@ class OnlineUpdate:
                 replay_count, draw.num_base, draw.num_recent,
             )
         reals = self._real_sampler.sample(real_count, modality=modality)
+        # train 侧干净域复算（ADR-0009-β）：参数更新前、同一批上重算一次
+        # 干净域准确率随报告上行——带噪训练前向的 loss 伴生量系统性低估
+        # 分叉（带噪输入使任务天然更难），不得复用
+        train_pairwise_acc = self._clean_pairwise_accuracy(reals, fakes)
         # 参数更新前向 = 训练专用带噪入口（ADR-0009-α）：real/fake 两侧
         # 同一入口、同一噪声流（对称性 = 同一采样机制、同分布）；打分
         # 路径（patch_logits / reward / AUC）不经过本入口、恒干净域
@@ -146,4 +157,32 @@ class OnlineUpdate:
             num_recent_replay=num_recent_replay,
             modality=modality,
             replay_degraded=degraded,
+            train_pairwise_acc=train_pairwise_acc,
         )
+
+    def _clean_pairwise_accuracy(
+        self, reals: torch.Tensor, fakes: torch.Tensor,
+    ) -> float:
+        """本步更新批的 train 侧干净域 pairwise 准确率（ADR-0009-β）。
+
+        干净域打分入口（``patch_logits``）no_grad 复算——与带噪训练
+        前向同批（real/fake 两侧）、同判别器快照（发生在 optimizer.step
+        之前，参数未动），故与同 iteration 的 held-out AUC（更新前测得）
+        同刻可比，分叉 = 同一刻 in-sample 训练批 vs out-of-sample 池的
+        判别力差。估计量复用 ``HeldOutAuc.auc_from_scores``（Mann-Whitney
+        pairwise 占比，并列计 0.5）：与 held-out AUC 同一估计量、不同
+        采样平面，分叉才有「同尺可比」语义，且分数非有限的 fail-fast
+        闸口单点共用。监控前向恒 eval 相（spectral norm 的 power
+        iteration 不被监控推进，与打分/监控相位约定一致）。
+        """
+        discriminator = self.scorer.discriminator
+        was_training = discriminator.training
+        discriminator.eval()
+        try:
+            with torch.no_grad():
+                real_scores = self.scorer.patch_logits(reals).flatten()
+                fake_scores = self.scorer.patch_logits(fakes).flatten()
+        finally:
+            if was_training:
+                discriminator.train()
+        return HeldOutAuc.auc_from_scores(real_scores, fake_scores)

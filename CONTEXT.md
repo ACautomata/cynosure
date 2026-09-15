@@ -128,6 +128,10 @@ _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 判别器参数更新前向中 real 与 fake 两侧 latent 的对称加噪（ADR-0009-α）：逐样本 σ ~ U[0, σ_max]（上限 = config `reward.disc_noise_sigma_max`，暂定 0.2 待 MR-RATE 预训练曲线校准）在归一化域注入——通道归一化之后、σ 以相对通道 std 的比例参数化（免依赖 latent 存储域量级）。机制 = 冲掉单样本精确值指纹、逼判别器学平滑特征（ADA），补齐条件匹配采样把 real 侧骤缩到稀疏模态小池之后的过拟合防线后半道。training-only augmentation：噪声只进参数更新前向，reward 打分、held-out AUC、监控复算全部留在干净域——打分与训练共用前向主干，路径分流 = 训练专用带噪入口（scorer 的 `training_patch_logits`）、打分入口契约不动（双侧同噪会让 reward 每步 i.i.d. 抖动经 GRPO 组内标准化放大进 advantage，已否决；采样平均消抖因 rollout 打分成本 ×N，已否决）。σ_max = 0 是唯一关闭形态（回归锚：全链路与无注入逐位一致），不设独立 off 开关。噪声采样走专属命名随机流（`disc_noise`，随续训分片落盘），与训练/评测/AUC 流不交叉——σ_max 取值不漂移回放抽样序列；预训练与在线经同一更新原语（Online update）消费同一 knobs，预训练 driver 零改动获得注入。
 _Avoid_: 数据增强（像素域强度变换是上游 recipe 概念；这里是 latent 域判别器输入增强）、双向噪声（「双侧同噪」的歧义叫法）
 
+**过拟合分叉监控（Overfit divergence monitoring）**:
+判别器内收敛健康度观测面（ADR-0009-β）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量：带噪输入使训练批任务天然更难、系统性低估分叉），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件、按 rank 独立记账（rank 间离散 = 数据切片异质性的诊断信号，不跨 rank 平均），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank，随 iter 事件同归并序；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：不自动移出白名单、不自动调 σ（升级项留校准后另议）。RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
+_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动降 σ（升级项，校准后另议）、跨 rank 平均的分叉读数（rank 离散本身是诊断信号）
+
 **Replay buffer（回放缓冲）**:
 封顶 FIFO 的 fake latent 存库（base 时期 + 近期），条目带条件标记（目标模态标签——组2 跨模态条目按目标端归因）；更新判别器时按比例混入、回放抽取与本 iteration 条件匹配，防漂移、防灾难性遗忘。
 条件标记的落地面（ADR-0008-01）：base 分区种子按每条件配额量产（配额 ≥ 判别器更新回放半区需求是装配期硬守卫，预训练 driver 与 train 装配同口径）；回放采样按条件过滤、该条件候选不足时显式拒绝（可区分「条件不足」与「总数不足」，绝不静默回退全池混采）；在线更新在该条件候选 < 回放半区需求时该步**退化纯 current 半区**（回放 0 条、real 侧与退化后批同量匹配、iter 事件落退化标记——不静默漂移）；续训状态分片 v3 随条目标记升级，旧格式分片被版本对账显式拒绝。

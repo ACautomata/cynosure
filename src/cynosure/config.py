@@ -538,6 +538,25 @@ class RewardConfig(BaseModel):
         "不设独立 off 开关",
         default=0.2, ge=0.0,
     )
+    overfit_ema_span: int = SpecField(
+        "tunable", "ADR-0009",
+        "过拟合分叉监控的 EMA 跨度（ADR-0009 决策 4，暂定 8——与 "
+        "gating_ema_span 的 EMA(AUC) 跨度同值口径，MR-RATE 预训练曲线"
+        "校准后定版）：per-condition 分叉 = EMA(train 干净域 pairwise "
+        "acc − held-out AUC) 的平滑窗口（α = 2/(span+1)），观测流是"
+        "该条件判别器步的稀疏序列（跨度语义 = 观测条数尺度）",
+        default=8, ge=1,
+    )
+    overfit_alert_divergence: float = SpecField(
+        "tunable", "ADR-0009",
+        "overfit_alert 的分叉报警阈值（ADR-0009 决策 5，暂定 0.2，"
+        "MR-RATE 预训练曲线校准后定版）：per-condition 分叉 EMA 自下"
+        "而上越线即发 overfit_alert 事件——只报警、人工裁决，不自动移出"
+        "白名单、不自动调 σ（升级项留校准后另议）。两侧同为 [0,1] 的 "
+        "Mann-Whitney pairwise 占比，健康判别器的分叉贴 0；0 与 1 分属"
+        "「任何正分叉即报警」的噪声区与「永不报警」的哑区，均不合法",
+        default=0.2, gt=0.0, lt=1.0,
+    )
 
     @model_validator(mode="after")
     def _gating_hysteresis_band(self) -> "RewardConfig":

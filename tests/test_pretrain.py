@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
 from cynosure.fixtures import Fixture
@@ -40,6 +41,7 @@ from cynosure.train import (
     CrossModalConditionSampler,
     IterEvent,
     MilestoneEvent,
+    OverfitAlertEvent,
     PretrainEvent,
     RewindAccounting,
     RunArtifacts,
@@ -92,6 +94,18 @@ def milestone_event(iteration: int) -> MilestoneEvent:
     return MilestoneEvent(iteration=iteration, fid=1.0)
 
 
+def alert_event(iteration: int, stage: int = 1) -> OverfitAlertEvent:
+    """最小合法 overfit_alert 事件（ADR-0009-β 的分叉报警事件）。"""
+    return OverfitAlertEvent(
+        iteration=iteration,
+        stage=stage,
+        modality="t1n",
+        divergence_ema=0.3,
+        train_pairwise_acc=0.8,
+        heldout_auc=0.5,
+    )
+
+
 def event_type_vocabulary() -> set[str]:
     """指标流事件类型的判别值词汇表（由事件模型实例的 ``event`` 默认值取
     真值——判别字段的 Literal 是那一处的单一来源，测试不另抄字面量）。"""
@@ -99,6 +113,7 @@ def event_type_vocabulary() -> set[str]:
         event.event
         for event in (
             iter_event(0), milestone_event(0), pretrain_event(0),
+            alert_event(0),
         )
     }
 
@@ -152,6 +167,7 @@ class TestEventRewindAccounting:
         assert REWIND_ACCOUNTING["iter"] is RewindAccounting.ITERATION
         assert REWIND_ACCOUNTING["milestone"] is RewindAccounting.COMPLETION
         assert REWIND_ACCOUNTING["pretrain"] is RewindAccounting.EXEMPT
+        assert REWIND_ACCOUNTING["overfit_alert"] is RewindAccounting.ITERATION
 
     def test_recovery_point_covers_by_event_own_accounting(self) -> None:
         """保留边界按各型自身口径取（恢复点 = 最近 checkpoint 的计数）：
@@ -1071,3 +1087,70 @@ class TestPretrainRotationStateMachine:
             "t1n", "t1c", "t2w", "t2f",
         ]
         assert events[0]["heldout_auc"] == pytest.approx(0.9)  # 首测值落事件
+
+
+class TestOverfitAlertEventContract:
+    """overfit_alert 事件契约（ADR-0009-β，issue #105）：判别字段区分于
+    既有三型、要素齐备、非有限浮点构造期拒绝（「可扩不可改名」与「全流
+    拒绝」两口径的事件面）；回退记账按 iteration 轴随所属 iteration 删除
+    （回退重执行重发），口径表本体锁在 TestEventRewindAccounting。"""
+
+    def test_event_type_discriminant_and_roundtrip(self, tmp_path: Path) -> None:
+        """混存同一 metrics.jsonl 读取无损；要素齐备（modality、分叉值、
+        train acc、held-out AUC、rank + iteration/stage 记账轴）。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(alert_event(3))
+        artifacts.append_event(pretrain_event(0))
+        events = artifacts.read_events()
+        assert [event["event"] for event in events] == [
+            "iter", "overfit_alert", "pretrain",
+        ]
+        alert = events[1]
+        assert alert["iteration"] == 3
+        assert alert["stage"] == 1
+        assert alert["rank"] == 0
+        assert alert["modality"] == "t1n"
+        assert alert["divergence_ema"] == pytest.approx(0.3)
+        assert alert["train_pairwise_acc"] == pytest.approx(0.8)
+        assert alert["heldout_auc"] == pytest.approx(0.5)
+
+    def test_non_finite_fields_rejected(self) -> None:
+        """非有限浮点在事件构造期即拒绝（判别器数值发散不产毒事件——
+        指标 JSONL 的 NaN/Inf 非标准 token，严格消费方拒读）。"""
+        for field in ("divergence_ema", "train_pairwise_acc", "heldout_auc"):
+            for bad in (float("nan"), float("inf")):
+                fields = {
+                    "iteration": 0,
+                    "modality": "t1n",
+                    "divergence_ema": 0.3,
+                    "train_pairwise_acc": 0.8,
+                    "heldout_auc": 0.5,
+                }
+                fields[field] = bad
+                with pytest.raises(ValidationError):
+                    OverfitAlertEvent(**fields)
+
+    def test_rewind_keeps_and_drops_alerts_by_iteration(self, tmp_path: Path) -> None:
+        """RL 相告警按 iteration 轴参与回退记账：号 < 恢复点的告警保留
+        （已进 checkpoint 覆盖面的执行史）、号 ≥ 恢复点的半截告警删除
+        （重执行重发）；其他 stage 的告警一概不动。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(alert_event(0))
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(alert_event(1))
+        artifacts.append_event(alert_event(2))
+        artifacts.append_event(iter_event(2))
+        artifacts.append_event(alert_event(2, stage=2))  # 组3 stage-2 历史
+        removed = artifacts.rewind_events(2, stage=1)
+        assert removed == 2  # stage-1 的 iter@2 与 alert@2（同轴半截执行史）
+        survivors = artifacts.read_events()
+        assert [
+            (event["event"], event["iteration"], event["stage"])
+            for event in survivors
+        ] == [
+            ("overfit_alert", 0, 1),
+            ("iter", 0, 1),
+            ("overfit_alert", 1, 1),
+            ("overfit_alert", 2, 2),  # 其他 stage 的历史不动
+        ]
