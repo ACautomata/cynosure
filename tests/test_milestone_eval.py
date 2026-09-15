@@ -66,8 +66,15 @@ class TestMilestoneEventStream:
         result = scenario.train()
         assert result.code == 0, result.stderr
         events = scenario.events()
-        assert [event["event"] for event in events] == ["iter", "milestone"]
-        milestone = events[1]
+        # overfit_alert 合法插入流中（小 real 池上判别器记忆化、分叉越线
+        # 即告警）：按类型过滤后对照交错序，milestone 按类型选取
+        assert [
+            event["event"] for event in events
+            if event["event"] != "overfit_alert"
+        ] == ["iter", "milestone"]
+        milestone = next(
+            event for event in events if event["event"] == "milestone"
+        )
         assert milestone["iteration"] == 1
         assert milestone["stage"] == 1
         assert math.isfinite(milestone["fid"]) and milestone["fid"] >= 0.0
@@ -91,7 +98,12 @@ class TestMilestoneEventStream:
         scenario.set_schedule(max_iterations=1, milestone_interval=1)
         result = scenario.train()
         assert result.code == 0, result.stderr
-        milestone = scenario.events()[1]
+        # 按事件类型选取：overfit_alert 合法插入流中（小 real 池上判别
+        # 器记忆化、分叉越线即告警），位置索引不再恒定
+        milestone = next(
+            event for event in scenario.events()
+            if event["event"] == "milestone"
+        )
         assert milestone["ssim"] is not None and -1.0 <= milestone["ssim"] <= 1.0
         assert milestone["mae"] is not None and milestone["mae"] >= 0.0
         assert milestone["psnr"] is not None and 0.0 < milestone["psnr"] <= 100.0
@@ -114,7 +126,10 @@ class TestMilestoneEventStream:
             scenario.set_schedule(max_iterations=1, milestone_interval=1)
             result = scenario.train()
             assert result.code == 0, result.stderr
-            fids.append(scenario.events()[1]["fid"])
+            fids.append(next(
+                event["fid"] for event in scenario.events()
+                if event["event"] == "milestone"
+            ))
         assert fids[0] == fids[1]
 
 
@@ -830,9 +845,16 @@ class TestEarlyStopWiring:
         assert trainer.run() == 4  # 里程碑 1 立基准，2/3/4 连续 plateau → 停
         assert stub.baseline_called and stub.resample_called
         events = artifacts.read_events()
-        # 每 iteration 先落 iter 事件、里程碑再落 milestone 事件：交错流
-        assert [event["event"] for event in events] == ["iter", "milestone"] * 4
-        final_milestone = events[-1]
+        # 每 iteration 先落 iter 事件、里程碑再落 milestone 事件：交错
+        # 流（overfit_alert 合法插入，过滤后对照）
+        assert [
+            event["event"] for event in events
+            if event["event"] != "overfit_alert"
+        ] == ["iter", "milestone"] * 4
+        final_milestone = next(
+            event for event in reversed(events)
+            if event["event"] == "milestone"
+        )
         assert final_milestone["early_stop"] is True
         assert final_milestone["early_stop_reason"] == "plateau"
         assert final_milestone["criteria_summary"]["plateau_stalled"] == 1.0
@@ -857,5 +879,9 @@ class TestEarlyStopWiring:
         trainer = GranularGrpoTrainer(config, artifacts, evaluation=stub)
         assert trainer.run() == 3  # 跑满，不早停
         events = artifacts.read_events()
-        assert events[-1]["early_stop"] is False
-        assert events[-1]["early_stop_reason"] is None
+        final_milestone = next(
+            event for event in reversed(events)
+            if event["event"] == "milestone"
+        )
+        assert final_milestone["early_stop"] is False
+        assert final_milestone["early_stop_reason"] is None

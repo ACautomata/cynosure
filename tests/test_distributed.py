@@ -517,10 +517,18 @@ class TestTwoRankSharding:
         events = RunArtifacts(
             RunArtifacts.layout(scenario.run_dir),
         ).read_events()
-        # AC3：无重复、无丢失、顺序稳定——(iteration, rank) 升序且各恰一次
-        assert [(event["iteration"], event["rank"]) for event in events] == [
-            (0, 0), (0, 1), (1, 0), (1, 1),
+        # AC3：无重复、无丢失、顺序稳定——(iteration, rank) 升序且各恰
+        # 一次。只对照 iter 事件：overfit_alert 合法插入流中（fixture
+        # 小 real 池上判别器记忆化、分叉越线即告警），不属于本测试锁定
+        # 的归并序；告警的 (iteration, rank) 必须落在已归并的 iter 轴上
+        iter_pairs = [
+            (event["iteration"], event["rank"])
+            for event in events if event["event"] == "iter"
         ]
+        assert iter_pairs == [(0, 0), (0, 1), (1, 0), (1, 1)]
+        for event in events:
+            if event["event"] == "overfit_alert":
+                assert (event["iteration"], event["rank"]) in iter_pairs
 
         # AC1/AC2：各 rank 训练后 policy（FSDP full state）与判别器（DDP
         # 副本）逐位一致——梯度 allreduce 同步生效、无 rank 漂移
@@ -668,19 +676,23 @@ class TestTwoRankGating:
         assert "t1n" in gating["members"]  # 启动名单成员不被门控出带
         assert gating["ema"]  # 观测流记录（rank 0 合并的全 world 观测）
 
-        # iter 事件带门控观测面：policy_gated 是全 rank OR 归约的集体
-        # 决定——同 iteration 的各 rank 事件判定必然一致（任一 rank
-        # 条件被门控 → 全体跳过，FSDP 集合操作不错配）
         events = RunArtifacts(
             RunArtifacts.layout(scenario.run_dir),
         ).read_events()
-        assert [(event["iteration"], event["rank"]) for event in events] == [
-            (0, 0), (0, 1), (1, 0), (1, 1),
+        # iter 事件带门控观测面：policy_gated 是全 rank OR 归约的集体
+        # 决定——同 iteration 的各 rank 事件判定必然一致（任一 rank
+        # 条件被门控 → 全体跳过，FSDP 集合操作不错配）。只对照 iter
+        # 事件：overfit_alert 合法插入流中，且不带 policy_gated 字段
+        iter_events = [
+            event for event in events if event["event"] == "iter"
         ]
+        assert [
+            (event["iteration"], event["rank"]) for event in iter_events
+        ] == [(0, 0), (0, 1), (1, 0), (1, 1)]
         for iteration in (0, 1):
             flags = {
                 event["policy_gated"]
-                for event in events if event["iteration"] == iteration
+                for event in iter_events if event["iteration"] == iteration
             }
             assert len(flags) == 1
 
@@ -893,11 +905,13 @@ class TestTwoRankResume:
         SpawnedTrainWorld(
             scenario.config_path, scenario.run_dir, world=2,
         ).launch().assert_green()
+        # 只对照 iter 事件：overfit_alert 合法插入流中（小 real 池上
+        # 判别器记忆化、分叉越线即告警），不属于本测试锁定的轨迹轴
         assert [
             event["iteration"]
             for event in RunArtifacts(
                 RunArtifacts.layout(scenario.run_dir),
-            ).read_events()
+            ).read_events() if event["event"] == "iter"
         ] == [0, 0, 1, 1]
 
         scenario.patch_config(schedule={"max_iterations": 4})
@@ -906,7 +920,13 @@ class TestTwoRankResume:
         resumed_events = RunArtifacts(
             RunArtifacts.layout(scenario.run_dir),
         ).read_events()
-        assert [(event["iteration"], event["rank"]) for event in resumed_events] == [
+        # 只对照 iter 事件（告警合法入流；告警布点与新鲜世界逐位一致——
+        # 上升沿判定的 previous 即 EMA 前值、已随 v6 状态落盘，下方
+        # _CROSS_PATH 对全流含告警做逐事件对账）
+        assert [
+            (event["iteration"], event["rank"]) for event in resumed_events
+            if event["event"] == "iter"
+        ] == [
             (0, 0), (0, 1), (1, 0), (1, 1),
             (2, 0), (2, 1), (3, 0), (3, 1),
         ]

@@ -243,7 +243,11 @@ class TestSingleIterationLoop:
         result = scenario.train()
         assert result.code == 0, result.stderr
         events = scenario.events()
-        assert [event["event"] for event in events] == ["iter"]
+        # overfit_alert 合法插入流中（小 real 池上判别器记忆化、分叉越线
+        # 即告警）：只对照 iter 事件
+        assert [
+            event["event"] for event in events if event["event"] == "iter"
+        ] == ["iter"]
 
     def test_iter_event_carries_health_metrics(
         self, scenario: TrainingLoopScenario,
