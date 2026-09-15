@@ -37,7 +37,7 @@ _Avoid_: 基座（base model 指 checkpoint 本体）、参考实现
 _Avoid_: canonical 方向、ToCanonical（那是实现名）
 
 **上游 `dynamic_infer`（参照函数）**:
-NV-Generate-CTMR `utils.py` 的体积分派函数：单样本体素数 ≤ roi 元素数走整前向，否则 roi 逐轴 clamp 到图像尺寸后走滑窗。只读参照、永不 import（零依赖原则）；本仓同语义实现 = decode 侧 `LatentDecoder`（含滑窗分支）、encode 侧 `MaisiLatentEncoder`（恒整前向 + 超界显式拒绝，滑窗分支未交付）。
+NV-Generate-CTMR `utils.py` 的体积分派函数：单样本体素数 ≤ roi 元素数走整前向，否则 roi 逐轴 clamp 到图像尺寸后走滑窗。只读参照、永不 import（零依赖原则）；本仓同语义实现 = decode 侧 `LatentDecoder`（含滑窗分支）、encode 侧 `MaisiLatentEncoder`（豁免/滑窗两分支，滑窗走「b 语义」偏离）。
 _Avoid_: Dynamic_Inferer（全库无此类，上游是函数不是 Inferer 类）
 
 **Decode（解码）**:
@@ -45,8 +45,12 @@ latent → 像素域的 VAE 解码，只发生在评测路径（Baseline 采样�
 _Avoid_: Dynamic_Inferer、逐 iteration 解码
 
 **预编码（Encode）**:
-影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写，幂等重跑），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构）；超界滑窗分支未交付（NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4）。
-_Avoid_: 编码器推理、把「encoder 滑窗」当既有能力引用
+影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写，幂等重跑），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构，BraTS 全语料恒整前向）；超界走滑窗分支（b 语义，NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4、T12 复核探针改判后交付）。
+_Avoid_: 编码器推理、「超界显式拒绝」作现状引用
+
+**b 语义（blend-then-sample）**:
+encode 滑窗的采样编排：MONAI `SlidingWindowInferer` 包 encoder 确定性前向，逐窗 (z_mu, z_sigma) 在 latent 网格高斯加权拼合，拼合**后**以单一内容寻址种子采样一次 eps——重跑零漂移幂等保持、接缝带方差与体心均匀。对 NVIDIA 的逐窗采样拼接（a 语义，接缝方差收缩）为记录在案偏离（#139/#143）。
+_Avoid_: 逐窗采样拼接当本仓语义、a/b 语义混称
 
 **上游锚（Upstream anchor）**:
 对齐的双重锚。recipe 级分线：BraTS 线锚 fork（ADR-0006，`clip=True` 为记录在案故意偏差），MR-RATE 线锚 NVIDIA 真上游 v1（`clip=False`）。机制级（滑窗、采样、scale factor）fork 与 NVIDIA 逐字节相同（`da438fe` 对拍 `utils.py`/`create_training_data.py`/`utils_infer.py` 零差异），两锚无分歧。说「与上游对齐」必须指明哪一锚。

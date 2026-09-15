@@ -128,7 +128,13 @@ class PreparePipeline:
             config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
             checkpoint=config.artifacts.vae_ckpt,
         )
-        return MaisiLatentEncoder(artifact, device)
+        # 滑窗参数走既有 spec 字段通道（#143，与 decode 的 roi/overlap 同构）
+        return MaisiLatentEncoder(
+            artifact,
+            device,
+            roi_size=tuple(config.preprocessing.encode_roi_size),
+            overlap=config.preprocessing.encode_overlap,
+        )
 
     def run(self) -> PrepareReport:
         cases = self._layout.scan()
