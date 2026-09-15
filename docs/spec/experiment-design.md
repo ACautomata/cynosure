@@ -15,10 +15,11 @@
 | 组 | 训练对象 | 条件 c | 采样场 | ckpt 输入 | 规模 |
 |---|---|---|---|---|---|
 | 组1 模态标签 | base UNet 全参数 | BraTS 序列 modality token（t1n/t1c/t2w/t2f → 29/34/30/31） | CFG=10 组合场 | rflow-mr-brain_v1 UNet + autoencoder_v1.pt | ~200–500 iter |
-| 组2 跨模态 | ControlNet（base 冻结） | 源序列 latent × scale_factor + 目标序列 token | 裸条件单前向（CFG=0） | 冻结 base UNet + fork P3 跨序列 ControlNet | ~200–500 iter |
+| 组2 跨模态 | ControlNet（base 冻结） | 源序列 latent × scale_factor + 源序列 token（ControlNet）/ 目标序列 token（UNet） | 裸条件单前向（CFG=0） | 冻结 base UNet + fork P3 跨序列 ControlNet | ~200–500 iter |
 | 组3 序贯 | 先组1 后组2 | 继承各阶段 | 随所训阶段 | 组1 产出 base + 预训练 ControlNet | 组1 + 组2 步数 |
 
 - **组2 跨模态方向** = 脑 MRI 四序列 `t1n/t1c/t2w/t2f` 的 **12 个有序 src→tgt 对**（每序列作 anchor、其余三序列为目标），**非 CT↔MR**（真正的 CT↔MR 合成只在外部仓 `brudfors/maisi-mr-to-ct`，不在本仓库）。组2 条件分布 = 12 对均匀采样。
+- **组2 条件 = 双 label（#115）**：同一 (源, 目标) 有序对同时产出两个序列 token——**源序列 token 随 ControlNet 前向**（解读源影像）、**目标序列 token 随 UNet 前向**（生成目标模态）；源序列 latent 与源序列 token 同源于同一源序列条目。分路的权威记述见 `docs/spec/policy-modeling.md`「MDP 形式化」，组别与 CFG 语义见 `CONTEXT.md`「CFG 组合场」。
 - **组3 序贯衔接**：第二阶段 base（组1 RL 产出）**冻结**、ControlNet **训练**——从**预训练 ControlNet checkpoint** 复用作初始化，非冻结照搬、非挪用组2 独立产出。若 ControlNet 对组1 新 base 不匹配（残差是对旧 base 的加性修正），「对组1 产出 base 再微调 ControlNet」作消融、非默认步骤。
 - **组3 预训练产物衔接（操作面，#116）**：跑序贯需**两份预训练产物**，config 分别指定——stage-1（组1 配置）消费 modal-label 预训练报告（`reward.pretrain_report_json`），stage-2（组2 配置）消费 cross-modal 预训练报告（`experiment.stage2_pretrain_report_json`，序贯必填、非序贯组携带即被 schema 拒绝）；**cross-modal 预训练 run 需真实执行一次**（`pretrain` 子命令按 config 组别走同一条 driver 路径，代码现成）。stage-2 指向异组报告被装载守卫拒绝（#113 组别等值守卫，报错指引绑定配置面）——序贯不静默继承 stage-1 报告。
 - **训练规模**：每组默认 **~200–500 iteration**（先跑 50 iter sanity 再扩），rollout = 条件组 × G=12 方向；三组共用同一量级保证横向可比。实际吞吐以 `orchestration.md` 的 rollout profile 为准。
