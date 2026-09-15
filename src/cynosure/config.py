@@ -528,6 +528,16 @@ class RewardConfig(BaseModel):
         "观测流的平滑窗口——抑制单次测量的噪声进出",
         default=8, ge=1,
     )
+    disc_noise_sigma_max: float = SpecField(
+        "tunable", "ADR-0009",
+        "判别器训练期对称噪声注入的强度上限（暂定 0.2，MR-RATE 预训练"
+        "曲线校准后定版）：参数更新前向中 real/fake 两侧逐样本 "
+        "σ ~ U[0, σ_max] 的归一化域加噪（σ 以相对通道 std 的比例参数化）；"
+        "打分路径（reward / held-out AUC / 监控复算）恒干净域。"
+        "σ_max = 0 是唯一关闭形态（回归锚：全链路与无注入逐位一致），"
+        "不设独立 off 开关",
+        default=0.2, ge=0.0,
+    )
 
     @model_validator(mode="after")
     def _gating_hysteresis_band(self) -> "RewardConfig":

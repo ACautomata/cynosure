@@ -7,7 +7,7 @@ CUDA 同走 nccl 接口；本机 CPU fixture 走 gloo）；无环境变量的单
 训练循环由此对单进程/分布式走同一条执行序（spec 执行序不变，
 barrier/gather 在 world-1 下恒等）。
 
-seed 派生含 rank 偏移：各 rank 的六条命名 RNG 流独立演化（rollout 的
+seed 派生含 rank 偏移：各 rank 的七条命名 RNG 流独立演化（rollout 的
 条件/噪声各 rank 不同 = 分布式 rollout 的数据多样性来源）；rank 0 恒等
 偏移（derive_seed(seed) == seed）是「world=1 与单进程逐位一致」的
 等价性前提。判别器冷启动初始化不经本派生（跨 rank 同 seed 构建一致

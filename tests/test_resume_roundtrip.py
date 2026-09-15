@@ -5,7 +5,7 @@ fixture 下 CLI train 端到端的三条验收：
    （iter 事件逐条相等（除 wall-clock elapsed_s，RunTrajectory）+ 收官
    policy/判别器 checkpoint 逐位一致）；
 2. 续训状态清单完整覆盖：两模型权重与 optimizer、buffer 两区、RNG
-   （torch/CUDA/numpy/python + 六条命名 generator 流）、iteration 计数、
+   （torch/CUDA/numpy/python + 七条命名 generator 流）、iteration 计数、
    LR scheduler 状态槽、EMA 条件项槽；
 3. 落盘周期走 config schema（schedule.checkpoint_interval，默认 10）
    且默认值生效——周期未到不产出状态、恢复入口对缺失状态显式拒绝；
@@ -185,7 +185,7 @@ class TestResumeStateChecklist:
         state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
 
-        assert state["format_version"] == 4
+        assert state["format_version"] == 5
         assert state["iteration"] == 1  # 收尾兜底落盘点 = max_iterations
         assert state["world_size"] == 1  # 单进程拓扑（多 rank 见 test_distributed）
 
@@ -218,12 +218,12 @@ class TestResumeStateChecklist:
         assert len(recent["modalities"]) == 25
         assert all(m in MODALITIES for m in recent["modalities"])
 
-        # RNG：六条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
+        # RNG：七条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
         # 形态：有 CUDA 的环境（集群）经装配期 fork_rng 触发 CUDA RNG
         # 初始化后捕获全设备 state；无 CUDA 恒 None）
         assert set(state["generators"]) == {
             "rollout", "real_pool", "disc_update",
-            "heldout_auc", "fake_shuffle", "base_partition",
+            "heldout_auc", "fake_shuffle", "base_partition", "disc_noise",
         }
         assert all(
             saved.dtype == torch.uint8 for saved in state["generators"].values()

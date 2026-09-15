@@ -126,6 +126,7 @@ class RewardFixtureScenario:
             real_sampler=RealPoolSampler(pool, torch.Generator().manual_seed(200)),
             config=config.reward,
             generator=torch.Generator().manual_seed(201),
+            noise_generator=torch.Generator().manual_seed(203),
         )
         auc = HeldOutAuc(
             heldout_manifest=heldout,
