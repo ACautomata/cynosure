@@ -400,7 +400,8 @@ class TestEntryConditionResolver:
         self, tmp_path: Path,
     ) -> None:
         """组2 条件 = 源条目侧车 spacing + 源 latent（同条目同源），
-        label = 目标端 token。"""
+        双 label 各收其职（issue #115）：label = 目标端 token、
+        source_label = 源端 token。"""
         resolver = self._resolver(tmp_path)
         entry = ManifestEntry(
             stage=1, index=0, condition=["t1n", "t2w"],
@@ -408,16 +409,21 @@ class TestEntryConditionResolver:
         )
         condition, target = resolver.resolve(entry)
         assert target == "t2w"
-        assert condition.label.item() == 30
+        assert condition.label.item() == 30  # t2w 目标端 token
+        assert condition.source_label is not None
+        assert condition.source_label.item() == 29  # t1n 源端 token
         assert tuple(condition.spacing[0].tolist()) == (50.0, 100.0, 200.0)
         assert condition.source_latent[0, 0, 0, 0, 0].item() == 0.0  # t1n 条目
 
     def test_label_condition_keeps_constant_spacing(
         self, tmp_path: Path,
     ) -> None:
-        """组1 条件无源条目：spacing = 条件常量（组1 专用语义）。"""
+        """组1 条件无源条目：spacing = 条件常量（组1 专用语义），
+        源位（latent/label）恒为 None。"""
         resolver = self._resolver(tmp_path)
         entry = ManifestEntry(stage=1, index=1, condition="t2w", noise_seed=1)
         condition, target = resolver.resolve(entry)
         assert target == "t2w"
         assert tuple(condition.spacing[0].tolist()) == tuple(CONDITION_SPACING_X1E2)
+        assert condition.source_latent is None
+        assert condition.source_label is None

@@ -311,10 +311,13 @@ class RecordingControlnet:
 
 class TestBareConditionField:
     """组2 CFG=0 裸条件单前向：frozen base UNet + ControlNet 残差注入，
-    双条件（源影像 latent × scale_factor + 目标序列 token）都参与（ADR-0002：
-    基座代码强制 cfg==0，无无条件分支）。"""
+    三条件（源影像 latent × scale_factor + 源模态 token + 目标序列 token）
+    都参与（ADR-0002：基座代码强制 cfg==0，无无条件分支）。class label
+    各收其职（issue #115）：ControlNet 收源模态 label（解读源影像的模态
+    先验），UNet 收目标模态 label（生成目标模态的模态先验）。"""
 
     LABEL = 34  # t1c 的 modality token（目标序列）
+    SOURCE_LABEL = 29  # t1n 的 modality token（源序列）
     SCALE_FACTOR = 2.0
 
     @pytest.fixture
@@ -346,21 +349,34 @@ class TestBareConditionField:
             label=torch.tensor([self.LABEL]),
             spacing=SPACING,
             source_latent=torch.randn(1, *LATENT_SHAPE),
+            source_label=torch.tensor([self.SOURCE_LABEL]),
         )
+
+    def test_dual_label_routing_controlnet_source_unet_target(
+        self, field: BareConditionField, recording_unet: RecordingUnet,
+        recording_controlnet: RecordingControlnet, condition: RolloutCondition,
+    ) -> None:
+        """class label 各收其职（issue #115）：ControlNet 前向收源模态
+        label、UNet 前向收目标模态 label——两路 class_labels 直接断言。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        field.velocity(x, timesteps=442, condition=condition)
+        assert recording_controlnet.calls[0]["labels"] == [self.SOURCE_LABEL]
+        assert recording_unet.calls[0]["labels"] == [self.LABEL]
 
     def test_velocity_single_bare_forward_with_residuals(
         self, field: BareConditionField, recording_unet: RecordingUnet,
         recording_controlnet: RecordingControlnet, condition: RolloutCondition,
     ) -> None:
         """单前向（无 CFG 拆分）：ControlNet batch=1 产出残差注入 UNet，
-        条件 = 源 latent × scale_factor + 目标 label 双条件。"""
+        条件 = 源 latent × scale_factor + 源/目标双 label 三条件。"""
         torch.manual_seed(3)
         x = torch.randn(1, *LATENT_SHAPE)
         field.velocity(x, timesteps=442, condition=condition)
         assert len(recording_controlnet.calls) == 1
         call = recording_controlnet.calls[0]
         assert call["batch"] == 1
-        assert call["labels"] == [self.LABEL]  # 目标序列 token 进 ControlNet
+        assert call["labels"] == [self.SOURCE_LABEL]  # 源模态 token 进 ControlNet
         assert torch.equal(
             call["controlnet_cond"],
             condition.source_latent * self.SCALE_FACTOR,  # 源 latent × scale_factor
@@ -372,15 +388,15 @@ class TestBareConditionField:
         self, field: BareConditionField, fixture_unet: DiffusionModelUNetMaisi,
         fixture_controlnet: ControlNetMaisi, condition: RolloutCondition,
     ) -> None:
-        """数值 = UNet(x, residuals=ControlNet(x, cond=src·scale, label))
-        （残差注入的逐位对照）。"""
+        """数值 = UNet(x, residuals=ControlNet(x, cond=src·scale, 源 label),
+        label=目标 label)（残差注入的逐位对照）。"""
         torch.manual_seed(3)
         x = torch.randn(1, *LATENT_SHAPE)
         down, mid = fixture_controlnet(
             x=x,
             timesteps=torch.tensor([442]),
             controlnet_cond=condition.source_latent * self.SCALE_FACTOR,
-            class_labels=condition.label,
+            class_labels=condition.source_label,
         )
         with torch.no_grad():
             expected = fixture_unet(
@@ -405,6 +421,26 @@ class TestBareConditionField:
             label=condition.label,
             spacing=condition.spacing,
             source_latent=torch.randn(1, *LATENT_SHAPE),
+            source_label=condition.source_label,
+        )
+        with torch.no_grad():
+            v_first = field.velocity(x, timesteps=442, condition=condition)
+            v_second = field.velocity(x, timesteps=442, condition=other)
+        assert not torch.equal(v_first, v_second)
+
+    def test_source_label_condition_changes_velocity(
+        self, field: BareConditionField, condition: RolloutCondition,
+    ) -> None:
+        """源模态 label 注入生效：源 label 不同（latent 相同）→ ControlNet
+        残差不同 → velocity 不同（label embedding 是显式模态先验通道，
+        非仅靠源 latent 隐式携带）。"""
+        torch.manual_seed(3)
+        x = torch.randn(1, *LATENT_SHAPE)
+        other = RolloutCondition(
+            label=condition.label,
+            spacing=condition.spacing,
+            source_latent=condition.source_latent,
+            source_label=torch.tensor([34]),  # t1c 作源（对照 t1n）
         )
         with torch.no_grad():
             v_first = field.velocity(x, timesteps=442, condition=condition)
@@ -417,7 +453,8 @@ class TestBareConditionField:
     ) -> None:
         """全组复用（G²RPO 技巧，spec policy-modeling 实现接缝 #2）：
         ControlNet 与 UNet 各 batch=1 一次前向，velocity 输出 expand 成 G
-        ——组内 G 条方向共享同一 x_k 与条件，batch-G 前向是 12× 的纯浪费。"""
+        ——组内 G 条方向共享同一 x_k 与条件，batch-G 前向是 12× 的纯浪费；
+        复用路径同样各收其职（ControlNet 源 label、UNet 目标 label）。"""
         x = torch.randn(1, *LATENT_SHAPE)
         v = field.group_velocity(x, timesteps=442, condition=condition, group_size=12)
         assert v.shape == (12, *LATENT_SHAPE)
@@ -425,6 +462,8 @@ class TestBareConditionField:
         assert len(recording_unet.calls) == 1
         assert recording_controlnet.calls[0]["batch"] == 1
         assert recording_unet.calls[0]["batch"] == 1  # G²RPO：batch=1 评估后 expand
+        assert recording_controlnet.calls[0]["labels"] == [self.SOURCE_LABEL]
+        assert recording_unet.calls[0]["labels"] == [self.LABEL]
 
     def test_group_velocity_matches_expanded_velocity(
         self, field: BareConditionField, condition: RolloutCondition,
@@ -448,13 +487,60 @@ class TestBareConditionField:
         """组2 采样场缺源影像条件 = 装配契约违例：显式拒绝而非静默单条件
         前向（跨模态对齐会静默失效）。"""
         field = BareConditionField(recording_unet, recording_controlnet, 1.0)
-        condition = RolloutCondition(label=torch.tensor([29]), spacing=SPACING)
+        condition = RolloutCondition(
+            label=torch.tensor([29]), spacing=SPACING,
+            source_label=torch.tensor([29]),
+        )
         with pytest.raises(ValueError, match="source_latent"):
+            field.velocity(torch.randn(1, *LATENT_SHAPE), 442, condition)
+
+    def test_missing_source_label_rejected(
+        self, recording_unet: RecordingUnet, recording_controlnet: RecordingControlnet,
+    ) -> None:
+        """组2 采样场缺源模态 label = 装配契约违例（issue #115）：显式拒绝
+        而非静默退回目标 label（同源错位正是本票修订要消除的语义）。"""
+        field = BareConditionField(recording_unet, recording_controlnet, 1.0)
+        torch.manual_seed(13)
+        condition = RolloutCondition(
+            label=torch.tensor([34]), spacing=SPACING,
+            source_latent=torch.randn(1, *LATENT_SHAPE),
+        )
+        with pytest.raises(ValueError, match="source_label"):
             field.velocity(torch.randn(1, *LATENT_SHAPE), 442, condition)
 
 
 class TestRolloutConditionSourceLatent:
-    """组2 条件扩展：source_latent 与 label/spacing 同 batch 约束与广播。"""
+    """组2 条件扩展：source_latent/source_label 与 label/spacing 同 batch
+    约束与广播；组1 条件源位（latent/label）恒为 None。"""
+
+    def test_group1_condition_source_slots_are_none(self) -> None:
+        """组1 条件（label + spacing）无源影像自由度：source_latent 与
+        source_label 均为 None（单 label 语义不受影响）。"""
+        condition = RolloutCondition(label=torch.tensor([29]), spacing=SPACING)
+        assert condition.source_latent is None
+        assert condition.source_label is None
+        broadcast = condition.broadcast_to(4)
+        assert broadcast.source_label is None  # 组1 广播后源位仍缺席
+
+    def test_group2_condition_carries_dual_labels(self) -> None:
+        """组2 条件双 label 齐备：目标 label 与源 label 各自独立取值，
+        广播到整批时两 label 与源 latent 一并携带。"""
+        torch.manual_seed(17)
+        condition = RolloutCondition(
+            label=torch.tensor([34]),
+            spacing=SPACING,
+            source_latent=torch.randn(1, *LATENT_SHAPE),
+            source_label=torch.tensor([29]),
+        )
+        assert condition.source_label is not None
+        broadcast = condition.broadcast_to(12)
+        assert broadcast.label.shape == (12,)
+        assert broadcast.spacing.shape == (12, 3)
+        assert broadcast.source_latent.shape == (12, *LATENT_SHAPE)
+        assert broadcast.source_label.shape == (12,)
+        assert torch.equal(broadcast.source_label, torch.full((12,), 29))
+        assert torch.equal(broadcast.label, torch.full((12,), 34))
+        assert torch.equal(broadcast.source_latent[0], condition.source_latent[0])
 
     def test_broadcast_expands_source_latent(self) -> None:
         torch.manual_seed(17)
@@ -478,12 +564,23 @@ class TestRolloutConditionSourceLatent:
                 source_latent=torch.randn(3, *LATENT_SHAPE),
             )
 
+    def test_batch_mismatch_between_label_and_source_label_rejected(self) -> None:
+        """source_label 与 label batch 不符：构造即显式拒绝（校验对齐
+        扩展到源 label 位）。"""
+        with pytest.raises(ValueError, match="batch"):
+            RolloutCondition(
+                label=torch.tensor([29]),
+                spacing=SPACING,
+                source_label=torch.tensor([29, 34]),
+            )
+
     def test_batch_mismatch_on_broadcast_rejected(self) -> None:
         torch.manual_seed(17)
         condition = RolloutCondition(
             label=torch.tensor([29, 34]),
             spacing=SPACING.expand(2, -1),
             source_latent=torch.randn(2, *LATENT_SHAPE),
+            source_label=torch.tensor([29, 34]),
         )
         with pytest.raises(ValueError, match="batch"):
             condition.broadcast_to(12)
