@@ -28,7 +28,6 @@ checkpoint 容器 + VAE 裸权重）后出定点前向指纹与 VAE 生产尺寸
 
 import argparse
 import json
-import os
 import pickle
 import shutil
 import sys
@@ -70,7 +69,6 @@ class CynosureCli:
     def run(self) -> int:
         parser = self._build_parser()
         args = parser.parse_args(self._argv)
-        self._enforce_deterministic_kernels()
         # fid / fid-floor 走独立 schema（裁决性评测仪器，与训练 config 分离）
         if args.command == "fid":
             return self._fid(args)
@@ -178,21 +176,6 @@ class CynosureCli:
         except json.JSONDecodeError as exc:
             print(f"config 不是合法 JSON: {exc}", file=self._stderr)
             return None
-
-    @staticmethod
-    def _enforce_deterministic_kernels() -> None:
-        """确定性 kernel 执行——逐位复现契约的运行时前提。
-
-        逐位类断言（同 seed 里程碑 FID、跨 rank 权重对账、续训
-        roundtrip、FID 裁决仪器）在 GPU 上依赖 kernel 算法选择确定；
-        缺省的 autotune/split-K 原子归约随负载漂移（同 seed 两 run 的
-        policy 权重实测 4e-6 级分叉、里程碑 FID 逐次漂移 0.04-0.09）。
-        workspace 变量须在首个 cuBLAS handle 创建前生效，CLI 分发入口
-        是进程内唯一必然先于一切子命令执行（含 fixture 预训练构建）的
-        统一收口。``setdefault`` 尊重外部显式配置。"""
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True)
 
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
         resume = args.resume

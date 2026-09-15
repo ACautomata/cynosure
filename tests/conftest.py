@@ -24,6 +24,29 @@ from cynosure.fixtures import Fixture
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.update import UpdateReport
 
+
+def enforce_deterministic_kernels() -> None:
+    """确定性 kernel 执行——**测试进程**的逐位复现前提（ADR-0010）。
+
+    逐位类断言（同 seed 里程碑 FID、跨 rank 权重对账、续训 roundtrip、
+    轨迹诊断 sha256 数值锚）在 GPU 上依赖 kernel 算法选择确定；缺省的
+    autotune/split-K 原子归约随负载漂移（同 seed 两 run 的 policy 权重
+    实测 4e-6 级分叉、里程碑 FID 逐次漂移 0.04-0.09）。**生产 pipeline
+    不开**该模式（ADR-0010：解码峰值 DCU 实测 46 GiB vs 非确定 8 GiB），
+    故它落在测试进程——本函数在 conftest 导入期调用一次，spawn 出的
+    rank 子进程由 ``TrainWorldWorker`` 显式再调用（子进程以 pickle 引用
+    导入测试模块，不继承父进程的运行时开关）。
+
+    workspace 变量须在首个 cuBLAS handle 创建前生效：conftest 导入期
+    早于任何子命令执行，是本进程内的最早统一收口。``setdefault`` 尊重
+    外部显式配置。"""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+
+
+enforce_deterministic_kernels()
+
 # 测试进程的 torch CPU 线程池固定为 4 线程。缺省值 = 全部物理核
 # （sugon 上 ~56）：集群被他人训练任务占满时，小张量算子（如 MR FID
 # 骨干在 CPU 上的 resnet50 forward，16×16 切片）拆给几十个线程后

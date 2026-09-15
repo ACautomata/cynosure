@@ -23,20 +23,24 @@
 基准网格 ``[4,64,64,32]``（= 影像体 ``[1,256,256,128]`` ÷4）；多网格承接
 由 #111 网格裁决后另行表达，不在本票。
 
+确定性口径的分工（ADR-0010）：生产 pipeline 不开确定性模式；本自检的
+AC「固定 seed 与确定性 kernels」只把**定点前向**放进确定性作用域，
+VAE 往返留在 pipeline 口径（AC 只要求跑通 + fp16 autocast 口径）。
+
 显存画像（DCU 实测，sugon torch-dcu 2.9.0）：装载 + 定点前向 ~2 GiB、
-生产尺寸 encode ~5 GiB；**decode 在确定性模式（CLI 入口的
-``use_deterministic_algorithms``）下峰值 ~46 GiB**——确定性 trilinear
-上采样走 torch 分解实现，是非确定性模式（~8 GiB）的 5 倍以上。同卡
-共享跑会 OOM，解码读数要整卡独占；这条对全部 decode 消费点
-（里程碑评测 / Baseline 采样）同样成立。
+生产尺寸 encode ~5 GiB、decode ~8 GiB（pipeline 口径）；**确定性模式下
+decode 峰值 ~46 GiB**——确定性 trilinear 上采样走 torch 分解实现，是
+非确定性模式的 5 倍以上。故确定性作用域只圈前向、不圈解码。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import torch
 from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
@@ -361,18 +365,19 @@ class BaseSmokeRunner:
 
     def run(self) -> BaseSmokeReport:
         """跑完四步读数并落盘报告（返回同一份值对象）。"""
-        velocity = self._velocity()
-        if not bool(torch.isfinite(velocity).all()):
-            raise ValueError(
-                "基座定点前向输出含非有限值（NaN/Inf）：装载出的网络不可用"
-            )
-        repeat_identical = bool(torch.equal(velocity, self._velocity()))
+        with self._deterministic_kernels():
+            velocity = self._velocity()
+            if not bool(torch.isfinite(velocity).all()):
+                raise ValueError(
+                    "基座定点前向输出含非有限值（NaN/Inf）：装载出的网络不可用"
+                )
+            repeat_identical = bool(torch.equal(velocity, self._velocity()))
         if not repeat_identical:
             raise ValueError(
                 "基座定点前向输出逐位不可复现：同一定点 latent + 同一定点"
                 "模态 token 的两次前向出现位级差异（确定性 kernel 口径未生效"
-                "——CLI 入口的 CUBLAS_WORKSPACE_CONFIG / deterministic "
-                "algorithms 是此契约的运行时前提）"
+                "——ADR-0010 的作用域开启 / CUBLAS_WORKSPACE_CONFIG 是此"
+                "契约的运行时前提）"
             )
         # 指纹读数在 CPU 上取（LatentFingerprint 的 numpy 序列化口径；
         # 张量本体留在设备，取哈希的搬运是一次性读数成本）
@@ -415,6 +420,30 @@ class BaseSmokeRunner:
         )
         report.write(self._config.output_json)
         return report
+
+    @contextlib.contextmanager
+    def _deterministic_kernels(self) -> Iterator[None]:
+        """定点前向的确定性 kernel 作用域（ADR-0010：生产 pipeline 不开
+        确定性模式，逐位复现是**测试进程**的属性；本自检的 AC2 要求前向
+        逐位复现，故只圈前向、退出即还原外部状态——pytest 进程已全局
+        开启时还原为开启）。
+
+        workspace 变量须在首个 cuBLAS handle 创建前生效：自检的首次
+        CUDA 计算就在本作用域内（装载与 ``.to(device)`` 只搬权重、不起
+        cuBLAS），``setdefault`` 尊重外部显式配置。解码留在作用域外
+        ——确定性 upsample 的分解实现在 DCU 上把解码峰值推到 ~46 GiB
+        （非确定 ~8 GiB，见模块 docstring），而解码侧的 AC 只要求
+        跑通 + fp16 autocast 口径，不需要逐位。"""
+        previous_algorithms = torch.are_deterministic_algorithms_enabled()
+        previous_benchmark = torch.backends.cudnn.benchmark
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(previous_algorithms)
+            torch.backends.cudnn.benchmark = previous_benchmark
 
     def _velocity(self) -> torch.Tensor:
         """定点 latent + 定点条件（模态 token + 间距）经组1 采样场的前向
