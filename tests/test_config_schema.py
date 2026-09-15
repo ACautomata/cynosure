@@ -351,6 +351,11 @@ class TestRejection:
         data["experiment"]["group"] = "sequential"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        # 先补齐 stage-2 报告绑定（#116 schema 必填）：缺绑定的错误在
+        # 字段层先行短路，会掩盖本用例针对的 milestone 词汇表错误
+        data["experiment"]["stage2_pretrain_report_json"] = (
+            "pretrain_run_stage2/pretrain_report.json"
+        )
         with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
@@ -434,15 +439,50 @@ class TestRejection:
 
     def test_sequential_group_minimal_config(self, valid_config_dict: dict) -> None:
         """组3 最小合法 config：stage1_run_dir 缺省 = 同一次运行内先跑 stage-1
-        （spec 配置项清单「组3 衔接」行的两个分支之一）。"""
+        （spec 配置项清单「组3 衔接」行的两个分支之一）；stage-2 报告绑定
+        必填（#116）——缺省即装载期拒绝，不静默继承 stage-1 报告。"""
         data = copy.deepcopy(valid_config_dict)
         data["experiment"]["group"] = "sequential"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
         data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
+        with pytest.raises(ValidationError) as exc_info:  # 未绑定 stage-2 报告
+            CynosureConfig.model_validate(data)
+        assert ("experiment", "stage2_pretrain_report_json") in self._locations(
+            exc_info.value,
+        )
+        assert "stage2_pretrain_report_json" in str(
+            exc_info.value.errors()[0]["msg"],
+        )  # 指引配置面
+        assert "stage-1" in str(exc_info.value.errors()[0]["msg"])  # 指引继承面
+        data["experiment"]["stage2_pretrain_report_json"] = (
+            "pretrain_run_stage2/pretrain_report.json"
+        )
         config = CynosureConfig.model_validate(data)
         assert config.experiment.group == "sequential"
         assert config.experiment.stage1_run_dir is None
+        assert config.experiment.stage2_pretrain_report_json == Path(
+            "pretrain_run_stage2/pretrain_report.json",
+        )
+
+    def test_stage2_report_binding_only_valid_for_sequential(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """stage-2 报告绑定只对组3 有语义：非序贯组携带即拒绝（与
+        stage1_run_dir 同款——拼错组名时静默绑定比显式拒绝危险）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 12 有序对
+        data["experiment"]["stage2_pretrain_report_json"] = (
+            "pretrain_run_stage2/pretrain_report.json"
+        )
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("experiment", "stage2_pretrain_report_json") in self._locations(
+            exc_info.value,
+        )
 
     def test_stage1_run_dir_only_valid_for_sequential(
         self, valid_config_dict: dict,
@@ -460,6 +500,11 @@ class TestRejection:
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
         data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
+        # 组3 config 须绑定 stage-2 报告（#116 schema 必填，本用例补齐后
+        # 验证 stage1_run_dir 的组3 合法形态）
+        data["experiment"]["stage2_pretrain_report_json"] = (
+            "pretrain_run_stage2/pretrain_report.json"
+        )
         config = CynosureConfig.model_validate(data)
         assert config.experiment.stage1_run_dir == Path("runs/stage1")
 

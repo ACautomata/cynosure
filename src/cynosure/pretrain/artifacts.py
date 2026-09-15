@@ -155,14 +155,17 @@ class PretrainReport(BaseModel):
         组别对照先行（纯内存比较）：group 是 fake 分布的归因轴，
         per-condition AUC 与条件白名单都在预训练组别自己的 fake 分布上
         测量——跨组消费是口径错位而非可配置语义，显式拒绝、无逃生门
-        （#113；组3 序贯 stage-2 的合法消费路径由 stage-2 报告路径绑定
-        交付，#116）。随后 latent 形状对照（纯内存比较）：口径指纹与
-        判别器形态指纹都不覆盖分辨率——全卷积 scorer 可用旧 shape 的
-        real 评新 shape 的 fake 静默通过 gate 并把错位数据带进在线更新。
-        real pool / held-out manifest / channel stats 任一文件内容与预训
-        练时的指纹不符（manifest 重建、统计量换源）都让上岗判别力与预
-        训练报告脱钩——warm-start 装载前显式拒绝，不给静默错位留缝
-        （判别器形态指纹的对照在 ``load_discriminator``）。
+        （#113）。组3 序贯 stage-2 的合法消费路径 = stage 级报告绑定
+        （#116）：序贯编排把 ``experiment.stage2_pretrain_report_json``
+        重写进 stage-2 计划 config 的 ``reward.pretrain_report_json``，
+        本守卫只见一份普通的同组（cross-modal）消费，无序贯分支。随后
+        latent 形状对照（纯内存比较）：口径指纹与判别器形态指纹都不覆盖
+        分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的 fake
+        静默通过 gate 并把错位数据带进在线更新。real pool / held-out
+        manifest / channel stats 任一文件内容与预训练时的指纹不符
+        （manifest 重建、统计量换源）都让上岗判别力与预训练报告脱钩——
+        warm-start 装载前显式拒绝，不给静默错位留缝（判别器形态指纹的
+        对照在 ``load_discriminator``）。
         """
         if config.experiment.group != self.group:
             raise ValueError(
@@ -170,7 +173,10 @@ class PretrainReport(BaseModel):
                 f"{config.experiment.group}（预训练与上岗须同组别口径——"
                 "per-condition AUC 与条件白名单是在预训练组别自己的 fake "
                 "分布上测量的，跨组消费是显式拒绝的错误，无配置开关可"
-                "绕过）"
+                f"绕过；单阶段组请核对 reward.pretrain_report_json 指向的"
+                f"预训练 run 组别；组3 序贯 stage-2 的对应配置面是 "
+                "experiment.stage2_pretrain_report_json——绑定 cross-modal "
+                "预训练产物、不继承 stage-1 报告（#116））"
             )
         if tuple(config.latent_shape) != self.latent_shape:
             raise ValueError(
