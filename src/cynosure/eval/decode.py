@@ -48,6 +48,11 @@ class LatentDecoder:
     上游同边界整前向。
     """
 
+    AUTOCAST_DTYPE: torch.dtype = torch.float16
+    """解码前向的 autocast dtype（单一来源：官方 utils_infer 口径，见
+    ``decode``——不得换 bf16）。报告/文档面的「口径留痕」从此读数，
+    不另设副本。"""
+
     def __init__(
         self,
         artifact: NetworkArtifact,
@@ -92,7 +97,7 @@ class LatentDecoder:
         autocast 外，整批除与官方逐 patch 除等价。"""
         scaled = latents / self._latent_scale_factor
         with torch.no_grad():
-            with torch.autocast(self._device.type, dtype=torch.float16):
+            with torch.autocast(self._device.type, dtype=self.AUTOCAST_DTYPE):
                 if torch.numel(scaled[0:1, 0:1, ...]) <= math.prod(self._roi_size):
                     decoded = self._vae.decode(scaled)
                 else:

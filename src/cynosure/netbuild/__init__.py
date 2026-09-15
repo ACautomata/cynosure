@@ -9,6 +9,16 @@ PatchDiscriminator 的按 artifact 构建与装载、per-channel 标准化统计
 判别器的 checkpoint 有**形态**之分（裸权重 / 谱归一化形态）：装载按形态
 分派、导出面 ``loadable_state_dict`` 与之成对（形态契约与分派理由见
 ``discriminator``）。
+
+checkpoint 另有一层**容器**形态之分（裸 state_dict / 上游训练 checkpoint
+容器）：上游 NV-Generate-CTMR 训练脚本把网络权重包在含 epoch/loss/
+optimizer 等训练态的 dict 里（``unet_state_dict``、``controlnet_state_dict``
+两个包装键），发布件（HF ``nvidia/NV-Generate-MR-Brain`` 的
+``diff_unet_3d_rflow-mr-brain_v1.pt``）即此形态——装载面按容器键解包，
+仓库自产工件（fixture、``loadable_state_dict`` 导出）维持裸形态直通。
+上游容器的标量元数据以 MONAI ``MetaTensor`` 落盘，严格反序列化
+（``weights_only=True``）须先把这两个 MONAI 类登记进 torch 的 safe
+globals 白名单（不开 ``weights_only=False`` 的任意反序列化逃生门）。
 """
 
 import inspect
@@ -23,8 +33,23 @@ from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMais
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
 )
+from monai.data.meta_tensor import MetaTensor
 from monai.networks.nets import PatchDiscriminator
 from monai.networks.schedulers import RFlowScheduler
+from monai.utils.enums import TraceKeys
+
+CHECKPOINT_CONTAINER_KEYS: tuple[str, ...] = (
+    "unet_state_dict",
+    "controlnet_state_dict",
+)
+"""上游训练 checkpoint 的容器包装键（只读参照 NV-Generate-CTMR：训练脚本
+``diff_model_train.py`` 存 ``unet_state_dict``、``train_controlnet.py`` 存
+``controlnet_state_dict``）。清单只收观测到的键——未知容器形态显式拒绝，
+不猜键名。"""
+
+SCALE_FACTOR_KEY = "scale_factor"
+"""上游容器里本仓消费的标量元数据键（= 1/std(z)，latent 域缩放因子的
+权威来源）。裸 state_dict 形态无此元数据——消费方须显式处理缺席。"""
 
 
 @dataclass
@@ -42,6 +67,8 @@ class NetworkAssembler:
     非构造参数（如基座 config 字面 ``scale`` 死参数）静默过滤，不复刻其语义
     （ADR-0002：对齐实际生效行为，不照抄 config 字面值）。
     """
+
+    _safe_globals_registered: bool = False
 
     @classmethod
     def load_json(cls, path: Path) -> dict:
@@ -105,7 +132,7 @@ class NetworkAssembler:
         model = PatchDiscriminator(
             **cls._known_kwargs(PatchDiscriminator, artifact.config),
         )
-        state = cls._read_state_dict(artifact.checkpoint)
+        state = cls.read_state_dict(artifact.checkpoint)
         if state is not None and cls._is_spectral_norm_state(state):
             if not spectral_norm:
                 raise ValueError(
@@ -171,12 +198,82 @@ class NetworkAssembler:
         return {key: value for key, value in config.items() if key in params}
 
     @classmethod
-    def _read_state_dict(cls, ckpt: Path | None) -> dict | None:
+    def unconsumed_keys(cls, target: type, config: dict) -> set[str]:
+        """网络配置里 target 构造器不接受的键（``_known_kwargs`` 静默过滤面）。
+
+        上游 config 混着 ``_target_`` / 插值 / 死参数，静默过滤是装载面
+        的既定语义；但**转写工件**（逐字段誊抄的基座网络配置）里出现
+        未知键即誊抄错误——架构参数被静默丢弃 = 装载出的网络与发布
+        权重不是同一份。消费方（基座装载自检）据此在装载前 fail-fast。
+        """
+        return set(config) - set(cls._known_kwargs(target, config))
+
+    @classmethod
+    def read_checkpoint(cls, ckpt: Path) -> dict:
+        """读 checkpoint 顶层容器（``weights_only=True`` 严格反序列化）。
+
+        上游训练 checkpoint 的容器原貌经此可见（``CHECKPOINT_METADATA_KEYS``
+        的标量元数据、训练态键）；仓库自产工件经此读到的就是裸 state_dict。
+        """
+        cls._register_safe_globals()
+        loaded = torch.load(ckpt, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"checkpoint 须为 dict（state_dict 或上游训练容器），得到 "
+                f"{type(loaded).__name__}: {ckpt}"
+            )
+        return loaded
+
+    @classmethod
+    def checkpoint_scale_factor(cls, container: dict) -> float | None:
+        """容器里的 ``scale_factor`` 元数据（latent 域缩放因子的权威来源，
+        上游容器以 ``MetaTensor`` 形态落盘、统一取标量）；裸 state_dict
+        形态缺席，返回 ``None``——不造默认值，消费方显式处理。"""
+        value = container.get(SCALE_FACTOR_KEY)
+        return None if value is None else float(value)
+
+    @classmethod
+    def _register_safe_globals(cls) -> None:
+        """登记上游容器标量元数据的反序列化白名单（幂等）。
+
+        ``scale_factor`` 等标量以 MONAI ``MetaTensor`` 形态落盘、其 meta
+        字典含 ``TraceKeys``——两者均为本包白名单内的 MONAI 类，登记后
+        ``weights_only=True`` 的严格反序列化即可装载上游发布件；不因此
+        打开 ``weights_only=False`` 的任意反序列化。"""
+        if cls._safe_globals_registered:
+            return
+        torch.serialization.add_safe_globals([MetaTensor, TraceKeys])
+        cls._safe_globals_registered = True
+
+    @classmethod
+    def unwrap_container(cls, state: dict) -> dict:
+        """容器形态分派：上游训练容器 → 内层 state_dict；裸形态 → 原样。
+
+        多键同时在场（形态含糊）即显式拒绝——猜错键名会静默装载出一份
+        与发布件无关的权重。"""
+        present = [key for key in CHECKPOINT_CONTAINER_KEYS if key in state]
+        if not present:
+            return state
+        if len(present) > 1:
+            raise ValueError(
+                f"checkpoint 容器的网络权重键不唯一 {present}：无法判定"
+                "装载哪一个（裸 state_dict 形态与容器形态的含糊态）"
+            )
+        unwrapped = state[present[0]]
+        if not isinstance(unwrapped, dict):
+            raise ValueError(
+                f"checkpoint 容器键 {present[0]} 的值须为 state_dict，得到 "
+                f"{type(unwrapped).__name__}"
+            )
+        return unwrapped
+
+    @classmethod
+    def read_state_dict(cls, ckpt: Path | None) -> dict | None:
         """读 checkpoint 的 state_dict（None → 无 checkpoint = 随机初始化；
-        weights_only 严格反序列化）。"""
+        weights_only 严格反序列化 + 容器形态解包）。"""
         if ckpt is None:
             return None
-        return torch.load(ckpt, map_location="cpu", weights_only=True)
+        return cls.unwrap_container(cls.read_checkpoint(ckpt))
 
     @classmethod
     def _is_spectral_norm_state(cls, state: dict) -> bool:
@@ -186,9 +283,14 @@ class NetworkAssembler:
 
     @classmethod
     def _load_state_dict(cls, model: Any, ckpt: Path | None) -> None:
-        state = cls._read_state_dict(ckpt)
+        state = cls.read_state_dict(ckpt)
         if state is not None:
             model.load_state_dict(state, strict=True)
 
 
-__all__ = ["NetworkArtifact", "NetworkAssembler"]
+__all__ = [
+    "CHECKPOINT_CONTAINER_KEYS",
+    "SCALE_FACTOR_KEY",
+    "NetworkArtifact",
+    "NetworkAssembler",
+]
