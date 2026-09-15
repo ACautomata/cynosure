@@ -128,7 +128,14 @@ class PreparePipeline:
             config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
             checkpoint=config.artifacts.vae_ckpt,
         )
-        return MaisiLatentEncoder(artifact, device)
+        # encode 滑窗机制参数随 config 注入（#143：生产钉 NVIDIA 锚
+        # [320,320,160]/0.4，fixture 经 fixture_mode 声明后可注入替代值）
+        return MaisiLatentEncoder(
+            artifact,
+            device,
+            roi_size=tuple(config.preprocessing.encode_roi_size),
+            overlap=config.preprocessing.encode_overlap,
+        )
 
     def run(self) -> PrepareReport:
         cases = self._layout.scan()

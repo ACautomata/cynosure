@@ -655,6 +655,63 @@ class TestPreprocessingSchema:
             CynosureConfig.model_validate(data)
         assert ("preprocessing", "resize_base") in self._locations(exc_info.value)
 
+    def test_encode_sliding_window_defaults_anchor_nvidia(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """encode 滑窗参数默认锚 NVIDIA（issue #143）：影像空间 roi
+        [320,320,160]、overlap 0.4（diff_model_create_training_data 的
+        dynamic_infer 机制参数，T12 复核探针改判后交付）。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.preprocessing.encode_roi_size == [320, 320, 160]
+        assert config.preprocessing.encode_overlap == 0.4
+
+    def test_production_encode_roi_fixed_without_fixture_mode(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config（fixture_mode=false）下 encode 滑窗 roi 钉 NVIDIA 锚：
+        窗口布局是 latent 语义的一部分，静默换布局等于换对齐锚。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["preprocessing"] = {"encode_roi_size": [64, 64, 64]}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "encode_roi_size" in str(exc_info.value.errors())
+
+    def test_production_encode_overlap_fixed_without_fixture_mode(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["preprocessing"] = {"encode_overlap": 0.5}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "encode_overlap" in str(exc_info.value.errors())
+
+    def test_fixture_mode_allows_injected_encode_sliding_params(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """fixture 注入通道（fixture 与生产同链验证、参数可追溯）：
+        fixture_mode=true 显式声明后可注入小 roi/overlap。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["fixture_mode"] = True
+        data["preprocessing"] = {
+            "encode_roi_size": [32, 32, 32],
+            "encode_overlap": 0.5,
+        }
+        config = CynosureConfig.model_validate(data)
+        assert config.preprocessing.encode_roi_size == [32, 32, 32]
+        assert config.preprocessing.encode_overlap == 0.5
+
+    def test_encode_overlap_must_be_in_unit_range(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["fixture_mode"] = True
+        data["preprocessing"] = {"encode_overlap": 1.0}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("preprocessing", "encode_overlap") in self._locations(
+            exc_info.value,
+        )
+
     @staticmethod
     def _locations(exc: ValidationError) -> list[tuple]:
         return [err["loc"] for err in exc.errors()]

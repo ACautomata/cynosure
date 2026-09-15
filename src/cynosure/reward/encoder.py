@@ -7,10 +7,13 @@
 """
 
 import math
+from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol
 
 import torch
+from monai.inferers.inferer import SlidingWindowInferer
 
+from cynosure.config import UPSTREAM_ENCODE_OVERLAP, UPSTREAM_ENCODE_ROI
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 
 
@@ -90,17 +93,23 @@ class MaisiLatentEncoder:
     崩溃——autocast 是结构性必需，非省显存优化），CPU 纯 fp32（fixture
     与本地测试路径）。
 
-    编排：**恒整前向**——单样本元素数 ≤ roi 元素数才编码（上游
-    ``dynamic_infer`` 小体豁免同语义，``roi_size`` 即豁免阈值；
-    判定按元素总数而非逐维窗口——BraTS 形状下两者等价（单窗），
-    非 BraTS 形状先被 latent_shape 契约拦截，语义分叉无实际观测面）。
-    BraTS [1,1,256,256,128] = 8.39M ≤ 影像空间阈值 [320,320,160] 的
-    16.38M，生产全语料恒整前向（VAE 无注意力层、fp16 峰值 GB 级）。
-    超过阈值的体积显式拒绝而非滑窗：MONAI ``SlidingWindowInferer`` 的
-    多分辨率拼合是为上采样分割网络设计的，对下采样 encoder 实测把
-    通道维折进空间维（[4,16,16,8] 产出 [1,16,16,8]）——静默产出语义
-    错误的 latent 比显式失败危险得多；真出现超大体的需求时先裁剪，
-    或以「输出网格直接加权拼合」实现 encoder 专用滑窗（随施工验证）。
+    编排（上游 ``dynamic_infer`` 判定式逐字同构，#143 交付滑窗分支）：
+    单样本**单通道空间体素数**（``batch[0:1, 0:1]``）≤ roi 元素数走
+    **整前向**（官方小体豁免；BraTS [1,1,256,256,128] = 8.39M ≤ 影像
+    空间阈值 [320,320,160] 的 16.38M，BraTS 全语料恒整前向，行为与
+    豁免口径不变）；超过 → roi 逐轴 clamp 到图像尺寸后
+    ``SlidingWindowInferer`` 高斯滑窗（sw_batch_size=1，参数锚 NVIDIA
+    ``diff_model_create_training_data``：roi [320,320,160] 影像空间、
+    overlap 0.4）。T12 复核探针改判（#140）：原「SlidingWindowInferer
+    对下采样 encoder 把通道维折进空间维」的裁决在 MONAI 1.6 的
+    ``z_scale`` 路径（下采样网络输出网格原生拼合）上不复现，全部目标
+    网格滑窗输出形状逐格正确。
+
+    滑窗走 **b 语义**：逐窗 (z_mu, z_sigma) 经 MONAI 在 latent 网格
+    高斯加权拼合后，与整前向同款以**单一内容寻址种子采样一次** eps。
+    对上游「逐窗采样后拼 z」的记录在案偏离（上游 a 语义接缝方差收缩
+    最高 0.5×；b 语义接缝方差与体心均匀）——偏离理由：幂等契约 +
+    real pool 分布卫生；偏离的 ADR 落档随 #144。
     """
 
     name = "autoencoderkl_maisi"
@@ -109,36 +118,42 @@ class MaisiLatentEncoder:
         self,
         artifact: NetworkArtifact,
         device: torch.device,
-        roi_size: tuple[int, int, int] = (320, 320, 160),
+        roi_size: tuple[int, int, int] = UPSTREAM_ENCODE_ROI,
+        overlap: float = UPSTREAM_ENCODE_OVERLAP,
     ) -> None:
         if any(dimension <= 0 for dimension in roi_size):
             raise ValueError(
-                f"整前向豁免阈值 roi 须逐维为正（影像空间），得到 {roi_size}"
+                f"滑动窗口 roi 须逐维为正（影像空间豁免阈值），得到 {roi_size}"
+            )
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError(
+                f"滑动窗口重叠比须在 [0, 1)，得到 {overlap}"
             )
         self._vae = NetworkAssembler.vae(artifact).to(device)
         self._device = device
         self._roi_size = roi_size
+        self._overlap = overlap
         self._vae.eval()  # 预编码是推断前向：恒 eval 相，不推进任何训练语义
 
     def encode(
         self, image: torch.Tensor, noise_seed: int = 0,
     ) -> torch.Tensor:
         """[1, D, H, W] 影像体 → [4, D/4, H/4, W/4] latent（CPU fp32，
-        seeded 后验采样 z，不乘 scale_factor）。"""
+        seeded 后验采样 z，不乘 scale_factor；超界影像体走滑窗拼合，
+        形状契约不变）。"""
         if image.dim() != 4 or image.shape[0] != 1:
             raise ValueError(
                 f"影像体须为 [1, D, H, W]，得到 {tuple(image.shape)}"
             )
         batch = image.unsqueeze(0).to(self._device)
-        if batch[0].numel() > math.prod(self._roi_size):
-            raise ValueError(
-                f"影像体元素数 {batch[0].numel()} 超过整前向豁免阈值 "
-                f"{math.prod(self._roi_size)}（roi={self._roi_size}）："
-                "encoder 滑窗未交付（MONAI SlidingWindowInferer 对下采样"
-                "网络拼合通道错乱），超大体积请先裁剪"
-            )
         with torch.no_grad():
-            z_mu, z_sigma = self._encode_batch(batch)
+            # 豁免判定单通道口径（batch[0:1, 0:1]）：与 LatentDecoder 及
+            # 上游 dynamic_infer 判定式逐字同构；入口契约已锁单通道
+            # （上方 shape[0] != 1 校验），两口径逐位等值
+            if batch[0:1, 0:1].numel() <= math.prod(self._roi_size):
+                z_mu, z_sigma = self._encode_batch(batch)
+            else:
+                z_mu, z_sigma = self._encode_sliding(batch)
             eps = torch.randn(
                 z_mu.shape,
                 generator=torch.Generator().manual_seed(noise_seed),
@@ -146,13 +161,37 @@ class MaisiLatentEncoder:
             latent = z_mu + eps * z_sigma
         return latent.squeeze(0).to(device="cpu", dtype=torch.float32)
 
+    def _numerics(self) -> AbstractContextManager:
+        """数值口径上下文（类 docstring「数值口径」段；整前向与滑窗两路
+        共用同一口径，不得分叉）。"""
+        if self._device.type == "cuda":
+            return torch.autocast("cuda", dtype=torch.float16)
+        return nullcontext()
+
     def _encode_batch(
         self, batch: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """单批编码前向：encode 输出元组（z_mu, z_sigma）。"""
-        if self._device.type == "cuda":
-            with torch.autocast("cuda", dtype=torch.float16):
-                z_mu, z_sigma = self._vae.encode(batch)
-        else:
-            z_mu, z_sigma = self._vae.encode(batch)
+        """整前向编码：encode 输出元组（z_mu, z_sigma）。"""
+        with self._numerics():
+            return self._vae.encode(batch)
+
+    def _encode_sliding(
+        self, batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """滑窗编码（b 语义参数锚 NVIDIA）：roi 逐轴 clamp 后高斯滑窗，
+        MONAI 1.6 z_scale 路径在 latent 网格逐成员拼合 (z_mu, z_sigma)。"""
+        clamped = [
+            min(roi, size) for roi, size in zip(self._roi_size, batch.shape[2:])
+        ]
+        inferer = SlidingWindowInferer(
+            roi_size=clamped,
+            sw_batch_size=1,
+            progress=False,
+            mode="gaussian",
+            overlap=self._overlap,
+            sw_device=self._device,
+            device=self._device,
+        )
+        with self._numerics():
+            z_mu, z_sigma = inferer(inputs=batch, network=self._vae.encode)
         return z_mu, z_sigma

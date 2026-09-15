@@ -50,6 +50,16 @@ UPSTREAM_RESIZE_BASE = 128
 round_number，data-preparation + ADR-0006）：生产定死值、schema 权威单一来源，
 fixture 经 fixture_mode=true 显式声明后可注入小基数替代。"""
 
+UPSTREAM_ENCODE_ROI = (320, 320, 160)
+"""encode 滑窗的影像空间 roi 上游锚（NVIDIA diff_model_create_training_data
+的 dynamic_infer 机制参数，#143）：单样本单通道空间体素数 ≤ prod(roi) 走
+整前向豁免、超过则逐轴 clamp 后高斯滑窗。生产定死值、schema 权威单一来源。"""
+
+UPSTREAM_ENCODE_OVERLAP = 0.4
+"""encode 滑窗的重叠比上游锚（NVIDIA 同上，#143）：MONAI 要求
+overlap×roi×z_scale 逐维整数（320×0.4=128、160×0.4=64，4× 下采样下
+latent 空间 scan 间隔成立）。"""
+
 
 class SpecField:
     """spec 配置项清单的字段声明：状态（status）+ 出处（source）标注。
@@ -643,8 +653,9 @@ class PreprocessingConfig(BaseModel):
     """prepare 读图编码的上游 recipe 参数（data-preparation spec + ADR-0006）。
 
     transform 链本体在 ``cynosure.reward.preprocessing``（MONAI 六步语义重写，
-    零依赖）；config 只携带可注入参数：resize 基数。链中不存在 spacing 重采样 /
-    foreground crop / z-score，均为对齐结论、无参数可暴露。
+    零依赖）；config 只携带可注入参数：resize 基数与 encode 滑窗机制参数
+    （#143：超界影像体的滑窗编码分支，参数锚 NVIDIA）。链中不存在 spacing
+    重采样 / foreground crop / z-score，均为对齐结论、无参数可暴露。
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -657,6 +668,25 @@ class PreprocessingConfig(BaseModel):
         "fixture 注入小基数使夹具影像尺寸不变（须经 fixture_mode=true "
         "显式声明）",
         default=UPSTREAM_RESIZE_BASE, ge=1,
+    )
+    encode_roi_size: list[int] = SpecField(
+        "定死（fixture 可缩小）", "data-preparation + #139 探针改判",
+        "VAE 编码滑动窗口的影像空间 roi（三轴；NVIDIA "
+        "diff_model_create_training_data 的 dynamic_infer 机制参数）："
+        "单样本单通道空间体素数 ≤ prod(roi) 走整前向（上游豁免判定式"
+        "逐字同构，BraTS 全语料恒整前向），超过则 roi 逐轴 clamp 后高斯"
+        "滑窗（#143 交付）；生产钉 NVIDIA 锚，fixture 注入须 "
+        "fixture_mode=true 声明",
+        default=list(UPSTREAM_ENCODE_ROI),
+    )
+    encode_overlap: float = SpecField(
+        "定死（fixture 可缩小）", "data-preparation + #139 探针改判",
+        "VAE 编码滑动窗口的重叠比（NVIDIA 锚；MONAI 建议 "
+        "overlap×roi×z_scale 逐维整数——非整数时 scan 间隔由其内部取整，"
+        "属 MONAI 语义而非拒绝条件；生产锚 320×0.4=128、160×0.4=64 过 "
+        "4× 下采样后逐维整数）。mode 定死 gaussian、sw_batch_size 定死 1"
+        "（NVIDIA 口径）",
+        default=UPSTREAM_ENCODE_OVERLAP, ge=0.0, lt=1.0,
     )
 
 
@@ -932,6 +962,32 @@ class CynosureConfig(BaseModel):
                 f"定死上游基数 {UPSTREAM_RESIZE_BASE}（ADR-0006），得到 "
                 f"{self.preprocessing.resize_base}；注入小基数属 fixture，"
                 "须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _encode_sliding_params_match_mode(self) -> "CynosureConfig":
+        """encode 滑窗机制参数的通道显式化（#143）：fixture_mode=false 时
+        roi/overlap 钉 NVIDIA 锚——窗口布局是 latent 语义的一部分
+        （窗口序列与高斯权重决定拼合后的 μ/σ 场），生产上静默换布局等于
+        换对齐锚。"""
+        if self.fixture_mode:
+            return self
+        if self.preprocessing.encode_roi_size != list(UPSTREAM_ENCODE_ROI):
+            raise ValueError(
+                "生产 config（fixture_mode=false）下 "
+                f"preprocessing.encode_roi_size 定死 NVIDIA 锚 "
+                f"{list(UPSTREAM_ENCODE_ROI)}（#143），得到 "
+                f"{self.preprocessing.encode_roi_size}；注入替代值属 "
+                "fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        if self.preprocessing.encode_overlap != UPSTREAM_ENCODE_OVERLAP:
+            raise ValueError(
+                "生产 config（fixture_mode=false）下 "
+                "preprocessing.encode_overlap 定死 NVIDIA 锚 "
+                f"{UPSTREAM_ENCODE_OVERLAP}（#143），"
+                f"得到 {self.preprocessing.encode_overlap}；注入替代值属 "
+                "fixture，须经顶层 fixture_mode=true 显式声明"
             )
         return self
 

@@ -13,6 +13,8 @@ import nibabel as nib
 import numpy as np
 import pytest
 import torch
+from monai.data.utils import dense_patch_slices
+from monai.inferers.inferer import SlidingWindowInferer
 
 from cynosure.config import CynosureConfig, MODALITIES, ConfigLoader
 from cynosure.fixtures import Fixture
@@ -439,6 +441,41 @@ class MeanPoolEncoderTwin:
         return latent, torch.zeros_like(latent)
 
 
+class PosteriorStitchTwin:
+    """AutoencoderKlMaisi.encode 的后验参数替身（b 语义的拼合观测面）：
+    z_mu / z_sigma 均为影像内容的确定性函数——**非均匀且随空间变化**
+    （均匀 σ 下错误拼合不可检出：逐窗采样的接缝方差收缩只在 σ 非均匀
+    时改变方差场）。``encode`` 返回 (z_mu, z_sigma) 与真实 encode 同构；
+    ``mu_arm`` / ``sigma_arm`` 返回单一成员张量，供测试独立重构「拼合 μ」
+    与「拼合 σ」的 golden path 参照。记录每次 encode 输入形状（分派观测面）。"""
+
+    def __init__(self, sigma_gain: float = 0.75) -> None:
+        self._sigma_gain = sigma_gain
+        self.encode_shapes: list[tuple[int, ...]] = []
+
+    def to(self, device: torch.device) -> "PosteriorStitchTwin":
+        return self
+
+    def eval(self) -> "PosteriorStitchTwin":
+        return self
+
+    def encode(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.encode_shapes.append(tuple(batch.shape))
+        return self.mu_arm(batch), self.sigma_arm(batch)
+
+    def mu_arm(self, batch: torch.Tensor) -> torch.Tensor:
+        pooled = torch.nn.functional.avg_pool3d(
+            batch.repeat(1, 4, 1, 1, 1), kernel_size=4, stride=4,
+        )
+        return pooled + 0.5  # 内容平移：μ 场非均匀且非零
+
+    def sigma_arm(self, batch: torch.Tensor) -> torch.Tensor:
+        pooled = torch.nn.functional.avg_pool3d(
+            batch.repeat(1, 4, 1, 1, 1), kernel_size=4, stride=4,
+        )
+        return 1.0 + self._sigma_gain * pooled.abs()  # σ 场非均匀、恒正
+
+
 class TestMaisiLatentEncoder:
     """生产预编码器（fixture 微型 VAE 走同一 netbuild 严格装载契约）：
     z_mu 确定性与 raw 存储域是 prepare 幂等/缩放契约的根基。"""
@@ -519,14 +556,14 @@ class TestMaisiLatentEncoder:
         with pytest.raises(ValueError, match="影像体须为"):
             encoder.encode(torch.randn(2, 1, 64, 64, 32))  # 带 batch 维
 
-    def test_whole_forward_within_threshold_large_rejected(
+    def test_within_threshold_whole_forward_beyond_slides(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """官方 dynamic_infer 小体豁免语义：单样本元素数 ≤ 阈值元素数
-        → 整前向（BraTS [1,1,256,256,128]=8.39M ≤ 影像空间阈值
-        [320,320,160]，生产恒走此路）；超过 → 显式拒绝而非滑窗
-        （MONAI SlidingWindowInferer 对下采样 encoder 拼合通道错乱，
-        静默错误比显式失败危险）。"""
+        """豁免判定两侧分派（issue #143：超界不再 raise）：单样本单通道
+        空间体素数 ≤ 阈值元素数 → 恰一次整前向（BraTS [1,1,256,256,128]
+        = 8.39M ≤ 影像空间阈值 [320,320,160]=16.38M，生产恒走此路）；
+        超过 → 滑窗窗口序列（MONAI 1.6 z_scale 路径，T12 复核探针改判，
+        #140），拼合后 latent 形状契约不变。"""
         artifact = self.artifact(tmp_path)
         image = torch.randn(self.ENCODE_INPUT_SHAPE)
 
@@ -540,13 +577,89 @@ class TestMaisiLatentEncoder:
         assert tuple(latent.shape) == self.LATENT_SHAPE
 
         small_threshold = self.encoder(artifact, roi_size=(32, 32, 32))
-        with pytest.raises(ValueError, match="整前向豁免阈值"):
-            small_threshold.encode(image)
-        assert len(twin.encode_shapes) == 1  # 拒绝路径不产生前向
+        twin.encode_shapes.clear()  # 只观测滑窗段的窗口序列
+        slid = small_threshold.encode(image)
+        assert len(twin.encode_shapes) > 1  # 超界：滑窗窗口序列（不再 raise）
+        assert all(
+            max(shape[2:]) <= 32 for shape in twin.encode_shapes
+        )  # 每个窗口的空间维 ≤ roi
+        assert tuple(slid.shape) == self.LATENT_SHAPE  # 拼合后形状契约不变
 
     def test_invalid_roi_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="roi"):
             self.encoder(self.artifact(tmp_path), roi_size=(0, 320, 160))
+
+    def test_invalid_overlap_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="重叠比"):
+            self.encoder(self.artifact(tmp_path), overlap=1.0)
+
+    def test_sliding_branch_with_fixture_vae_shape_contract(
+        self, tmp_path: Path,
+    ) -> None:
+        """fixture 微型 VAE（真实 AutoencoderKlMaisi 网络类）走滑窗分支：
+        MONAI 1.6 z_scale 路径与真网络类的下采样 encode 兼容，拼合 latent
+        形状契约与整前向逐维一致（本地 CPU 最小真件验证；真权重的数值
+        对拍属集群缝 B，#140 探针已覆盖）。"""
+        torch.manual_seed(0)
+        encoder = self.encoder(self.artifact(tmp_path), roi_size=(16, 16, 16))
+        latent = encoder.encode(torch.randn(self.ENCODE_INPUT_SHAPE))
+        assert tuple(latent.shape) == self.LATENT_SHAPE
+        assert latent.dtype == torch.float32
+        assert latent.device == torch.device("cpu")
+
+    def test_window_layout_matches_nvidia_scan_semantics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """窗口序列 = 上游 dynamic_infer 同语义布局（NVIDIA 锚：roi 逐轴
+        clamp 到图像尺寸、scan 间隔 = roi×(1−overlap)、overlap 0.4）：
+        窗口形状逐窗等于 clamp 后 roi，窗口数与位置由 dense_patch_slices
+        公式给出（MONAI SlidingWindowInferer 的 scan 布局，探针
+        window_slices 同款转录）。豁免等值点（roi == 影像尺寸）恒整前向。"""
+        def scan_interval(
+            roi: tuple[int, ...], grid: tuple[int, ...], overlap: float,
+        ) -> tuple[int, ...]:
+            return tuple(
+                int(r) if r == s else max(int(r * (1.0 - overlap)), 1)
+                for r, s in zip(roi, grid)
+            )
+
+        artifact = self.artifact(tmp_path)
+        twin = MeanPoolEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+
+        # 等值点：roi == 影像尺寸（32³ = 32³）→ 豁免，恰一次整前向
+        boundary = torch.randn(1, 32, 32, 32)
+        self.encoder(artifact, roi_size=(32, 32, 32)).encode(boundary)
+        assert twin.encode_shapes == [(1, 1, 32, 32, 32)]
+
+        # 多窗无 clamp：40³ 超界，roi 保持 (32,32,32)，间隔 19 → 2³ = 8 窗
+        twin.encode_shapes.clear()
+        cube = torch.randn(1, 40, 40, 40)
+        self.encoder(artifact, roi_size=(32, 32, 32)).encode(cube)
+        expected = dense_patch_slices(
+            (40, 40, 40), (32, 32, 32), scan_interval((32, 32, 32), (40, 40, 40), 0.4),
+        )
+        assert twin.encode_shapes == [
+            (1, 1, *[w.stop - w.start for w in window])
+            for window in expected
+        ]
+
+        # 逐轴 clamp：中轴 24 < roi 轴 32，clamp 后该轴单窗 → 2×1×2 = 4 窗
+        twin.encode_shapes.clear()
+        slab = torch.randn(1, 40, 24, 40)
+        latent = self.encoder(artifact, roi_size=(32, 32, 32)).encode(slab)
+        clamped = (32, 24, 32)
+        expected = dense_patch_slices(
+            (40, 24, 40), clamped, scan_interval(clamped, (40, 24, 40), 0.4),
+        )
+        assert twin.encode_shapes == [
+            (1, 1, *[w.stop - w.start for w in window])
+            for window in expected
+        ]
+        assert tuple(latent.shape) == (4, 10, 6, 10)  # 拼合网格 = 影像 ÷4
 
     def test_checkpoint_mismatch_rejected(self, tmp_path: Path) -> None:
         """工件错配（VAE 网络配置对 UNet checkpoint）：严格装载契约在
@@ -559,6 +672,162 @@ class TestMaisiLatentEncoder:
         )
         with pytest.raises(RuntimeError):
             MaisiLatentEncoder(artifact, torch.device("cpu"))
+
+
+class TestSlidingWindowBSemantics:
+    """滑窗 b 语义（issue #143）：逐窗 (z_mu, z_sigma) 经 MONAI 在 latent
+    网格高斯加权拼合后，以单一内容寻址种子采样一次 eps——对上游「逐窗
+    采样后拼 z」（a 语义）的记录在案偏离。替身 σ 非均匀（内容决定），
+    错误拼合在接缝带可检出。"""
+
+    SLIDING_IMAGE_SHAPE = (1, 40, 40, 40)  # 64k 体素 > roi 32³，强制滑窗
+    SLIDING_ROI = (32, 32, 32)
+    SLIDING_OVERLAP = 0.4  # NVIDIA 锚
+    LATENT_GRID = (10, 10, 10)  # 40 ÷ 4
+    SEAM_MARGIN = 1  # latent 网格接缝带厚（探针 SEAM_MARGIN_LATENT 的等比缩小）
+    NUM_SEEDS = 16
+
+    def artifact(self, tmp_path: Path) -> NetworkArtifact:
+        directory = tmp_path / "fixture_artifacts"
+        Fixture().write_artifacts(directory)
+        return NetworkArtifact(
+            config=NetworkAssembler.load_json(directory / "vae_config.json"),
+            checkpoint=directory / "vae.pt",
+        )
+
+    def inject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[PosteriorStitchTwin, object]:
+        """替身分派的共用装配缝（MeanPoolEncoderTwin 同款）。"""
+        artifact = self.artifact(tmp_path)
+        twin = PosteriorStitchTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+
+        def build() -> MaisiLatentEncoder:
+            return MaisiLatentEncoder(
+                artifact, torch.device("cpu"),
+                roi_size=self.SLIDING_ROI, overlap=self.SLIDING_OVERLAP,
+            )
+
+        return twin, build
+
+    @staticmethod
+    def _stitched(twin: PosteriorStitchTwin, image: torch.Tensor):
+        """golden path 参照：μ 臂与 σ 臂各自走一次同参高斯滑窗拼合。"""
+        batch = image.unsqueeze(0)
+        return [
+            SlidingWindowInferer(
+                roi_size=list(TestSlidingWindowBSemantics.SLIDING_ROI),
+                sw_batch_size=1, progress=False,
+                mode="gaussian",
+                overlap=TestSlidingWindowBSemantics.SLIDING_OVERLAP,
+                sw_device=torch.device("cpu"), device=torch.device("cpu"),
+            )(inputs=batch, network=arm)
+            for arm in (twin.mu_arm, twin.sigma_arm)
+        ]
+
+    def test_b_semantics_stitches_parameters_then_samples_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """b 语义定义（golden path）：encode ≡ SWI(μ臂) + eps(seed)·
+        SWI(σ臂)——μ/σ 先各自高斯拼合、再以同一内容寻址种子采样一次。
+        逐窗采样（a 语义：每窗独立 eps 后拼 z）与丢 σ、单窗拷贝等错误
+        拼合在非均匀 σ 场下过不了逐位比对。"""
+        image = torch.randn(self.SLIDING_IMAGE_SHAPE)
+        seed = 4242
+        twin, build = self.inject(tmp_path, monkeypatch)
+        latent = build().encode(image, noise_seed=seed)
+
+        expected_mu, expected_sigma = self._stitched(twin, image)
+        eps = torch.randn(
+            expected_mu.shape,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        expected = (expected_mu + eps * expected_sigma).squeeze(0)
+        assert torch.equal(latent, expected)
+
+    def test_sliding_same_seed_zero_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """重跑零漂移（RNG 幂等契约在滑窗路上保持）：同 seed 两次编码
+        （第二次全新 encoder 装配）逐位相等；换 seed 换后验样本。"""
+        image = torch.randn(self.SLIDING_IMAGE_SHAPE)
+        _, build = self.inject(tmp_path, monkeypatch)
+        first = build().encode(image, noise_seed=9)
+        second = build().encode(image, noise_seed=9)
+        assert torch.equal(first, second)
+        assert not torch.equal(first, build().encode(image, noise_seed=10))
+
+    def test_b_semantics_seam_band_variance_uniform_with_core(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """接缝带方差与体心均匀（验收语言）：σ 非均匀替身下，多 seed 的
+        逐体素样本方差 ÷ 拼合 σ² 在接缝带与体心都 ≈ 1（b 语义高斯权重
+        归一、方差场无窗界塌陷）；逐窗采样的接缝方差收缩会把带比值压到
+        Σg² < 1，不可通过。"""
+        image = torch.randn(self.SLIDING_IMAGE_SHAPE)
+        twin, build = self.inject(tmp_path, monkeypatch)
+        samples = torch.stack([
+            build().encode(image, noise_seed=seed)
+            for seed in range(8, 8 + self.NUM_SEEDS)
+        ])
+        variance = samples.var(dim=0, unbiased=True)  # [4, 10, 10, 10]
+        expected_sigma = self._stitched(twin, image)[1][0]
+        ratio = variance / expected_sigma**2
+
+        band = self._seam_band_mask()
+        core = self._core_mask()
+        band_mean = ratio[band].mean().item()
+        core_mean = ratio[core].mean().item()
+        assert 0.9 < band_mean < 1.1, f"接缝带方差比 {band_mean}"
+        assert 0.9 < core_mean < 1.1, f"体心方差比 {core_mean}"
+        assert abs(band_mean - core_mean) < 0.05, "带/心方差比不均匀"
+
+    def _seam_band_mask(self) -> torch.Tensor:
+        """接缝带：latent 网格上每窗边缘 ±SEAM_MARGIN 壳的并集（含影像
+        边界窗的外缘壳——单窗权重区，正确拼合下比值同为 1）。"""
+        scan = self._scan_interval()
+        band = torch.zeros((4, *self.LATENT_GRID), dtype=torch.bool)
+        for window in dense_patch_slices(
+            self.SLIDING_IMAGE_SHAPE[1:], self.SLIDING_ROI, scan,
+        ):
+            latent_window = [
+                slice(w.start // 4, w.stop // 4) for w in window
+            ]
+            for axis in range(3):
+                lo = list(latent_window)
+                lo[axis] = slice(
+                    latent_window[axis].start,
+                    latent_window[axis].start + self.SEAM_MARGIN,
+                )
+                band[(slice(None), *lo)] = True
+                hi = list(latent_window)
+                hi[axis] = slice(
+                    latent_window[axis].stop - self.SEAM_MARGIN,
+                    latent_window[axis].stop,
+                )
+                band[(slice(None), *hi)] = True
+        return band
+
+    def _core_mask(self) -> torch.Tensor:
+        """体心：各轴中央 50% 立方（探针 _core_mask 同款）。"""
+        core = tuple(
+            slice(n // 4, n - n // 4) for n in self.LATENT_GRID
+        )
+        mask = torch.zeros((4, *self.LATENT_GRID), dtype=torch.bool)
+        mask[(slice(None), *core)] = True
+        return mask
+
+    @classmethod
+    def _scan_interval(cls) -> tuple[int, ...]:
+        """MONAI scan 间隔（roi×(1−overlap)，r==s 退化为单窗）。"""
+        return tuple(
+            int(r) if r == s else max(int(r * (1.0 - cls.SLIDING_OVERLAP)), 1)
+            for r, s in zip(cls.SLIDING_ROI, cls.SLIDING_IMAGE_SHAPE[1:])
+        )
 
 
 class TestPrepareEncoderDispatch:
@@ -588,6 +857,37 @@ class TestPrepareEncoderDispatch:
         config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
         with pytest.raises(ValueError, match="vae_config_json"):
             PreparePipeline.build_encoder(config, torch.device("cpu"))
+
+    def test_encode_sliding_params_flow_to_dispatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """encode 滑窗参数通道端到端（issue #143 user story 12）：
+        ``preprocessing.encode_roi_size``/``encode_overlap`` 的生产默认
+        NVIDIA 锚经 ``build_encoder`` 到达豁免分派——BraTS 形状 8.39M 体
+        恒整前向，[512,512,128]=33.5M 体越过 16.38M 阈值走滑窗（clamp 后
+        2×2×1 = 4 窗，替身观测面）。"""
+        artifacts = Fixture().write_artifacts(tmp_path / "fixtures")
+        data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+        data["artifacts"]["vae_ckpt"] = str(artifacts.vae_ckpt)
+        data["artifacts"]["vae_config_json"] = str(artifacts.vae_config_json)
+        config = CynosureConfig.model_validate(data)
+
+        twin = MeanPoolEncoderTwin()
+        monkeypatch.setattr(
+            "cynosure.reward.encoder.NetworkAssembler",
+            SimpleNamespace(vae=lambda unused_artifact: twin),
+        )
+        encoder = PreparePipeline.build_encoder(config, torch.device("cpu"))
+
+        brats = torch.randn(1, 256, 256, 128)  # 8.39M ≤ 16.38M：恒整前向
+        encoder.encode(brats)
+        assert twin.encode_shapes == [(1, 1, 256, 256, 128)]
+
+        twin.encode_shapes.clear()
+        long_tail = torch.randn(1, 512, 512, 128)  # 33.5M > 16.38M：滑窗
+        latent = encoder.encode(long_tail)
+        assert twin.encode_shapes == [(1, 1, 320, 320, 128)] * 4
+        assert tuple(latent.shape) == (4, 128, 128, 32)  # 拼合网格 = 影像 ÷4
 
     def test_noise_seed_is_content_addressed(self) -> None:
         """后验采样噪声种子按（schedule seed, 病例, 序列）稳定派生：
