@@ -13,6 +13,12 @@ stage-2 的 buffer base 分区由 stage-2 自己的初始 policy 生成。
 
 stage-1 传递（spec 配置项清单「组3 衔接」）：缺省时同一次运行内先跑
 stage-1；config 指定既有 stage-1 产物 run 目录则跳过 stage-1，只跑 stage-2。
+
+stage-2 报告绑定（#116）：config 的 ``experiment.stage2_pretrain_report_json``
+指向 cross-modal 预训练报告（stage-2 上岗的合法消费面），stage-2 计划把
+绑定路径重写进本阶段 config 的 ``reward.pretrain_report_json``——trainer
+装配与 warm-start 守卫（含 #113 组别等值对照）按单阶段语义消费，无序贯
+分支；绑定缺省在 config 装载期即被拒（不静默继承 stage-1 报告）。
 """
 
 import json
@@ -117,17 +123,41 @@ class SequentialTrainer:
         config = self._config.model_copy(deep=True)
         config.experiment.group = "modal-label"
         config.experiment.stage1_run_dir = None
+        # 计划 config = 单阶段组1 语义：组3 专属绑定字段随组别重写一并清空
+        # （model_copy 不重验，清空与 group/stage1_run_dir 重写同一手工
+        # 同步面；清点后重验 schema 即合法形态）
+        config.experiment.stage2_pretrain_report_json = None
         return StagePlan(stage=1, config=config, checkpoint_prefix="")
 
     def _stage2_plan(self, base_prime: Path) -> StagePlan:
         """stage-2 = 组2 配置 + base′ 冻结（unet checkpoint 重写为 stage-1
         产物）+ 预训练 ControlNet 复用初始化（artifacts.controlnet_ckpt
         不变，experiment-design「从预训练 ControlNet checkpoint 复用作
-        初始化」）。"""
+        初始化」）+ stage 级报告绑定重写（#116）：warm-start 报告路径改指
+        ``experiment.stage2_pretrain_report_json``（cross-modal 预训练
+        报告）——不重写则 stage-2 沿 stage-1 的 modal-label 报告装载，被
+        组别等值守卫（#113）在装配期拒绝。trainer 装配与守卫保持无感知：
+        重写后的 stage-2 计划 config 是一份普通的单阶段组2 config。"""
+        stage2_report = self._config.experiment.stage2_pretrain_report_json
+        if stage2_report is None:
+            # schema 装载已拒绝序贯缺绑定（config._stage2_report_binding_
+            # is_sequential_only）；本守卫收口绕过 schema 的编程构造路径
+            # ——缺绑定宁可显式拒绝，也不静默继承 stage-1 报告
+            raise ValueError(
+                "stage2_pretrain_report_json 未绑定：stage-2 消费的 "
+                "cross-modal 预训练报告路径须显式声明（不静默继承 stage-1 "
+                "的 reward.pretrain_report_json——跨组消费会被组别等值守卫"
+                "拒绝）"
+            )
         config = self._config.model_copy(deep=True)
         config.experiment.group = "cross-modal"
         config.experiment.stage1_run_dir = None
+        # 计划 config = 单阶段组2 语义：组3 专属绑定字段随组别重写一并清空
+        # （model_copy 不重验，清空与 group/stage1_run_dir 重写同一手工
+        # 同步面；清点后重验 schema 即合法形态）
+        config.experiment.stage2_pretrain_report_json = None
         config.artifacts.unet_ckpt = base_prime
+        config.reward.pretrain_report_json = stage2_report
         return StagePlan(
             stage=2, config=config, checkpoint_prefix=_STAGE2_CHECKPOINT_PREFIX,
         )

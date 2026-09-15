@@ -349,7 +349,8 @@ class TestPretrainReportGuard:
         装载期显式拒绝（#113）——per-condition AUC 与条件白名单是在预
         训练组别自己的 fake 分布上测量的，跨组上岗是口径错位而非可配置
         语义（无逃生门）。判别性构造：数据口径指纹全部对齐，拒绝只能
-        来自组别对照；报错含两侧组别值与「同组别口径」的可读指引。"""
+        来自组别对照；报错含两侧组别值、「同组别口径」与 stage-2 报告
+        绑定配置面（#116）的可读指引。"""
         report = self._guard_aligned_report(report_scenario)
         report_scenario.config.experiment.group = "cross-modal"
         with pytest.raises(ValueError) as exc_info:
@@ -359,6 +360,8 @@ class TestPretrainReportGuard:
         assert "modal-label" in message  # 报告侧组别值
         assert "cross-modal" in message  # config 侧组别值
         assert "同组别" in message  # 预训练与上岗须同组别口径的指引
+        assert "stage2_pretrain_report_json" in message  # 组3 stage-2 的绑定配置面
+        assert "stage-1" in message  # 不继承 stage-1 报告的指引
 
     def test_group_match_passes(
         self, report_scenario: PretrainReportScenario,

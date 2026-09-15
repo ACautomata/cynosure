@@ -218,9 +218,17 @@ class Fixture:
         """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。
 
         ``group`` 选实验组（三选一）；组2/组3 的 config 携带 ControlNet
-        工件对（schema 强制），组1 携带亦无害（modal-label 训练不消费）。"""
+        工件对（schema 强制），组1 携带亦无害（modal-label 训练不消费）。
+        组3 另携带 stage-2 报告绑定（#116，schema 必填）：指向工件库序贯
+        变体的第二份预训练产物（cross-modal 报告，``FixtureArtifactLibrary``
+        真跑 pretrain driver 产出）。"""
+        experiment: dict = {"group": group}
+        if group == "sequential":
+            experiment["stage2_pretrain_report_json"] = str(
+                artifacts_dir / "pretrain_run_stage2" / "pretrain_report.json",
+            )
         return CynosureConfig.model_validate({
-            "experiment": {"group": group},
+            "experiment": experiment,
             "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "preprocessing": {"resize_base": self.RESIZE_BASE},

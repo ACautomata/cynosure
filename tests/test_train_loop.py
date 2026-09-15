@@ -1387,9 +1387,10 @@ class TestGradientGating:
             iter_events[-1]["buffer_recent_occupied"]
             > iter_events[0]["buffer_recent_occupied"]
         )
-        # 门控状态随续训分片落盘（v4）：静态名单逐位恒定、无观测记录
+        # 门控状态随续训分片落盘（v5，#147 续训分片升级后跟进）：静态名单
+        # 逐位恒定、无观测记录
         state = scenario.resume_state()
-        assert state["format_version"] == 4
+        assert state["format_version"] == 5
         assert state["gating"]["members"] == ["t1n"]
         assert state["gating"]["ema"] == {}
 

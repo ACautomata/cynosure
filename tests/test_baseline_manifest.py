@@ -124,6 +124,11 @@ class TestStageManifestMatchesExecutedStages:
         data["experiment"] = {
             "group": "sequential",
             "stage1_run_dir": stage1_run_dir,
+            # stage-2 报告绑定（#116，schema 必填；本类只测 manifest 形态，
+            # 绑定路径不消费）
+            "stage2_pretrain_report_json": (
+                "pretrain_run_stage2/pretrain_report.json"
+            ),
         }
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"

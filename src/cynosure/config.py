@@ -162,6 +162,14 @@ class Experiment(BaseModel):
         "组3：既有 stage-1 产物路径（指定则跳过 stage-1 训练；None = 同一次运行内先跑 stage-1）",
         default=None,
     )
+    stage2_pretrain_report_json: Path | None = SpecField(
+        "定死", "本 spec 补钉",
+        "组3：stage-2（cross-modal config）上岗消费的 cross-modal 预训练报告路径"
+        "（stage 级报告绑定，#116——序贯编排把绑定路径重写进 stage-2 计划 config 的"
+        " reward.pretrain_report_json，不静默继承 stage-1 报告；序贯必填，非序贯组"
+        "携带即拒绝）",
+        default=None,
+    )
 
     @field_validator("cross_modal_pairs")
     @classmethod
@@ -189,6 +197,37 @@ class Experiment(BaseModel):
             raise ValueError(
                 "stage1_run_dir 仅对组3（sequential）有语义：既有 stage-1 "
                 f"产物路径用于跳过 stage-1 训练，得到组 {group}"
+            )
+        return value
+
+    @field_validator("stage2_pretrain_report_json")
+    @classmethod
+    def _stage2_report_binding_is_sequential_only(
+        cls, value: Path | None, info: ValidationInfo,
+    ) -> Path | None:
+        """stage-2 报告绑定只对组3 有语义，双向显式拒绝（#116）：
+
+        - 非序贯组携带即拒绝（与 ``stage1_run_dir`` 同款——拼错组名时
+          静默绑定比显式拒绝危险）；
+        - 序贯缺绑定也拒绝——stage-2 若不绑定 cross-modal 报告，就会沿
+          stage-1 的 ``reward.pretrain_report_json`` 装载 modal-label
+          报告、到 stage-2 装配期才被组别等值守卫（#113）拒绝；装载期
+          显式拒绝把指引提前到 config 面，不静默继承。"""
+        group = info.data.get("group")
+        if group != "sequential" and value is not None:
+            raise ValueError(
+                "stage2_pretrain_report_json 仅对组3（sequential）有语义："
+                "stage-2 消费的 cross-modal 预训练报告路径绑定，得到组 "
+                f"{group}"
+            )
+        if group == "sequential" and value is None:
+            raise ValueError(
+                "组3（sequential）须配置 stage2_pretrain_report_json"
+                "（stage-2 消费的 cross-modal 预训练报告路径，#116 stage 级"
+                "报告绑定）：缺省时 stage-2 会沿 stage-1 的 reward."
+                "pretrain_report_json 继承 modal-label 报告，被组别等值守卫"
+                "在装载期拒绝——序贯不静默继承 stage-1 报告，两份预训练产物"
+                "的路径须分别显式声明"
             )
         return value
 
