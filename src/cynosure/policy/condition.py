@@ -44,9 +44,23 @@ class RolloutCondition:
     source_label: torch.Tensor | None = None
     """组2 源位之二：源模态 token（int64），形状 [B]；组1 为 ``None``。
     ControlNet 前向的 class label（issue #115 各收其职：ControlNet 解读
-    源影像，残差按源模态分化；UNet 保持目标 label）。"""
+    源影像，残差按源模态分化；UNet 保持目标 label）。源位一致性
+    （与 source_latent 同齐同缺）由构造期 contract 保证（issue #117）。"""
 
     def __post_init__(self) -> None:
+        if self.source_latent is not None and self.source_label is None:
+            raise ValueError(
+                "组2 条件构造缺源模态 label（RolloutCondition.source_label）："
+                "源影像 latent 与源 label 须同源齐备（issue #117 收紧为组2 "
+                "必填——漏 label 即 ControlNet 退回目标 label 的同源错位语义，"
+                "构造期拒绝而非静默默认）"
+            )
+        if self.source_latent is None and self.source_label is not None:
+            raise ValueError(
+                "组1 条件构造携带源模态 label（RolloutCondition.source_label）："
+                "源 label 是组2 专属位，须与源影像 latent 同齐同缺"
+                "（issue #117 源位一致性 contract）"
+            )
         if self.label.shape[0] != self.spacing.shape[0]:
             raise ValueError(
                 f"条件 batch 不符：label {self.label.shape[0]} vs spacing "

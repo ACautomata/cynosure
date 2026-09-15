@@ -481,33 +481,6 @@ class TestBareConditionField:
             )
         assert torch.allclose(grouped, expanded, rtol=1e-4, atol=2e-5)
 
-    def test_missing_source_latent_rejected(
-        self, recording_unet: RecordingUnet, recording_controlnet: RecordingControlnet,
-    ) -> None:
-        """组2 采样场缺源影像条件 = 装配契约违例：显式拒绝而非静默单条件
-        前向（跨模态对齐会静默失效）。"""
-        field = BareConditionField(recording_unet, recording_controlnet, 1.0)
-        condition = RolloutCondition(
-            label=torch.tensor([29]), spacing=SPACING,
-            source_label=torch.tensor([29]),
-        )
-        with pytest.raises(ValueError, match="source_latent"):
-            field.velocity(torch.randn(1, *LATENT_SHAPE), 442, condition)
-
-    def test_missing_source_label_rejected(
-        self, recording_unet: RecordingUnet, recording_controlnet: RecordingControlnet,
-    ) -> None:
-        """组2 采样场缺源模态 label = 装配契约违例（issue #115）：显式拒绝
-        而非静默退回目标 label（同源错位正是本票修订要消除的语义）。"""
-        field = BareConditionField(recording_unet, recording_controlnet, 1.0)
-        torch.manual_seed(13)
-        condition = RolloutCondition(
-            label=torch.tensor([34]), spacing=SPACING,
-            source_latent=torch.randn(1, *LATENT_SHAPE),
-        )
-        with pytest.raises(ValueError, match="source_label"):
-            field.velocity(torch.randn(1, *LATENT_SHAPE), 442, condition)
-
 
 class TestRolloutConditionSourceLatent:
     """组2 条件扩展：source_latent/source_label 与 label/spacing 同 batch
@@ -542,18 +515,28 @@ class TestRolloutConditionSourceLatent:
         assert torch.equal(broadcast.label, torch.full((12,), 34))
         assert torch.equal(broadcast.source_latent[0], condition.source_latent[0])
 
-    def test_broadcast_expands_source_latent(self) -> None:
-        torch.manual_seed(17)
-        condition = RolloutCondition(
-            label=torch.tensor([29]),
-            spacing=SPACING,
-            source_latent=torch.randn(1, *LATENT_SHAPE),
-        )
-        broadcast = condition.broadcast_to(12)
-        assert broadcast.label.shape == (12,)
-        assert broadcast.spacing.shape == (12, 3)
-        assert broadcast.source_latent.shape == (12, *LATENT_SHAPE)
-        assert torch.equal(broadcast.source_latent[0], condition.source_latent[0])
+    def test_group2_missing_source_label_rejected_at_construction(self) -> None:
+        """组2 条件构造缺源模态 label：构造期显式失败（issue #117 收紧为
+        组2 必填）——「source_latent 可单独在场」的过渡形态废止，源位
+        （latent/label）同齐同缺是数据结构级不变式，不经 ControlNet 的
+        消费路径也无法静默携带半源位条件。"""
+        torch.manual_seed(19)
+        with pytest.raises(ValueError, match="source_label"):
+            RolloutCondition(
+                label=torch.tensor([34]),
+                spacing=SPACING,
+                source_latent=torch.randn(1, *LATENT_SHAPE),
+            )
+
+    def test_group1_with_source_label_rejected_at_construction(self) -> None:
+        """组1 条件携带源模态 label：构造期显式失败（issue #117 源位
+        一致性的反向）——源 label 是组2 专属位，组1 条件源位恒双缺。"""
+        with pytest.raises(ValueError, match="source_label"):
+            RolloutCondition(
+                label=torch.tensor([29]),
+                spacing=SPACING,
+                source_label=torch.tensor([29]),
+            )
 
     def test_batch_mismatch_between_label_and_source_rejected(self) -> None:
         torch.manual_seed(17)
@@ -562,15 +545,18 @@ class TestRolloutConditionSourceLatent:
                 label=torch.tensor([29]),
                 spacing=SPACING,
                 source_latent=torch.randn(3, *LATENT_SHAPE),
+                source_label=torch.tensor([29, 34, 30]),
             )
 
     def test_batch_mismatch_between_label_and_source_label_rejected(self) -> None:
         """source_label 与 label batch 不符：构造即显式拒绝（校验对齐
         扩展到源 label 位）。"""
+        torch.manual_seed(17)
         with pytest.raises(ValueError, match="batch"):
             RolloutCondition(
                 label=torch.tensor([29]),
                 spacing=SPACING,
+                source_latent=torch.randn(1, *LATENT_SHAPE),
                 source_label=torch.tensor([29, 34]),
             )
 
