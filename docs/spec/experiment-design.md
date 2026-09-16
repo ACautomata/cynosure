@@ -48,7 +48,7 @@ schema 语义（与 BraTS 线的隔离保证）：
 - **无共享可变状态**：词表装载产物不可变（frozen 值对象 + 只读映射视图），同进程先后装载互不污染；
 - **MR-RATE 线只定义组1**：上游无 MR ControlNet，非 modal-label 组别即拒绝（跨模态/序贯是 BraTS 语义）。
 
-**运行时消费边界（#127 装载层 → #129 贯通层）**：#127 交付到工件装载与 schema 绑定；**#129 接线 rollout 条件组装与 latent 形状按条件贯通**——`cynosure.conditions.ConditionVocabulary` 协议是两域统一解析面（`names` / `latent_shape` / `latent_numel` / `token` / `spacing_x1e2`），MR 侧 = 词汇表工件装载产物、BraTS 侧 = 单域常量策略（四序列、任意条件恒 config `latent_shape`——单域 = 单条件词汇特例）。落地口径：
+**运行时消费边界（#127 装载层 → #129 贯通层）**：#127 交付到工件装载与 schema 绑定；**#129 接线 rollout 条件组装与 latent 形状按条件贯通**——`cynosure.conditions.ConditionVocabulary` 协议是两域统一解析面（`names` / `latent_shape` / `latent_numel` / `token` / `spacing_condition`——末者与 #130 的 `MrConditionVocabulary.spacing_condition` 同名同语义：合并期统一命名，换算因子取 config 单一来源 `SPACING_CONDITION_SCALE`），MR 侧 = 词汇表工件装载产物、BraTS 侧 = 单域常量策略（四序列、任意条件恒 config `latent_shape`——单域 = 单条件词汇特例）。落地口径：
 
 - **rollout 条件组装**：MR 组1 条件分布 = 词汇表生成条件均匀轮转（`MrConditionSampler`，spec #125 决策 5 默认口径），token 与等效 spacing ×1e2 都是条件五元组属性、经协议取数（单一来源）；BraTS 组1 = 四序列采样（`ModalLabelConditionSampler`，行为不变）。条件名随 `RolloutCondition.name` 贯通采样场。
 - **latent 形状按条件贯通**：rollout 初始噪声/扰动噪声、base 分区量产、eval/baseline 逐条目采样的形状一律从批次条件经协议解析（批内同条件即同形状；GRPO 组内天然同条件同形状，advantage 无跨形状问题）。base 分区量产与 buffer `fill_base` 收逐条目张量清单（跨条件异形状无从 cat）；回放采样与判别器输入的同条件过滤使批内同形成为结构事实。

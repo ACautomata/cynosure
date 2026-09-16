@@ -47,6 +47,7 @@ from cynosure.distributed import DistributedContext, RankSlicedPool
 from tests.conftest import (
     CliSession,
     FixturePrepareScenario,
+    enforce_deterministic_kernels,
 )
 from tests.test_train_loop import TrainingLoopScenario
 
@@ -116,6 +117,11 @@ class TrainWorldWorker:
         # 在两路径同线程数下才自洽（集群实测 rank 8 线程 vs 参考
         # 1 线程 → loss ~1e-6 尺度 7% 相对差超容差）。
         torch.set_num_threads(self.num_threads)
+        # 确定性 kernel 口径：spawn 子进程是独立进程，不继承 pytest 进程
+        # 的运行时开关（conftest 的导入期调用只在导入它的进程生效），
+        # 而跨 rank 权重逐位对账（RankResumeShards）依赖它——ADR-0011
+        # 把确定性从 CLI 运行时挪到测试进程后，本处是子进程侧的显式收口
+        enforce_deterministic_kernels()
         os.environ.update(
             RANK=str(self.rank),
             LOCAL_RANK=str(self.rank),

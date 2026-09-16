@@ -223,7 +223,7 @@ class TestConditionVocabularyBraTSStrategy:
     def test_spacing_is_unit_x1e2(self) -> None:
         """BraTS 组1 间距 = 单位间距 ×1e2 常量（policy-modeling 章
         spacing ×1e2 恒传口径）。"""
-        assert self._vocabulary().spacing_x1e2("t1n") == (100.0, 100.0, 100.0)
+        assert self._vocabulary().spacing_condition("t1n") == (100.0, 100.0, 100.0)
 
 
 class TestMrConditionSampler:

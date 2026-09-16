@@ -484,3 +484,46 @@ class TestLatentNumelPerCondition:
         vocab = MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
         with pytest.raises(KeyError, match="not-in-vocabulary"):
             vocab.latent_numel("not-in-vocabulary")
+
+
+class TestSpacingConditionFace:
+    """spacing 条件属性解析面（issue #130，spec #125 决策 6）：条件 →
+    ×1e2 条件张量值——real 侧 manifest 条目与 fake 侧 rollout 条件的
+    同值来源；换算因子 ×1e2 在测试内独立登记（换算漂移即测出）。"""
+
+    @classmethod
+    def _vocab(cls) -> MrConditionVocabulary:
+        return MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
+
+    def test_values_are_fov_over_grid_times_1e2(self) -> None:
+        """逐条件：spacing_condition = FOV / 网格 ×1e2（与 spacing_mm
+        同一定义式、与 per-case 侧车同一条件单位）。"""
+        for condition in self._vocab().conditions:
+            expected = tuple(
+                fov / grid * 100.0
+                for fov, grid in zip(condition.fov_mm, condition.grid_xyz)
+            )
+            assert (
+                self._vocab().spacing_condition(condition.name)
+                == pytest.approx(expected)
+            ), condition.name
+
+    def test_anchor_value_thin_axis_has_largest_spacing(self) -> None:
+        """锚值抽查：t1w/axial = (240/256, 240/256, 174/128)×1e2——薄轴
+        （FOV 174 mm、网格 128）等效 spacing 最大（物理分辨率最粗）。"""
+        assert self._vocab().spacing_condition("t1w/axial") == pytest.approx(
+            (93.75, 93.75, 135.9375)
+        )
+
+    def test_fixture_vocabulary_same_face(self, tmp_path: Path) -> None:
+        """fixture 词汇表同一解析面：FOV = 网格 = (64, 64, 32) → 单位
+        spacing ×1e2 = (100, 100, 100)。"""
+        artifacts = Fixture().write_artifacts(tmp_path / "fixtures")
+        vocab = MrConditionVocabulary.load(
+            artifacts.condition_vocabulary_json, fixture_mode=True,
+        )
+        assert vocab.spacing_condition("t1w/axial") == (100.0, 100.0, 100.0)
+
+    def test_unknown_condition_rejected(self) -> None:
+        with pytest.raises(KeyError, match="pd/axial"):
+            self._vocab().spacing_condition("pd/axial")

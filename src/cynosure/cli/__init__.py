@@ -19,20 +19,23 @@ fid 是裁决性 MR FID 读数仪器（#73 双轨之一，wayfinder #79 移植�
 特征缓存带几何口径 fingerprint 防护。fid-floor 是 real-vs-real
 地板的病例级半分工具（#73 裁决八）：读 MR-RATE 评估 manifest，
 seed 冻结落盘（split_record.json + 逐格双侧清单），产物直接喂 fid。
-两子命令与训练族 config 完全分离（fid 不需要训练工件）。
+两子命令与训练族 config 完全分离（fid 不需要训练工件）。base-smoke
+是基座 checkpoint 装载与前向自检（wayfinder #120）：独立
+``BaseSmokeConfig`` schema，单进程执行，装载上游发布件（UNet 训练
+checkpoint 容器 + VAE 裸权重）后出定点前向指纹与 VAE 生产尺寸往返
+读数，报告落盘供 #121/#122 消费。
 """
 
 import argparse
 import json
-import os
 import pickle
 import shutil
 import sys
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, TypeVar
 
 import torch
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.distributed import DistributedContext
@@ -46,9 +49,14 @@ from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.pretrain import PretrainRun
 from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward import PreparePipeline
+from cynosure.smoke import BaseSmokeConfig, BaseSmokeRunner
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer
 
 _EXIT_USAGE_ERROR = 2
+
+_SchemaT = TypeVar("_SchemaT", bound=BaseModel)
+"""独立 schema 子命令的装载返回类型（``fid`` 的 MrFidConfig / ``base-smoke``
+的 BaseSmokeConfig）。"""
 
 
 class CynosureCli:
@@ -62,12 +70,14 @@ class CynosureCli:
     def run(self) -> int:
         parser = self._build_parser()
         args = parser.parse_args(self._argv)
-        self._enforce_deterministic_kernels()
         # fid / fid-floor 走独立 schema（裁决性评测仪器，与训练 config 分离）
         if args.command == "fid":
             return self._fid(args)
         if args.command == "fid-floor":
             return self._fid_floor(args)
+        # base-smoke 走独立 schema（基座装载自检，与训练 config 分离）
+        if args.command == "base-smoke":
+            return self._base_smoke(args)
         # 四子命令共享同一 config schema：dispatch 前统一校验
         config = self._load_config(args.config)
         if config is None:
@@ -93,6 +103,7 @@ class CynosureCli:
             ("pretrain", "判别器 warm-start 预训练（RM readiness gate 的上岗产物）"),
             ("fid", "裁决性 MR FID 读数（fork 口径 2.5D 仪器，#73 双轨）"),
             ("fid-floor", "real-vs-real 地板半分（病例级 seed 冻结 + 逐格清单）"),
+            ("base-smoke", "基座 checkpoint 装载与前向自检（wayfinder #120）"),
         ):
             sub = subparsers.add_parser(name, help=help_text)
             if name == "fid-floor":
@@ -166,21 +177,6 @@ class CynosureCli:
         except json.JSONDecodeError as exc:
             print(f"config 不是合法 JSON: {exc}", file=self._stderr)
             return None
-
-    @staticmethod
-    def _enforce_deterministic_kernels() -> None:
-        """确定性 kernel 执行——逐位复现契约的运行时前提。
-
-        逐位类断言（同 seed 里程碑 FID、跨 rank 权重对账、续训
-        roundtrip、FID 裁决仪器）在 GPU 上依赖 kernel 算法选择确定；
-        缺省的 autotune/split-K 原子归约随负载漂移（同 seed 两 run 的
-        policy 权重实测 4e-6 级分叉、里程碑 FID 逐次漂移 0.04-0.09）。
-        workspace 变量须在首个 cuBLAS handle 创建前生效，CLI 分发入口
-        是进程内唯一必然先于一切子命令执行（含 fixture 预训练构建）的
-        统一收口。``setdefault`` 尊重外部显式配置。"""
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True)
 
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
         resume = args.resume
@@ -419,9 +415,13 @@ class CynosureCli:
         )
         return 0
 
-    def _load_mr_fid_config(self, config_arg: str) -> MrFidConfig | None:
-        """fid 子命令的独立 schema 装载（与训练 config 完全分离：
-        裁决性评测仪器的冻结变量不经由训练 schema）。"""
+    def _load_detached_config(
+        self, config_arg: str, schema: type[_SchemaT],
+    ) -> _SchemaT | None:
+        """独立 schema 子命令（fid / base-smoke）的 config 装载：与训练
+        config 完全分离——裁决性评测仪器的冻结变量与基座装载自检的定点
+        输入都不经由训练 schema。错误面与行为同训练族装载（不存在 /
+        非法 JSON / 字段级校验失败均落 exit 2 的可读输出）。"""
         path = Path(config_arg)
         if not path.is_file():
             print(f"config 文件不存在: {path}", file=self._stderr)
@@ -429,7 +429,7 @@ class CynosureCli:
         try:
             with path.open(encoding="utf-8") as fh:
                 data = json.load(fh)
-            return MrFidConfig.model_validate(data)
+            return schema.model_validate(data)
         except ValidationError as exc:
             print("config 校验失败：", file=self._stderr)
             for error in exc.errors():
@@ -466,7 +466,7 @@ class CynosureCli:
         )
         if rejected is not None:
             return rejected
-        config = self._load_mr_fid_config(args.config)
+        config = self._load_detached_config(args.config, MrFidConfig)
         if config is None:
             return _EXIT_USAGE_ERROR
         try:
@@ -526,6 +526,62 @@ class CynosureCli:
         print(
             f"冻结记录与逐格双侧清单已落盘: {args.output_dir}"
             "（split_record.json + filelist_half_<a|b>[_<格>].txt）",
+            file=self._stdout,
+        )
+        return 0
+
+    def _base_smoke(self, args: argparse.Namespace) -> int:
+        """基座 checkpoint 装载与前向自检（wayfinder #120）：装载上游发布件
+        （UNet 训练 checkpoint 容器 + VAE 裸权重）→ 定点 latent/模态 token
+        前向指纹 → VAE 生产 latent 尺寸往返 → 报告落盘。
+
+        装载期与执行期的失败（工件缺失 / 转写配置键不完整 / 参数量对账
+        不符 / 定点前向逐位不可复现）= 自检未通过，exit 2：退出码即
+        结论，不留一份「半绿」的报告。"""
+        rejected = self._reject_torchrun(
+            "base-smoke",
+            "多 rank 各自全量装载会重复读同一权重并并发覆写同一报告工件",
+        )
+        if rejected is not None:
+            return rejected
+        config = self._load_detached_config(args.config, BaseSmokeConfig)
+        if config is None:
+            return _EXIT_USAGE_ERROR
+        try:
+            report = BaseSmokeRunner(config).run()
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"base-smoke 未通过: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        print(
+            f"装载：UNet {report.loading.unet_parameters} 参数（权重文件 "
+            f"{report.loading.unet_checkpoint_parameters}）、VAE 权重文件 "
+            f"{report.loading.vae_checkpoint_parameters} 参数",
+            file=self._stdout,
+        )
+        print(
+            f"定点前向：latent {list(report.latent_shape)} @ t="
+            f"{report.timestep}、模态 token={report.modality_token}、"
+            f"CFG={report.cfg_weight}、spacing={list(report.spacing)} → "
+            f"velocity {list(report.velocity_shape)} sha256="
+            f"{report.velocity_sha256}（两次前向逐位一致："
+            f"{report.velocity_repeat_identical}）",
+            file=self._stdout,
+        )
+        print(
+            f"VAE 往返：{list(report.image_shape)} → "
+            f"{list(report.encoded_shape)} → {list(report.decoded_shape)}"
+            f"（decode 口径 {report.decode_autocast_dtype} autocast、"
+            f"roi={list(report.decode_roi_size)}、"
+            f"overlap={report.decode_overlap:.4f}、scale="
+            f"{report.loading.latent_scale_factor} 来自 "
+            f"{report.loading.latent_scale_factor_source}）",
+            file=self._stdout,
+        )
+        print(
+            f"基座装载自检报告已落盘: {config.output_json}",
             file=self._stdout,
         )
         return 0

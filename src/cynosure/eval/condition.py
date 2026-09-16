@@ -125,7 +125,7 @@ class EntryConditionResolver:
                 [self._vocabulary.token(name)], device=self._device,
             ),
             spacing=torch.tensor(
-                [self._vocabulary.spacing_x1e2(name)], device=self._device,
+                [self._vocabulary.spacing_condition(name)], device=self._device,
             ),
             name=name,
         )

@@ -33,12 +33,14 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from cynosure.config import CynosureConfig, MODALITIES
+from cynosure.config import CynosureConfig, MODALITIES, SPACING_CONDITION_SCALE
 
 CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
 """组1 条件的体素间距常量（1.0 × 1e2，fixture 单位间距；基座
 ``include_spacing_input=true`` 的 ×1e2 恒传口径）。本模块是两域词汇
-spacing 语义（BraTS 组1 单位间距 / MR 条件属性）的常量定义位；
+spacing 语义（BraTS 组1 单位间距 / MR 条件属性）的常量定义位——MR
+侧条件属性的换算因子 ``SPACING_CONDITION_SCALE`` 定义位在 config
+（#130 两臂共享单一来源）；
 ``cynosure.policy.condition`` re-export 保持既有消费面（import 方向
 单向：policy → conditions，防环）。"""
 
@@ -392,11 +394,18 @@ class MrConditionVocabulary:
         模态派生、平面不分化——上游 modality mapping 语义）。"""
         return self.by_name(name).token
 
-    def spacing_x1e2(self, name: str) -> tuple[float, float, float]:
-        """条件的体素间距 ×1e2（采样场 spacing 输入）：等效 spacing
-        条件属性（统一网格下的 FOV/网格，spec #125 决策 6——real 侧
-        与 fake 侧条件张量同值，不构成隐藏捷径）。"""
-        return tuple(axis * 100.0 for axis in self.by_name(name).spacing_mm)
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """条件的 spacing 条件张量值（等效 spacing ×1e2，与 per-case 侧车
+        同一换算因子与条件单位）：real 侧 manifest 条目与 fake 侧 rollout
+        条件张量的同值来源（#130 消费面；spec #125 决策 6——spacing 是
+        条件属性而非逐卷侧车，值只依赖条件名，同条件任意两卷严格同值，
+        堵死「spacing 差异」判别捷径）。``ConditionVocabulary`` 协议的
+        spacing 取数面（#129 消费侧命名面，两域同名同语义）。"""
+        i, j, k = (
+            value * SPACING_CONDITION_SCALE
+            for value in self.by_name(name).spacing_mm
+        )
+        return (i, j, k)
 
 
 class ConditionVocabulary(Protocol):
@@ -430,10 +439,11 @@ class ConditionVocabulary(Protocol):
         token，取数自 modality mapping 工件）。"""
         ...
 
-    def spacing_x1e2(self, name: str) -> tuple[float, float, float]:
-        """条件的体素间距 ×1e2（采样场 spacing 输入）：MR = 等效
-        spacing 条件属性（spec #125 决策 6，real/fake 条件张量同值）；
-        BraTS 组1 = 单位间距常量。"""
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """条件的 spacing 条件张量值（采样场 spacing 输入，×1e2 条件
+        单位）：MR = 等效 spacing 条件属性（spec #125 决策 6，real/fake
+        条件张量同值）；BraTS 组1 = 单位间距常量。两域同名同语义
+        （#130 命名面）。"""
         ...
 
     @property
@@ -539,8 +549,9 @@ class BraTSConditionVocabulary:
         self.latent_shape(name)  # 域守卫先行（未知名即拒绝）
         return self._mapping.label(name)
 
-    def spacing_x1e2(self, name: str) -> tuple[float, float, float]:
-        """BraTS 组1 条件的体素间距：单位间距 ×1e2（fixture/生产同
-        口径，policy-modeling 章 spacing ×1e2 恒传）。"""
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """BraTS 组1 条件的 spacing 条件张量值：单位间距 ×1e2 常量
+        （fixture/生产同口径，policy-modeling 章 spacing ×1e2 恒传；
+        #130 命名面与 MR 侧同名同语义）。"""
         self.latent_shape(name)
         return CONDITION_SPACING_X1E2
