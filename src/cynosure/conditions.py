@@ -11,18 +11,38 @@
 config 只携带路径（``artifacts.condition_vocabulary_json``），装载发生在
 消费点。fixture 模式（显式声明纪律，同 resize_base 先例）放行小词汇表：
 非 11 条件全量的词汇表只能经 ``fixture_mode=True`` 装载。
+
+运行时消费（#129，spec 实现决策 2「形状按条件贯通全链」）：
+``ConditionVocabulary`` 协议是两域条件的统一解析面（rollout 初始噪声、
+eval/baseline 采样、里程碑评测的 latent 形状与 sigma 日程逐条件锚一律
+经它按批次条件解析）——MR-RATE 侧 = 本模块 ``MrConditionVocabulary``
+（条件名 → 词汇表条件，逐条件网格派生），BraTS 侧 =
+``BraTSConditionVocabulary``（单域特例：条件集 = 四序列常量，任意条件
+恒 config ``latent_shape``）。sigma 日程数值锚的语义不变（ADR-0002）：
+单域锚 = 唯一条件的空间 numel；逐条件锚 = 该条件的空间 numel——锚即
+``latent_shape(name)`` 的派生，装载期与运行时同一入口，结构性防错位。
 """
 
 import csv
 import json
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from cynosure.config import SPACING_CONDITION_SCALE
+from cynosure.config import CynosureConfig, MODALITIES, SPACING_CONDITION_SCALE
+
+CONDITION_SPACING_X1E2: tuple[float, float, float] = (100.0, 100.0, 100.0)
+"""组1 条件的体素间距常量（1.0 × 1e2，fixture 单位间距；基座
+``include_spacing_input=true`` 的 ×1e2 恒传口径）。本模块是两域词汇
+spacing 语义（BraTS 组1 单位间距 / MR 条件属性）的常量定义位——MR
+侧条件属性的换算因子 ``SPACING_CONDITION_SCALE`` 定义位在 config
+（#130 两臂共享单一来源）；
+``cynosure.policy.condition`` re-export 保持既有消费面（import 方向
+单向：policy → conditions，防环）。"""
 
 MrPlane = Literal["axial", "sagittal", "coronal", "all-planes"]
 """生成条件的采集平面；all-planes 是 #81 读数格的并池口径（T2w 三格
@@ -227,6 +247,12 @@ class MrConditionVocabulary:
         self._tokens: MappingProxyType[str, int] = MappingProxyType(dict(tokens))
         self._by_name = {condition.name: condition for condition in self._conditions}
 
+    @property
+    def single_condition(self) -> bool:
+        """多条件域 = False：逐条件形状契约是 real 侧工件的必需品
+        （缺表即 ``assert_condition_shapes`` 装配期拒绝）。"""
+        return False
+
     @classmethod
     def load(
         cls, path: str | Path, *, fixture_mode: bool = False,
@@ -355,12 +381,26 @@ class MrConditionVocabulary:
         输入的形状解析来源（#129 消费面）。"""
         return (LATENT_CHANNELS, *self.by_name(name).latent_grid)
 
+    def latent_numel(self, name: str) -> int:
+        """该条件的 sigma 日程数值锚 = 条件空间 numel（#129，ADR-0002
+        语义逐条件化：单域锚 = 唯一条件的空间 numel 的特例）。锚即
+        ``latent_shape(name)`` 的派生，装载期与运行时同一入口——
+        sigma 日程构建与 rollout 噪声形状因此结构性同源，防日程
+        静默错位。未知条件名即拒绝。"""
+        return prod(self.latent_shape(name)[1:])
+
+    def token(self, name: str) -> int:
+        """条件的模态标签 token（条件五元组装载产物取数；token 按
+        模态派生、平面不分化——上游 modality mapping 语义）。"""
+        return self.by_name(name).token
+
     def spacing_condition(self, name: str) -> tuple[float, float, float]:
         """条件的 spacing 条件张量值（等效 spacing ×1e2，与 per-case 侧车
         同一换算因子与条件单位）：real 侧 manifest 条目与 fake 侧 rollout
         条件张量的同值来源（#130 消费面；spec #125 决策 6——spacing 是
         条件属性而非逐卷侧车，值只依赖条件名，同条件任意两卷严格同值，
-        堵死「spacing 差异」判别捷径）。"""
+        堵死「spacing 差异」判别捷径）。``ConditionVocabulary`` 协议的
+        spacing 取数面（#129 消费侧命名面，两域同名同语义）。"""
         i, j, k = (
             value * SPACING_CONDITION_SCALE
             for value in self.by_name(name).spacing_mm
@@ -382,3 +422,151 @@ class MrConditionVocabulary:
             "mra/all-planes" if modality == "mra" else f"{modality}/{plane}"
         )
         return name if name in self._by_name else None
+
+class ConditionVocabulary(Protocol):
+    """生成条件词汇表的运行时协议（#129「形状按条件贯通全链」的
+    解析接缝）：批内同条件即同形状，rollout 初始噪声、eval/baseline
+    采样、里程碑评测的 latent 形状与 sigma 日程逐条件锚一律经本协议
+    按批次条件解析。
+
+    两域实现（Strategy，装配点按 ``experiment.dataset`` 分派，
+    与 ``GroupPolicy.build`` 的组分派同款惯例）：
+    ``MrConditionVocabulary``（MR-RATE，词汇表工件）与
+    ``BraTSConditionVocabulary``（BraTS2023，单域特例：条件集 = 四序列
+    常量、任意条件恒 config ``latent_shape``——单条件词汇形态）。
+    """
+
+    def names(self) -> tuple[str, ...]:
+        """本域条件名清单（条件集；轮转序由此而来）。"""
+        ...
+
+    def latent_shape(self, name: str) -> tuple[int, int, int, int]:
+        """条件的 latent 形状 (4, X, Y, Z)；域外条件名显式拒绝。"""
+        ...
+
+    def latent_numel(self, name: str) -> int:
+        """该条件的 sigma 日程数值锚 = 条件空间 numel。"""
+        ...
+
+    def token(self, name: str) -> int:
+        """条件的模态标签 token（rollout 条件 label 的取数点：MR =
+        条件五元组的 token（平面不分化）；BraTS = 序列的 modality
+        token，取数自 modality mapping 工件）。"""
+        ...
+
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """条件的 spacing 条件张量值（采样场 spacing 输入，×1e2 条件
+        单位）：MR = 等效 spacing 条件属性（spec #125 决策 6，real/fake
+        条件张量同值）；BraTS 组1 = 单位间距常量。两域同名同语义
+        （#130 命名面）。"""
+        ...
+
+    @property
+    def single_condition(self) -> bool:
+        """单条件域标记（形状契约必需性的判据，#129）：BraTS = True
+        （单条件词汇特例——任意条件恒全局形状，manifest 全局对账即
+        完备）；MR-RATE = False（逐条件形状/日程/spacing 消费面按条件
+        解析，real 侧工件必须携带逐条件形状契约，缺表即装配期拒绝）。
+        """
+        ...
+
+    @classmethod
+    def assemble(cls, config: CynosureConfig) -> "ConditionVocabulary":
+        """两域词汇表的 config 驱动装配分派点（#129 消费侧单一来源）：
+        MR-RATE = 条件词汇表工件装载（fixture_mode 透传——fixture 小
+        词汇表只经显式声明通道）；BraTS = 单域常量策略（条件集 = 四序列、
+        形状 = config ``latent_shape`` 全局单值——单条件词汇特例；token
+        取数自 modality mapping 工件装载产物）。train.runtime / eval /
+        train.policy / train.artifacts 四消费侧同口径经此装配——词汇表
+        工件路径或装配语义变更单点生效（防内联副本四处漂移）。"""
+        if config.experiment.dataset == "MR-RATE":
+            return MrConditionVocabulary.load(
+                config.artifacts.condition_vocabulary_json,
+                fixture_mode=config.fixture_mode,
+            )
+        return BraTSConditionVocabulary(
+            latent_shape=tuple(config.latent_shape),
+            mapping=ModalityMapping.load(
+                config.artifacts.modality_mapping_json,
+            ),
+        )
+
+
+class ModalityMapping:
+    """组1 模态标签映射（spec 输入物 modality_mapping：t1n/t1c/t2w/t2f →
+    modality token）。从工件装载、单一来源——不设代码内常量副本，防与
+    基座映射静默漂移。定义位与条件词汇同模块（BraTS 词汇 token 取数的
+    注入 collaborator）；``cynosure.policy.condition`` re-export 保持既有
+    消费面（import 方向单向：policy → conditions，防环）。"""
+
+    def __init__(self, labels: dict[str, int]) -> None:
+        missing = [modality for modality in MODALITIES if modality not in labels]
+        if missing:
+            raise ValueError(
+                f"modality mapping 缺少序列 {missing}（须覆盖 {MODALITIES}）",
+            )
+        self._labels = dict(labels)
+
+    @classmethod
+    def load(cls, path: Path) -> "ModalityMapping":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"modality mapping 工件须为 JSON 对象: {path}")
+        return cls({str(key): int(value) for key, value in data.items()})
+
+    def label(self, modality: str) -> int:
+        """序列的 modality token（组1 条件与组2 双 label 的共同取数点：
+        目标/源模态 token 都从本映射查表，杜绝代码内副本漂移）。"""
+        return self._labels[modality]
+
+
+class BraTSConditionVocabulary:
+    """BraTS 线的条件词汇（单域语义 = 单条件词汇特例）：条件集 =
+    ``MODALITIES`` 四序列常量语义，任意条件共享 config ``latent_shape``
+    全局单值（四序列同网格的历史口径不动——单域下逐条件解析退化为
+    恒等解析）。token 取数自 modality mapping 工件（装载产物注入，
+    不设代码内副本）。"""
+
+    def __init__(
+        self,
+        latent_shape: tuple[int, int, int, int],
+        mapping: ModalityMapping,
+    ) -> None:
+        self._latent_shape = latent_shape
+        self._mapping = mapping
+
+    @property
+    def single_condition(self) -> bool:
+        """单条件域 = True（单条件词汇特例：任意条件恒全局形状，
+        manifest 全局 ``latent_shape`` 对账即完备，缺逐条件表合法）。"""
+        return True
+
+    def names(self) -> tuple[str, ...]:
+        """BraTS 条件集 = 四序列固定序（stage_condition_vocabulary 同口径）。"""
+        return MODALITIES
+
+    def latent_shape(self, name: str) -> tuple[int, int, int, int]:
+        """单域语义：任意本域条件恒 config latent 形状；域外序列名
+        显式拒绝（防「条件拼错静默按同形处理」——形状消费前的合法域
+        守卫）。"""
+        if name not in MODALITIES:
+            raise KeyError(
+                f"序列 {name!r} 不在 BraTS 条件集（在册：{list(MODALITIES)}）"
+            )
+        return self._latent_shape
+
+    def latent_numel(self, name: str) -> int:
+        """BraTS 锚 = 全局 latent 空间 numel（单条件词汇特例语义）。"""
+        return prod(self.latent_shape(name)[1:])
+
+    def token(self, name: str) -> int:
+        """序列的 modality token（modality mapping 工件取数，单一来源）。"""
+        self.latent_shape(name)  # 域守卫先行（未知名即拒绝）
+        return self._mapping.label(name)
+
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """BraTS 组1 条件的 spacing 条件张量值：单位间距 ×1e2 常量
+        （fixture/生产同口径，policy-modeling 章 spacing ×1e2 恒传；
+        #130 命名面与 MR 侧同名同语义）。"""
+        self.latent_shape(name)
+        return CONDITION_SPACING_X1E2

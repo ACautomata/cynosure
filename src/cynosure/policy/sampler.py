@@ -7,6 +7,10 @@
 
 除被优化步外全组共享同一确定性轨迹，组内差异唯一来源于该步注入的噪声
 ——步级 reward 归因的结构前提（research/granular-grpo.md §3）。
+
+sigma 日程经 ``ConditionSchedules`` 按条件名选择（#129 逐条件锚）：
+同一批 rollout 共享同一条件 → 同一份日程快照；GRPO 更新侧重算
+log-prob 经同一入口，扰动与重算的日程口径逐位一致。
 """
 
 import torch
@@ -15,6 +19,7 @@ from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel, SdeTransition
+from cynosure.policy.schedules import ConditionSchedules
 
 
 class RolloutSampler:
@@ -24,11 +29,11 @@ class RolloutSampler:
         self,
         field: VelocityField,
         kernel: SdeKernel,
-        cursor: TrajectoryCursor,
+        schedules: ConditionSchedules,
     ) -> None:
         self._field = field
         self._kernel = kernel
-        self._cursor = cursor
+        self._schedules = schedules
         self._deterministic = SdeKernel.deterministic(s_max=kernel.s_max)
 
     def anchor_trajectory(
@@ -39,10 +44,11 @@ class RolloutSampler:
         """同一批初始噪声的 η=0 全 ODE 轨迹：返回逐步 latent
         （trajectory[0] = 初始噪声，长度 = num_steps + 1）；
         batch 维并行（同组条件批量共享日程）。"""
+        cursor = self._schedules.cursor(condition.name)
         trajectory = [initial_noise]
         x = initial_noise
-        for index in range(self._cursor.num_steps):
-            x = self._deterministic_step(x, index, condition)
+        for index in range(cursor.num_steps):
+            x = self._deterministic_step(x, index, condition, cursor)
             trajectory.append(x)
         return trajectory
 
@@ -60,7 +66,10 @@ class RolloutSampler:
         log-prob 返回 ``None``（确定性步不存在策略密度，非缺数据）。
         """
         group_size = noise.shape[0]
-        transition = self._group_transition(x_k, index, condition, group_size, noise=noise)
+        cursor = self._schedules.cursor(condition.name)
+        transition = self._group_transition(
+            x_k, index, condition, group_size, cursor, noise=noise,
+        )
         if self._kernel.eta <= 0.0:
             return transition.sample, None
         return transition.sample, self._kernel.log_prob(transition.sample, transition)
@@ -78,8 +87,9 @@ class RolloutSampler:
         无条件分支 batch=1 一次评估全组复用；与 batch=2 前向的口径一致，
         仅 batch 尺寸的 fp32 舍入差）。
         """
+        cursor = self._schedules.cursor(condition.name)
         transition = self._group_transition(
-            x_k, index, condition, samples.shape[0],
+            x_k, index, condition, samples.shape[0], cursor,
         )
         return self._kernel.log_prob(samples, transition)
 
@@ -100,28 +110,29 @@ class RolloutSampler:
         抽稀——跳过该细步会漏掉普通续跑的第一个端点），之后访问点相隔
         λ（大步 Δs = 相邻访问位 σ 之差、velocity 在段起点评估），末段
         一律从最后位置直达 σ=0 终点。"""
+        cursor = self._schedules.cursor(condition.name)
         x = latents
         current = index + 1
-        if stride > 1 and current < self._cursor.num_steps:
+        if stride > 1 and current < cursor.num_steps:
             velocity = self._field.velocity(
-                x, self._cursor.timestep(current), condition,
+                x, cursor.timestep(current), condition,
             )
             x = self._deterministic.transition(
                 x,
                 velocity,
-                self._cursor.sigma_level(current),
-                self._cursor.delta_s(current),
+                cursor.sigma_level(current),
+                cursor.delta_s(current),
             ).sample
             current += 1
-        while current < self._cursor.num_steps:
+        while current < cursor.num_steps:
             velocity = self._field.velocity(
-                x, self._cursor.timestep(current), condition,
+                x, cursor.timestep(current), condition,
             )
             x = self._deterministic.transition(
                 x,
                 velocity,
-                self._cursor.sigma_level(current),
-                self._cursor.delta_s(current, stride),
+                cursor.sigma_level(current),
+                cursor.delta_s(current, stride),
             ).sample
             current += stride
         return x
@@ -132,18 +143,19 @@ class RolloutSampler:
         index: int,
         condition: RolloutCondition,
         group_size: int,
+        cursor: TrajectoryCursor,
         noise: torch.Tensor | None = None,
     ) -> SdeTransition:
         """共享 anchor 的组内转移：velocity 走全组复用评估，核参数取自
         同一日程位（扰动步与 log-prob 重算共用，保证两侧口径一致）。"""
         velocity = self._field.group_velocity(
-            x_k, self._cursor.timestep(index), condition, group_size,
+            x_k, cursor.timestep(index), condition, group_size,
         )
         return self._kernel.transition(
             x_k.expand(group_size, *x_k.shape[1:]),
             velocity,
-            self._cursor.sigma_level(index),
-            self._cursor.delta_s(index),
+            cursor.sigma_level(index),
+            cursor.delta_s(index),
             noise=noise,
         )
 
@@ -152,11 +164,12 @@ class RolloutSampler:
         x: torch.Tensor,
         index: int,
         condition: RolloutCondition,
+        cursor: TrajectoryCursor,
     ) -> torch.Tensor:
-        velocity = self._field.velocity(x, self._cursor.timestep(index), condition)
+        velocity = self._field.velocity(x, cursor.timestep(index), condition)
         return self._deterministic.transition(
             x,
             velocity,
-            self._cursor.sigma_level(index),
-            self._cursor.delta_s(index),
+            cursor.sigma_level(index),
+            cursor.delta_s(index),
         ).sample

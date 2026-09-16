@@ -706,6 +706,9 @@ class TestMrRateConditionVocabularyBinding:
     def _mr_config_dict(valid_config_dict: dict) -> dict:
         data = copy.deepcopy(valid_config_dict)
         data["experiment"]["dataset"] = "MR-RATE"
+        # 单域锚字段不随 MR config 携带（#129 互斥携带守卫：latent 形状
+        # 与数值锚逐条件派生自词汇表工件）
+        data.pop("latent_shape", None)
         # 词汇表工件绑定（schema 强制）：路径在 config 层不可缺席——
         # 词表内容的普查对账在 MrConditionVocabulary 装载期
         data["artifacts"]["condition_vocabulary_json"] = (
@@ -849,6 +852,10 @@ class TestMrRateDataAssemblyBinding:
         data["artifacts"]["mrrate_data_snapshot"] = "MR-RATE@v1.0"
         data["reward"]["sampling_manifest_json"] = "prepare/sampling_manifest.json"
         data.setdefault("preprocessing", {})["intensity_clip"] = False
+        # 单域锚字段属 BraTS 语义（#129 互斥携带即拒）：形状/锚逐条件
+        # 派生自条件词汇表工件
+        data.pop("latent_shape", None)
+        data.get("policy", {}).pop("input_img_size_numel", None)
         return data
 
     def test_mrrate_assembly_config_passes(
@@ -1014,3 +1021,115 @@ class TestStatusAnnotations:
                 assert extra["status"] in allowed, (
                     f"{model.__name__} 未知状态标注: {extra['status']}"
                 )
+
+
+class TestMrRateAnchorsPerCondition:
+    """数值锚逐条件口径（#129）：MR-RATE 线 latent 形状与 sigma 日程
+    数值锚逐条件派生自条件词汇表工件，config 单域锚字段
+    （``latent_shape`` / ``policy.input_img_size_numel``）属 BraTS 语义——
+    显式声明即字段级拒绝（防「以为全局单值锚仍生效」的日程静默错位；
+    与 condition_vocabulary_json 互斥携带同款哲学）。BraTS 线显式声明
+    现状放行（单域语义 = 单条件词汇特例）。
+    """
+
+    def _mr_data(self, tmp_path: Path) -> dict:
+        """MR-RATE 合法 config 原始 dict（不携带单域锚字段；schema 不查
+        工件存在性，路径占位即可）。"""
+        return {
+            "experiment": {"group": "modal-label", "dataset": "MR-RATE"},
+            "fixture_mode": True,
+            # 强度臂两域锁死（#130/#71）：MR 线须显式 clip=False
+            "preprocessing": {"intensity_clip": False},
+            "artifacts": {
+                "unet_ckpt": str(tmp_path / "unet.pt"),
+                "vae_ckpt": str(tmp_path / "vae.pt"),
+                "net_config_json": str(tmp_path / "unet_config.json"),
+                "modality_mapping_json": str(tmp_path / "modality_mapping.json"),
+                "dataset_root": str(tmp_path / "dataset"),
+                "condition_vocabulary_json": str(
+                    tmp_path / "condition_vocabulary.json"
+                ),
+                # prepare 装配输入四件套（#121/#131 schema 必填面）
+                "mrrate_metadata_csv": str(tmp_path / "metadata.csv"),
+                "mrrate_splits_csv": str(tmp_path / "splits.csv"),
+                "eval_manifest_csv": str(tmp_path / "eval_manifest.csv"),
+                "mrrate_data_snapshot": "MR-RATE@v1.0",
+            },
+            "reward": {
+                "disc_batch_size_k": 4,
+                "replay_buffer_capacity": 64,
+                "real_pool_manifest": str(tmp_path / "real_pool.json"),
+                "heldout_real_manifest": str(tmp_path / "heldout_real.json"),
+                "channel_stats_json": str(tmp_path / "channel_stats.json"),
+                "pretrain_report_json": str(tmp_path / "report.json"),
+                "pretrain_gate_auc": 0.51,
+                "sampling_manifest_json": str(
+                    tmp_path / "sampling_manifest.json"
+                ),
+            },
+            "schedule": {"seed": 0, "baseline_samples": 4},
+        }
+
+    def test_mr_rate_rejects_explicit_latent_shape(
+        self, tmp_path: Path,
+    ) -> None:
+        """MR 线显式携带 latent_shape → 装载拒绝（错误点名该字段与
+        逐条件口径；守卫在模型层、先例同 fixture_mode 通道守卫）。"""
+        data = self._mr_data(tmp_path)
+        data["latent_shape"] = [4, 16, 16, 8]
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        message = str(exc_info.value.errors())
+        assert "latent_shape" in message
+        assert "词汇表" in message
+
+    def test_mr_rate_rejects_explicit_numel_anchor(
+        self, tmp_path: Path,
+    ) -> None:
+        """MR 线显式携带 policy.input_img_size_numel → 装载拒绝。"""
+        data = self._mr_data(tmp_path)
+        data["policy"] = {"input_img_size_numel": 2048}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        message = str(exc_info.value.errors())
+        assert "input_img_size_numel" in message
+        assert "词汇表" in message
+
+    def test_mr_rate_rejects_default_valued_explicit_declaration(
+        self, tmp_path: Path,
+    ) -> None:
+        """显式传默认值（[4,64,64,32]）同样是单域锚意图的表达——同样
+        拒绝（fields_set 语义：显式携带即意图，不区分值是否为默认）。"""
+        data = self._mr_data(tmp_path)
+        data["latent_shape"] = [4, 64, 64, 32]
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "latent_shape" in str(exc_info.value.errors())
+
+    def test_mr_rate_default_anchors_pass(self, tmp_path: Path) -> None:
+        """未显式携带（默认单域值在 MR 线无消费）→ 装载通过。"""
+        config = CynosureConfig.model_validate(self._mr_data(tmp_path))
+        # 默认值仍在 schema 上（字段保留），但 MR 线运行时零消费
+        assert config.latent_shape == (4, 64, 64, 32)
+        assert config.policy.input_img_size_numel == 131072
+
+    def test_brats_explicit_anchors_pass(self, valid_config_dict: dict) -> None:
+        """BraTS 线显式携带单域锚字段照旧合法（单条件词汇特例语义不动）。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.latent_shape == (4, 64, 64, 32)
+        assert config.policy.input_img_size_numel == 131072
+
+    def test_mr_rate_dump_excludes_single_domain_anchors(
+        self, tmp_path: Path,
+    ) -> None:
+        """MR config 的序列化工件形态不携带单域锚字段（model_dump_json
+        全量展开会把未显式声明的默认值落成显式键——不经排除则 JSON
+        往返被互斥守卫误拒）。"""
+        data = self._mr_data(tmp_path)
+        config = CynosureConfig.model_validate(data)
+        payload = json.loads(config.model_dump_json())
+        assert "latent_shape" not in payload
+        assert "input_img_size_numel" not in payload["policy"]
+        # 往返：序列化产物可原样再装载
+        revived = CynosureConfig.model_validate(payload)
+        assert revived.experiment.dataset == "MR-RATE"

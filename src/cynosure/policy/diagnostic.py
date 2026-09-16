@@ -23,10 +23,10 @@ from pydantic import BaseModel, ConfigDict
 from cynosure.config import CynosureConfig, MODALITIES
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping, RolloutCondition
-from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.schedules import SingleConditionSchedules
 
 CONDITION_SPACING: float = 100.0
 """诊断条件里的体素间距（1.0 × 1e2，policy-modeling 章：spacing ×1e2 恒传）。"""
@@ -146,22 +146,43 @@ class TrajectoryDiagnosticRunner:
                 "轨迹诊断当前仅覆盖组1（modal-label）采样场，得到组 "
                 f"{config.experiment.group}",
             )
+        if config.experiment.dataset == "MR-RATE":
+            # 诊断回路是 BraTS 单域的数值回归锚（单条件日程 + 全局形状
+            # 噪声 + 四序列条件；「与改造前数值逐位一致」）：MR 线的
+            # 逐条件诊断（PerConditionSchedules + 逐条件噪声/条件）属
+            # 后续 ticket——现路径会把 schema 默认单域锚（MR config 的
+            # latent_shape / input_img_size_numel 无语义默认值）与四序列
+            # 条件误当成 MR 诊断落盘，显式拒绝而非静默产出错域工件
+            #（CLI --dump-trajectory 经 _dump_trajectory 的 ValueError
+            # 收口转 usage error，不进入训练）
+            raise ValueError(
+                "轨迹诊断当前仅覆盖 BraTS 单域（单条件日程 + 全局形状"
+                f"锚），得到 dataset={config.experiment.dataset}——"
+                "MR-RATE 的逐条件诊断属后续 ticket",
+            )
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,
         ))
         unet.eval()
-        scheduler = NetworkAssembler.rflow_scheduler(
+        kernel = SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max)
+        self._config = config
+        # 单域诊断回路（BraTS/fixture 语义）走单条件日程表：任意条件名
+        # 共用 ADR-0002 全局锚日程，与改造前数值逐位一致
+        self._schedules = SingleConditionSchedules(
             num_inference_steps=config.policy.num_inference_steps,
             input_img_size_numel=config.policy.input_img_size_numel,
         )
-        kernel = SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max)
-        self._config = config
-        self._scheduler = scheduler
         self._kernel = kernel
-        self._cursor = TrajectoryCursor(scheduler)
+        self._cursor = self._schedules.cursor(None)
+        # MONAI step() 直接对照路径的调度器本体（parity 隔离单步算术的
+        # 真值锚列；与单条件日程表同一锚、同一日程）
+        self._monai_scheduler = NetworkAssembler.rflow_scheduler(
+            num_inference_steps=config.policy.num_inference_steps,
+            input_img_size_numel=config.policy.input_img_size_numel,
+        )
         self._field = CfgCombinedField(unet)
-        self._sampler = RolloutSampler(self._field, kernel, self._cursor)
+        self._sampler = RolloutSampler(self._field, kernel, self._schedules)
 
     def run(self) -> TrajectoryDiagnosticReport:
         with torch.no_grad():
@@ -202,7 +223,7 @@ class TrajectoryDiagnosticRunner:
         x = noises
         for index in range(self._cursor.num_steps):
             velocity = self._field.velocity(x, self._cursor.timestep(index), condition)
-            x, _ = self._scheduler.step(
+            x, _ = self._monai_scheduler.step(
                 velocity,
                 self._cursor.timestep(index),
                 x,

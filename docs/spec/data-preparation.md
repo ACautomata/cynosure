@@ -53,7 +53,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 
 ### 预编码 resize/网格口径（#111 网格裁决的落地）
 
-- **裁决 = 多网格案（逐条件统一网格）**：#111 点名裁决点「单一网格案 vs 多网格案」由 spec #125 实现决策 1/3 定案——11 生成条件各有统一网格（条件词汇表工件 `data/conditions/mrrate_conditions.json` 携带，= #78 普查逐条件众数 latent 网格 ×4），rollout 条件解析形状（#129）、判别器输入按条件分层、里程碑评测与 prepare 编码同一网格口径。同条件内任意原生形状的 real 卷影像域 trilinear resample 到该条件统一网格后编码——**同条件出链 latent 形状唯一**，real/fake 同网格不喂「网格差异」判别捷径；条件间异形状（#78 普查实测逐格 5–11 种原生 latent 网格）在一份工件内按条件登记（`LatentManifest.condition_shapes`）。
+- **裁决 = 多网格案（逐条件统一网格）**：#111 点名裁决点「单一网格案 vs 多网格案」由 spec #125 实现决策 1/3 定案——11 生成条件各有统一网格（条件词汇表工件 `data/conditions/mrrate_conditions.json` 携带，= #78 普查逐条件众数 latent 网格 ×4），rollout 条件解析形状（#129）、判别器输入按条件分层、里程碑评测与 prepare 编码同一网格口径。同条件内任意原生形状的 real 卷影像域 trilinear resample 到该条件统一网格后编码——**同条件出链 latent 形状唯一**，real/fake 同网格不喂「网格差异」判别捷径；条件间异形状（#78 普查实测逐格 5–11 种原生 latent 网格）在一份工件内按条件登记（`LatentManifest.condition_latent_shapes`）。
 - **强度臂 = 官方 clip=False**（#71 裁决，NVIDIA v1 训练口径；两臂 embedding 不可互用）：MR-RATE 线 `preprocessing.intensity_clip=false`、BraTS 线恒 `true`（ADR-0006 fork 锚）——两域取值由 config schema 锁死，显式携带错误值即拒绝。
 - **spacing = 条件属性**：等效 spacing = 推荐 FOV / 统一网格（spec #125 决策 6），条目值 = 等效 spacing ×1e2，同条件严格同值——BraTS 线的 per-case zooms 侧车消费（组2 语义）在 MR-RATE 线由条件属性取代，堵死「spacing 差异」判别捷径；BraTS 线侧车机制原样保留。
 
@@ -66,7 +66,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 
 ### 工件契约（分层键泛化）
 
-- **Real sample pool / Held-out real manifest**（`LatentManifest` 泛化，可扩不改名）：MR-RATE 域条目带 `condition`（11 格名；BraTS 条目带 `modality`——恰一非空）、卷键 = `<study_uid>/<series_id>`、`conditions` 逐条件计数 + `condition_shapes` 逐条件 latent 形状登记（单一 `latent_shape` 恒 None——异形状的对照表）、spacing = 条件属性值。可被 reward 数据管线既有契约装载（`LatentManifest.load` + `RealPoolSampler.sample(condition=...)` 条件匹配采样——同条件同形，批 stack 前提）。
+- **Real sample pool / Held-out real manifest**（`LatentManifest` 泛化，可扩不改名）：条件键两域同名（`PoolEntry.modality`，#129 统一面——BraTS = 序列名、MR-RATE = 生成条件名，判别器条件匹配采样与分层计数的同一归因轴）、卷键 = `<study_uid>/<series_id>`、`modalities` 逐条件计数（由条目派生）+ `condition_latent_shapes` 逐条件 latent 形状契约（多条件域必带、与词汇表逐条件同形，装载期逐条目对账）、spacing = 条件属性值。可被 reward 数据管线既有契约装载（`LatentManifest.load` + `RealPoolSampler.sample(modality=...)` 条件匹配采样——同条件同形，批 stack 前提）。
 - **per-channel 统计量**（#121 AC2）：MR-RATE pool 重算（异形状不影响 per-channel 归约），随工件落 `provenance`（数据域、release 快照 `artifacts.mrrate_data_snapshot`、来源 commit `artifacts.source_commit`（运行环境显式声明注入）、强度臂 clip、resize 口径 = uniform-grid、上游锚 = NVIDIA v1 clip=False）。
 - **配额抽样留痕**（`SamplingManifest`，`reward.sampling_manifest_json`）：seed / 快照 / 配额 / 逐条件候选与实抽计数 / pool 与 held-out 逐卷归属（patient/study/series/modality/plane/condition/role）/ 互斥守卫读数——prepare 幂等与 held-out 互斥的「落档可查」登记面。
 - **容量装配守卫**（ADR-0008-03 口径，#121 AC5）：逐（条件, 全量）容量 ≥ `disc_batch_size_k × world_size`（条件全集 = 词汇表 11 格，稀疏模态小池触发口径——任一条件不足即装配期可读拒绝，开工前失败而非训练中途）。守卫落在 manifest **落盘之前**：失败时盘上 manifest 明确缺失（latents 已写但无索引指向），维持「要么全量一致、要么明确缺失」的工件契约。train 装配期的同款守卫（rank 切片口径）语义不变。

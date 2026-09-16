@@ -13,6 +13,7 @@ base 冻结经断言验证（issue #23 验收）：组2 装配期显式关闭 UN
 
 import torch
 
+from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.distributed.shard import PolicySharding
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
@@ -23,6 +24,7 @@ from cynosure.train.rollout import (
     ConditionSampler,
     CrossModalConditionSampler,
     ModalLabelConditionSampler,
+    MrConditionSampler,
     SourceLatentPool,
 )
 
@@ -87,7 +89,18 @@ class GroupPolicy:
             )
         else:
             network = unet
-            conditions = ModalLabelConditionSampler(mapping, generator, device)
+            if config.experiment.dataset == "MR-RATE":
+                # MR-RATE 组1 条件分布：词汇表生成条件均匀轮转（spec #125
+                # 决策 5）——装配走 ConditionVocabulary.assemble 统一分派
+                # （本类不经 runtime 装配面，防 import 环），token/spacing
+                # 取数单一来源
+                conditions = MrConditionSampler(
+                    ConditionVocabulary.assemble(config), generator, device,
+                )
+            else:
+                conditions = ModalLabelConditionSampler(
+                    mapping, generator, device,
+                )
         if sharding is not None:
             # 分片先于采样场构建：field 必须引用 FSDP wrapper（裸网络的
             # 前向不进分片的梯度聚合路径）；optimizer 最后构建（状态活在

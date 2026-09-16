@@ -12,8 +12,8 @@ fake 供给与判别器相位约定：更新批的当前半区从全批 fake 随
 """
 
 import torch
+from typing import Sequence
 
-from cynosure.config import Modality
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayStore
 from cynosure.reward.overfit import OverfitMonitor
@@ -64,14 +64,15 @@ class RewardCoordinator:
         return self.update.scorer.discriminator
 
     def seed_base(
-        self, samples: torch.Tensor, modalities: list[Modality],
+        self, samples: Sequence[torch.Tensor], modalities: list[str],
     ) -> None:
         """冻结初始 policy 的产出填充 base 分区（train 启动期一次，
-        逐样本目标模态标签对齐——ADR-0008-01 的配额量产标签输入）。"""
+        逐样本目标条件标签对齐——ADR-0008-01 的配额量产标签输入；
+        samples 为逐条目张量清单，异形状条件可表达，#129）。"""
         self.buffer.fill_base(samples, modalities)
 
     def update_step(
-        self, current_fakes: torch.Tensor, modality: Modality,
+        self, current_fakes: torch.Tensor, modality: str,
     ) -> UpdateReport:
         """判别器 Online update 一步：全批 fake 随机置换后交更新
         （50% 当前 / 50% 回放的混采由 update 消费置换批的头部；该条件
@@ -92,7 +93,7 @@ class RewardCoordinator:
             self.discriminator.eval()
 
     def heldout_auc(
-        self, current_fakes: torch.Tensor, modality: Modality,
+        self, current_fakes: torch.Tensor, modality: str,
     ) -> float:
         """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。
 

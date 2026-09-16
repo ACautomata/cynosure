@@ -28,11 +28,11 @@ from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.pretrain import (
-    PretrainDriver,
     PretrainProvenance,
     PretrainReport,
     PretrainRun,
 )
+from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.buffer import base_condition_quota
 from cynosure.train import (
@@ -350,15 +350,19 @@ class TestReportReproduction:
         # （每条件配额量产）、再轮转条件集首条件（确定性轮转不耗 RNG）
         # 的单条件量产测量批、再复测批（同条件）→ 同流同批；报告值 =
         # 该条件两次独立测量的较小者（全量卷池化点估计口径）
-        quota = base_condition_quota(pretrain_config.reward.replay_buffer_capacity)
+        quota = base_condition_quota(pretrain_config.reward.replay_buffer_capacity, MODALITIES)
         driver.rollout.base_partition_samples(quota)
         batch = pretrain_config.reward.pretrain_fake_batch
         target = driver.policy.conditions.targets()[0]
+        # base 分区逐条目产出（#129）——单条件同形，stack 成批
+        # （同 driver._measurement_batch 范式）
+        latents, _ = driver.rollout.base_partition_samples({target: batch})
         first = driver.rewards.auc.compute_volume_clusters(
-            driver.rollout.base_partition_samples({target: batch})[0], target,
+            torch.stack(latents), target,
         ).pooled_auc()
+        latents, _ = driver.rollout.base_partition_samples({target: batch})
         second = driver.rewards.auc.compute_volume_clusters(
-            driver.rollout.base_partition_samples({target: batch})[0], target,
+            torch.stack(latents), target,
         ).pooled_auc()
         assert report.condition_auc[target] == pytest.approx(
             min(first, second), rel=0.0, abs=0.0,
@@ -420,7 +424,7 @@ class TestConditionWhitelist:
 
     def test_unrestricted_covers_every_modality(self) -> None:
         """resume 占位 = 全条件放行（恢复点不重查白名单）。"""
-        whitelist = ConditionWhitelist.unrestricted()
+        whitelist = ConditionWhitelist.unrestricted(("t1n", "t1c", "t2w", "t2f"))
         assert len(whitelist) == len(MODALITIES)
         assert all(modality in whitelist for modality in MODALITIES)
         assert whitelist.measured == {}

@@ -429,14 +429,14 @@ class TestPoolSliceUnit:
 
     def test_stripe_slice_keeps_alternating_layers(self, manifest: LatentManifest) -> None:
         context = DistributedContext(0, 1, False)
-        sliced = RankSlicedPool(manifest, context).view()
+        sliced = RankSlicedPool(manifest, context, MODALITIES).view()
         assert sliced.kind == manifest.kind
         assert sliced.entries == manifest.entries  # world=1 恒等
 
     def test_stripe_slice_distributes_entries_by_rank(self, manifest: LatentManifest) -> None:
         """分层条带切片：每序列内部 entries[rank::world]，各片覆盖全部序列。"""
         context = DistributedContext(1, 2, True)  # 不 init 进程组的纯切片语义
-        sliced = RankSlicedPool(manifest, context).view()
+        sliced = RankSlicedPool(manifest, context, MODALITIES).view()
         # t1n=[0,4] t1c=[1,5] t2w=[2,6] t2f=[3,7] → rank 1 取各序列第 2 条
         assert [entry.case_id for entry in sliced.entries] == [
             "case-4", "case-5", "case-6", "case-7",
@@ -450,7 +450,7 @@ class TestPoolSliceUnit:
         starved = manifest.model_copy(deep=True)
         starved.entries = starved.entries[:2]  # 只剩 t1n/t1c 两序列
         with pytest.raises(ValueError, match="t2w|t2f|序列"):
-            RankSlicedPool(starved, context).view()
+            RankSlicedPool(starved, context, MODALITIES).view()
 
     def test_insufficient_pool_rejected_consistently_on_every_rank(
         self, manifest: LatentManifest,
@@ -464,7 +464,9 @@ class TestPoolSliceUnit:
         starved.entries = starved.entries[:4]  # 每序列恰好 1 条
         for rank in range(2):
             with pytest.raises(ValueError, match="不足"):
-                RankSlicedPool(starved, DistributedContext(rank, 2, True)).view()
+                RankSlicedPool(
+                    starved, DistributedContext(rank, 2, True), MODALITIES,
+                ).view()
 
 
 class TestSingleRankEquivalence:

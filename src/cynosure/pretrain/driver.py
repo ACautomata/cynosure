@@ -40,7 +40,7 @@ import time
 
 import torch
 
-from cynosure.config import CynosureConfig, Modality
+from cynosure.config import CynosureConfig
 from cynosure.distributed import DistributedContext
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
@@ -78,7 +78,9 @@ class PretrainDriver:
         # ADR-0008-03）+ 预训练特有守卫：每步量产的 fake 须覆盖判别器
         # 更新批的当前半区——无效组合在装配期显式拒绝，而非让昂贵 rollout
         # 先行、更新时才缺样本
-        assert_replay_supply(reward)
+        assert_replay_supply(
+            reward, TrainingRuntime.assemble_vocabulary(config).names(),
+        )
         current_count = math.ceil(
             reward.disc_batch_size_k * reward.replay_current_fraction,
         )
@@ -110,6 +112,7 @@ class PretrainDriver:
             self._rewards.update.scorer,
             generators["rollout"],
             condition_sampler=self._policy.conditions,
+            vocabulary=TrainingRuntime.assemble_vocabulary(config),
             device_type=amp.device_type,
             autocast_dtype=amp.dtype,
             device=amp.device,
@@ -177,10 +180,13 @@ class PretrainDriver:
         self._rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         # buffer base 分区由冻结初始 policy 产出按每条件配额填充（与在线期
         # 同源：base 分区采样入口；条目带目标模态标签——ADR-0008-01）
-        quota = base_condition_quota(reward.replay_buffer_capacity)
+        quota = base_condition_quota(
+            reward.replay_buffer_capacity,
+            self._policy.conditions.targets(),
+        )
         base_fakes, base_modalities = self._rollout.base_partition_samples(quota)
         self._rewards.seed_base(base_fakes, base_modalities)
-        confirmed: dict[Modality, float] = {}
+        confirmed: dict[str, float] = {}
         steps_completed = 0
         gate_passed = False
         for step in range(reward.pretrain_max_steps):
@@ -251,19 +257,21 @@ class PretrainDriver:
             steps_completed, reported, list(confirmed), gate_passed,
         )
 
-    def _measurement_batch(self, modality: Modality) -> torch.Tensor:
+    def _measurement_batch(self, modality: str) -> torch.Tensor:
         """单条件量产一批 fake（gate 测量/复测/补测共用入口）：update_step
         的回放按本步条件过滤，测量批与更新批同条件——混采量产批没有诚实
-        标签可穿（ADR-0008-03 的最小诚实形态）。"""
-        return self._rollout.base_partition_samples(
+        标签可穿（ADR-0008-03 的最小诚实形态）。同条件批量量产（逐条清单
+        语义，#129——同条件同形状，单条件内 stack 成批）。"""
+        latents, _ = self._rollout.base_partition_samples(
             {modality: self._config.reward.pretrain_fake_batch},
-        )[0]
+        )
+        return torch.stack(latents)
 
     def _finalize(
         self,
         steps_completed: int,
-        condition_auc: dict[Modality, float],
-        whitelist: list[Modality],
+        condition_auc: dict[str, float],
+        whitelist: list[str],
         gate_passed: bool,
     ) -> PretrainReport:
         """产物落盘：判别器 checkpoint（可装载 state_dict，与训练期产物
@@ -287,9 +295,18 @@ class PretrainDriver:
                 "判别器网络配置缺失（artifacts.discriminator_config_json）"
             )
         reward = self._config.reward
+        # 词表工件绑定 = 多条件线的判据（schema 面 MR-RATE 必填 / BraTS
+        # 携带即拒），不复制 dataset 字符串
+        vocabulary_path = self._config.artifacts.condition_vocabulary_json
         report = PretrainReport(
             group=self._config.experiment.group,
-            latent_shape=self._config.latent_shape,
+            # 形状口径两态（#129）：多条件线的形状逐条件派生自词表工件、
+            # 报告不落派生副本（口径由 provenance 指纹承载）；单域线记
+            # 全局形状（单条件词汇特例）
+            latent_shape=(
+                None if vocabulary_path is not None
+                else self._config.latent_shape
+            ),
             condition_auc=condition_auc,
             gate_whitelist=whitelist,
             steps_completed=steps_completed,
@@ -316,6 +333,14 @@ class PretrainDriver:
                 discriminator_ckpt=discriminator_relative,
                 discriminator_ckpt_sha256=PretrainProvenance.digest(
                     self._run.paths.discriminator_ckpt,
+                ),
+                # 词表工件口径指纹（多条件线；单域线无工件，两侧同为 None）
+                condition_vocabulary=(
+                    None if vocabulary_path is None else str(vocabulary_path)
+                ),
+                condition_vocabulary_sha256=(
+                    None if vocabulary_path is None
+                    else PretrainProvenance.digest(vocabulary_path)
                 ),
             ),
         )

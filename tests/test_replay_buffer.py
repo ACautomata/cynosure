@@ -386,14 +386,14 @@ class TestBaseConditionQuota:
 
     def test_quota_splits_base_capacity_across_modalities(self) -> None:
         """base 容量均匀分派到各目标模态（余数按 MODALITIES 顺序）。"""
-        quota = base_condition_quota(CAPACITY)  # base 32 → 每模态 8
+        quota = base_condition_quota(CAPACITY, MODALITIES)  # base 32 → 每模态 8
         assert quota == {
             "t1n": 8, "t1c": 8, "t2w": 8, "t2f": 8,
         }
 
     def test_quota_remainder_rounds_in_modality_order(self) -> None:
         """base 容量不整除时余数按 MODALITIES 顺序逐个 +1（确定性）。"""
-        quota = base_condition_quota(38)  # base 19 → 5,5,5,4
+        quota = base_condition_quota(38, MODALITIES)  # base 19 → 5,5,5,4
         assert sum(quota.values()) == 19
         assert quota["t1n"] == 5
         assert quota["t1c"] == 5
@@ -402,11 +402,11 @@ class TestBaseConditionQuota:
 
     def test_quota_sums_to_base_capacity(self) -> None:
         for capacity in (2, 7, 64, 65, 100):
-            quota = base_condition_quota(capacity)
+            quota = base_condition_quota(capacity, MODALITIES)
             assert sum(quota.values()) == capacity // 2
 
     def test_quota_covers_every_modality(self) -> None:
-        quota = base_condition_quota(7)  # base 3：0/1/1/1——配额可为 0（守卫兜底线）
+        quota = base_condition_quota(7, MODALITIES)  # base 3：0/1/1/1——配额可为 0（守卫兜底线）
         assert set(quota) == set(MODALITIES)
 
 
@@ -443,13 +443,14 @@ class TestAssertReplaySupply:
         return CynosureConfig.model_validate(data)
 
     def test_valid_supply_passes(self, tmp_path) -> None:
-        assert_replay_supply(self._config(tmp_path).reward)  # 不抛
+        assert_replay_supply(self._config(tmp_path).reward, MODALITIES)  # 不抛
 
     def test_replay_half_zero_rejected(self, tmp_path) -> None:
         """K=1：回放半区为 0 条——更新批无回放成分，装配期显式拒绝。"""
         with pytest.raises(ValueError, match="回放半区"):
             assert_replay_supply(
                 self._config(tmp_path, disc_batch_size_k=1).reward,
+                MODALITIES,
             )
 
     def test_per_condition_quota_shortage_rejected(self, tmp_path) -> None:
@@ -462,6 +463,7 @@ class TestAssertReplaySupply:
                     tmp_path,
                     disc_batch_size_k=4, replay_buffer_capacity=8,
                 ).reward,
+                MODALITIES,
             )
         message = str(exc_info.value)
         assert "1" in message and "2" in message
@@ -474,6 +476,7 @@ class TestAssertReplaySupply:
             self._config(
                 tmp_path, disc_batch_size_k=4, replay_buffer_capacity=20,
             ).reward,
+            MODALITIES,
         )
         # K=6 → 回放半区 3 > min 配额 2：拒
         with pytest.raises(ValueError, match="每条件配额"):
@@ -481,4 +484,5 @@ class TestAssertReplaySupply:
                 self._config(
                     tmp_path, disc_batch_size_k=6, replay_buffer_capacity=20,
                 ).reward,
+                MODALITIES,
             )

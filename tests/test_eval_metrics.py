@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from cynosure.conditions import BraTSConditionVocabulary
 from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.frechet import BootstrapKernelMmd, FrechetDistance, KernelMmd
 from cynosure.eval.features import (
@@ -391,7 +392,7 @@ class TestEntryConditionResolver:
         }), encoding="utf-8")
         mapping = ModalityMapping({"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31})
         return EntryConditionResolver(
-            mapping,
+            BraTSConditionVocabulary((4, 16, 16, 8), mapping),
             torch.device("cpu"),
             pool=LatentManifest.load(manifest_path, kind="real_pool"),
         )

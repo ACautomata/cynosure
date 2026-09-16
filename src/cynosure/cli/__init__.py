@@ -46,7 +46,8 @@ from cynosure.eval.real_real_floor import (
     RealRealFloorSplit,
 )
 from cynosure.policy import TrajectoryDiagnosticRunner
-from cynosure.pretrain import PretrainDriver, PretrainRun
+from cynosure.pretrain import PretrainRun
+from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward import PreparePipeline
 from cynosure.smoke import BaseSmokeConfig, BaseSmokeRunner
 from cynosure.train import GranularGrpoTrainer, RunArtifacts, SequentialTrainer

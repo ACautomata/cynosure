@@ -1,10 +1,10 @@
-"""MR-RATE 工件契约泛化测试（#121/#131，spec #125 实现决策 3）。
+"""MR-RATE 工件契约测试（#121/#131，spec #125 实现决策 3）。
 
-分层键泛化（BraTS = 序列 modality、MR-RATE = 生成条件名）下的装载契约：
-旧 BraTS 工件零变化照常装载（可扩不可改名），MR 工件按条件分层登记
-（逐条件计数 + 逐条件 latent 形状）——异形状贯通（#129）前工件自洽的
-单一权威。容量装配守卫按分层计数表泛化（prepare 装配期与 train 装配期
-同一条判定路径，ADR-0008 决策 4）。"""
+条件键两域同名（#129 统一面：BraTS = 序列名、MR-RATE = 生成条件名）下
+prepare 工件的装载契约：旧 BraTS 工件零变化照常装载（可扩不可改名），
+MR 工件按条件分层登记（``modalities`` 计数 + ``condition_latent_shapes``
+逐条件形状契约）。容量装配守卫经条件集注入（ADR-0008 决策 4）。
+"""
 
 import json
 from pathlib import Path
@@ -13,6 +13,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from cynosure.config import MODALITIES
 from cynosure.reward.artifacts import (
     ChannelStats,
     LatentManifest,
@@ -27,13 +28,14 @@ LATENT_SHAPE_B = (4, 16, 16, 16)
 
 
 class PoolEntryFactory:
-    """两域 manifest 条目的测试构造器（分层键各一：BraTS 序列 / MR 条件）。"""
+    """两域 manifest 条目的测试构造器（条件键各取一格：BraTS 序列 /
+    MR 生成条件——字段同为 ``modality``）。"""
 
     @staticmethod
     def brats(case_id: str, modality: str = "t1n") -> PoolEntry:
         return PoolEntry(
             case_id=case_id,
-            modality=modality,  # type: ignore[arg-type]
+            modality=modality,
             latent=f"real_pool_latents/{case_id}-{modality}.pt",
             spacing=(100.0, 100.0, 100.0),
         )
@@ -42,129 +44,103 @@ class PoolEntryFactory:
     def mr(series_id: str, condition: str = "t1w/axial") -> PoolEntry:
         return PoolEntry(
             case_id=f"S{series_id}/{series_id}",
-            condition=condition,
-            latent=f"real_pool_latents/{condition}/{series_id}.pt",
+            modality=condition,
+            latent=(
+                f"real_pool_latents/{condition.replace('/', '_')}/{series_id}.pt"
+            ),
             spacing=(37.5, 37.5, 50.0),
         )
 
 
-class TestPoolEntryStratificationKeys:
-    """条目分层键（序列 modality / 生成条件 condition）恰一非空。"""
+class TestConditionKey:
+    """条目条件键（#129 统一面）：两域同为 ``modality`` 字段，语义按域
+    解释；键必填、未知字段拒绝。"""
 
-    def test_brats_entry_modality_only(self) -> None:
-        entry = PoolEntryFactory.brats("BraTS-00001")
-        assert entry.condition is None
-        assert entry.stratification_key == "t1n"
+    def test_brats_entry_carries_series_name(self) -> None:
+        assert PoolEntryFactory.brats("BraTS-00001").modality == "t1n"
 
-    def test_mr_entry_condition_only(self) -> None:
-        entry = PoolEntryFactory.mr("S1")
-        assert entry.modality is None
-        assert entry.stratification_key == "t1w/axial"
+    def test_mr_entry_carries_condition_name(self) -> None:
+        assert PoolEntryFactory.mr("S1").modality == "t1w/axial"
 
-    def test_both_keys_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PoolEntry(
-                case_id="X",
-                modality="t1n",  # type: ignore[arg-type]
-                condition="t1w/axial",
-                latent="l.pt",
-                spacing=(1.0, 1.0, 1.0),
-            )
-
-    def test_neither_key_rejected(self) -> None:
+    def test_missing_key_rejected(self) -> None:
         with pytest.raises(ValidationError):
             PoolEntry(case_id="X", latent="l.pt", spacing=(1.0, 1.0, 1.0))
 
+    def test_unknown_field_rejected(self) -> None:
+        """旧双字段形态（condition=）已收敛为条件键单字段：携带即拒绝。"""
+        with pytest.raises(ValidationError):
+            PoolEntry(
+                case_id="X", modality="t1w/axial", condition="t1w/axial",
+                latent="l.pt", spacing=(1.0, 1.0, 1.0),
+            )
+
 
 class TestMrLatentManifest:
-    """MR-RATE manifest 装载契约：条件分层计数 + 逐条件形状登记。"""
+    """MR-RATE manifest 装载契约：逐条件计数派生 + 逐条件形状契约对账。"""
 
     @staticmethod
     def manifest(
         entries: list[PoolEntry],
-        conditions: dict[str, int],
         condition_shapes: dict[str, tuple],
         **overrides,
     ) -> LatentManifest:
         fields = dict(
             kind="real_pool",
             encoder="synthetic",
+            latent_shape=LATENT_SHAPE_A,
             split_seed=0,
             split_sizes={"train": 6, "val": 2, "test": 0},
             entries=entries,
-            conditions=conditions,
-            condition_shapes=condition_shapes,
+            condition_latent_shapes=condition_shapes,
         )
         fields.update(overrides)
         return LatentManifest(**fields)
 
-    def test_mr_manifest_derives_conditions(self) -> None:
+    def test_mr_manifest_derives_condition_counts(self) -> None:
         manifest = self.manifest(
             [
                 PoolEntryFactory.mr("S1"),
                 PoolEntryFactory.mr("S2", condition="flair/axial"),
             ],
-            conditions={"t1w/axial": 1, "flair/axial": 1},
             condition_shapes={
                 "t1w/axial": LATENT_SHAPE_A,
                 "flair/axial": LATENT_SHAPE_B,
             },
         )
-        assert manifest.modalities == {}
-        assert manifest.conditions == {"t1w/axial": 1, "flair/axial": 1}
+        assert manifest.modalities == {"t1w/axial": 1, "flair/axial": 1}
 
-    def test_mr_manifest_rejects_single_latent_shape(self) -> None:
-        """MR 域 manifest 禁止单一 latent_shape：形状权威 = condition_shapes
-        （逐条件异形状是 #111 多网格案的落地语义，单值口径会静默错位）。"""
-        with pytest.raises(ValidationError) as exc_info:
+    def test_count_mismatch_rejected(self) -> None:
+        """传入的 modalities 计数与条目实际分布不符 → 拒绝。"""
+        with pytest.raises(ValidationError, match="modalities 计数"):
             self.manifest(
                 [PoolEntryFactory.mr("S1")],
-                conditions={"t1w/axial": 1},
                 condition_shapes={"t1w/axial": LATENT_SHAPE_A},
-                latent_shape=LATENT_SHAPE_A,
+                modalities={"t1w/axial": 3},
             )
-        assert "latent_shape" in str(exc_info.value)
 
-    def test_mr_manifest_requires_shape_registration(self) -> None:
-        """条件计数有键而形状登记缺键 → 拒绝：异形状装载校验的对照表
-        不完整等于契约缺口。"""
+    def test_shape_contract_must_cover_entries(self) -> None:
+        """条目条件不在逐条件形状契约内 → 拒绝：条件名拼错会静默回退
+        全局形状对账，异形条件到采样期才炸。"""
         with pytest.raises(ValidationError) as exc_info:
             self.manifest(
-                [
-                PoolEntryFactory.mr("S1"),
-                PoolEntryFactory.mr("S2", condition="flair/axial"),
-            ],
-                conditions={"t1w/axial": 1, "flair/axial": 1},
+                [PoolEntryFactory.mr("S1", condition="flair/axial")],
                 condition_shapes={"t1w/axial": LATENT_SHAPE_A},
             )
         assert "flair/axial" in str(exc_info.value)
 
-    def test_mr_manifest_rejects_stratification_mismatch(self) -> None:
-        """传入的 conditions 计数与条目实际分布不符 → 拒绝（同 modalities
-        先例）。"""
-        with pytest.raises(ValidationError):
+    def test_condition_shape_channel_count_checked(self) -> None:
+        """逐条件形状的通道数须与全局 latent_shape 通道数一致（latent
+        通道数定死 4）——异通道数即拒绝。"""
+        with pytest.raises(ValidationError) as exc_info:
             self.manifest(
                 [PoolEntryFactory.mr("S1")],
-                conditions={"t1w/axial": 3},
-                condition_shapes={"t1w/axial": LATENT_SHAPE_A},
+                condition_shapes={"t1w/axial": (8, 16, 16, 8)},
             )
-
-    def test_mr_manifest_rejects_mixed_domain_entries(self) -> None:
-        """BraTS 条目（modality）与 MR 条目（condition）混装 → 拒绝：
-        一份 manifest 一个域，混合域分层语义不可判读。"""
-        with pytest.raises(ValidationError):
-            self.manifest(
-                [
-                    PoolEntryFactory.mr("S1"),
-                    PoolEntryFactory.brats("BraTS-00001"),
-                ],
-                conditions={"t1w/axial": 1},
-                condition_shapes={"t1w/axial": LATENT_SHAPE_A},
-            )
+        assert "通道数" in str(exc_info.value)
 
     def test_brats_manifest_unchanged(self) -> None:
-        """BraTS 旧形态零变化：latent_shape 必有、条件字段空——既有
-        工件与构造点（test_online_update 等）不受泛化影响。"""
+        """BraTS 旧形态零变化：全局 latent_shape 必有、不带逐条件表——
+        既有工件与构造点（test_online_update 等）不受泛化影响。"""
         manifest = LatentManifest(
             kind="real_pool",
             encoder="synthetic",
@@ -177,22 +153,7 @@ class TestMrLatentManifest:
             ],
         )
         assert manifest.modalities == {"t1n": 1, "t2w": 1}
-        assert manifest.conditions == {}
-        assert manifest.condition_shapes == {}
-
-    def test_brats_manifest_rejects_conditions(self) -> None:
-        """BraTS manifest 携带条件分层 → 拒绝（域自洽双向守卫）。"""
-        with pytest.raises(ValidationError):
-            LatentManifest(
-                kind="real_pool",
-                encoder="synthetic",
-                latent_shape=LATENT_SHAPE_A,
-                split_seed=0,
-                split_sizes={"train": 1, "val": 1, "test": 1},
-                entries=[PoolEntryFactory.brats("C1")],
-                conditions={"t1w/axial": 1},
-                condition_shapes={"t1w/axial": LATENT_SHAPE_A},
-            )
+        assert manifest.condition_latent_shapes is None
 
     def test_load_latent_per_condition_shape(self, tmp_path: Path) -> None:
         """MR 工件 load_latent 按条件形状校验：异条件异形状各自对照，
@@ -203,14 +164,12 @@ class TestMrLatentManifest:
         ]
         manifest = self.manifest(
             entries,
-            conditions={"t1w/axial": 1, "flair/axial": 1},
             condition_shapes={
                 "t1w/axial": LATENT_SHAPE_A,
                 "flair/axial": LATENT_SHAPE_B,
             },
         )
-        manifest_path = tmp_path / "real_pool.json"
-        manifest._path = manifest_path
+        manifest._path = tmp_path / "real_pool.json"
         for entry, shape in (
             (entries[0], LATENT_SHAPE_A), (entries[1], LATENT_SHAPE_B),
         ):
@@ -225,50 +184,61 @@ class TestMrLatentManifest:
             manifest.load_latent(entries[0])
         assert "t1w/axial" in str(exc_info.value)
 
-    def test_capacity_guard_per_condition(self) -> None:
-        """容量守卫按条件计数表判定（MR 域）：逐条件 ≥ K×world——
-        稀疏条件（小池）先饿，报错列出饥荒条件明细。"""
+    def test_roundtrip_preserves_condition_contract(self, tmp_path: Path) -> None:
+        """落盘 → 装载往返保持逐条件契约（工件可被 reward 管线装载，AC1）。"""
         manifest = self.manifest(
-            [PoolEntryFactory.mr(f"S{i}") for i in range(3)],
-            conditions={"t1w/axial": 3},
+            [PoolEntryFactory.mr("S1")],
             condition_shapes={"t1w/axial": LATENT_SHAPE_A},
         )
-        manifest.assert_condition_capacity(batch_size_k=3, world_size=1)
+        path = tmp_path / "real_pool.json"
+        path.write_text(manifest.model_dump_json(), encoding="utf-8")
+        revived = LatentManifest.load(path, "real_pool")
+        assert revived.condition_latent_shapes == {"t1w/axial": LATENT_SHAPE_A}
+        assert revived.modalities == {"t1w/axial": 1}
+
+
+class TestCapacityGuard:
+    """容量装配守卫（ADR-0008 决策 4）：条件集经注入（BraTS = 四序列常量、
+    MR-RATE = 词汇表条件集），本类不设代码内副本。"""
+
+    def test_mr_guard_per_condition(self) -> None:
+        manifest = TestMrLatentManifest.manifest(
+            [PoolEntryFactory.mr(f"S{i}") for i in range(3)],
+            condition_shapes={"t1w/axial": LATENT_SHAPE_A},
+        )
+        manifest.assert_condition_capacity(3, 1, ("t1w/axial",))
         with pytest.raises(ValueError) as exc_info:
-            manifest.assert_condition_capacity(batch_size_k=4, world_size=1)
+            manifest.assert_condition_capacity(4, 1, ("t1w/axial",))
         assert "t1w/axial×3" in str(exc_info.value)
 
-    def test_capacity_guard_brats_uses_modalities(self) -> None:
-        """BraTS manifest 容量守卫照旧按 modalities 判定（回归锚）：
-        全集 = MODALITIES 常量（缺序 = 0 条 = 饿死）。"""
+    def test_guard_catches_zero_condition_off_table(self) -> None:
+        """条件集含计数表外条件（本域语料里 0 条）→ 饿死拒绝：prepare
+        装配期传 ``vocabulary.names()`` 的语义（稀疏模态小池触发口径）。"""
+        manifest = TestMrLatentManifest.manifest(
+            [PoolEntryFactory.mr(f"S{i}") for i in range(3)],
+            condition_shapes={"t1w/axial": LATENT_SHAPE_A},
+        )
+        manifest.assert_condition_capacity(3, 1, ("t1w/axial",))  # 表内键全过
+        with pytest.raises(ValueError) as exc_info:
+            manifest.assert_condition_capacity(
+                3, 1, ("t1w/axial", "flair/axial", "mra/all-planes"),
+            )
+        assert "flair/axial×0" in str(exc_info.value)
+
+    def test_guard_brats_uses_four_series(self) -> None:
+        """BraTS 线回归锚：条件集 = MODALITIES 常量（缺序 = 0 条 = 饿死）。"""
         manifest = LatentManifest(
             kind="real_pool",
             encoder="synthetic",
             latent_shape=LATENT_SHAPE_A,
             split_seed=0,
             split_sizes={"train": 4, "val": 1, "test": 1},
-            entries=[PoolEntryFactory.brats("C1", m) for m in ("t1n", "t1c", "t2w", "t2f")],
+            entries=[PoolEntryFactory.brats("C1", m) for m in MODALITIES],
         )
-        manifest.assert_condition_capacity(batch_size_k=1, world_size=1)
+        manifest.assert_condition_capacity(1, 1, MODALITIES)
         with pytest.raises(ValueError) as exc_info:
-            manifest.assert_condition_capacity(batch_size_k=2, world_size=1)
+            manifest.assert_condition_capacity(2, 1, MODALITIES)
         assert "t1n×1" in str(exc_info.value)
-
-    def test_capacity_guard_expected_keys_catch_zero_conditions(self) -> None:
-        """MR 域传词汇表全集：计数表外 0 条件被抓（装配期全量口径由
-        调用方决定——prepare 传 vocab.names() 的语义）。"""
-        manifest = self.manifest(
-            [PoolEntryFactory.mr(f"S{i}") for i in range(3)],
-            conditions={"t1w/axial": 3},
-            condition_shapes={"t1w/axial": LATENT_SHAPE_A},
-        )
-        manifest.assert_condition_capacity(3, 1)  # 缺省：表内键全过
-        with pytest.raises(ValueError) as exc_info:
-            manifest.assert_condition_capacity(
-                3, 1,
-                expected_keys=("t1w/axial", "flair/axial", "mra/all-planes"),
-            )
-        assert "flair/axial×0" in str(exc_info.value)
 
 
 class TestSamplingManifest:
@@ -325,6 +295,10 @@ class TestSamplingManifest:
         with pytest.raises(ValidationError):
             SamplingManifest.model_validate(data)
 
+    def test_non_train_volumes_default_zero(self) -> None:
+        """非 train split 卷计数缺省 0（既有留痕形态可扩不可改名）。"""
+        assert self.manifest().non_train_volumes == 0
+
 
 class TestChannelStatsProvenance:
     """per-channel 统计量的 provenance 留痕（#121 AC2：来源快照 + 预处理口径）。"""
@@ -339,6 +313,7 @@ class TestChannelStatsProvenance:
             provenance=PrepareProvenance(
                 dataset="MR-RATE",
                 data_snapshot="MR-RATE@v1.0",
+                source_commit="deadbeef",
                 intensity_clip=False,
                 resize_semantics="uniform-grid",
                 upstream_anchor="NVIDIA v1 clip=False",
@@ -346,6 +321,7 @@ class TestChannelStatsProvenance:
         )
         revived = ChannelStats.model_validate_json(stats.model_dump_json())
         assert revived.provenance == stats.provenance
+        assert revived.provenance.source_commit == "deadbeef"
 
     def test_provenance_optional(self) -> None:
         """BraTS 既有 stats 工件（无 provenance）照常装载（可扩不改名）。"""
@@ -358,31 +334,13 @@ class TestChannelStatsProvenance:
         )
         assert stats.provenance is None
 
-
-class TestChannelStatsChannelContract:
-    """per-channel 统计量的通道数一致性（两域共有的 defense：单形状契约与
-    逐条件异形状都不放宽「mean/std 逐通道成对」这一条）。"""
-
-    def test_mr_stats_loads_without_single_shape(self) -> None:
-        """MR-RATE 域 stats（latent_shape=None）照常装载：逐条件异形状下
-        无单一 latent_shape 可对照，通道数契约由编码期形状断言承担。"""
-        stats = ChannelStats(
-            mean=[0.0] * 4,
-            std=[1.0] * 4,
-            num_latents=8,
-            latent_shape=None,
-            source_manifest="real_pool.json",
-        )
-        assert stats.latent_shape is None
-
     def test_mean_std_length_mismatch_rejected(self) -> None:
-        """mean 与 std 长度不等（逐通道成对性破坏）→ 两域一律拒绝：异形状
-        域少了一道 latent_shape 对照后，这条是仅存的通道面 defense。"""
-        with pytest.raises(ValidationError, match="长度必须相等"):
+        """mean/std 长度与 latent 通道数不符 → 拒绝（逐通道成对性破坏）。"""
+        with pytest.raises(ValidationError, match="通道数"):
             ChannelStats(
                 mean=[0.0] * 4,
                 std=[1.0] * 3,
                 num_latents=8,
-                latent_shape=None,
+                latent_shape=LATENT_SHAPE_A,
                 source_manifest="real_pool.json",
             )

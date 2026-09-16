@@ -245,6 +245,29 @@ class TestPrepareContract:
         assert stats.latent_shape == pool.latent_shape
 
 
+class TestPrepareDomainDispatch:
+    """MR-RATE prepare 已交付（#121/#131）：域分派到 MrRateAssembly（官方
+    split join + 条件词汇表候选域），不再在构造期拒绝。输入缺件按 **MR
+    数据链**口径可读拒绝（缺失的 MR 元数据/splits 工件被点名），而非走到
+    BratsSeriesLayout 扫描才炸出 BraTS 布局错误（「源数据集根目录不存在」/
+    「病例缺序列」）——报错归因与 MR 域的真实原因相符。"""
+
+    def test_mr_rate_inputs_missing_rejected_readably(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        fixture_dir = tmp_path / "fixtures"
+        # fixture 落的是 BraTS 病例布局，不含 MR 元数据/splits 工件
+        Fixture().write_artifacts(fixture_dir)
+        config = Fixture().config(fixture_dir, dataset="MR-RATE")
+        config_path = tmp_path / "mr_config.json"
+        config_path.write_text(
+            config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = cli.run("prepare", "--config", str(config_path))
+        assert result.code == 2
+        assert "splits.csv" in result.stderr
+
+
 class TestPrepareIdempotency:
     def test_rerun_is_drift_free(self, scenario: PrepareScenario) -> None:
         """prepare 幂等（AC）：重跑不产生工件漂移——JSON 字节相等、latent 内容相等。"""

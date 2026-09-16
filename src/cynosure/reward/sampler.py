@@ -18,7 +18,6 @@ from typing import Protocol
 
 import torch
 
-from cynosure.config import Modality
 from cynosure.reward.artifacts import LatentManifest
 
 
@@ -36,12 +35,12 @@ class RealSampling(Protocol):
         ...
 
     def sample(
-        self, count: int, *, modality: Modality | None = None,
-        condition: str | None = None,
+        self, count: int, *, modality: str | None = None,
     ) -> torch.Tensor:
-        """无放回均匀采 count 条 latent（``modality``/``condition`` 给定
-        时候选收窄为该序列/生成条件的条目——MR-RATE 线按条件采样是
-        批内同形的前提：同条件同统一网格，异条件 latent 异形状）。"""
+        """无放回均匀采 count 条 latent（``modality`` 给定时候选收窄为
+        该条件键的条目——条件键两域同名（#129）：BraTS = 序列名、MR-RATE
+        = 生成条件名。MR-RATE 线按条件采样是批内同形的前提：同条件同
+        统一网格，异条件 latent 异形状）。"""
         ...
 
 
@@ -67,33 +66,23 @@ class RealPoolSampler:
         return len(self._manifest.entries)
 
     def sample(
-        self, count: int, *, modality: Modality | None = None,
-        condition: str | None = None,
+        self, count: int, *, modality: str | None = None,
     ) -> torch.Tensor:
         """无放回均匀采 count 条 latent；超出候选条目数显式拒绝。
 
-        分层过滤（二选一，同给即拒绝）：``modality`` = BraTS 序列
-        （online update 的 real 侧按本 iteration 目标序列归因）；
-        ``condition`` = MR-RATE 生成条件（批内同形的前提——异条件
-        latent 异形状，条件匹配键 = 生成条件名）。缺省 None 为全池
-        （诊断与预训练 gate 口径——预训练 fake 批跨条件混合，无单一
-        目标可归因；MR-RATE 异形状下仅对同形子集可用）。"""
-        if modality is not None and condition is not None:
-            raise ValueError(
-                "采样分层键二选一：modality（BraTS 序列）与 condition"
-                "（MR-RATE 生成条件）不可同给"
-            )
+        分层过滤：``modality`` = 条件键（#129 统一面——BraTS 序列名 /
+        MR-RATE 生成条件名；online update 的 real 侧按本 iteration 目标
+        条件归因；MR-RATE 线批内同形的前提是异条件 latent 异形状，条件
+        匹配键 = 生成条件名）。缺省 None 为全池（诊断与预训练 gate
+        口径——预训练 fake 批跨条件混合，无单一目标可归因；MR-RATE
+        异形状下仅对同形子集可用）。"""
         candidates = self._manifest.entries
         if modality is not None:
             candidates = [
                 entry for entry in candidates if entry.modality == modality
             ]
-        elif condition is not None:
-            candidates = [
-                entry for entry in candidates if entry.condition == condition
-            ]
         if count < 1 or count > len(candidates):
-            scope = modality or condition or "全池"
+            scope = modality or "全池"
             raise ValueError(
                 f"采样数 {count} 超出 pool 条目 {len(candidates)}"
                 f"（无放回采样；范围 = {scope}）"

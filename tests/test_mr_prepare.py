@@ -107,16 +107,20 @@ class TestFixtureFullChain:
         pool = LatentManifest.load(
             config.reward.real_pool_manifest, "real_pool",
         )
-        assert pool.conditions == {"t1w/axial": 4, "flair/axial": 4}
-        assert pool.condition_shapes == {
-            "t1w/axial": (4, 16, 16, 8), "flair/axial": (4, 16, 16, 8),
+        assert pool.modalities == {"t1w/axial": 4, "flair/axial": 4}
+        # 逐条件异形状（fixture 词表两条件网格互换厚薄轴）：t1w/axial
+        # [64,64,32] → (4,16,16,8)；flair/axial [32,32,64] → (4,8,8,16)
+        assert pool.condition_latent_shapes == {
+            "t1w/axial": (4, 16, 16, 8), "flair/axial": (4, 8, 8, 16),
         }
-        assert pool.latent_shape is None
+        # 全局 latent_shape 两域恒填（#129）：MR 多条件域该值只作通道数
+        # 对账锚，逐条目对账走 condition_latent_shapes 的权威表
+        assert pool.latent_shape == tuple(config.latent_shape)
         # Held-out real：同契约、kind 守卫区分（patient 级二分的另一侧）
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, "heldout_real",
         )
-        assert heldout.conditions == {"t1w/axial": 2, "flair/axial": 2}
+        assert heldout.modalities == {"t1w/axial": 2, "flair/axial": 2}
         # per-channel 统计量 + provenance（#121 AC2）
         stats = ChannelStats.load(config.reward.channel_stats_json)
         assert stats.provenance is not None
@@ -163,10 +167,10 @@ class TestFixtureFullChain:
             config.reward.real_pool_manifest, "real_pool",
         )
         sampler = RealPoolSampler(pool, torch.Generator().manual_seed(0))
-        batch = sampler.sample(4, condition="t1w/axial")
+        batch = sampler.sample(4, modality="t1w/axial")
         assert tuple(batch.shape) == (4, 4, 16, 16, 8)
         with pytest.raises(ValueError, match="超出.*flair/axial"):
-            sampler.sample(99, condition="flair/axial")
+            sampler.sample(99, modality="flair/axial")
 
     def test_quota_manifest_idempotent(
         self, mr_scenario: MrPrepareScenario,
@@ -294,7 +298,7 @@ class TestFixtureFullChain:
         pool = LatentManifest.load(
             config.reward.real_pool_manifest, "real_pool",
         )
-        assert pool.conditions == {"t1w/axial": 4, "flair/axial": 4}
+        assert pool.modalities == {"t1w/axial": 4, "flair/axial": 4}
 
     def test_dangling_patient_rejected(
         self, mr_scenario: MrPrepareScenario,
@@ -372,7 +376,7 @@ class TestFixtureFullChain:
 class TestPerConditionLatentShapes:
     """逐条件异形状贯通的 prepare 侧锚（#111 多网格案落地语义）：条件
     统一网格来自词汇表，编码产物逐条件形状唯一（= 统一网格 / 4）；
-    异条件异 latent 形状在同一份工件内登记（condition_shapes）。"""
+    异条件异 latent 形状在同一份工件内登记（condition_latent_shapes）。"""
 
     def test_conditions_with_distinct_grids(self, mr_scenario) -> None:
         fixtures_dir = mr_scenario.work_dir / "fixtures"
@@ -422,19 +426,19 @@ class TestPerConditionLatentShapes:
         pool = LatentManifest.load(
             config.reward.real_pool_manifest, "real_pool",
         )
-        assert pool.condition_shapes == {
+        assert pool.condition_latent_shapes == {
             "t1w/axial": (4, 16, 16, 8),
             "flair/axial": (4, 16, 16, 16),
         }
         for entry in pool.entries:
             latent = pool.load_latent(entry)
-            expected = pool.condition_shapes[entry.condition]
+            expected = pool.condition_latent_shapes[entry.modality]
             assert tuple(latent.shape) == expected, entry.case_id
         # spacing = 条件属性（spec #125 决策 6）：同条件两卷的条目值严格
         # 同值（= 等效 spacing ×1e2），不构成「spacing 差异」判别捷径
         by_condition: dict[str, set[tuple[float, float, float]]] = {}
         for entry in pool.entries:
-            by_condition.setdefault(entry.condition, set()).add(entry.spacing)
+            by_condition.setdefault(entry.modality, set()).add(entry.spacing)
         assert all(
             len(spacings) == 1 for spacings in by_condition.values()
         )

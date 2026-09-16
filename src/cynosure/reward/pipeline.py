@@ -238,15 +238,15 @@ class PreparePipeline:
     def _manifest_extras(
         self, plan, entries: list[PoolEntry],
     ) -> dict | None:
-        """MR-RATE 域 manifest 的附加字段（条件分层计数 + 逐条件形状
-        登记，按本 manifest 条目实际出现的条件）；BraTS 域 None（单一
-        latent_shape 契约）。"""
+        """MR-RATE 域 manifest 的附加字段（逐条件 latent 形状契约，按本
+        manifest 条目实际出现的条件，形状权威 = 条件词汇表）；BraTS 域
+        None（单条件词汇特例——全局 latent_shape 对账即完备，缺表合法）。
+        条件分层计数由 manifest 从条目派生（``modalities``，单一来源）。"""
         if not plan.is_mr_rate:
             return None
         counts = self._condition_counts(entries)
         return {
-            "conditions": dict(counts),
-            "condition_shapes": {
+            "condition_latent_shapes": {
                 name: self._vocabulary.latent_shape(name)
                 for name in counts
             },
@@ -257,9 +257,7 @@ class PreparePipeline:
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for entry in entries:
-            counts[entry.stratification_key] = (
-                counts.get(entry.stratification_key, 0) + 1
-            )
+            counts[entry.modality] = counts.get(entry.modality, 0) + 1
         return counts
 
     def _guard_mr_capacity(
@@ -274,7 +272,8 @@ class PreparePipeline:
             return
         pool_manifest.assert_condition_capacity(
             self._config.reward.disc_batch_size_k,
-            expected_keys=self._vocabulary.names(),
+            1,  # 全量口径：prepare 落 pool 工件，rank 切片守卫在 train 装配期
+            self._vocabulary.names(),
         )
 
     def _write_sampling_manifest(self, plan) -> Path | None:
@@ -344,8 +343,8 @@ class PreparePipeline:
         is_mr_rate: bool,
     ) -> list[PoolEntry]:
         """按装配计划编码（条目序 = 计划序：两域各自的确定性分层顺序）。
-        stats 非 None 时同步累加统计量（train pool）。分层键按域落位：
-        BraTS → modality、MR-RATE → condition（条目契约恰一非空）。"""
+        stats 非 None 时同步累加统计量（train pool）。条件键两域同落
+        ``modality``（#129 统一面：BraTS = 序列名、MR-RATE = 生成条件名）。"""
         entries: list[PoolEntry] = []
         for task in tasks:
             latent, spacing = self._encode_one(task, is_mr_rate)
@@ -357,8 +356,9 @@ class PreparePipeline:
             torch.save(latent, latent_path)
             entries.append(PoolEntry(
                 case_id=task.case_id,
-                modality=None if is_mr_rate else task.stratification,
-                condition=task.stratification if is_mr_rate else None,
+                # 条件键两域同名（#129 统一面）：BraTS = 序列名、MR-RATE =
+                # 生成条件名——判别器条件匹配采样与分层计数的同一归因轴
+                modality=task.stratification,
                 latent=latent_path.relative_to(
                     summary.manifest_path.parent,
                 ).as_posix(),
@@ -434,9 +434,10 @@ class PreparePipeline:
         return LatentManifest(
             kind=summary.kind,
             encoder=self._encoder.name,
-            latent_shape=(
-                self._config.latent_shape if manifest_extras is None else None
-            ),
+            # 全局 latent_shape 两域恒填（#129）：多条件域该值只作通道数
+            # 对账锚——空间分量非权威（逐条目形状走 condition_latent_shapes
+            # 的权威表）；BraTS 单条件词汇特例下全局对账即完备
+            latent_shape=tuple(self._config.latent_shape),
             split_seed=self._config.schedule.seed,
             split_sizes=plan.split_sizes,
             entries=entries,  # 分层计数由条目派生（artifacts 层单一来源）
@@ -471,9 +472,7 @@ class PreparePipeline:
             mean=mean,
             std=std,
             num_latents=num_latents,
-            latent_shape=(
-                self._config.latent_shape if not plan.is_mr_rate else None
-            ),
+            latent_shape=tuple(self._config.latent_shape),
             # 与 PoolEntry.latent 同一相对化机制（relative_to）：跨树布局在此
             # 显式失败，不静默产出 ../ 逃逸路径——stats 与 manifest 同目录是布局契约
             source_manifest=Path(
