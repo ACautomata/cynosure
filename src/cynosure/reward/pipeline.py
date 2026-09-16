@@ -5,7 +5,7 @@
 覆盖写是预期语义（与 train run 目录的「不静默覆盖」不同）。latent 子树与
 manifest 随每次运行整体重建：先失效旧件、编码成功才落盘新件——任何时刻
 盘上要么全量一致、要么明确缺失，不留「索引指向缺失 latent」的悬挂工件。
-逐位幂等归测试口径（ADR-0010：生产 pipeline 不开确定性 kernel，生产
+逐位幂等归测试口径（ADR-0011：生产 pipeline 不开确定性 kernel，生产
 预编码的 VAE 前向重跑有浮点噪声级漂移；seeded 后验采样与统计量归约
 本身仍逐位确定）。
 """
@@ -131,7 +131,13 @@ class PreparePipeline:
             config=NetworkAssembler.load_json(config.artifacts.vae_config_json),
             checkpoint=config.artifacts.vae_ckpt,
         )
-        return MaisiLatentEncoder(artifact, device)
+        # 滑窗参数走既有 spec 字段通道（#143，与 decode 的 roi/overlap 同构）
+        return MaisiLatentEncoder(
+            artifact,
+            device,
+            roi_size=tuple(config.preprocessing.encode_roi_size),
+            overlap=config.preprocessing.encode_overlap,
+        )
 
     def run(self) -> PrepareReport:
         cases = self._layout.scan()

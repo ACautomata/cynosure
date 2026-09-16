@@ -2,13 +2,20 @@
 定死值不可改、跨字段定死语义（数值锚、奇异端、组2/组3 ControlNet）。"""
 
 import copy
+import json
 import math
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from cynosure.config import ConfigLoader, CynosureConfig
+from cynosure.config import (
+    ConfigLoader,
+    CynosureConfig,
+    MrConditionGroup,
+    MrRateConditioning,
+    MrSequenceEntry,
+)
 from tests.conftest import CROSS_MODAL_PAIRS, MINIMAL_CONFIG_DICT
 
 
@@ -57,6 +64,11 @@ class TestValidConfigs:
         # 训练期噪声注入（ADR-0009 决策 3，issue #104）：σ_max 暂定 0.2——
         # MR-RATE 预训练曲线校准后定版；σ_max = 0 是唯一关闭形态
         assert config.reward.disc_noise_sigma_max == pytest.approx(0.2)
+        # 过拟合分叉监控（ADR-0009 决策 4/5，issue #105）：EMA 跨度与
+        # ADR-0008 的 EMA(AUC) 跨度同值口径（8）、报警阈值暂定 0.2——
+        # MR-RATE 预训练曲线校准后定版
+        assert config.reward.overfit_ema_span == 8
+        assert config.reward.overfit_alert_divergence == pytest.approx(0.2)
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
@@ -105,6 +117,31 @@ class TestRejection:
     @staticmethod
     def _locations_with_messages(exc: ValidationError) -> list[tuple[tuple, str]]:
         return [(err["loc"], err["msg"]) for err in exc.errors()]
+
+    def test_overfit_alert_threshold_outside_unit_interval_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """分叉报警阈值（ADR-0009 决策 5）须在开区间 (0,1)：0 = 任何正
+        分叉即报警（测量噪声淹没报警面）、1 = 永不越线（哑区），均不合法。"""
+        for bad in (0.0, -0.2, 1.0, 1.5):
+            data = copy.deepcopy(valid_config_dict)
+            data["reward"]["overfit_alert_divergence"] = bad
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("reward", "overfit_alert_divergence") in self._locations(
+                exc_info.value,
+            )
+
+    def test_overfit_ema_span_rejects_non_positive(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """分叉 EMA 跨度（ADR-0009 决策 4）须为正整数（0 会除零、负数
+        无平滑语义）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["overfit_ema_span"] = 0
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward", "overfit_ema_span") in self._locations(exc_info.value)
 
     def test_missing_required_field_is_field_level_error(self) -> None:
         data = copy.deepcopy(MINIMAL_CONFIG_DICT)
@@ -625,9 +662,356 @@ class TestPreprocessingSchema:
             CynosureConfig.model_validate(data)
         assert ("preprocessing", "resize_base") in self._locations(exc_info.value)
 
+    def test_encode_sliding_window_defaults_anchor_nvidia(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """encode 滑窗参数锚 NVIDIA（#143）：roi [320,320,160] 影像空间、
+        overlap 0.4（create_training_data 锚，T12 复核探针复核后交付）。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.preprocessing.encode_roi_size == [320, 320, 160]
+        assert config.preprocessing.encode_overlap == 0.4
+
+    def test_encode_overlap_out_of_range_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """encode overlap 域 [0, 1)：越界（≥1 或负）在 schema 拒绝。"""
+        for bad in (1.0, -0.1, 1.5):
+            data = copy.deepcopy(valid_config_dict)
+            data["preprocessing"] = {"encode_overlap": bad}
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("preprocessing", "encode_overlap") in self._locations(
+                exc_info.value,
+            )
+
     @staticmethod
     def _locations(exc: ValidationError) -> list[tuple]:
         return [err["loc"] for err in exc.errors()]
+
+
+class TestMrRateConditioning:
+    """MR-RATE 条件词表换域（issue #119，地图 #67 下游施工 1/7）：
+
+    模态集 / token 映射 / 双条目序列词表 / 11 生成条件分组全部入
+    config schema，定死 validator 对账上游权威（NV-Generate-CTMR
+    ``configs/modality_mapping.json``）与 #81 白名单；BraTS 口径原样
+    保留（默认 dataset=BraTS2023 的既有 config 零改动），两套口径经
+    ``dataset`` 字段互斥激活、无共享可变状态。
+    """
+
+    # #81 终审白名单：9 读数格展开为 11 生成条件（T2w 三平面独立成格、
+    # 读数并池；SWI 仅轴位可得；MRA 全平面一格）
+    MR_WHITELIST: frozenset[str] = frozenset({
+        "t1w/axial", "t1w/sagittal", "t1w/coronal",
+        "t2w/axial", "t2w/sagittal", "t2w/coronal",
+        "flair/axial", "flair/sagittal", "flair/coronal",
+        "swi/axial", "mra/all-planes",
+    })
+
+    MR_MODALITY_TOKENS: dict[str, int] = {
+        "t1w": 9, "t2w": 10, "flair": 11, "swi": 20, "mra": 16,
+    }
+
+    # 序列词表双条目：whole-brain + skull-stripped（上游 29–33 权威）
+    MR_SKULL_STRIPPED_TOKENS: dict[str, int] = {
+        "t1w": 29, "t2w": 30, "flair": 31, "swi": 32, "mra": 33,
+    }
+
+    @staticmethod
+    def _mr_config_dict(valid_config_dict: dict) -> dict:
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["dataset"] = "MR-RATE"
+        return data
+
+    @classmethod
+    def _conditioning_dict(cls) -> dict:
+        """显式给出的全量 MR-RATE 词表（与定死默认逐位一致）。"""
+        return {
+            "modalities": list(cls.MR_MODALITY_TOKENS),
+            "modality_tokens": dict(cls.MR_MODALITY_TOKENS),
+            "sequences": [
+                {"modality": modality, "form": form, "token": token}
+                for modality in cls.MR_MODALITY_TOKENS
+                for form, token in (
+                    ("whole-brain", cls.MR_MODALITY_TOKENS[modality]),
+                    ("skull-stripped", cls.MR_SKULL_STRIPPED_TOKENS[modality]),
+                )
+            ],
+            "conditions": [
+                {"name": name, "modality": name.split("/")[0],
+                 "plane": name.split("/")[1], "token": cls.MR_MODALITY_TOKENS[name.split("/")[0]]}
+                for name in sorted(cls.MR_WHITELIST)
+            ],
+        }
+
+    def test_mrrate_config_passes_and_vocab_filled_by_default(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """MR config 通过 schema 校验：词表缺省自动填充（单一来源，
+        config 文件不必抄录定死值）。"""
+        config = CynosureConfig.model_validate(
+            self._mr_config_dict(valid_config_dict),
+        )
+        assert config.experiment.dataset == "MR-RATE"
+        conditioning = config.experiment.conditioning
+        assert conditioning is not None
+        assert conditioning.modalities == list(self.MR_MODALITY_TOKENS)
+        assert conditioning.modality_tokens == self.MR_MODALITY_TOKENS
+
+    def test_sequence_vocabulary_is_whole_brain_plus_skull_stripped_pairs(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """每序列双条目：5 模态 × 2 形态 = 10 条目；token 对账上游
+        29–33（whole-brain = 9/10/11/20/16）。"""
+        config = CynosureConfig.model_validate(
+            self._mr_config_dict(valid_config_dict),
+        )
+        sequences = config.experiment.conditioning.sequences
+        assert len(sequences) == 10
+        by_modality_form = {
+            (entry.modality, entry.form): entry.token for entry in sequences
+        }
+        assert set(by_modality_form) == {
+            (modality, form)
+            for modality in self.MR_MODALITY_TOKENS
+            for form in ("whole-brain", "skull-stripped")
+        }
+        for modality, token in self.MR_MODALITY_TOKENS.items():
+            assert by_modality_form[(modality, "whole-brain")] == token
+        for modality, token in self.MR_SKULL_STRIPPED_TOKENS.items():
+            assert by_modality_form[(modality, "skull-stripped")] == token
+
+    def test_condition_groups_match_issue81_whitelist(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """11 生成条件分组与 #81 白名单逐位一致：名称集合、每分组
+        token = 该模态 whole-brain 条目 token（生成口径）。"""
+        config = CynosureConfig.model_validate(
+            self._mr_config_dict(valid_config_dict),
+        )
+        conditions = config.experiment.conditioning.conditions
+        assert len(conditions) == 11
+        assert {group.name for group in conditions} == self.MR_WHITELIST
+        assert len({(group.modality, group.plane) for group in conditions}) == 11
+        for group in conditions:
+            assert group.token == self.MR_MODALITY_TOKENS[group.modality]
+
+    def test_mrrate_config_loads_from_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(self._mr_config_dict(MINIMAL_CONFIG_DICT)))
+        config = ConfigLoader.load(path)
+        assert config.experiment.dataset == "MR-RATE"
+        assert len(config.experiment.conditioning.conditions) == 11
+
+
+class TestMrRateConditioningRejection:
+    """MR 词表定死对账：改值即字段级拒绝（上游权威 + #81 白名单，
+    同 cross_modal_pairs 的等值 validator 先例）。"""
+
+    @staticmethod
+    def _locations(exc: ValidationError) -> list[tuple]:
+        return [err["loc"] for err in exc.errors()]
+
+    def test_modality_tokens_fixed_to_upstream_mapping(self) -> None:
+        data = TestMrRateConditioning._conditioning_dict()
+        data["modality_tokens"]["t1w"] = 8  # 上游权威 mri_t1 = 9
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("modality_tokens",) in self._locations(exc_info.value)
+
+    def test_modalities_fixed_to_five(self) -> None:
+        data = TestMrRateConditioning._conditioning_dict()
+        data["modalities"] = ["t1w", "t2w", "flair", "swi"]  # 漏 mra
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("modalities",) in self._locations(exc_info.value)
+
+    def test_sequence_vocabulary_fixed_to_double_entries(self) -> None:
+        data = TestMrRateConditioning._conditioning_dict()
+        # 少一个条目：mra 的 skull-stripped 缺失
+        data["sequences"] = [
+            entry for entry in data["sequences"]
+            if not (entry["modality"] == "mra" and entry["form"] == "skull-stripped")
+        ]
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("sequences",) in self._locations(exc_info.value)
+        # token 漂移：swi skull-stripped 32 → 33（mra 的码）同样拒绝
+        data = TestMrRateConditioning._conditioning_dict()
+        for entry in data["sequences"]:
+            if entry["modality"] == "swi" and entry["form"] == "skull-stripped":
+                entry["token"] = 33
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("sequences",) in self._locations(exc_info.value)
+
+    def test_condition_groups_fixed_to_whitelist(self) -> None:
+        data = TestMrRateConditioning._conditioning_dict()
+        # 缺一：swi/axial 不在
+        data["conditions"] = [
+            group for group in data["conditions"] if group["name"] != "swi/axial"
+        ]
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("conditions",) in self._locations(exc_info.value)
+        # 多一：mra/axial 类型合法但不在白名单（MRA 只 all-planes 一格）
+        data = TestMrRateConditioning._conditioning_dict()
+        data["conditions"].append(
+            {"name": "mra/axial", "modality": "mra", "plane": "axial", "token": 16}
+        )
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("conditions",) in self._locations(exc_info.value)
+
+    def test_condition_token_cross_checked_against_modality_tokens(self) -> None:
+        """分组 token 与模态映射交叉对账：生成 token 必须是该模态
+        whole-brain 条目（#81 swap 探针的生成口径）。"""
+        data = TestMrRateConditioning._conditioning_dict()
+        for group in data["conditions"]:
+            if group["name"] == "t1w/axial":
+                group["token"] = 29  # skull-stripped 码不是生成 token
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("conditions",) in self._locations(exc_info.value)
+
+    def test_duplicate_condition_group_rejected(self) -> None:
+        """重复分组名静默坍缩漏洞的回归锚（code-review 实测复现）：list
+        压 dict 对账前基数先行——12 条（11 名 + 重复一条）必须拒绝。"""
+        data = TestMrRateConditioning._conditioning_dict()
+        data["conditions"].append(dict(data["conditions"][0]))
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("conditions",) in self._locations(exc_info.value)
+
+    def test_duplicate_sequence_entry_rejected(self) -> None:
+        """序列词表同理：重复条目（11 条压成 10 键）必须拒绝。"""
+        data = TestMrRateConditioning._conditioning_dict()
+        data["sequences"].append(dict(data["sequences"][0]))
+        with pytest.raises(ValidationError) as exc_info:
+            MrRateConditioning.model_validate(data)
+        assert ("sequences",) in self._locations(exc_info.value)
+
+    def test_unknown_form_and_plane_rejected(self) -> None:
+        data = TestMrRateConditioning._conditioning_dict()
+        data["sequences"][0]["form"] = "masked"
+        with pytest.raises(ValidationError):
+            MrRateConditioning.model_validate(data)
+        data = TestMrRateConditioning._conditioning_dict()
+        data["conditions"][0]["plane"] = "oblique"
+        with pytest.raises(ValidationError):
+            MrRateConditioning.model_validate(data)
+
+
+class TestMrRateDomainSeparation:
+    """两套口径并存、互不污染：dataset 字段互斥激活；无共享可变状态。"""
+
+    @staticmethod
+    def _locations(exc: ValidationError) -> list[tuple]:
+        return [err["loc"] for err in exc.errors()]
+
+    def test_brats_config_default_unchanged(self, valid_config_dict: dict) -> None:
+        """回归锚：既有 BraTS config（不显式携带 dataset）加载与行为
+        不变——dataset 默认 BraTS2023、conditioning 段缺席。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        assert config.experiment.dataset == "BraTS2023"
+        assert config.experiment.conditioning is None
+
+    def test_brats_config_explicit_dataset_unchanged(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["dataset"] = "BraTS2023"
+        config = CynosureConfig.model_validate(data)
+        assert config.experiment.dataset == "BraTS2023"
+        assert config.experiment.conditioning is None
+
+    def test_brats_rejects_mrrate_conditioning_section(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """BraTS config 携带 MR 词表即拒绝：拼错 dataset 时两套口径
+        静默共存比显式拒绝危险（同 stage1_run_dir 守卫哲学）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["conditioning"] = (
+            TestMrRateConditioning._conditioning_dict()
+        )
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("experiment", "conditioning") in self._locations(exc_info.value)
+
+    def test_mrrate_supports_modal_label_only(self, valid_config_dict: dict) -> None:
+        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态/
+        序贯是 BraTS 语义）——非组1 携带即拒绝，防 BraTS 条件语义静默错位。
+        序贯分支补齐 stage-2 报告绑定（#116 字段层先行短路的同款处理），
+        让 dataset 守卫成为显式拒绝面。"""
+        for group in ("cross-modal", "sequential"):
+            data = copy.deepcopy(valid_config_dict)
+            data["experiment"]["dataset"] = "MR-RATE"
+            data["experiment"]["group"] = group
+            if group == "sequential":
+                data["experiment"]["stage2_pretrain_report_json"] = (
+                    "pretrain_run_stage2/pretrain_report.json"
+                )
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("experiment",) in self._locations(exc_info.value)
+            assert "modal-label" in str(exc_info.value)
+
+    def test_mrrate_explicit_conditioning_must_match_fixed_vocab(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """MR config 显式给出词表：与定死默认逐位一致则通过。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["dataset"] = "MR-RATE"
+        data["experiment"]["conditioning"] = (
+            TestMrRateConditioning._conditioning_dict()
+        )
+        config = CynosureConfig.model_validate(data)
+        assert len(config.experiment.conditioning.conditions) == 11
+
+    def test_no_shared_mutable_state_between_instances(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """两套口径无共享可变状态：词表经 default_factory 每实例独立
+        构造——改实例 A 的内部容器不影响实例 B 与模块锚。"""
+        mr_data = TestMrRateConditioning._mr_config_dict(valid_config_dict)
+        config_a = CynosureConfig.model_validate(mr_data)
+        config_b = CynosureConfig.model_validate(copy.deepcopy(mr_data))
+        config_a.experiment.conditioning.modality_tokens["t1w"] = 99
+        config_a.experiment.conditioning.modalities.append("pd")
+        config_a.experiment.conditioning.sequences[0].token = 99
+        assert config_b.experiment.conditioning.modality_tokens["t1w"] == 9
+        assert config_b.experiment.conditioning.modalities == [
+            "t1w", "t2w", "flair", "swi", "mra",
+        ]
+        assert config_b.experiment.conditioning.sequences[0].token == 9
+
+    def test_sequential_loads_do_not_pollute_each_other(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """同进程先后加载互不污染：先 MR 后 BraTS，先加载实例的词表
+        不被后加载改变。"""
+        mr = CynosureConfig.model_validate(
+            TestMrRateConditioning._mr_config_dict(valid_config_dict),
+        )
+        brats = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
+        assert mr.experiment.conditioning.modality_tokens == {
+            "t1w": 9, "t2w": 10, "flair": 11, "swi": 20, "mra": 16,
+        }
+        assert brats.experiment.dataset == "BraTS2023"
+        assert brats.experiment.conditioning is None
+
+    def test_mrrate_json_roundtrip(self, valid_config_dict: dict) -> None:
+        """词表填充后 dump → reload 逐位一致（显式化词表同样过定死对账）；
+        BraTS dump 不含词表（行为不变锚）。"""
+        config = CynosureConfig.model_validate(
+            TestMrRateConditioning._mr_config_dict(valid_config_dict),
+        )
+        revived = CynosureConfig.model_validate_json(config.model_dump_json())
+        assert revived == config
+        brats = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
+        dumped = json.loads(brats.model_dump_json())
+        assert dumped["experiment"]["conditioning"] is None
+        assert dumped["experiment"]["dataset"] == "BraTS2023"
 
 
 class TestStatusAnnotations:
@@ -638,6 +1022,11 @@ class TestStatusAnnotations:
             for f in CynosureConfig.model_fields.values()
             if hasattr(f.annotation, "model_fields")
         ],
+        # Optional 嵌套（experiment.conditioning 的 MrRateConditioning |
+        # None）不在上面的自动收集面，显式补齐（issue #119）
+        MrRateConditioning,
+        MrSequenceEntry,
+        MrConditionGroup,
     ]
 
     def test_every_field_has_status_and_source(self) -> None:

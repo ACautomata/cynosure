@@ -26,13 +26,13 @@ from cynosure.reward.update import UpdateReport
 
 
 def enforce_deterministic_kernels() -> None:
-    """确定性 kernel 执行——**测试进程**的逐位复现前提（ADR-0010）。
+    """确定性 kernel 执行——**测试进程**的逐位复现前提（ADR-0011）。
 
     逐位类断言（同 seed 里程碑 FID、跨 rank 权重对账、续训 roundtrip、
     轨迹诊断 sha256 数值锚）在 GPU 上依赖 kernel 算法选择确定；缺省的
     autotune/split-K 原子归约随负载漂移（同 seed 两 run 的 policy 权重
     实测 4e-6 级分叉、里程碑 FID 逐次漂移 0.04-0.09）。**生产 pipeline
-    不开**该模式（ADR-0010：解码峰值 DCU 实测 46 GiB vs 非确定 8 GiB），
+    不开**该模式（ADR-0011：解码峰值 DCU 实测 46 GiB vs 非确定 8 GiB），
     故它落在测试进程——本函数在 conftest 导入期调用一次，spawn 出的
     rank 子进程由 ``TrainWorldWorker`` 显式再调用（子进程以 pickle 引用
     导入测试模块，不继承父进程的运行时开关）。
@@ -553,6 +553,7 @@ class RecordingUpdate:
             num_recent_replay=0,
             modality=modality,
             replay_degraded=self._replay_degraded,
+            train_pairwise_acc=0.5,
         )
 
 

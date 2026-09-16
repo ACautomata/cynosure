@@ -70,6 +70,16 @@ class IterEvent(BaseModel):
     判别器更新照常）。单 rank 下退化为「本 iteration 的目标条件不在
     白名单」。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度。
     False = 正常更新步。观测面扩展：事件契约可扩不可改名。"""
+    train_pairwise_acc: float | None = None
+    """train 侧干净域 pairwise 准确率（ADR-0009-β）：本 iteration 判别器
+    更新批上的干净域 no_grad 复算（更新前快照，随单步更新报告上行）。
+    N_d 跳过的 iteration（无判别器步）为 None。观测面扩展：事件契约
+    可扩不可改名。"""
+    overfit_divergence_ema: float | None = None
+    """per-condition 分叉 EMA（ADR-0009-β）：EMA(train pairwise acc −
+    held-out AUC) 的本 rank 读数——按 rank 独立计算落盘（rank 间离散
+    是数据切片异质性的诊断信号，不跨 rank 平均）。N_d 跳过的 iteration
+    为 None。观测面扩展：事件契约可扩不可改名。"""
     buffer_base_occupied: int
     """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
     buffer_recent_occupied: int
@@ -96,6 +106,48 @@ class MilestoneEvent(BaseModel):
     early_stop: bool = False
     early_stop_reason: str | None = None
     """触发早停的签名（"plateau" / "reward_hacking"）；未停为 None。"""
+
+
+class OverfitAlertEvent(BaseModel):
+    """训练指标流的过拟合分叉报警事件（ADR-0009 决策 4/5，issue #105；
+    γ 按相分轨，#106）。
+
+    per-condition 分叉（EMA(train 干净域 pairwise acc − held-out AUC)）
+    自下而上越线时由编排方产出——RL 相由 train 循环产出（随 iter 事件
+    同归并序写出），预训练相由预训练 driver 产出（随 pretrain 事件之后
+    直写）——按 rank 独立计算（rank 间离散是数据切片异质性的诊断信号，
+    不跨 rank 平均）。**报警不动作**：事件只承载读数，白名单与噪声 σ 不
+    被联动（人工裁决，ADR-0009 决策 5）。回退记账按相分轨（γ）：RL 相
+    按 iteration 轴随所属 iteration 删除（``REWIND_ACCOUNTING`` 的
+    ``ITERATION`` 口径——恢复点之后的告警由重执行重发）；预训练相
+    （``phase="pretrain"``）与预训练事件同口径全量保留——预训练执行史
+    没有对应的 checkpoint 可重放，删除即永久丢失。事件契约「可扩不可
+    改名」；非有限浮点构造期拒绝（判别器数值发散不产毒事件，指标流的
+    全流拒绝口径）。
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    event: Literal["overfit_alert"] = "overfit_alert"
+    iteration: int
+    """报警所属轴号：RL 相 = iteration 号（回退记账轴）；预训练相 =
+    预训练步号（与 pretrain 事件的 ``step`` 同轴）。"""
+    stage: int = 1
+    """报警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    rank: int = 0
+    """观测到越线的 rank（分叉按 rank 独立计算落盘的归因轴）。"""
+    phase: Literal["pretrain", "rl"] = "rl"
+    """告警所属相（γ 的回退记账分轨轴）：``"rl"`` = RL 在线循环（默认，
+    既有构造点与旧事件零改动兼容）；``"pretrain"`` = warm-start 预训练
+    driver（登记 EXEMPT——预训练执行史不参与续训回退重写）。"""
+    modality: str
+    """越线条件（目标模态，与 iter 事件同归因轴）。"""
+    divergence_ema: float
+    """分叉值（该条件 EMA(train pairwise acc − held-out AUC) 的越线读数）。"""
+    train_pairwise_acc: float
+    """本步 train 侧干净域 pairwise 准确率（两侧原始量之一）。"""
+    heldout_auc: float
+    """本 iteration 该条件 held-out AUC（两侧原始量之二，更新前快照）。"""
 
 
 class PretrainEvent(BaseModel):
@@ -173,6 +225,7 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
     "iter": RewindAccounting.ITERATION,
     "milestone": RewindAccounting.COMPLETION,
     "pretrain": RewindAccounting.EXEMPT,
+    "overfit_alert": RewindAccounting.ITERATION,
 }
 """事件判别值 → 回退记账口径的登记表（契约「可扩不可改名」的记账面）。
 
@@ -180,6 +233,12 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
 判定，表外（未登记 / 新增未声明）的事件类型一律保留——宁可留痕不可误删。
 新增事件类型 = 新判别值 + 登记口径 + spec 事件类型清单同步（三者同批），
 既有类型的判别值与字段名不变。
+
+``overfit_alert`` 的口径按相分轨（ADR-0009-γ）：表内登记的
+``ITERATION`` 是 **RL 相**（``phase="rl"``，缺省值）的记账轴；预训练相
+（``phase="pretrain"``）与 ``pretrain`` 事件同口径全量保留，分派在
+``RunArtifacts._kept_by_rewind`` 的相特判——登记表按判别值索引，相是
+事件级字段，一型两轨的判定不进表。
 """
 
 
@@ -382,7 +441,10 @@ class RunArtifacts:
         """
         return BaselineManifest.build(config)
 
-    def append_event(self, event: IterEvent | MilestoneEvent | PretrainEvent) -> None:
+    def append_event(
+        self,
+        event: IterEvent | MilestoneEvent | PretrainEvent | OverfitAlertEvent,
+    ) -> None:
         """向训练指标流追加一行 JSON 事件（按行追加、rank 0 归并）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(
@@ -434,6 +496,16 @@ class RunArtifacts:
             event.get("event"), RewindAccounting.EXEMPT,
         )
         if accounting is RewindAccounting.EXEMPT:
+            return True
+        # overfit_alert 按相分轨（ADR-0009-γ）：预训练相告警与预训练
+        # 事件同口径——预训练执行史没有对应的 checkpoint 可重放，按
+        # iteration 轴删是永久丢失（旧事件无 phase 字段，缺省 RL 相，
+        # 与既有流的删除口径逐字兼容）；stage/iteration 轴只有 RL 相
+        # 告警消费
+        if (
+            event.get("event") == "overfit_alert"
+            and event.get("phase", "rl") == "pretrain"
+        ):
             return True
         if event.get("stage", 1) != stage:
             return True

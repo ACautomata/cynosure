@@ -23,10 +23,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
+from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.pretrain import (
     PretrainDriver,
     PretrainProvenance,
@@ -34,15 +37,19 @@ from cynosure.pretrain import (
     PretrainRun,
 )
 from cynosure.reward.artifacts import ChannelStats
+from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train import (
     REWIND_ACCOUNTING,
+    AmpContext,
     CrossModalConditionSampler,
     IterEvent,
     MilestoneEvent,
+    OverfitAlertEvent,
     PretrainEvent,
     RewindAccounting,
     RunArtifacts,
+    TrainingRuntime,
 )
 from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
@@ -92,6 +99,22 @@ def milestone_event(iteration: int) -> MilestoneEvent:
     return MilestoneEvent(iteration=iteration, fid=1.0)
 
 
+def alert_event(
+    iteration: int, stage: int = 1, phase: str = "rl",
+) -> OverfitAlertEvent:
+    """最小合法 overfit_alert 事件（ADR-0009-β 的分叉报警事件；γ 起带
+    相判别字段，默认 RL 相与既有构造点逐字一致）。"""
+    return OverfitAlertEvent(
+        iteration=iteration,
+        stage=stage,
+        phase=phase,
+        modality="t1n",
+        divergence_ema=0.3,
+        train_pairwise_acc=0.8,
+        heldout_auc=0.5,
+    )
+
+
 def event_type_vocabulary() -> set[str]:
     """指标流事件类型的判别值词汇表（由事件模型实例的 ``event`` 默认值取
     真值——判别字段的 Literal 是那一处的单一来源，测试不另抄字面量）。"""
@@ -99,6 +122,7 @@ def event_type_vocabulary() -> set[str]:
         event.event
         for event in (
             iter_event(0), milestone_event(0), pretrain_event(0),
+            alert_event(0),
         )
     }
 
@@ -152,6 +176,7 @@ class TestEventRewindAccounting:
         assert REWIND_ACCOUNTING["iter"] is RewindAccounting.ITERATION
         assert REWIND_ACCOUNTING["milestone"] is RewindAccounting.COMPLETION
         assert REWIND_ACCOUNTING["pretrain"] is RewindAccounting.EXEMPT
+        assert REWIND_ACCOUNTING["overfit_alert"] is RewindAccounting.ITERATION
 
     def test_recovery_point_covers_by_event_own_accounting(self) -> None:
         """保留边界按各型自身口径取（恢复点 = 最近 checkpoint 的计数）：
@@ -801,6 +826,38 @@ class TestPretrainDriverAssembly:
         driver.rewards.update.scorer.training_patch_logits(latents, probe)
         assert not torch.equal(probe.get_state(), state_before)
 
+    def test_consumes_same_overfit_monitor_via_shared_assembly(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """AC（ADR-0009-γ，issue #106 验收 1）：预训练 driver 每步消费与
+        在线同一监控组件、同一 config knobs——分叉监控器经共享装配缝
+        （``TrainingRuntime.assemble_rewards``）挂进 ``RewardCoordinator``，
+        两阶段同一组件类、knobs 同源于 ``config.reward.overfit_*``；
+        与在线装配逐位一致（同一调用、同一入参，产物 knobs 无分歧）。
+        """
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "overfit_assembly_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        assert isinstance(driver.rewards.overfit, OverfitMonitor)
+        assert driver.rewards.overfit._threshold == pytest.approx(
+            config.reward.overfit_alert_divergence
+        )
+        assert driver.rewards.overfit._span == config.reward.overfit_ema_span
+        # 在线装配同缝重放：产物监控器 knobs 与预训练侧逐位一致
+        dist = DistributedContext.bootstrap()
+        amp = AmpContext(
+            device=torch.device("cpu"),
+            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        )
+        generators = TrainingRngStreams(
+            dist.derive_seed(config.schedule.seed),
+        ).named()
+        online = TrainingRuntime.assemble_rewards(config, amp, generators, dist)
+        assert isinstance(online.overfit, OverfitMonitor)
+        assert online.overfit._threshold == driver.rewards.overfit._threshold
+        assert online.overfit._span == driver.rewards.overfit._span
+
     def test_cross_modal_conditions_from_controlnet_path(
         self, scenario: PretrainScenario,
     ) -> None:
@@ -968,14 +1025,16 @@ class TestPretrainRotationStateMachine:
 
     @pytest.fixture
     def scripted(self, scenario: PretrainScenario):
-        """替身驱动的 driver 工厂：config 定死不可达门槛，三 seam 注入。"""
+        """替身驱动的 driver 工厂：config 定死不可达门槛，三 seam 注入；
+        ``reward_overrides`` 供 γ 用例覆写分叉 knobs（不牵动其余用例）。"""
         def factory(
             values: dict[str, float], plan: dict[str, list[bool]],
-            max_steps: int = 8,
+            max_steps: int = 8, reward_overrides: dict | None = None,
         ) -> tuple[PretrainDriver, ScriptedAuc, ScriptedSupport, RecordingUpdate]:
             scenario.write_config(reward={
                 "pretrain_gate_auc": 0.99,
                 "pretrain_max_steps": max_steps,
+                **(reward_overrides or {}),
             })
             config = scenario.config()
             run = PretrainRun.init(config, scenario.tmp_path / "state_run")
@@ -1074,3 +1133,176 @@ class TestPretrainRotationStateMachine:
             "t1n", "t1c", "t2w", "t2f",
         ]
         assert events[0]["heldout_auc"] == pytest.approx(0.9)  # 首测值落事件
+
+    @pytest.mark.slow  # 集群实测 ~530s：分叉告警轮转 × 每步真实 rollout
+    def test_pretrain_phase_alert_events_carry_modality_attribution(
+        self, scripted,
+    ) -> None:
+        """AC（ADR-0009-γ，issue #106 验收 2）：预训练更新步消费与在线
+        同一分叉监控（train 侧 0.5 − held-out 0.4 = 分叉 0.1 ≥ 阈值
+        0.01，每条件首观测即越线）——告警落 ``overfit_alert`` 事件：
+        ``phase="pretrain"``、``iteration`` = 本步步号、modality 归因 =
+        本步轮转条件（与 pretrain 事件同轴），排在同 step 的 pretrain
+        事件之后（与在线侧「iter 后随告警」同构的归并序）。"""
+        values = {modality: 0.4 for modality in MODALITIES}
+        plan = {modality: [False] for modality in MODALITIES}
+        driver, auc, support, recording = scripted(
+            values, plan, max_steps=4,
+            reward_overrides={"overfit_alert_divergence": 0.01},
+        )
+        report = driver.run()
+        assert report.steps_completed == 4
+        events = driver._run.read_events()
+        assert [
+            (event["event"], event["modality"]) for event in events
+        ] == [
+            pair
+            for modality in MODALITIES
+            for pair in (("pretrain", modality), ("overfit_alert", modality))
+        ]
+        for step, alert in enumerate(
+            event for event in events if event["event"] == "overfit_alert"
+        ):
+            assert alert["phase"] == "pretrain"  # γ：相判别字段
+            assert alert["iteration"] == step  # 预训练相 = 步号轴
+            assert alert["modality"] == MODALITIES[step % len(MODALITIES)]
+            assert alert["divergence_ema"] == pytest.approx(0.1)
+            assert alert["train_pairwise_acc"] == pytest.approx(0.5)
+            assert alert["heldout_auc"] == pytest.approx(0.4)
+        # pretrain 事件带分叉 EMA 读数之外的既有字段不受 γ 影响
+        assert all(
+            event["heldout_auc"] == pytest.approx(0.4)
+            for event in events if event["event"] == "pretrain"
+        )
+
+
+class TestOverfitAlertEventContract:
+    """overfit_alert 事件契约（ADR-0009-β，issue #105；γ 按相分轨，#106）：
+    判别字段区分于既有三型、要素齐备、非有限浮点构造期拒绝（「可扩不
+    可改名」与「全流拒绝」两口径的事件面）；回退记账按相分轨——RL 相
+    按 iteration 轴随所属 iteration 删除（回退重执行重发），预训练相
+    （``phase="pretrain"``）登记 EXEMPT 全量保留（预训练执行史不参与
+    回退重写），口径表本体锁在 TestEventRewindAccounting。"""
+
+    def test_event_type_discriminant_and_roundtrip(self, tmp_path: Path) -> None:
+        """混存同一 metrics.jsonl 读取无损；要素齐备（modality、分叉值、
+        train acc、held-out AUC、rank + iteration/stage 记账轴 + γ 的相
+        判别字段）。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(alert_event(3))
+        artifacts.append_event(pretrain_event(0))
+        events = artifacts.read_events()
+        assert [event["event"] for event in events] == [
+            "iter", "overfit_alert", "pretrain",
+        ]
+        alert = events[1]
+        assert alert["iteration"] == 3
+        assert alert["stage"] == 1
+        assert alert["rank"] == 0
+        assert alert["modality"] == "t1n"
+        assert alert["divergence_ema"] == pytest.approx(0.3)
+        assert alert["train_pairwise_acc"] == pytest.approx(0.8)
+        assert alert["heldout_auc"] == pytest.approx(0.5)
+        assert alert["phase"] == "rl"  # 默认 RL 相：既有构造点零改动
+
+    def test_phase_field_pretrain_roundtrip(self, tmp_path: Path) -> None:
+        """预训练相告警的相判别字段混存读取无损；其 ``iteration`` 记
+        预训练步号（与 pretrain 事件的 ``step`` 同轴）。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(pretrain_event(0))
+        artifacts.append_event(alert_event(0, phase="pretrain"))
+        events = artifacts.read_events()
+        assert events[1]["phase"] == "pretrain"
+        assert events[1]["iteration"] == 0  # 预训练相 = 步号轴
+
+    def test_non_finite_fields_rejected(self) -> None:
+        """非有限浮点在事件构造期即拒绝（判别器数值发散不产毒事件——
+        指标 JSONL 的 NaN/Inf 非标准 token，严格消费方拒读）。"""
+        for field in ("divergence_ema", "train_pairwise_acc", "heldout_auc"):
+            for bad in (float("nan"), float("inf")):
+                fields = {
+                    "iteration": 0,
+                    "modality": "t1n",
+                    "divergence_ema": 0.3,
+                    "train_pairwise_acc": 0.8,
+                    "heldout_auc": 0.5,
+                }
+                fields[field] = bad
+                with pytest.raises(ValidationError):
+                    OverfitAlertEvent(**fields)
+
+    def test_rewind_keeps_and_drops_alerts_by_iteration(self, tmp_path: Path) -> None:
+        """RL 相告警按 iteration 轴参与回退记账：号 < 恢复点的告警保留
+        （已进 checkpoint 覆盖面的执行史）、号 ≥ 恢复点的半截告警删除
+        （重执行重发）；其他 stage 的告警一概不动。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(alert_event(0))
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(alert_event(1))
+        artifacts.append_event(alert_event(2))
+        artifacts.append_event(iter_event(2))
+        artifacts.append_event(alert_event(2, stage=2))  # 组3 stage-2 历史
+        removed = artifacts.rewind_events(2, stage=1)
+        assert removed == 2  # stage-1 的 iter@2 与 alert@2（同轴半截执行史）
+        survivors = artifacts.read_events()
+        assert [
+            (event["event"], event["iteration"], event["stage"])
+            for event in survivors
+        ] == [
+            ("overfit_alert", 0, 1),
+            ("iter", 0, 1),
+            ("overfit_alert", 1, 1),
+            ("overfit_alert", 2, 2),  # 其他 stage 的历史不动
+        ]
+
+    def test_rewind_preserves_pretrain_phase_alerts(self, tmp_path: Path) -> None:
+        """预训练相告警 EXEMPT 全量保留（ADR-0009-γ，issue #106 验收 3）：
+        预训练执行史（pretrain 事件 + 预训练相告警）不参与回退重写——
+        即便步号落在恢复点的删除边界内（号 ≥ 恢复点的「半截」预训练
+        告警没有重执行可重发），预训练收敛曲线的报警读数删除即永久
+        丢失。RL 相同流告警的记账口径不受影响（照旧按 iteration 轴）。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(pretrain_event(0))
+        artifacts.append_event(alert_event(0, phase="pretrain"))
+        artifacts.append_event(iter_event(0))
+        artifacts.append_event(pretrain_event(1))
+        artifacts.append_event(alert_event(1, phase="pretrain"))
+        artifacts.append_event(alert_event(1))  # RL 相：恢复点内，保留
+        artifacts.append_event(iter_event(9))
+        artifacts.append_event(alert_event(9))  # RL 相：恢复点外，删除
+        removed = artifacts.rewind_events(5, stage=1)
+        assert removed == 2  # 只删 stage-1 的 iter@9 与 RL 相 alert@9
+        survivors = artifacts.read_events()
+        assert [
+            (
+                event["event"],
+                event.get("phase"),
+                event["step"] if event["event"] == "pretrain"
+                else event["iteration"],
+            )
+            for event in survivors
+        ] == [
+            ("pretrain", None, 0),
+            ("overfit_alert", "pretrain", 0),
+            ("iter", None, 0),
+            ("pretrain", None, 1),
+            ("overfit_alert", "pretrain", 1),
+            ("overfit_alert", "rl", 1),
+        ]
+
+    def test_rewind_to_origin_keeps_pretrain_phase_alerts(
+        self, tmp_path: Path,
+    ) -> None:
+        """恢复点 0 的误删边界（ADR-0009-γ）：预训练相告警的 ``iteration``
+        = 步号，按 RL 相口径记账时号 0 恰落在删除边界外（``0 < 0`` 为
+        假）——相特判是唯一挡得住这次误删的机制；RL 相 alert@0 仍删。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(alert_event(0, phase="pretrain"))
+        artifacts.append_event(alert_event(0))
+        artifacts.append_event(iter_event(0))
+        assert artifacts.rewind_events(0, stage=1) == 2  # RL 相 alert@0 + iter@0
+        assert [
+            (event["event"], event.get("phase"))
+            for event in artifacts.read_events()
+        ] == [("overfit_alert", "pretrain")]

@@ -23,7 +23,7 @@
 基准网格 ``[4,64,64,32]``（= 影像体 ``[1,256,256,128]`` ÷4）；多网格承接
 由 #111 网格裁决后另行表达，不在本票。
 
-确定性口径的分工（ADR-0010）：生产 pipeline 不开确定性模式；本自检的
+确定性口径的分工（ADR-0011）：生产 pipeline 不开确定性模式；本自检的
 AC「固定 seed 与确定性 kernels」只把**定点前向**放进确定性作用域，
 VAE 往返留在 pipeline 口径（AC 只要求跑通 + fp16 autocast 口径）。
 
@@ -417,7 +417,7 @@ class BaseSmokeRunner:
             raise ValueError(
                 "基座定点前向输出逐位不可复现：同一定点 latent + 同一定点"
                 "模态 token 的两次前向出现位级差异（确定性 kernel 口径未生效"
-                "——ADR-0010 的作用域开启 / CUBLAS_WORKSPACE_CONFIG 是此"
+                "——ADR-0011 的作用域开启 / CUBLAS_WORKSPACE_CONFIG 是此"
                 "契约的运行时前提）"
             )
         # 指纹读数在 CPU 上取（LatentFingerprint 的 numpy 序列化口径；
@@ -493,7 +493,7 @@ class BaseSmokeRunner:
 
     @contextlib.contextmanager
     def _deterministic_kernels(self) -> Iterator[None]:
-        """定点前向的确定性 kernel 作用域（ADR-0010：生产 pipeline 不开
+        """定点前向的确定性 kernel 作用域（ADR-0011：生产 pipeline 不开
         确定性模式，逐位复现是**测试进程**的属性；本自检的 AC2 要求前向
         逐位复现，故只圈前向、退出即还原外部状态——pytest 进程已全局
         开启时还原为开启）。

@@ -33,6 +33,66 @@ Modality = Literal["t1n", "t1c", "t2w", "t2f"]
 MODALITIES: tuple[Modality, ...] = ("t1n", "t1c", "t2w", "t2f")
 """组1 模态标签条件与组2 跨模态方向共用的四序列清单（定死，experiment-design）。"""
 
+MrModality = Literal["t1w", "t2w", "flair", "swi", "mra"]
+"""MR-RATE 五模态（地图 #67 换域线）；token 映射锚上游
+``configs/modality_mapping.json``（mrrate-data-spec §3.4）。"""
+
+MR_MODALITIES: tuple[MrModality, ...] = ("t1w", "t2w", "flair", "swi", "mra")
+"""MR-RATE 模态集（定死五模态；#81 swap 探针五 token 全 responsive 的证明面）。"""
+
+MrSequenceForm = Literal["whole-brain", "skull-stripped"]
+"""序列词表条目的形态：whole-brain 官方直发 + 现场 derive 的 skull-stripped
+（官方只发 img/ + seg/，mrrate-data-spec 约束 #7）。"""
+
+MrPlane = Literal["axial", "sagittal", "coronal", "all-planes"]
+"""生成条件的采集平面；all-planes 是 #81 读数格的并池口径（T2w 三格
+并池读数、MRA 全平面一格），ML 层面四值全域，格级允许集由词表定死。"""
+
+MR_MODALITY_TOKENS: dict[MrModality, int] = {
+    "t1w": 9, "t2w": 10, "flair": 11, "swi": 20, "mra": 16,
+}
+"""MR-RATE whole-brain token 映射（定死，上游权威）：mri_t1/t2/flair/
+swi/mra = 9/10/11/20/16（NV-Generate-CTMR ``configs/modality_mapping.json``）。"""
+
+MR_SKULL_STRIPPED_TOKENS: dict[MrModality, int] = {
+    "t1w": 29, "t2w": 30, "flair": 31, "swi": 32, "mra": 33,
+}
+"""MR-RATE skull-stripped token 映射（定死，上游 29–33 权威）。生成条件
+用 whole-brain 条目（#81 swap 探针生成口径）；skull-stripped 是 prepare
+数据链的双产条目（mrrate-data-spec 约束 #7）。"""
+
+MR_CONDITION_GROUPS: tuple[tuple[str, MrModality, MrPlane], ...] = (
+    ("t1w/axial", "t1w", "axial"),
+    ("t1w/sagittal", "t1w", "sagittal"),
+    ("t1w/coronal", "t1w", "coronal"),
+    ("t2w/axial", "t2w", "axial"),
+    ("t2w/sagittal", "t2w", "sagittal"),
+    ("t2w/coronal", "t2w", "coronal"),
+    ("flair/axial", "flair", "axial"),
+    ("flair/sagittal", "flair", "sagittal"),
+    ("flair/coronal", "flair", "coronal"),
+    ("swi/axial", "swi", "axial"),
+    ("mra/all-planes", "mra", "all-planes"),
+)
+"""RL 条件白名单 = 全部 11 个生成条件（#81 终审：9 读数格欠训、0 饱和、
+0 标签存疑；T2w 三平面独立成格、读数并池，SWI 仅轴位可得，MRA 全平面
+一格）。分组 token 不单独定死——恒取该模态 whole-brain 条目
+（``MR_MODALITY_TOKENS``，#81 swap 生成口径），单一来源防双份漂移。"""
+
+
+def _mr_sequence_token_table() -> dict[tuple[MrModality, MrSequenceForm], int]:
+    """MR-RATE 序列词表定死表：每序列双条目（whole-brain + skull-stripped，
+    上游 29–33）。schema 默认值与定死 validator 共用的单一来源——两侧
+    引用同一张表，期望集永不漂移（#119）。"""
+    return {
+        (modality, form): token
+        for modality in MR_MODALITIES
+        for form, token in (
+            ("whole-brain", MR_MODALITY_TOKENS[modality]),
+            ("skull-stripped", MR_SKULL_STRIPPED_TOKENS[modality]),
+        )
+    }
+
 # 组1 采样场（ADR-0002 定死）：CFG=10 组合场，v_cfg = v_uncond + 10·(v_cond − v_uncond)
 CFG_MODAL_LABEL: float = 10.0
 # 组2 采样场（ADR-0002 定死）：基座代码强制 CFG=0，裸条件单前向
@@ -66,6 +126,193 @@ class SpecField:
             json_schema_extra={"status": status, "source": source},
             **field_kwargs,
         )
+
+
+class MrSequenceEntry(BaseModel):
+    """MR-RATE 序列词表的一条目：（模态, 形态, token）。
+
+    每序列双条目——whole-brain（官方直发）+ skull-stripped（现场
+    derive，官方只发 img/ + seg/）；条目集合的定死对账在
+    ``MrRateConditioning`` 词表级 validator（mrrate-data-spec 约束 #6/#7）。
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    modality: MrModality = SpecField(
+        "定死", "mrrate-data-spec",
+        "MR-RATE 五模态之一（t1w/t2w/flair/swi/mra）",
+    )
+    form: MrSequenceForm = SpecField(
+        "定死", "mrrate-data-spec",
+        "条目形态：whole-brain 官方直发 / skull-stripped 现场 derive",
+    )
+    token: int = SpecField(
+        "定死", "mrrate-data-spec",
+        "modality token（上游 modality_mapping.json 权威；0 = unknown "
+        "是上游保留码，MR 词表条目必须为正）",
+        gt=0,
+    )
+
+
+class MrConditionGroup(BaseModel):
+    """MR-RATE 生成条件分组（RL 条件白名单成员，#81）。
+
+    条件 = (模态, 平面) 生成格；token 恒为该模态 whole-brain 条目
+    （#81 swap 探针的生成口径——skull-stripped 码属 prepare 数据链的
+    双产条目，不进生成分组）。集合的定死对账在 ``MrRateConditioning``
+    词表级 validator。
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    name: str = SpecField(
+        "定死", "#81",
+        "条件分组键（小写「模态/平面」，如 t1w/axial、mra/all-planes）——"
+        "per-condition gating（ADR-0008）的按条件统计与轮转消费面",
+    )
+    modality: MrModality = SpecField(
+        "定死", "#81", "条件的目标模态（token 取数键）",
+    )
+    plane: MrPlane = SpecField(
+        "定死", "#81",
+        "采集平面；all-planes 是并池读数口径（T2w 三格并池、MRA 全平面）",
+    )
+    token: int = SpecField(
+        "定死", "#81", "生成 token = 该模态 whole-brain 条目 token", gt=0,
+    )
+
+
+def _default_mr_sequences() -> list[MrSequenceEntry]:
+    """序列词表定死默认：5 模态 × 双条目 = 10 条（每次构造新实例——
+    词表容器不跨 config 实例共享，#119 互不污染验收项）。"""
+    return [
+        MrSequenceEntry(modality=modality, form=form, token=token)
+        for (modality, form), token in _mr_sequence_token_table().items()
+    ]
+
+
+def _default_mr_condition_groups() -> list[MrConditionGroup]:
+    """11 生成条件分组定死默认（#81 白名单全量；每次构造新实例）。"""
+    return [
+        MrConditionGroup(
+            name=name, modality=modality, plane=plane,
+            token=MR_MODALITY_TOKENS[modality],
+        )
+        for name, modality, plane in MR_CONDITION_GROUPS
+    ]
+
+
+class MrRateConditioning(BaseModel):
+    """MR-RATE 条件词表（issue #119，地图 #67 下游施工 1/7）。
+
+    换域线的条件口径整体：五模态集 / whole-brain token 映射（上游
+    ``modality_mapping.json`` 权威）/ 每序列双条目序列词表（whole-brain
+    + skull-stripped 29–33）/ 11 生成条件分组（#81 白名单）。四字段全
+    部定死对账（改值即字段级拒绝，同 ``cross_modal_pairs`` 先例）；
+    ``default_factory`` 每次实例化独立构造容器——两套口径与两次加载
+    之间无共享可变状态。schema 装载层：词表的运行时消费（RolloutCondition
+    组装 / prepare 数据链 / 预训练 per-condition 分组）由后续票接线。
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    modalities: list[MrModality] = SpecField(
+        "定死", "mrrate-data-spec",
+        "MR-RATE 模态集（定死五模态，#81 五 token 全 responsive 的证明面）",
+        default_factory=lambda: list(MR_MODALITIES),
+    )
+    modality_tokens: dict[str, int] = SpecField(
+        "定死", "mrrate-data-spec",
+        "whole-brain token 映射 t1w/t2w/flair/swi/mra → 9/10/11/20/16"
+        "（上游权威；#73 背景事实：五 token 全在 MR-RATE 训练分布内）",
+        default_factory=lambda: dict(MR_MODALITY_TOKENS),
+    )
+    sequences: list[MrSequenceEntry] = SpecField(
+        "定死", "mrrate-data-spec",
+        "序列词表：每序列双条目（whole-brain + skull-stripped），10 条"
+        "定死对账上游 29–33（skull-stripped 是 prepare 数据链的双产条目）",
+        default_factory=_default_mr_sequences,
+    )
+    conditions: list[MrConditionGroup] = SpecField(
+        "定死", "#81",
+        "11 生成条件分组（#81 白名单全量：9 读数格欠训 0 饱和 0 标签存疑；"
+        "T2w 三平面独立成格、SWI 仅轴位、MRA 全平面一格）",
+        default_factory=_default_mr_condition_groups,
+    )
+
+    @field_validator("modalities")
+    @classmethod
+    def _modalities_fixed_to_five(
+        cls, value: list[MrModality],
+    ) -> list[MrModality]:
+        if tuple(value) != MR_MODALITIES:
+            raise ValueError(
+                "MR-RATE 模态集定死为五模态 "
+                f"{MR_MODALITIES}（mrrate-data-spec），得到 {tuple(value)}"
+            )
+        return value
+
+    @field_validator("modality_tokens")
+    @classmethod
+    def _tokens_fixed_to_upstream_mapping(
+        cls, value: dict[str, int],
+    ) -> dict[str, int]:
+        if dict(value) != MR_MODALITY_TOKENS:
+            raise ValueError(
+                "MR-RATE token 映射定死为上游权威 "
+                f"{MR_MODALITY_TOKENS}（configs/modality_mapping.json），"
+                f"得到 {dict(value)}"
+            )
+        return value
+
+    @field_validator("sequences")
+    @classmethod
+    def _sequences_fixed_to_double_entries(
+        cls, value: list[MrSequenceEntry],
+    ) -> list[MrSequenceEntry]:
+        actual = {(entry.modality, entry.form): entry.token for entry in value}
+        expected = _mr_sequence_token_table()
+        # 基数先行：list 压 dict 对账前查长度——重复条目会静默坍缩
+        # （12 条压成 10 键），「每序列双条目」的计数约束必须显式强制
+        if len(value) != len(expected) or actual != expected:
+            raise ValueError(
+                "MR-RATE 序列词表定死为每序列双条目（whole-brain + "
+                f"skull-stripped，上游 29–33，共 {len(expected)} 条），期望 "
+                f"{expected}，得到 {len(value)} 条 {actual}"
+            )
+        return value
+
+    @field_validator("conditions")
+    @classmethod
+    def _conditions_fixed_to_issue81_whitelist(
+        cls, value: list[MrConditionGroup],
+    ) -> list[MrConditionGroup]:
+        actual = {
+            (group.name): (group.modality, group.plane, group.token)
+            for group in value
+        }
+        expected = {
+            name: (modality, plane, MR_MODALITY_TOKENS[modality])
+            for name, modality, plane in MR_CONDITION_GROUPS
+        }
+        # 基数先行：防重复分组名静默坍缩（#119 评审实测漏洞）——
+        # 11 分组的计数约束必须显式强制
+        if len(value) != len(expected) or actual != expected:
+            raise ValueError(
+                "11 生成条件分组定死为 #81 白名单全量（9 读数格欠训、"
+                f"T2w 三平面独立成格、SWI 仅轴位、MRA 全平面，共 "
+                f"{len(expected)} 个），期望 {sorted(expected)}，得到 "
+                f"{len(value)} 个 {sorted(actual)}"
+            )
+        for group in value:
+            if group.token != MR_MODALITY_TOKENS[group.modality]:
+                raise ValueError(
+                    f"条件分组 {group.name} 的 token {group.token} 与模态"
+                    f"映射不符：生成 token 必须是 {group.modality} 的 "
+                    "whole-brain 条目（#81 swap 生成口径，skull-stripped "
+                    "码不进生成分组）"
+                )
+        return value
 
 
 class Artifacts(BaseModel):
@@ -144,13 +391,24 @@ class Experiment(BaseModel):
     )
     base_model: Literal["rflow-mr-brain_v1"] = SpecField(
         "定死", "experiment-design",
-        "实验基座 = rflow-mr-brain_v1 + BraTS2023",
+        "实验基座 = rflow-mr-brain_v1（BraTS2023 与 MR-RATE 两域共用冻结基座）",
         default="rflow-mr-brain_v1",
     )
-    dataset: Literal["BraTS2023"] = SpecField(
-        "定死", "experiment-design",
-        "数据集 = BraTS2023（下游 nnUNet 仪器与跨模态 ControlNet 同域）",
+    dataset: Literal["BraTS2023", "MR-RATE"] = SpecField(
+        "定死", "experiment-design + #67",
+        "数据集 = BraTS2023（下游 nnUNet 仪器与跨模态 ControlNet 同域）/ "
+        "MR-RATE（地图 #67 换域：同基座的组1 模态标签 RL 后训练，条件"
+        "词表经 conditioning 段装载，#119）——两套口径的互斥选择开关",
         default="BraTS2023",
+    )
+    conditioning: MrRateConditioning | None = SpecField(
+        "定死", "mrrate-data-spec + #81",
+        "MR-RATE 条件词表（仅 dataset=MR-RATE 有语义）：五模态集 / "
+        "token 映射（9/10/11/20/16，上游 modality_mapping.json 权威）/ "
+        "每序列双条目序列词表（whole-brain + skull-stripped 29–33）/ "
+        "11 生成条件分组（#81 白名单）。缺省自动填充定死词表（单一来源，"
+        "config 不必抄录）；BraTS config 携带即拒绝",
+        default=None,
     )
     cross_modal_pairs: list[tuple[Modality, Modality]] = SpecField(
         "定死", "experiment-design",
@@ -184,6 +442,43 @@ class Experiment(BaseModel):
                 f"期望 {sorted(expected)}，得到 {sorted(seen)}"
             )
         return value
+
+    @field_validator("conditioning")
+    @classmethod
+    def _conditioning_section_matches_dataset(
+        cls, value: MrRateConditioning | None, info: ValidationInfo,
+    ) -> MrRateConditioning | None:
+        """两套口径经 dataset 互斥激活（#119 验收：互不污染）：
+
+        - BraTS config 携带 MR 词表即拒绝——拼错 dataset 时两套口径
+          静默共存比显式拒绝危险（同 stage1_run_dir 守卫哲学）；
+        - MR-RATE 缺 conditioning 自动填充上游权威定死词表——词表
+          单一来源（schema 默认值），config 文件不必抄录定死值。
+        """
+        dataset = info.data.get("dataset")
+        if dataset != "MR-RATE":
+            if value is not None:
+                raise ValueError(
+                    "conditioning 段（MR-RATE 条件词表）仅对 "
+                    f"dataset=\"MR-RATE\" 有语义，得到 dataset={dataset}"
+                    "（两套口径互斥激活：BraTS config 携带 MR 词表即拒绝）"
+                )
+            return value
+        if value is None:
+            return MrRateConditioning()
+        return value
+
+    @model_validator(mode="after")
+    def _mrrate_supports_modal_label_only(self) -> "Experiment":
+        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态/
+        序贯是 BraTS 语义）——非组1 即拒绝：组2/组3 的 cross_modal_pairs、
+        ControlNet 工件等 BraTS 条件语义在 MR config 里静默错位。"""
+        if self.dataset == "MR-RATE" and self.group != "modal-label":
+            raise ValueError(
+                "MR-RATE 线只定义组1（modal-label）：上游无 MR ControlNet，"
+                f"跨模态/序贯是 BraTS 语义（地图 #67），得到组 {self.group}"
+            )
+        return self
 
     @field_validator("stage1_run_dir")
     @classmethod
@@ -577,6 +872,25 @@ class RewardConfig(BaseModel):
         "不设独立 off 开关",
         default=0.2, ge=0.0,
     )
+    overfit_ema_span: int = SpecField(
+        "tunable", "ADR-0009",
+        "过拟合分叉监控的 EMA 跨度（ADR-0009 决策 4，暂定 8——与 "
+        "gating_ema_span 的 EMA(AUC) 跨度同值口径，MR-RATE 预训练曲线"
+        "校准后定版）：per-condition 分叉 = EMA(train 干净域 pairwise "
+        "acc − held-out AUC) 的平滑窗口（α = 2/(span+1)），观测流是"
+        "该条件判别器步的稀疏序列（跨度语义 = 观测条数尺度）",
+        default=8, ge=1,
+    )
+    overfit_alert_divergence: float = SpecField(
+        "tunable", "ADR-0009",
+        "overfit_alert 的分叉报警阈值（ADR-0009 决策 5，暂定 0.2，"
+        "MR-RATE 预训练曲线校准后定版）：per-condition 分叉 EMA 自下"
+        "而上越线即发 overfit_alert 事件——只报警、人工裁决，不自动移出"
+        "白名单、不自动调 σ（升级项留校准后另议）。两侧同为 [0,1] 的 "
+        "Mann-Whitney pairwise 占比，健康判别器的分叉贴 0；0 与 1 分属"
+        "「任何正分叉即报警」的噪声区与「永不报警」的哑区，均不合法",
+        default=0.2, gt=0.0, lt=1.0,
+    )
 
     @model_validator(mode="after")
     def _gating_hysteresis_band(self) -> "RewardConfig":
@@ -638,6 +952,20 @@ class PreprocessingConfig(BaseModel):
         "fixture 注入小基数使夹具影像尺寸不变（须经 fixture_mode=true "
         "显式声明）",
         default=UPSTREAM_RESIZE_BASE, ge=1,
+    )
+    encode_roi_size: list[int] = SpecField(
+        "定死", "data-preparation + T12 复核探针",
+        "VAE 编码滑动窗口的影像空间 roi（三轴；NVIDIA create_training_data 锚 "
+        "[320,320,160]）——单样本空间体素数 ≤ roi 元素数时整前向豁免（上游 "
+        "dynamic_infer 同语义，BraTS [1,1,256,256,128] 恒走此路）；超出时 roi "
+        "逐轴 clamp 到影像尺寸后走 SlidingWindowInferer（b 语义，#143）",
+        default=[320, 320, 160],
+    )
+    encode_overlap: float = SpecField(
+        "定死", "data-preparation + T12 复核探针",
+        "VAE 编码滑动窗口的重叠比（NVIDIA create_training_data 锚 0.4）。"
+        "mode 定死 gaussian、sw_batch_size 定死 1（上游口径）",
+        default=0.4, ge=0.0, lt=1.0,
     )
 
 
@@ -976,7 +1304,17 @@ __all__ = [
     "Experiment",
     "GrpoConfig",
     "MODALITIES",
+    "MR_CONDITION_GROUPS",
+    "MR_MODALITIES",
+    "MR_MODALITY_TOKENS",
+    "MR_SKULL_STRIPPED_TOKENS",
     "Modality",
+    "MrConditionGroup",
+    "MrModality",
+    "MrPlane",
+    "MrRateConditioning",
+    "MrSequenceEntry",
+    "MrSequenceForm",
     "PolicyConfig",
     "PreprocessingConfig",
     "RewardConfig",

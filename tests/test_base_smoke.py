@@ -701,7 +701,7 @@ class TestRealBaseArtifacts:
         CliSession 与 pytest 同进程，进程内循环共享 CUDA 上下文与环境
         状态，不构成跨进程证据（Codex review 5212797632）；确定性口径
         随测试 seam 显式随行——子进程导入 ``tests.conftest``（其导入期
-        收口，ADR-0010 的「测试进程属性」含测试派生的子进程）。"""
+        收口，ADR-0011 的「测试进程属性」含测试派生的子进程）。"""
         source = json.loads(
             Path(os.environ[_REAL_SMOKE_CONFIG_ENV]).read_text(encoding="utf-8"),
         )

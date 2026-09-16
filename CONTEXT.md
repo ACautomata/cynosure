@@ -37,16 +37,20 @@ _Avoid_: 基座（base model 指 checkpoint 本体）、参考实现
 _Avoid_: canonical 方向、ToCanonical（那是实现名）
 
 **上游 `dynamic_infer`（参照函数）**:
-NV-Generate-CTMR `utils.py` 的体积分派函数：单样本体素数 ≤ roi 元素数走整前向，否则 roi 逐轴 clamp 到图像尺寸后走滑窗。只读参照、永不 import（零依赖原则）；本仓同语义实现 = decode 侧 `LatentDecoder`（含滑窗分支）、encode 侧 `MaisiLatentEncoder`（恒整前向 + 超界显式拒绝，滑窗分支未交付）。
+NV-Generate-CTMR `utils.py` 的体积分派函数：单样本体素数 ≤ roi 元素数走整前向，否则 roi 逐轴 clamp 到图像尺寸后走滑窗。只读参照、永不 import（零依赖原则）；本仓同语义实现 = decode 侧 `LatentDecoder`（含滑窗分支）、encode 侧 `MaisiLatentEncoder`（豁免/滑窗两分支，滑窗走「b 语义」偏离）。
 _Avoid_: Dynamic_Inferer（全库无此类，上游是函数不是 Inferer 类）
 
 **Decode（解码）**:
-latent → 像素域的 VAE 解码，只发生在评测路径（Baseline 采样、里程碑评测、RL 后重采），不进逐 iteration 训练循环。滑窗口径与上游 `dynamic_infer` 同语义（单通道空间体素数 ≤ prod(roi) 走整前向豁免，否则 `SlidingWindowInferer` 高斯滑窗，latent 空间 roi=[48,48,48]、overlap 2/3，锚 NVIDIA `config_infer.json`），前向冻结 fp16 autocast 口径。
+latent → 像素域的 VAE 解码，只发生在评测路径（Baseline 采样、里程碑评测、RL 后重采），不进逐 iteration 训练循环。滑窗口径与上游 `dynamic_infer` 同语义（单通道空间体素数 ≤ prod(roi) 走整前向豁免，否则 `SlidingWindowInferer` 高斯滑窗，latent 空间 roi=[48,48,48]、overlap 2/3，锚 NVIDIA `config_infer.json`；豁免口径修正见 ADR-0010），前向冻结 fp16 autocast 口径。
 _Avoid_: Dynamic_Inferer、逐 iteration 解码
 
 **预编码（Encode）**:
-影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写；幂等重跑 = 语义层，生产 pipeline 的 VAE 前向有浮点噪声级漂移，逐位归测试口径——ADR-0010），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构）；超界滑窗分支未交付（NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4）。
-_Avoid_: 编码器推理、把「encoder 滑窗」当既有能力引用
+影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写；幂等重跑 = 语义层，生产 pipeline 的 VAE 前向有浮点噪声级漂移，逐位归测试口径——ADR-0011），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构，BraTS 全语料恒整前向）；超界走滑窗分支（b 语义，NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4；ADR-0010 改判、#143 交付）。
+_Avoid_: 编码器推理、「超界显式拒绝」作现状引用
+
+**b 语义（blend-then-sample）**:
+encode 滑窗的采样编排：MONAI `SlidingWindowInferer` 包 encoder 确定性前向，逐窗 (z_mu, z_sigma) 在 latent 网格高斯加权拼合，拼合**后**以单一内容寻址种子采样一次 eps——重跑零漂移幂等保持、接缝带方差与体心均匀。对 NVIDIA 的逐窗采样拼接（a 语义，接缝方差收缩）为记录在案偏离（ADR-0010；#139/#143）。
+_Avoid_: 逐窗采样拼接当本仓语义、a/b 语义混称
 
 **上游锚（Upstream anchor）**:
 对齐的双重锚。recipe 级分线：BraTS 线锚 fork（ADR-0006，`clip=True` 为记录在案故意偏差），MR-RATE 线锚 NVIDIA 真上游 v1（`clip=False`）。机制级（滑窗、采样、scale factor）fork 与 NVIDIA 逐字节相同（`da438fe` 对拍 `utils.py`/`create_training_data.py`/`utils_infer.py` 零差异），两锚无分歧。说「与上游对齐」必须指明哪一锚。
@@ -112,6 +116,10 @@ _Avoid_: 小支撑的点估计直接过线、patch 级 bootstrap、换被估计�
 RM readiness gate 的产物：预训练后逐条件判定的「判别器在该条件上有分辨率」清单。RL 期间它是 policy 更新的按条件开关（消费见 梯度门控）——名单内正常更新，名单外只跑 rollout 与判别器更新。名单不是静态产物：动态恢复（EMA 滞回）驱动名单进出——gated 条件的在线 per-condition held-out AUC 经 EMA 平滑越过 enter 阈值即恢复更新，名单内条件跌破 exit 阈值即重新门控（enter/exit/EMA 跨度三 knob 进 config、暂定值待校准；可配置关闭，静态白名单为降级路径）。门控决定全 rank 集体口径（rank 0 判定 + broadcast），门控状态随续训分片落盘逐位复原。
 _Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
 
+**生成条件（Generation condition）**:
+RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 线条件单位仍是序列/有序对）：#81 终审白名单全量 11 个——T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。词表与分组整体入 config schema（`experiment.conditioning`，`MrRateConditioning`，#119）：五模态集、whole-brain token 映射 9/10/11/20/16（上游 `configs/modality_mapping.json` 权威）、每序列双条目序列词表（whole-brain + skull-stripped 29–33，后者是 prepare 数据链的双产条目）、11 分组（分组 token 恒为 whole-brain 条目——#81 swap 生成口径）。两套口径经 `experiment.dataset` 互斥激活（`BraTS2023` 默认、既有 BraTS 线行为不变；`MR-RATE` 缺省自动填充定死词表、携带错值即拒、词表容器 per-instance 独立构造互不污染），MR-RATE 线只定义组1（上游无 MR ControlNet）。#119 是装载层交付：词表的运行时消费（RolloutCondition 组装 / prepare 数据链 / 预训练 per-condition 分组）由后续票接线。完整口径见 `docs/spec/experiment-design.md`「条件词表口径」节。
+_Avoid_: 把 skull-stripped 码当生成 token（生成分组恒用 whole-brain 条目）、在 BraTS config 里携带 MR 词表段（互斥携带即拒）
+
 **梯度门控（Gradient gating）**:
 白名单的按 iteration 消费（ADR-0008 决策 7）：目标条件不在名单 → 该 iteration 跳过 policy 更新——rollout、fake 入 buffer、判别器更新、iter 事件照常。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度（GRPO 无效样本不参与 advantage 的既有实践），不引入第二重 reward、KL 或参考模型。被门控条件的判别器持续受训——其建立判别力是白名单动态恢复的前提。门控决定是全 rank 集体口径：任一 rank 的条件被门控即全体跳过（policy 更新的 FSDP 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等死锁）；iter 事件以 policy_gated 标记区分门控 iteration（loss 缺 policy 项）。名单恢复由 条件白名单 词条的动态恢复机制驱动。
 _Avoid_: 条件过滤（判别器侧条件匹配采样，另一概念）
@@ -127,6 +135,10 @@ _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 **判别器训练期噪声注入（Training-time noise injection）**:
 判别器参数更新前向中 real 与 fake 两侧 latent 的对称加噪（ADR-0009-α）：逐样本 σ ~ U[0, σ_max]（上限 = config `reward.disc_noise_sigma_max`，暂定 0.2 待 MR-RATE 预训练曲线校准）在归一化域注入——通道归一化之后、σ 以相对通道 std 的比例参数化（免依赖 latent 存储域量级）。机制 = 冲掉单样本精确值指纹、逼判别器学平滑特征（ADA），补齐条件匹配采样把 real 侧骤缩到稀疏模态小池之后的过拟合防线后半道。training-only augmentation：噪声只进参数更新前向，reward 打分、held-out AUC、监控复算全部留在干净域——打分与训练共用前向主干，路径分流 = 训练专用带噪入口（scorer 的 `training_patch_logits`）、打分入口契约不动（双侧同噪会让 reward 每步 i.i.d. 抖动经 GRPO 组内标准化放大进 advantage，已否决；采样平均消抖因 rollout 打分成本 ×N，已否决）。σ_max = 0 是唯一关闭形态（回归锚：全链路与无注入逐位一致），不设独立 off 开关。噪声采样走专属命名随机流（`disc_noise`，随续训分片落盘），与训练/评测/AUC 流不交叉——σ_max 取值不漂移回放抽样序列；预训练与在线经同一更新原语（Online update）消费同一 knobs，预训练 driver 零改动获得注入。
 _Avoid_: 数据增强（像素域强度变换是上游 recipe 概念；这里是 latent 域判别器输入增强）、双向噪声（「双侧同噪」的歧义叫法）
+
+**过拟合分叉监控（Overfit divergence monitoring）**:
+判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量：带噪输入使训练批任务天然更难、系统性低估分叉），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件、按 rank 独立记账（rank 间离散 = 数据切片异质性的诊断信号，不跨 rank 平均），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：不自动移出白名单、不自动调 σ（升级项留校准后另议）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在 RM readiness gate 之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
+_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动降 σ（升级项，校准后另议）、跨 rank 平均的分叉读数（rank 离散本身是诊断信号）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
 
 **Replay buffer（回放缓冲）**:
 封顶 FIFO 的 fake latent 存库（base 时期 + 近期），条目带条件标记（目标模态标签——组2 跨模态条目按目标端归因）；更新判别器时按比例混入、回放抽取与本 iteration 条件匹配，防漂移、防灾难性遗忘。
