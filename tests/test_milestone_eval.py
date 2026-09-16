@@ -357,9 +357,10 @@ class TestDecodeOnlyInEvaluationPaths:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """运行时验证（计数解码器注入）：3 iteration、里程碑间隔 2 的
-        run 恰好 3 次 decode 调用——baseline（4 条目）+ 里程碑（前缀
-        milestone_eval_samples=2 条）+ 重采（4 条目）；逐 iteration
-        循环中零解码。"""
+        run 恰好在评测相发生 decode——baseline（4 条目 4 条件 → 4 批）+
+        里程碑（前缀 milestone_eval_samples=2 条、2 条件 → 2 批）+ 重采
+        （4 批）；逐 iteration 循环中零解码。#129 起解码批 = 块内条件组
+        （每批 ≤ decode_batch_size、批内同条件），不再整 manifest 一批。"""
         scenario.write_inputs()
         scenario.set_schedule(
             max_iterations=3,
@@ -392,11 +393,8 @@ class TestDecodeOnlyInEvaluationPaths:
         )
         trainer = GranularGrpoTrainer(config, artifacts, evaluation=evaluation)
         assert trainer.run() == 3
-        assert counter.calls == [
-            (4, 4, 16, 16, 8),  # baseline：manifest 全部 4 条目一批
-            (2, 4, 16, 16, 8),  # 里程碑：manifest 前缀 milestone_eval_samples=2 条
-            (4, 4, 16, 16, 8),  # RL 后重采：同 manifest 条目
-        ]
+        # baseline 4 批 + 里程碑 2 批 + 重采 4 批，全部单条目条件组
+        assert counter.calls == [(1, 4, 16, 16, 8)] * 10
 
 
 class TestBoundedVolumeSampling:
@@ -440,17 +438,19 @@ class TestBoundedVolumeSampling:
     def test_baseline_decoding_streams_in_bounded_chunks(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """decode_batch_size=2、4 条目：baseline 解码两次调用、每次批
-        ≤ 块大小——峰值显存以块为界；重采同口径。"""
+        """decode_batch_size=2、4 条目（条件轮转 t1n→t1c→t2w→t2f）：
+        块内按条件分组解码（#129）——每批 ≤ 块大小、批内同条件，峰值
+        显存以块为界；重采同口径。"""
         evaluation, counter = self._evaluation_with_counter(
             scenario, decode_batch_size=2,
         )
         evaluation.sample_baseline()
-        chunk_latent_shape = (2, 4, 16, 16, 8)  # 计数面 = decode 输入 latent
-        assert counter.calls == [chunk_latent_shape, chunk_latent_shape]
+        # 每块 2 条目异条件 → 块内 2 个单条目条件组：4 次调用全部批 1
+        single = (1, 4, 16, 16, 8)  # 计数面 = decode 输入 latent
+        assert counter.calls == [single] * 4
         counter.calls.clear()
         evaluation.resample()
-        assert counter.calls == [chunk_latent_shape, chunk_latent_shape]
+        assert counter.calls == [single] * 4
 
     def test_saved_volume_owns_its_storage(
         self, scenario: TrainingLoopScenario,

@@ -23,12 +23,18 @@ latent 张量本体不经 JSON：每条目一个 ``torch.save`` 文件，manifes
 
 import json
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from cynosure.reward.dataset import SplitPart
+
+if TYPE_CHECKING:
+    # 条件词汇表协议（本域条件集与形状的权威）；仅作类型标注使用——
+    # 运行时 import 会让工件契约反向依赖词汇表模块（消费方向是
+    # 词汇表 → 工件装载面）
+    from cynosure.conditions import ConditionVocabulary
 
 
 ManifestKind = Literal["real_pool", "heldout_real"]
@@ -155,6 +161,44 @@ class LatentManifest(BaseModel):
                 "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
                 f"不变，不引入有放回采样补洞）；不足: {detail}。"
                 "增大 real pool（或减小 disc_batch_size_k / 切片路数）"
+            )
+
+    def assert_condition_shapes(
+        self, vocabulary: "ConditionVocabulary",
+    ) -> None:
+        """逐条件形状契约与**活动词汇表**的装配期对照（#129 消费侧守卫）：
+        携带逐条件表的工件须与本域词汇表逐条件同形——同名异形（词表工件
+        改动/换域而 manifest 未重建，或 manifest 来自另一词表）在装配期
+        显式拒绝，而非首次判别器拼接 real 与 fake 时才炸（fake 侧形状经
+        ``vocabulary.latent_shape(name)`` 解析、real 侧经本表解析，两来源
+        不一致即错位对；全卷积判别器对此形状差异不报错）。单域（BraTS）
+        工件不带逐条件表：全局 ``latent_shape`` 对账 = 单条件词汇特例，
+        本守卫不适用（缺表即返回）。
+        """
+        if self.condition_latent_shapes is None:
+            return
+        expected = {
+            name: vocabulary.latent_shape(name) for name in vocabulary.names()
+        }
+        drifted = [
+            f"{name}（工件 {list(shape)} ≠ 词汇表 "
+            f"{list(expected[name]) if name in expected else '未在册'}）"
+            for name, shape in self.condition_latent_shapes.items()
+            if expected.get(name) != shape
+        ]
+        missing = [
+            name for name in expected
+            if name not in self.condition_latent_shapes
+        ]
+        if drifted or missing:
+            raise ValueError(
+                f"manifest 逐条件形状契约与活动词汇表不符（kind={self.kind}）: "
+                + "; ".join(
+                    drifted + [f"缺条件 {name}" for name in missing],
+                )
+                + "——形状的权威是本域条件词汇表（fake 侧同源），"
+                "同名异形会让判别器把两套影像空间的样本拼进同一批；"
+                "请按当前词表重建 manifest 后入训"
             )
 
     def load_latent(self, entry: PoolEntry) -> torch.Tensor:

@@ -149,7 +149,7 @@ class ManifestVolumeSampler:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 # clone 物化独立存储：条目体是分组批张量的 view，view 序列化
                 # 携带整块 backing storage（每文件膨胀 K 倍）
-                torch.save(volume[0].clone(), target)
+                torch.save(volume.clone(), target)
                 if phase == PHASE_BASELINE:
                     entry.baseline_sample = relative
                 else:
@@ -158,10 +158,12 @@ class ManifestVolumeSampler:
             self._manifest.write(self._paths.manifest)
 
     def _volumes(self, entries: list[ManifestEntry]) -> list[torch.Tensor]:
-        """一批条目的解码像素体（逐条目 [1, X, Y, Z] 清单，按条目序）——
-        块内按条件分组解码（#129：同条件条目 cat 成批一次解码，异条件
-        分组边界即同形边界；「批内同条件即同形状」使分组内 cat 恒安全），
-        与里程碑评测同口径。"""
+        """一批条目的解码像素体（逐条目 [X, Y, Z]，按条目序）——块内按
+        条件分组解码（#129：同条件条目 cat 成批一次解码，异条件分组
+        边界即同形边界；「批内同条件即同形状」使分组内 cat 恒安全），
+        与里程碑评测同口径。解码输出 [B, 1, X, Y, Z] 的批维与单通道维
+        在条目分离时一并剥离——条目体就是像素体本身（单例维不外溢，
+        落盘与下游像素消费方拿 3-D 体）。"""
         samples = self._latent_sampler.sample(entries)
         decoded_by_position: dict[int, torch.Tensor] = {}
         groups: dict[str, list[int]] = {}
@@ -171,5 +173,5 @@ class ManifestVolumeSampler:
             terminals = torch.cat([samples[p].terminal for p in positions])
             decoded = self._decoder.decode(terminals)
             for offset, position in enumerate(positions):
-                decoded_by_position[position] = decoded[offset:offset + 1]
+                decoded_by_position[position] = decoded[offset, 0]
         return [decoded_by_position[i] for i in range(len(samples))]

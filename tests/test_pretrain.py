@@ -319,6 +319,39 @@ def report_scenario(tmp_path: Path) -> PretrainReportScenario:
     return PretrainReportScenario(tmp_path)
 
 
+class TestPretrainReportConditionDomain:
+    """报告的条件域 = 本域词汇表条件集（#129）：MR-RATE 的条件名
+    （``t1w/axial`` 等）此前被 BraTS 四序列 ``Modality`` 字面量挡在
+    schema 之外——每次 MR 预训练都在 ``_finalize`` 处以 ValidationError
+    收场、``pretrain_report.json`` 落不了盘（无报告 = train 侧拿不到
+    warm-start 产物，整条换域线在收尾处断）。"""
+
+    def test_mr_condition_names_roundtrip(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """MR 条件名报告落盘 → 装载无损；多条件线不记单域全局形状
+        （形状逐条件派生自词表工件，口径由 provenance 承载）。"""
+        report = report_scenario.report(
+            latent_shape=None,
+            condition_auc={"t1w/axial": 0.72, "flair/axial": 0.61},
+            gate_whitelist=["t1w/axial"],
+        )
+        loaded = PretrainReport.load(report_scenario.write(report))
+        assert set(loaded.condition_auc) == {"t1w/axial", "flair/axial"}
+        assert loaded.gate_whitelist == ["t1w/axial"]
+        assert loaded.latent_shape is None
+
+    def test_brats_report_keeps_global_shape(
+        self, report_scenario: PretrainReportScenario,
+    ) -> None:
+        """单域（BraTS）口径不动：四序列条件名 + 全局 latent 形状。"""
+        loaded = PretrainReport.load(
+            report_scenario.write(report_scenario.report()),
+        )
+        assert loaded.latent_shape == tuple(Fixture.LATENT_SHAPE)
+        assert loaded.gate_whitelist == list(MODALITIES)
+
+
 class TestPretrainReportGuard:
     def test_load_rejects_missing_report(self, tmp_path: Path) -> None:
         """缺报告 = 未预训练：拒绝装载（守卫哲学）。"""

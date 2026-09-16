@@ -295,9 +295,18 @@ class PretrainDriver:
                 "判别器网络配置缺失（artifacts.discriminator_config_json）"
             )
         reward = self._config.reward
+        # 词表工件绑定 = 多条件线的判据（schema 面 MR-RATE 必填 / BraTS
+        # 携带即拒），不复制 dataset 字符串
+        vocabulary_path = self._config.artifacts.condition_vocabulary_json
         report = PretrainReport(
             group=self._config.experiment.group,
-            latent_shape=self._config.latent_shape,
+            # 形状口径两态（#129）：多条件线的形状逐条件派生自词表工件、
+            # 报告不落派生副本（口径由 provenance 指纹承载）；单域线记
+            # 全局形状（单条件词汇特例）
+            latent_shape=(
+                None if vocabulary_path is not None
+                else self._config.latent_shape
+            ),
             condition_auc=condition_auc,
             gate_whitelist=whitelist,
             steps_completed=steps_completed,
@@ -324,6 +333,14 @@ class PretrainDriver:
                 discriminator_ckpt=discriminator_relative,
                 discriminator_ckpt_sha256=PretrainProvenance.digest(
                     self._run.paths.discriminator_ckpt,
+                ),
+                # 词表工件口径指纹（多条件线；单域线无工件，两侧同为 None）
+                condition_vocabulary=(
+                    None if vocabulary_path is None else str(vocabulary_path)
+                ),
+                condition_vocabulary_sha256=(
+                    None if vocabulary_path is None
+                    else PretrainProvenance.digest(vocabulary_path)
                 ),
             ),
         )

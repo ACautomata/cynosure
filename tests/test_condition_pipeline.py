@@ -25,24 +25,27 @@ from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
 )
 
 from cynosure.conditions import MrConditionVocabulary
-from cynosure.eval import ManifestEvaluation
+from cynosure.eval import ManifestEvaluation, ManifestVolumeSampler
 from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.milestone import MilestoneEvaluator
 from cynosure.eval.sampling import EntrySample, ManifestLatentSampler
 from cynosure.eval.features import StubSliceFeatureExtractor
 from cynosure.eval.volumes import VolumePairFidelity
 from cynosure.config import CynosureConfig, RewardConfig
+from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
-from cynosure.policy.numerics import AmpContext
+from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import PerConditionSchedules
+from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import LatentScorer, LsganTerms
 from cynosure.reward.update import OnlineUpdate
+from cynosure.train import TrainingRuntime
 from cynosure.train.artifacts import (
     BaselineManifest,
     ManifestEntry,
@@ -50,6 +53,7 @@ from cynosure.train.artifacts import (
 )
 from cynosure.train.resume import ResumeStore
 from cynosure.train.rollout import MrConditionSampler, RolloutPhase
+from cynosure.train.rng import TrainingRngStreams
 from tests.test_condition_vocabulary import (
     PRODUCTION_CENSUS_PATH,
     PRODUCTION_VOCAB_PATH,
@@ -730,3 +734,309 @@ class TestMilestoneEvaluationBuildGuard:
                 amp=AmpContext(torch.device("cpu"), torch.bfloat16),
                 write_enabled=False,
             )
+
+
+class MrPretrainArtifactsFixture:
+    """MR-RATE 预训练产物夹具（#129 报告守卫与装配守卫共用）：real pool /
+    held-out manifest（逐条件形状契约 = 词汇表真值）、channel stats 与
+    对齐的报告 provenance——守卫测试里唯一的拒绝来源即被测对照本身。"""
+
+    ENTRIES_PER_CONDITION: int = 4
+    """每条件条目数：≥ fixture 的 disc_batch_size_k（4）× world（1）。"""
+
+    @staticmethod
+    def write_manifest(
+        path: Path, vocabulary: MrConditionVocabulary, kind: str,
+        shape_override: tuple[int, int, int, int] | None = None,
+    ) -> Path:
+        """按词汇表形状写一份逐条件 manifest（含 latent 本体）。
+
+        ``shape_override`` = 全部条件改用另一套（「旧词表」）形状落盘：
+        条目与契约自洽（装载期逐条目对账通过）、但与活动词汇表异形——
+        正是「词表工件改动而 manifest 未重建」的形态。"""
+        shapes = {
+            name: vocabulary.latent_shape(name) for name in vocabulary.names()
+        }
+        if shape_override is not None:
+            shapes = {name: shape_override for name in shapes}
+        latents_dir = path.parent / f"{path.stem}_latents"
+        latents_dir.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for name in vocabulary.names():
+            for index in range(MrPretrainArtifactsFixture.ENTRIES_PER_CONDITION):
+                file_name = f"{name.replace('/', '_')}-{index}.pt"
+                torch.save(torch.randn(*shapes[name]), latents_dir / file_name)
+                entries.append({
+                    "case_id": f"case-{name}-{index}",
+                    "modality": name,
+                    "latent": f"{latents_dir.name}/{file_name}",
+                    "spacing": [100.0, 100.0, 100.0],
+                })
+        path.write_text(json.dumps({
+            "kind": kind,
+            "encoder": "fixture-mr-pretrain",
+            "latent_shape": [4, 16, 16, 8],
+            "split_seed": 0,
+            "split_sizes": {"train": len(entries)},
+            "entries": entries,
+            "condition_latent_shapes": {
+                name: list(shape) for name, shape in shapes.items()
+            },
+        }), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def write_channel_stats(
+        path: Path, vocabulary: MrConditionVocabulary,
+    ) -> Path:
+        """判别器输入的标准化统计量（冷启动装配必读工件；取值不参与本组
+        断言——四通道恒等标准化）。"""
+        path.write_text(json.dumps({
+            "kind": "channel_stats",
+            "mean": [0.0, 0.0, 0.0, 0.0],
+            "std": [1.0, 1.0, 1.0, 1.0],
+            "num_latents": 8,
+            "latent_shape": list(
+                vocabulary.latent_shape(vocabulary.names()[0]),
+            ),
+            "source_manifest": "real_pool.json",
+        }), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def report(
+        config: CynosureConfig, vocabulary: MrConditionVocabulary,
+        **overrides,
+    ) -> PretrainReport:
+        """与磁盘工件全部对齐的 MR 预训练报告（条件集 = 词汇表条件集、
+        provenance 指纹 = 当前工件内容）——多条件线不记单域全局形状
+        （形状口径由词表指纹承载）。"""
+        reward = config.reward
+        provenance = PretrainProvenance(
+            real_pool_manifest=str(reward.real_pool_manifest),
+            real_pool_manifest_sha256=PretrainProvenance.digest(
+                Path(reward.real_pool_manifest),
+            ),
+            heldout_manifest=str(reward.heldout_real_manifest),
+            heldout_manifest_sha256=PretrainProvenance.digest(
+                Path(reward.heldout_real_manifest),
+            ),
+            channel_stats=str(reward.channel_stats_json),
+            channel_stats_sha256=PretrainProvenance.digest(
+                Path(reward.channel_stats_json),
+            ),
+            discriminator_config=str(config.artifacts.discriminator_config_json),
+            discriminator_config_sha256=PretrainProvenance.digest(
+                Path(config.artifacts.discriminator_config_json),
+            ),
+            discriminator_ckpt="checkpoints/pretrain_discriminator.pt",
+            discriminator_ckpt_sha256=PretrainProvenance.digest(
+                Path(config.artifacts.discriminator_ckpt),
+            ),
+            condition_vocabulary=str(config.artifacts.condition_vocabulary_json),
+            condition_vocabulary_sha256=PretrainProvenance.digest(
+                Path(config.artifacts.condition_vocabulary_json),
+            ),
+        )
+        fields = {
+            "group": config.experiment.group,
+            "latent_shape": None,
+            "condition_auc": {name: 0.7 for name in vocabulary.names()},
+            "gate_whitelist": list(vocabulary.names()),
+            "steps_completed": 12,
+            "gate_auc": 0.51,
+            "gate_passed": True,
+            "discriminator_ckpt": "checkpoints/pretrain_discriminator.pt",
+            "provenance": provenance,
+        }
+        fields.update(overrides)
+        return PretrainReport(**fields)
+
+
+@pytest.fixture
+def mr_pretrain_artifacts(fixture_env):
+    """MR 预训练产物面落盘（manifest 用词汇表真值形状 + channel stats）。"""
+    _, _, vocab, _, config = fixture_env
+    MrPretrainArtifactsFixture.write_manifest(
+        Path(config.reward.real_pool_manifest), vocab, kind="real_pool",
+    )
+    MrPretrainArtifactsFixture.write_manifest(
+        Path(config.reward.heldout_real_manifest), vocab,
+        kind="heldout_real",
+    )
+    MrPretrainArtifactsFixture.write_channel_stats(
+        Path(config.reward.channel_stats_json), vocab,
+    )
+    return vocab, config
+
+
+class TestRealPoolVocabularyShapeGuard:
+    """real pool / held-out manifest 的逐条件形状契约与活动词汇表的装配期
+    对照（#129）：同名异形（词表工件改动而 manifest 未重建）此前放行到
+    首次判别器拼接 real 与 fake 时才炸——装配期显式拒绝。"""
+
+    def test_aligned_manifest_passes(self, mr_pretrain_artifacts) -> None:
+        """契约与词汇表逐条件同形：守卫放行（无异常）。"""
+        vocab, config = mr_pretrain_artifacts
+        LatentManifest.load(
+            Path(config.reward.real_pool_manifest), kind="real_pool",
+        ).assert_condition_shapes(vocab)
+
+    def test_drifting_condition_named_in_error(
+        self, tmp_path: Path, mr_pretrain_artifacts,
+    ) -> None:
+        """条目与契约自洽的旧词表 manifest 不再静默入训：报错点名漂移
+        条件与词汇表侧期望形状（可行动）。"""
+        vocab, _ = mr_pretrain_artifacts
+        stale = MrPretrainArtifactsFixture.write_manifest(
+            tmp_path / "stale_pool.json", vocab, kind="real_pool",
+            shape_override=(4, 16, 16, 8),
+        )
+        manifest = LatentManifest.load(stale, kind="real_pool")
+        with pytest.raises(ValueError, match="词汇表") as exc_info:
+            manifest.assert_condition_shapes(vocab)
+        message = str(exc_info.value)
+        assert "flair/axial" in message  # 与词表异形的哪一条件
+        assert "[4, 8, 8, 16]" in message  # 词汇表侧期望形状
+        assert "按当前词表重建 manifest" in message  # 可行动指引
+
+    def test_assembly_rejects_stale_shape_contract(
+        self, mr_pretrain_artifacts,
+    ) -> None:
+        """装配缝收口：``assemble_rewards`` 在装配期拒绝同名异形的 real
+        pool（判别器侧无「两套影像空间拼一批」的窗口）。"""
+        vocab, config = mr_pretrain_artifacts
+        MrPretrainArtifactsFixture.write_manifest(
+            Path(config.reward.real_pool_manifest), vocab, kind="real_pool",
+            shape_override=(4, 16, 16, 8),
+        )
+        dist = DistributedContext.bootstrap()
+        with pytest.raises(ValueError, match="词汇表"):
+            TrainingRuntime.assemble_rewards(
+                config,
+                AmpContext(
+                    device=torch.device("cpu"),
+                    dtype=AMP_DTYPES[config.policy.amp_dtype],
+                ),
+                TrainingRngStreams(
+                    dist.derive_seed(config.schedule.seed),
+                ).named(),
+                dist,
+            )
+
+
+class TestPretrainReportVocabularyGuard:
+    """预训练报告与活动词汇表的口径对照（#129 装载期守卫）：条件集取值域
+    （换域报告不得上岗）+ 词表工件内容指纹（工件漂移即报告实测值对另一份
+    fake 分布负责）。"""
+
+    def test_aligned_report_passes(self, mr_pretrain_artifacts) -> None:
+        """条件集 = 词汇表条件集、各项指纹 = 当前工件：守卫全链放行。"""
+        vocab, config = mr_pretrain_artifacts
+        MrPretrainArtifactsFixture.report(
+            config, vocab,
+        ).assert_data_provenance(config)
+
+    def test_condition_set_mismatch_rejected(
+        self, mr_pretrain_artifacts,
+    ) -> None:
+        """报告条件集 ≠ 本域词汇表条件集（四序列名拿到 MR config 上岗）：
+        装载期显式拒绝——白名单不落到另一条件域的判别力上。"""
+        vocab, config = mr_pretrain_artifacts
+        mislabelled = MrPretrainArtifactsFixture.report(
+            config, vocab,
+            condition_auc={"t1n": 0.7, "t1c": 0.7},
+            gate_whitelist=["t1n"],
+        )
+        with pytest.raises(ValueError, match="条件集不符"):
+            mislabelled.assert_data_provenance(config)
+
+    def test_single_domain_shape_on_multi_condition_report_rejected(
+        self, mr_pretrain_artifacts,
+    ) -> None:
+        """多条件线报告携带单域全局 latent_shape（换域线无语义）：拒绝
+        ——形状口径只经词表工件指纹承载。"""
+        vocab, config = mr_pretrain_artifacts
+        report = MrPretrainArtifactsFixture.report(
+            config, vocab, latent_shape=(4, 16, 16, 8),
+        )
+        with pytest.raises(ValueError, match="不应携带单域全局"):
+            report.assert_data_provenance(config)
+
+    def test_vocabulary_content_drift_rejected(
+        self, mr_pretrain_artifacts,
+    ) -> None:
+        """词表工件内容改动（flair/axial 网格口径变更）而 real 侧工件与
+        权重未变：报告条件集与名称都对得上，唯有内容指纹不符——拒绝
+        （否则白名单与 AUC 是对另一份 fake 分布的测量）。"""
+        vocab, config = mr_pretrain_artifacts
+        report = MrPretrainArtifactsFixture.report(config, vocab)
+        report.assert_data_provenance(config)  # 对齐基线先放行
+        vocabulary_path = Path(config.artifacts.condition_vocabulary_json)
+        data = json.loads(vocabulary_path.read_text(encoding="utf-8"))
+        flair = next(
+            condition for condition in data["conditions"]
+            if condition["name"] == "flair/axial"
+        )
+        flair["grid_xyz"] = [64, 64, 32]  # 与 t1w 同网格：口径漂移
+        vocabulary_path.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ValueError, match="条件词汇表指纹不符"):
+            report.assert_data_provenance(config)
+
+
+class RecordingPixelDecoder:
+    """测试仪器：记录 decode 输入批并按真 VAE 的输出形态（[B, 1, X, Y, Z]
+    单通道像素批）返回固定体——baseline/重采物化路径的观测面。"""
+
+    def __init__(self) -> None:
+        self.batches: list[torch.Tensor] = []
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        self.batches.append(latents)
+        return torch.zeros(latents.shape[0], 1, 8, 8, 4)
+
+
+class TestBaselineVolumeMaterialization:
+    """baseline/重采的解码物化（#129 分组解码的落盘契约）：逐条目体是
+    [X, Y, Z] 像素体——解码输出 [B, 1, X, Y, Z] 的批维与单通道维在条目
+    分离时一并剥离（单例维不外溢进落盘体）；解码批 ≤ decode_batch_size
+    且批内同形（异形条件在分组边界分开，不跨形 cat）。"""
+
+    def test_stored_volume_is_pixel_volume_and_batches_are_bounded(
+        self, fixture_env, tmp_path: Path,
+    ) -> None:
+        _, _, vocab, sampler, config = fixture_env
+        config.schedule.decode_batch_size = 2
+        latent_sampler = ManifestLatentSampler(
+            sampler,
+            EntryConditionResolver(vocab, torch.device("cpu")),
+            AmpContext(device=torch.device("cpu"), dtype=torch.float32),
+            vocab,
+        )
+        entries = [
+            ManifestEntry(index=0, condition="t1w/axial", noise_seed=1),
+            ManifestEntry(index=1, condition="flair/axial", noise_seed=2),
+            ManifestEntry(index=2, condition="t1w/axial", noise_seed=3),
+            ManifestEntry(index=3, condition="flair/axial", noise_seed=4),
+        ]
+        manifest = BaselineManifest(
+            seed=0, group="modal-label",
+            conditions=list(vocab.names()), entries=entries,
+        )
+        paths = RunArtifacts.init(config, tmp_path / "run").paths
+        decoder = RecordingPixelDecoder()
+        ManifestVolumeSampler(
+            1, manifest, latent_sampler, decoder, paths,
+            decode_batch_size=config.schedule.decode_batch_size,
+        ).sample_baseline()
+        # 每批 ≤ 块大小、批内同形；每条目恰解码一次
+        for batch in decoder.batches:
+            assert batch.shape[0] <= config.schedule.decode_batch_size
+            assert len({tuple(t.shape) for t in batch}) == 1
+        assert sum(batch.shape[0] for batch in decoder.batches) == 4
+        for entry in manifest.entries:
+            stored = torch.load(
+                paths.root / entry.baseline_sample, weights_only=True,
+            )
+            assert stored.shape == (8, 8, 4)  # 批维与单通道维均已剥离
+            assert torch.isfinite(stored).all()

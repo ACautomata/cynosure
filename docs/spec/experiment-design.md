@@ -55,6 +55,7 @@ schema 语义（与 BraTS 线的隔离保证）：
 - **sigma 日程逐条件锚（ADR-0002 语义逐条件化）**：锚 = 该条件空间 numel（`latent_numel(name)`），与形状同源派生（词汇表单一入口，结构性防日程静默错位）；`ConditionSchedules` 按条件名选日程（MR = 逐条件惰性 `TrajectoryCursor`，numel 碰撞的条件日程天然等价；BraTS = 单条件日程表，数值零漂移）。MR 线 config **显式携带单域锚字段即字段级拒绝**（`latent_shape` / `policy.input_img_size_numel`——默认值在 MR 线无消费，显式声明即「以为全局锚仍生效」的意图表达）；MR 序列化产物自动排除两字段（JSON 往返不被误拒）。
 - **评测批组织**：里程碑评测按目标条件分组（组内同形 → 分组解码/分组参照 stack），读数逐条件产出（`fid_target_*` 键 = 条件名）；Baseline/重采落盘逐条目（分组解码、条目体 clone 独立存储）。条件词汇表工件与 `stage_condition_vocabulary` 的 MR 语义在 schema 层显式拒绝（BraTS 口径方法不动），MR 的条件集与里程碑样本面守卫在装配期消费词表。
 - **续训持久化（分片 v7）**：replay buffer 两区 latents 从单一堆叠张量改为逐条目张量清单（异形状条目可持久化），恢复对账逐条目经词汇表按条件校验形状；旧 v6 分片被版本对账显式拒绝。real pool / held-out manifest 的 MR 多条件形态携带逐条件形状契约（`condition_latent_shapes`，装载期逐条目对账）；BraTS 单域工件不带（全局形状对账照旧）。
+- **real pool 切片轴与预训练报告条件域**：rank 条带切片的分层轴 = 活动条件集（`RankSlicedPool` 经装配注入条件名，不设四序列代码内副本——换域线多 rank 运行的结构前提）；real pool / held-out manifest 的逐条件形状契约在装配期与词汇表逐条件对照（同名异形 = 词表工件改动而 manifest 未重建，装配期显式拒绝而非等到判别器拼接 real 与 fake 时才炸）。预训练报告的条件域随之泛化：`condition_auc` / `gate_whitelist` 键 = 本域条件名（BraTS 线仍是四序列、行为不变；MR-RATE 条件名此前被四序列字面量域挡在 schema 外，MR 预训练在收尾处 ValidationError、报告落不了盘）；多条件线报告不记单域全局 `latent_shape`（形状逐条件派生自词表工件，口径由 provenance 的 `condition_vocabulary_sha256` 承载），装载守卫另加条件集对照与词表内容指纹（工件漂移而 real 侧工件未变时，报告的白名单与实测值对另一份 fake 分布负责）。
 - **仍由后续票接线**：预处理统一网格与 spacing 条件属性的消费面（#130）、prepare 数据链配额装配（#131）。BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
 
 ## 对照基线（no-RL）
