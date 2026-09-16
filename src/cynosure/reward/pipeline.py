@@ -93,9 +93,19 @@ class LatentSummary(BaseModel):
 
 class PreparePipeline:
     """prepare 编排：依赖注入数据布局、划分策略与预编码策略（fixture 与
-    生产共用同一管线，仅编码器策略不同）。"""
+    生产共用同一管线，仅编码器策略不同）。
+
+    单域语义：本管线 = BraTS 病例布局扫描 + 四序列预编码；MR-RATE 的
+    逐条件统一网格预处理尚未交付（属 MR 数据管线后续 ticket），构造期
+    显式拒绝——不把能力边界藏成 BraTS 布局扫描的错误。"""
 
     def __init__(self, config: CynosureConfig, encoder: LatentEncoder) -> None:
+        if config.experiment.dataset == "MR-RATE":
+            raise ValueError(
+                "MR-RATE 的 prepare 管线尚未交付（本管线 = BraTS 病例布局"
+                "扫描 + 四序列预编码）：MR 逐条件统一网格预处理随 MR 数据"
+                "管线后续 ticket 交付后在此分派",
+            )
         self._config = config
         self._encoder = encoder
         self._layout = BratsSeriesLayout(config.artifacts.dataset_root)

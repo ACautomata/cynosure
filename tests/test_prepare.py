@@ -241,6 +241,27 @@ class TestPrepareContract:
         assert stats.latent_shape == pool.latent_shape
 
 
+class TestPrepareDomainGuard:
+    """MR-RATE 的 prepare 管线尚未交付（本管线 = BraTS 病例布局扫描 +
+    四序列预编码）：CLI 显式拒绝——此前走到 BratsSeriesLayout 扫描才炸出
+    BraTS 布局错误（「源数据集根目录不存在」/「病例缺序列」），报错归因
+    与 MR 域的真实原因不符。"""
+
+    def test_mr_rate_config_rejected(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        fixture_dir = tmp_path / "fixtures"
+        Fixture().write_artifacts(fixture_dir)
+        config = Fixture().config(fixture_dir, dataset="MR-RATE")
+        config_path = tmp_path / "mr_config.json"
+        config_path.write_text(
+            config.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = cli.run("prepare", "--config", str(config_path))
+        assert result.code == 2
+        assert "MR-RATE" in result.stderr
+
+
 class TestPrepareIdempotency:
     def test_rerun_is_drift_free(self, scenario: PrepareScenario) -> None:
         """prepare 幂等（AC）：重跑不产生工件漂移——JSON 字节相等、latent 内容相等。"""
