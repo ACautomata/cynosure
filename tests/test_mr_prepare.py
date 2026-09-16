@@ -26,6 +26,7 @@ from cynosure.reward.artifacts import (
     LatentManifest,
     SamplingManifest,
 )
+from cynosure.reward.mrrate import PatientHeldoutSplit
 from cynosure.reward.sampler import RealPoolSampler
 from tests.conftest import RAS_AFFINE, CliResult, CliSession, SyntheticMrRateDataset
 
@@ -446,3 +447,162 @@ class TestPerConditionLatentShapes:
         # 异条件异形状的 spacing 同为条件属性值、逐卷不再独立
         assert by_condition["flair/axial"] == {(100.0, 100.0, 100.0)}
         assert by_condition["t1w/axial"] == {(100.0, 100.0, 100.0)}
+
+
+MRA_CONDITION: dict = {
+    # 测试专用第三条件（fixture_mode 小词表通道）：MRA 全平面单格
+    # （#81 读数格），网格与 t1w 同形——稀疏条件场景的构造件
+    "name": "mra/all-planes", "modality": "mra", "plane": "all-planes",
+    "fov_mm": [64.0, 64.0, 32.0], "fov_source": "fixture",
+    "grid_xyz": [64, 64, 32],
+}
+
+MRA_SERIES_IDS: tuple[str, ...] = (
+    "mra-raw-axi", "mra-raw-sag", "mra-raw-cor", "mra-raw-tra",
+)
+"""稀疏条件卷数 = disc_batch_size_k（4）：容量守卫恰好过线，只剩
+held-out 覆盖一处可失败——两个守卫的口径互不遮蔽。"""
+
+
+class TestAssemblyInputHardening:
+    """装配输入的完整性守卫（PR #163 评审 5224004327）：重复/冲突登记、
+    空评估清单、逐条件 held-out 覆盖、守卫与编码的先后——一律在装配期
+    fail-fast，不留「静默降级」或「下游才炸」的路径。"""
+
+    def test_duplicate_series_key_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """元数据重复 (study_uid, series_id) 行 → 拒绝：两行编码到同一
+        latent 路径，manifest 把同一枚物理卷当作两卷计数与采样（统计量
+        被重复计入、容量守卫可被虚增行数骗过）。"""
+        duplicate = {
+            "batch_id": "batch00", "patient_uid": "P00", "study_uid": "ST00",
+            "series_id": "t1w-raw-axi", "modality": "T1W", "plane": "AXIAL",
+        }
+        result = mr_scenario.run(extra_metadata_rows=[duplicate])
+        assert result.code == 2
+        assert "ST00/t1w-raw-axi" in result.stderr
+
+    def test_conflicting_duplicate_split_row_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """splits.csv 同一 patient 两行且 split 冲突 → 拒绝：静默「后行
+        覆盖」让 train 人群随行序漂移（本意 val/test 的 patient 混进 real
+        pool），而 split_sizes 仍把两行都计上。8 个 train patient 起底：
+        P00 转 val 后每条件仍有 5 卷 ≥ K，容量守卫不遮蔽本守卫的报错。"""
+        config = mr_scenario.build_config(train_patients=8)
+        splits_path = config.artifacts.mrrate_splits_csv
+        original = splits_path.read_text(encoding="utf-8")
+        splits_path.write_text(f"{original}P00,val\n", encoding="utf-8")
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "P00" in result.stderr
+        assert "重复" in result.stderr
+
+    def test_duplicate_split_row_same_value_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """同 patient 重复行（split 值相同）→ 同样拒绝：patient → split
+        是映射不是行表，重复键即登记错误，且 split_sizes 留痕会把患者数
+        虚增。"""
+        config = mr_scenario.build_config()
+        splits_path = config.artifacts.mrrate_splits_csv
+        original = splits_path.read_text(encoding="utf-8")
+        splits_path.write_text(f"{original}P00,train\n", encoding="utf-8")
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "P00" in result.stderr
+
+    def test_empty_eval_manifest_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """评估清单只有表头、无数据行 → 拒绝：互斥守卫退化为空集比较
+        （恒不相交），硬守卫静默失效而抽样留痕还记下 eval_exclusion_keys=0
+        的「已执行」假凭据。同仓 #78 的另一读面（``MrRateEvalManifest``）
+        对同一形态即显式拒绝。"""
+        result = mr_scenario.run(eval_rows=[])
+        assert result.code == 2
+        assert "无数据行" in result.stderr
+
+    def test_capacity_guard_fails_before_encoding(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """容量守卫先于编码（「开工前失败」的字面口径）：逐条件实抽数
+        在装配计划里已经可知，生产体量下先编码整池再报错 = 白烧加速卡
+        数小时——失败时盘上不留任何 latent。"""
+        result = mr_scenario.run(quota={"t1w/axial": 2, "flair/axial": 8})
+        assert result.code == 2
+        assert "容量不足" in result.stderr
+        assert not list((mr_scenario.work_dir / "fixtures").rglob("*.pt"))
+
+    def test_failed_rerun_invalidates_sampling_manifest(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """失败重跑不留上一轮的抽样留痕：编码期失败的路径已失效
+        pool/held-out manifest 与统计量，抽样 manifest 若原地留存，盘上
+        就是「一次失败的运行 + 一份描述上一轮归属的审计工件」——违反
+        「要么全量一致、要么明确缺失」。"""
+        first = mr_scenario.run()
+        assert first.code == 0, first.stderr
+        config = CynosureConfig.model_validate_json(
+            mr_scenario.config_path.read_text(encoding="utf-8"),
+        )
+        sampling_path = Path(config.reward.sampling_manifest_json)
+        assert sampling_path.exists()
+        # 损坏一卷影像：重跑在编码期失败（已过装配计划与守卫）
+        victim = sorted(config.artifacts.dataset_root.glob("*.nii.gz"))[0]
+        victim.write_bytes(b"not a nifti")
+        second = mr_scenario.run_with_config(config)
+        assert second.code == 2
+        assert "影像读取失败" in second.stderr
+        assert not sampling_path.exists()
+        assert not Path(config.reward.real_pool_manifest).exists()
+
+    def test_condition_without_heldout_coverage_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """逐条件 held-out 覆盖：某条件全部卷落 pool 侧（patient 级二分
+        是条件无关的全局洗牌）→ 拒绝。该条件在 held-out 工件缺条目是
+        预训练装配期才炸的「下游错误」（ADR-0008-04 轮转条件集要求每条件
+        held-out 非空），根因（二分 seed / heldout_fraction）却在本侧——
+        按本仓「开工前失败而非训练中途」口径在此拒绝。"""
+        fixtures_dir = mr_scenario.work_dir / "fixtures"
+        Fixture().write_condition_vocabulary(fixtures_dir)
+        config = Fixture().config(fixtures_dir, dataset="MR-RATE")
+        vocabulary_path = fixtures_dir / "condition_vocabulary.json"
+        vocabulary = json.loads(vocabulary_path.read_text(encoding="utf-8"))
+        vocabulary["conditions"].append(MRA_CONDITION)
+        vocabulary_path.write_text(json.dumps(vocabulary), encoding="utf-8")
+        train_patients = 6
+        patients = {f"P{index:02d}" for index in range(train_patients)}
+        pool_patients, _ = PatientHeldoutSplit(
+            config.schedule.seed, config.reward.heldout_fraction,
+        ).split(patients)
+        # 稀疏条件的卷只落在一个 pool 侧 patient 上（held-out 侧 0 卷）：
+        # 二分归属用真装配类求，测试不复制洗牌逻辑
+        sparse_patient = sorted(pool_patients)[0]
+        study_uid = f"ST{int(sparse_patient[1:]):02d}"
+        extra_rows = [
+            {
+                "batch_id": "batchmra", "patient_uid": sparse_patient,
+                "study_uid": study_uid, "series_id": series_id,
+                "modality": "MRA", "plane": "AXIAL",
+            }
+            for series_id in MRA_SERIES_IDS
+        ]
+        SyntheticMrRateDataset(
+            config.artifacts.dataset_root, train_patients=train_patients,
+            extra_metadata_rows=extra_rows,
+        ).write()
+        for index, series_id in enumerate(MRA_SERIES_IDS):
+            volume = np.random.default_rng(index).standard_normal(
+                SyntheticMrRateDataset.SERIES_SHAPE,
+            ).astype(np.float32)
+            nib.save(
+                nib.Nifti1Image(volume, RAS_AFFINE),
+                config.artifacts.dataset_root
+                / f"{study_uid}_{series_id}.nii.gz",
+            )
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "mra/all-planes" in result.stderr

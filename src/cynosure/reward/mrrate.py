@@ -154,7 +154,12 @@ class MrRateSeriesCatalog:
 
     def split_patients(self) -> dict[str, str]:
         """官方 splits.csv 的 patient → split 映射（patient 级，同患者
-        所有 study 同 split——mrrate-data-spec §6；值 casefold 归一）。"""
+        所有 study 同 split——mrrate-data-spec §6；值 casefold 归一）。
+
+        重复 patient 行（值相同或冲突）即拒绝：patient → split 是映射不是
+        行表，后行覆盖会让 train 人群随行序漂移（本意 val/test 的患者混进
+        real pool），且 ``split_sizes`` 把重复行也计上、留痕虚增。
+        """
         mapping: dict[str, str] = {}
         with open(self._splits_csv, encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
@@ -163,9 +168,19 @@ class MrRateSeriesCatalog:
                 "官方 split",
             )
             for row in reader:
-                mapping[row["patient_uid"].strip()] = (
-                    row["split"].strip().casefold()
-                )
+                patient = row["patient_uid"].strip()
+                part = row["split"].strip().casefold()
+                previous = mapping.get(patient)
+                if previous is not None:
+                    raise ValueError(
+                        f"官方 splits.csv 重复登记 patient={patient!r}"
+                        f"（已登记 {previous!r}、本行 {part!r}）: "
+                        f"{self._splits_csv}——patient → split 是映射不是行表："
+                        "重复行让 train 人群随行序漂移（本意 val/test 的患者"
+                        "混进 real pool）、split_sizes 把患者数虚增；"
+                        "请用去重后的官方 split 文件"
+                    )
+                mapping[patient] = part
         if not mapping:
             raise ValueError(
                 f"官方 splits.csv 无 patient 记录: {self._splits_csv}"
@@ -200,10 +215,17 @@ class MrRateSeriesCatalog:
           不静默丢卷；
         - val/test split 的卷（评估留出池）不进 real 数据链候选，计数
           留痕（合法常态——生产元数据覆盖全 split）；
-        - 白名单条件域外的卷（如 swi/sagittal）不进候选，计数留痕。
+        - 白名单条件域外的卷（如 swi/sagittal）不进候选，计数留痕；
+        - 重复卷键（同一 ``(study_uid, series_id)`` 两行）即拒绝——两行编码
+          到同一 latent 路径，manifest 会把同一枚物理卷当两卷计数与采样
+          （统计量重复计入、容量守卫可被虚增行数骗过）。
+
+        卷键唯一性按**候选行**把守（非 train / 域外的重复行不进任何工件，
+        无实害）；键与条目键、latent 文件名同源（``SeriesRecord.case_id``）。
         """
         splits = self.split_patients()
         candidates: list[SeriesRecord] = []
+        seen_keys: set[tuple[str, str]] = set()
         out_of_vocabulary = 0
         non_train = 0
         with open(self._metadata_csv, encoding="utf-8") as fh:
@@ -229,14 +251,24 @@ class MrRateSeriesCatalog:
                 if condition is None:
                     out_of_vocabulary += 1
                     continue
-                candidates.append(SeriesRecord(
+                record = SeriesRecord(
                     patient_uid=patient_uid,
                     study_uid=row["study_uid"].strip(),
                     series_id=row["series_id"].strip(),
                     modality=modality.casefold(),
                     plane=plane.casefold(),
                     condition=condition,
-                ))
+                )
+                if record.series_key in seen_keys:
+                    raise ValueError(
+                        f"MR-RATE 元数据重复登记卷键 {record.case_id!r}: "
+                        f"{self._metadata_csv}——两行编码到同一 latent 路径，"
+                        "manifest 把同一枚物理卷当两卷计数与采样（per-channel"
+                        " 统计量重复计入、逐条件容量守卫可被虚增行数骗过）；"
+                        "请用去重后的元数据文件"
+                    )
+                seen_keys.add(record.series_key)
+                candidates.append(record)
         candidates.sort(key=SeriesRecord.sort_key)
         return candidates, out_of_vocabulary, non_train
 
@@ -266,9 +298,16 @@ class EvalSetExclusion:
         self._path = Path(eval_manifest_csv)
 
     def read(self) -> tuple[set[tuple[str, str]], set[str]]:
-        """评估清单的（series 键集, patient 集）。"""
+        """评估清单的（series 键集, patient 集）。
+
+        空清单（有表头、无数据行）即拒绝：互斥硬守卫会退化为空集比较
+        （恒不相交）静默失效，抽样留痕还记下 ``eval_exclusion_keys=0``
+        的「已执行」假凭据——清单截断/错版必须在此暴露（同仓 #78 的
+        另一读面 ``MrRateEvalManifest.volume_rows`` 对同一形态即拒绝）。
+        """
         series_keys: set[tuple[str, str]] = set()
         patients: set[str] = set()
+        rows = 0
         with open(self._path, encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             MrRateSeriesCatalog._assert_columns(
@@ -276,10 +315,18 @@ class EvalSetExclusion:
                 "#78 评估清单",
             )
             for row in reader:
+                rows += 1
                 series_keys.add(
                     (row["study_uid"].strip(), row["series_id"].strip()),
                 )
                 patients.add(row["patient_uid"].strip())
+        if rows == 0:
+            raise ValueError(
+                f"#78 评估清单无数据行: {self._path}（评估集互斥硬守卫会"
+                "退化为空集比较、恒不相交而静默失效，抽样留痕却记下键基数 "
+                "0 的「已执行」假凭据；清单截断/错版即拒绝——train split "
+                "与评估留出池的互斥是 #73 原则的硬前提）"
+            )
         return series_keys, patients
 
     def assert_disjoint(

@@ -144,10 +144,25 @@ class LatentManifest(BaseModel):
         不动，不引入有放回采样补洞。条件集经注入（#129：BraTS = 四序列、
         MR-RATE = 词汇表条件集），本类不设代码内副本。
         """
+        self.assert_capacity_counts(
+            self.modalities, batch_size_k, world_size, conditions,
+        )
+
+    @classmethod
+    def assert_capacity_counts(
+        cls, counts: dict[str, int], batch_size_k: int, world_size: int,
+        conditions: list[str] | tuple[str, ...],
+    ) -> None:
+        """容量守卫的算术本体（``assert_condition_capacity`` 与 prepare
+        装配计划期守卫共用的唯一实现）：manifest 侧传自身分层计数，
+        prepare 侧传装配计划计数——**编码之前**即可判定（生产体量下先
+        编码整池再报错是白烧加速卡；spec「开工前失败而非训练中途」的
+        字面口径），两入口的判据与报错不设第二份。
+        """
         required = batch_size_k * world_size
         starved: list[tuple[str, int]] = []
         for condition in conditions:
-            count = self.modalities.get(condition, 0)
+            count = counts.get(condition, 0)
             if count < required:
                 starved.append((condition, count))
         if starved:

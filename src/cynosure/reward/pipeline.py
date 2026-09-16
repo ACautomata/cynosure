@@ -13,9 +13,10 @@ manifest 随每次运行整体重建：先失效旧件、编码成功才落盘�
 ``experiment.dataset`` 分派到策略（``reward.mrrate`` 的 BratsAssembly /
 MrRateAssembly）——BraTS 线语义零改动（病例目录扫描 + 70/10/20），
 MR-RATE 线 = 官方 split join + 评估集互斥守卫 + patient 级 held-out
-二分 + 逐条件配额抽样。编排骨架（计划 → 失效 → 编码 → 统计量 → 落盘）
-两域单份；MR-RATE 域追加抽样 manifest 落盘与装配期容量守卫（逐条件
-≥ K×world，全量口径 world=1、条件全集 = 词汇表）。
+二分 + 逐条件配额抽样。编排骨架（计划 → 失效 → 守卫 → 编码 →
+统计量 → 落盘）两域单份；MR-RATE 域追加抽样 manifest 落盘与装配期守卫
+（逐条件容量 ≥ K×world + 逐条件 held-out 覆盖），守卫消费装配计划的
+计数口径、落在编码之前——稀疏条件与覆盖缺口在开工前失败。
 """
 
 import shutil
@@ -45,6 +46,7 @@ from cynosure.reward.encoder import (
     SyntheticLatentEncoder,
 )
 from cynosure.reward.mrrate import (
+    AssemblyPlan,
     AssemblyTask,
     BratsAssembly,
     MrRateAssembly,
@@ -198,7 +200,11 @@ class PreparePipeline:
             "heldout_real", self._config.reward.heldout_real_manifest,
         )
         self._invalidate(pool, heldout)  # 先失效旧件：编码成功才落新件
-        Path(self._config.reward.channel_stats_json).unlink(missing_ok=True)
+        self._invalidate_derived(plan)  # 单文件派生件（统计量/抽样留痕）同批失效
+        # 装配期守卫落在编码**之前**：逐条件计数在装配计划里已经完备，
+        # 稀疏模态小池与 held-out 覆盖缺口在开工前失败（spec「开工前失败
+        # 而非训练中途」），不白烧一遍全量预编码、盘上不留半个 latent
+        self._guard_assembly(plan)
         stats = ChannelRunningStats()
         is_mr = plan.is_mr_rate
         pool_entries = self._encode_tasks(plan.pool, pool, stats, is_mr)
@@ -211,11 +217,6 @@ class PreparePipeline:
             heldout, heldout_entries, plan,
             self._manifest_extras(plan, heldout_entries),
         )
-        # MR-RATE 装配期容量守卫（ADR-0008-03）：落在 manifest 落盘**之前**
-        # ——守卫失败时盘上 manifest 明确缺失（latents 已写但无索引指向），
-        # 维持「要么全量一致、要么明确缺失」的既有工件契约；稀疏模态小池
-        # 在开工前而非训练中途失败
-        self._guard_mr_capacity(plan, pool_manifest)
         self._persist(pool, pool_manifest)
         self._persist(heldout, heldout_manifest)
         self._write_stats(plan, mean, std, len(pool_entries))
@@ -260,21 +261,62 @@ class PreparePipeline:
             counts[entry.modality] = counts.get(entry.modality, 0) + 1
         return counts
 
-    def _guard_mr_capacity(
-        self, plan, pool_manifest: LatentManifest,
-    ) -> None:
-        """MR-RATE real pool 容量装配守卫（ADR-0008-03 口径，#121 AC5）：
-        逐（条件, 全量）容量 ≥ ``disc_batch_size_k × world_size``（全量
-        口径 world=1、条件全集 = 词汇表 11 格——稀疏模态小池任一条件
-        不足即装配期可读拒绝）。BraTS 域 no-op（同款守卫语义在 train
-        装配期，零改动）。"""
+    def _guard_assembly(self, plan: AssemblyPlan) -> None:
+        """MR-RATE 装配期守卫（编码之前、计数口径；#121 AC5）：
+
+        - **逐条件容量**（ADR-0008-03）：逐（条件, 全量）容量 ≥
+          ``disc_batch_size_k × world_size``（全量口径 world=1、条件全集
+          = 词汇表 11 格）——稀疏模态小池任一条件不足即装配期可读拒绝；
+        - **逐条件 held-out 覆盖**：pool 侧出现的条件在 held-out 侧须有卷。
+          patient 级二分是条件无关的全局洗牌（排序 + seed 洗牌 + 按
+          ``heldout_fraction`` 切片），稀疏条件的患者可能整批落 pool 侧
+          ——该条件在 held-out 工件缺条目，要到预训练装配期的轮转条件集
+          守卫（ADR-0008-04「每条件 held-out 非空」）才炸，而根因（二分
+          份额 / seed / 患者基数）在本侧。
+
+        计数取自装配计划（``SamplingTrace``）：条目与编码任务一一对应，
+        故与 manifest 侧 ``assert_condition_capacity`` 同一算术、同一报错。
+        BraTS 域 no-op（同款守卫语义在 train 装配期，零改动）。
+        """
         if not plan.is_mr_rate:
             return
-        pool_manifest.assert_condition_capacity(
+        trace = plan.sampling_trace
+        LatentManifest.assert_capacity_counts(
+            trace.census_quota_taken,
             self._config.reward.disc_batch_size_k,
             1,  # 全量口径：prepare 落 pool 工件，rank 切片守卫在 train 装配期
             self._vocabulary.names(),
         )
+        uncovered = [
+            (condition, count)
+            for condition, count in sorted(trace.census_quota_taken.items())
+            if trace.heldout_counts.get(condition, 0) < 1
+        ]
+        if uncovered:
+            detail = ", ".join(
+                f"{condition}（pool {count} 卷 / held-out 0 卷）"
+                for condition, count in uncovered
+            )
+            raise ValueError(
+                f"逐条件 held-out 覆盖不足：{detail}——patient 级二分是条件"
+                "无关的全局洗牌，稀疏条件的患者可能整批落 pool 侧；该条件"
+                "在 held-out real 工件缺条目 = per-condition AUC 归因无米下锅"
+                "（预训练装配期按 ADR-0008-04 拒绝启动），而根因在本侧：增大 "
+                "reward.heldout_fraction、增补该条件的患者，或调整 "
+                "schedule.seed 后重跑"
+            )
+
+    def _invalidate_derived(self, plan: AssemblyPlan) -> None:
+        """单文件派生件与 latent 子树同批失效（per-channel 统计量；MR 域
+        另加配额抽样留痕）：编码期失败的路径若把上一轮的抽样 manifest 留
+        在原地，盘上就是「一次失败的运行 + 一份描述上一轮归属的审计工件」
+        ——「要么全量一致、要么明确缺失」须对全部产物成立。BraTS 域无抽样
+        留痕，统计量恒失效。"""
+        Path(self._config.reward.channel_stats_json).unlink(missing_ok=True)
+        if plan.is_mr_rate:
+            Path(self._config.reward.sampling_manifest_json).unlink(
+                missing_ok=True,
+            )
 
     def _write_sampling_manifest(self, plan) -> Path | None:
         """配额抽样留痕落盘（MR-RATE 域）：seed / 快照 / 配额 / 逐条件
