@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     # 事件模型在 train.artifacts（指标流事件类型的集中地）；仅作类型标注
     # 使用——运行时 import 会与 train.runtime 的 PretrainReport 装配依赖
     # 成环（train 侧 warm-start 装载反向消费本模块）
-    from cynosure.train.artifacts import PretrainEvent
+    from cynosure.train.artifacts import OverfitAlertEvent, PretrainEvent
 
 
 class PretrainProvenance(BaseModel):
@@ -305,9 +305,13 @@ class PretrainRun:
             report=root / "pretrain_report.json",
         )
 
-    def append_event(self, event: "PretrainEvent") -> None:
-        """向预训练指标流追加一行 JSON 事件（事件类型与 iter/milestone
-        混存同一 metrics.jsonl，event 判别字段区分）。"""
+    def append_event(
+        self, event: "PretrainEvent | OverfitAlertEvent",
+    ) -> None:
+        """向预训练指标流追加一行 JSON 事件（事件类型混存同一
+        metrics.jsonl，event 判别字段区分；ADR-0009-γ 起预训练相
+        ``overfit_alert`` 告警随 pretrain 事件之后写入——单进程唯一
+        写者，写出序 = 步序 + 步内 pretrain 先于告警）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(
                 event.model_dump(), ensure_ascii=False, allow_nan=False,

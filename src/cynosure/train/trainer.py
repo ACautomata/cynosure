@@ -422,6 +422,7 @@ class GranularGrpoTrainer:
                         iteration=iteration,
                         stage=self.stage_tag.stage,
                         rank=dist.rank,
+                        phase="rl",  # γ 相判别：RL 相按 iteration 轴记账
                         modality=record.modality,
                         divergence_ema=reading.divergence,
                         train_pairwise_acc=report.train_pairwise_acc,
