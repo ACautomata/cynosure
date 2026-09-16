@@ -11,6 +11,8 @@ MetaTensor 元数据的严格反序列化）、``BaseSmokeRunner`` 的读数契�
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,25 @@ EXPECTED_UNET_PARAMETERS = 180_500_868
 EXPECTED_VAE_PARAMETERS = 20_944_897
 
 _REAL_SMOKE_CONFIG_ENV = "CYNOSURE_BASE_SMOKE_CONFIG"
+
+# 上游冻结转写的完整键集锚（Codex review 5212797632：漏转键若不影响
+# state_dict 形状——如 use_flash_attention、norm_float16——strict 装载与
+# unconsumed_keys 都检不出，网络会以 MONAI 缺省值静默执行）。键集被
+# 逐键钉死：任何键集变化都必须是有意的转写更新，本锚显式红。
+FROZEN_UNET_TRANSCRIPTION_KEYS = frozenset({
+    "spatial_dims", "in_channels", "out_channels", "num_channels",
+    "attention_levels", "num_head_channels", "num_res_blocks",
+    "use_flash_attention", "include_top_region_index_input",
+    "include_bottom_region_index_input", "include_spacing_input",
+    "num_class_embeds", "resblock_updown", "include_fc",
+})
+FROZEN_VAE_TRANSCRIPTION_KEYS = frozenset({
+    "spatial_dims", "in_channels", "out_channels", "latent_channels",
+    "num_channels", "num_res_blocks", "norm_num_groups", "norm_eps",
+    "attention_levels", "use_convtranspose", "norm_float16",
+    "num_splits", "dim_split", "use_checkpointing",
+    "with_encoder_nonlocal_attn", "with_decoder_nonlocal_attn",
+})
 
 
 def _write_fixture_artifacts(directory: Path):
@@ -74,6 +95,16 @@ class TestTranscriptionArtifacts:
         vae_config = NetworkAssembler.load_json(REPO_CONFIGS / "vae_config.json")
         assert NetworkAssembler.unconsumed_keys(DiffusionModelUNetMaisi, unet_config) == set()
         assert NetworkAssembler.unconsumed_keys(AutoencoderKlMaisi, vae_config) == set()
+
+    def test_transcription_key_sets_are_pinned_to_frozen_anchor(self) -> None:
+        """转写键集与冻结锚逐键相等：unconsumed_keys 只拦**多余**键，
+        拦不住**漏转**键（不影响 state_dict 形状的键——use_flash_attention、
+        norm_float16——漏转后网络以 MONAI 缺省值静默执行）。键集方向
+        的完整性只能对照冻结锚断言：漏键/多键/拼错都在此显式红。"""
+        unet_config = NetworkAssembler.load_json(REPO_CONFIGS / "unet_config.json")
+        vae_config = NetworkAssembler.load_json(REPO_CONFIGS / "vae_config.json")
+        assert set(unet_config) == FROZEN_UNET_TRANSCRIPTION_KEYS
+        assert set(vae_config) == FROZEN_VAE_TRANSCRIPTION_KEYS
 
     def test_upstream_semantics_are_preserved(self) -> None:
         """转写不是照抄上游 JSON（插值/死参数/其它网络段落不进来）：
@@ -288,6 +319,175 @@ class TestBaseSmokeRunner:
         with pytest.raises(ValueError, match="scale factor 缺席"):
             BaseSmokeRunner(config)
 
+    def test_decode_input_is_policy_domain_scaled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """解码器的输入契约是 policy 域（checkpoint scaled 域）：encoder
+        原始输出（存储域、未乘 scale_factor）必须先乘回再进 decode——
+        decode 内部除回后恰好归位 encoder 域，VAE 往返才闭环（Codex
+        review 5210746815：直送原始输出会把 encoded/scale_factor 送进
+        解码器，不是同一张量的往返）。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        state = NetworkAssembler.read_state_dict(artifacts.unet_ckpt)
+        container = tmp_path / "unet_container.pt"
+        torch.save(
+            {"epoch": 1, "scale_factor": 2.0, "unet_state_dict": state},
+            container,
+        )
+        config = _fixture_smoke_config(
+            tmp_path, artifacts, unet_ckpt=str(container),
+            latent_scale_factor=None,
+        )
+        runner = BaseSmokeRunner(config)
+        assert runner._readout.latent_scale_factor == pytest.approx(2.0)
+        observed: dict[str, torch.Tensor] = {}
+        original_encode = runner._encoder.encode
+        original_decode = runner._decoder.decode
+
+        def spy_encode(image: torch.Tensor, noise_seed: int = 0) -> torch.Tensor:
+            observed["encoded"] = original_encode(image, noise_seed).detach()
+            return observed["encoded"]
+
+        def spy_decode(latents: torch.Tensor) -> torch.Tensor:
+            observed["decode_input"] = latents.detach().cpu()
+            return original_decode(latents)
+
+        monkeypatch.setattr(runner._encoder, "encode", spy_encode)
+        monkeypatch.setattr(runner._decoder, "decode", spy_decode)
+        runner.run()
+        assert torch.equal(
+            observed["decode_input"].squeeze(0),
+            observed["encoded"] * 2.0,
+        )
+
+    def test_nonfinite_encode_output_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """编码输出含 NaN/Inf 时显式拒绝而非落一份「成功」报告：fp16
+        kernel 或权重损坏产出的非有限值不该通过哈希与形状读数蒙混。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        monkeypatch.setattr(
+            runner._encoder, "encode",
+            lambda image, noise_seed=0: torch.full((4, 16, 16, 8), float("nan")),
+        )
+        with pytest.raises(ValueError, match="非有限"):
+            runner.run()
+        assert not config.output_json.exists()
+
+    def test_nonfinite_decode_output_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        monkeypatch.setattr(
+            runner._decoder, "decode",
+            lambda latents: torch.full((1, 1, 64, 64, 32), float("inf")),
+        )
+        with pytest.raises(ValueError, match="非有限"):
+            runner.run()
+        assert not config.output_json.exists()
+
+    def test_velocity_shape_must_match_latent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """velocity 与 latent 同形是 ODE 更新的前提（Codex review
+        5210746815）：out_channels 错配的工件对产出确定性有限张量也不得
+        通过——形状守卫在逐位复现判定之前。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        wrong = torch.zeros(1, 8, 16, 16, 8)  # 同一对象两次返回：逐位一致
+        monkeypatch.setattr(runner, "_velocity", lambda: wrong)
+        with pytest.raises(ValueError, match="latent_shape"):
+            runner.run()
+        assert not config.output_json.exists()
+
+    def test_encode_shape_must_match_policy_grid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """VAE 工件对自洽但 latent 通道/压缩比与 policy 网格不同时，
+        装载与解码都「成功」——形状契约是唯一可判的面（Codex review
+        5210746815）：不得只记录 encoded_shape 而放行成功报告。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        monkeypatch.setattr(
+            runner._encoder, "encode",
+            lambda image, noise_seed=0: torch.zeros(3, 16, 16, 8),
+        )
+        with pytest.raises(ValueError, match="latent_shape"):
+            runner.run()
+        assert not config.output_json.exists()
+
+    def test_decode_shape_must_match_image_grid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        monkeypatch.setattr(
+            runner._decoder, "decode",
+            lambda latents: torch.zeros(1, 1, 32, 32, 16),
+        )
+        with pytest.raises(ValueError, match="image_shape"):
+            runner.run()
+        assert not config.output_json.exists()
+
+    def test_modality_token_beyond_embedding_table_is_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        """token 须落在装载出的类别名嵌入表内（fixture 表 128）：越界
+        token 在 schema 层合法（ge=0），到 nn.Embedding 才 IndexError——
+        构造期以 ValueError 拒绝（CLI 侧收敛为可读的 exit 2），而非
+        traceback（Codex review 5210746815）。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(
+            tmp_path, artifacts, modality_token=128,
+        )
+        with pytest.raises(ValueError, match="modality_token"):
+            BaseSmokeRunner(config)
+
+    def test_nonfinite_checkpoint_scale_factor_is_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        """容器元数据 scale_factor = inf 显式拒绝：inf 通过「>0」检查，
+        解码除 inf 得全零 latent——形状正确、数值有限的「成功」读数
+        （Codex review 5212797632）。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        state = NetworkAssembler.read_state_dict(artifacts.unet_ckpt)
+        container = tmp_path / "unet_container_inf.pt"
+        torch.save(
+            {"scale_factor": float("inf"), "unet_state_dict": state},
+            container,
+        )
+        config = _fixture_smoke_config(
+            tmp_path, artifacts, unet_ckpt=str(container),
+            latent_scale_factor=None,
+        )
+        with pytest.raises(ValueError, match="非有限"):
+            BaseSmokeRunner(config)
+
+    def test_deterministic_scope_restores_warn_only(
+        self, tmp_path: Path,
+    ) -> None:
+        """确定性作用域退出须还原 warn_only 位（Codex review
+        5212797632）：环境以 (True, warn_only=True) 运行时，退出后
+        warn_only 被静默降级为 False，后续非确定算子从告警变异常。"""
+        artifacts = _write_fixture_artifacts(tmp_path / "artifacts")
+        config = _fixture_smoke_config(tmp_path, artifacts)
+        runner = BaseSmokeRunner(config)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            runner.run()
+            assert torch.are_deterministic_algorithms_enabled()
+            assert torch.is_deterministic_algorithms_warn_only_enabled()
+        finally:
+            # 还原 conftest 导入期建立的基线口径 (True, warn_only=False)
+            torch.use_deterministic_algorithms(True, warn_only=False)
+
     def test_transcription_typo_is_rejected_at_construction(
         self, tmp_path: Path,
     ) -> None:
@@ -329,8 +529,11 @@ class TestBaseSmokeConfigSchema:
 
     def test_decode_window_must_integrate_with_vae_upsampling(self) -> None:
         """overlap×roi×4 须逐维为整数（MONAI 滑窗缩放约束在配置期
-        fail-fast，而非解码期炸出脱节错误）；官方字面 2/3 的四位截断
-        在容差下放行。"""
+        fail-fast，而非解码期炸出脱节错误）。满精度 2/3 的二进制浮点
+        表示（127.999…）在容差下数学整除、放行；官方四位截断字面
+        0.6666（=127.9872）显式拒绝——MONAI 按 ``int(roi·(1−overlap))``
+        截断滑窗步长，0.6666 与 2/3 的步长并不相同（16 vs 15），放行
+        即静默改变解码口径。"""
         base = {
             "unet_ckpt": "u.pt", "unet_config_json": "u.json",
             "vae_ckpt": "v.pt", "vae_config_json": "v.json",
@@ -342,6 +545,35 @@ class TestBaseSmokeConfigSchema:
         assert BaseSmokeConfig.model_validate(base).decode_overlap == pytest.approx(2 / 3)
         with pytest.raises(ValidationError, match="整数"):
             BaseSmokeConfig.model_validate({**base, "decode_overlap": 0.7})
+
+    def test_upstream_overlap_literal_is_rejected(self) -> None:
+        """官方 config 的四位截断字面 0.6666 不放行（锁定守卫意图）：
+        操作者照抄上游字面值会得到指向满精度 2/3 的明确报错，而非
+        静默落在步长不同的滑窗口径上。"""
+        base = {
+            "unet_ckpt": "u.pt", "unet_config_json": "u.json",
+            "vae_ckpt": "v.pt", "vae_config_json": "v.json",
+            "output_json": "r.json", "device": "cpu",
+        }
+        with pytest.raises(ValidationError, match="整数"):
+            BaseSmokeConfig.model_validate({**base, "decode_overlap": 0.6666})
+
+    def test_output_json_must_differ_from_input_artifacts(self) -> None:
+        """报告落盘路径不得与任何输入工件重合（Codex review
+        5212797632）：输入在报告写出前已全部装载，重合路径会被 JSON
+        报告静默覆盖掉模型权重/转写配置——自检「成功」即工件损毁。"""
+        base = {
+            "unet_ckpt": "weights.pt", "unet_config_json": "u.json",
+            "vae_ckpt": "v.pt", "vae_config_json": "v.json", "device": "cpu",
+        }
+        for colliding_field, value in (
+            ("unet_ckpt", "weights.pt"), ("unet_config_json", "u.json"),
+            ("vae_ckpt", "v.pt"), ("vae_config_json", "v.json"),
+        ):
+            with pytest.raises(ValidationError, match="输入工件"):
+                BaseSmokeConfig.model_validate({
+                    **base, colliding_field: value, "output_json": value,
+                })
 
     def test_timestep_confined_to_rflow_domain(self) -> None:
         base = {
@@ -460,21 +692,45 @@ class TestRealBaseArtifacts:
                "base-smoke config（集群侧产出）",
     )
     def test_hf_release_forward_is_reproducible_across_processes(
-        self, cli: CliSession,
+        self, tmp_path: Path,
     ) -> None:
         """跨进程逐位复现（AC「固定 seed 与确定性 kernels」的完整形态）：
-        两次独立 CLI 进程的同一定点前向 → 同一 velocity 指纹。"""
-        config_path = Path(os.environ[_REAL_SMOKE_CONFIG_ENV])
+        两个**独立解释器进程**（``python -c`` 子进程，pytest 进程之外
+        各自全新初始化 torch/CUDA）的同一定点前向 → 同一 velocity 指纹。
+
+        CliSession 与 pytest 同进程，进程内循环共享 CUDA 上下文与环境
+        状态，不构成跨进程证据（Codex review 5212797632）；确定性口径
+        随测试 seam 显式随行——子进程导入 ``tests.conftest``（其导入期
+        收口，ADR-0010 的「测试进程属性」含测试派生的子进程）。"""
+        source = json.loads(
+            Path(os.environ[_REAL_SMOKE_CONFIG_ENV]).read_text(encoding="utf-8"),
+        )
+        repo_root = Path(__file__).resolve().parent.parent
+        src_path = repo_root / "src"
         shas = set()
-        for _ in range(2):
-            result = cli.run("base-smoke", "--config", str(config_path))
-            assert result.code == 0, result.stderr
+        for index in range(2):
+            config = dict(source)
+            config["output_json"] = str(tmp_path / f"report_{index}.json")
+            config_path = tmp_path / f"config_{index}.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable, "-c",
+                    "import tests.conftest; from cynosure.cli import main; main()",
+                    "base-smoke", "--config", str(config_path),
+                ],
+                capture_output=True, text=True, timeout=1800, check=False,
+                cwd=str(repo_root),
+                env={
+                    **os.environ,
+                    "PYTHONPATH": os.pathsep.join(
+                        [str(src_path), os.environ.get("PYTHONPATH", "")],
+                    ).rstrip(os.pathsep),
+                },
+            )
+            assert result.returncode == 0, result.stderr
             report = json.loads(
-                Path(
-                    json.loads(
-                        config_path.read_text(encoding="utf-8"),
-                    )["output_json"],
-                ).read_text(encoding="utf-8"),
+                Path(config["output_json"]).read_text(encoding="utf-8"),
             )
             shas.add(report["velocity_sha256"])
         assert len(shas) == 1

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -153,7 +154,7 @@ class BaseSmokeConfig(BaseModel):
         "latent 域缩放因子（解码前除回 encoder 域）：缺省 None = 从基座 "
         "checkpoint 容器的 scale_factor 元数据读（生产单一来源，杜绝手抄"
         "漂移）；显式给出时以 config 为准（裸 state_dict 形态工件无元数据）",
-        default=None, gt=0.0,
+        default=None, gt=0.0, allow_inf_nan=False,
     )
     decode_roi_size: tuple[int, int, int] = SpecField(
         "运行时", "本票",
@@ -163,7 +164,10 @@ class BaseSmokeConfig(BaseModel):
     )
     decode_overlap: float = SpecField(
         "运行时", "本票",
-        "VAE 解码滑窗重叠比（官方字面 0.6666 = 2/3 的满精度取值）",
+        "VAE 解码滑窗重叠比（满精度 2/3 = 官方 0.6666 的意图值）。官方"
+        "四位截断字面 0.6666 **不放行**：MONAI 按 int(roi·(1−overlap)) "
+        "截断滑窗步长，0.6666 与 2/3 的步长并不相同（roi=48 时 16 vs "
+        "15）——照抄上游字面值会静默改变解码口径，整合性校验显式拒绝",
         default=2 / 3, ge=0.0, lt=1.0,
     )
 
@@ -205,8 +209,9 @@ class BaseSmokeConfig(BaseModel):
         """滑窗 overlap 与 roi 的整除约束（MONAI 要求 ``overlap×roi×
         zoom_scale`` 逐维为整数，VAE 4× 上采样下即 ``overlap×roi×4``）：
         不整除时 MONAI 在解码期才炸，错误信息与配置意图脱节。浮点比对
-        留容差——官方字面 2/3 是四位截断，``2/3×48×4`` 在二进制浮点下
-        是 127.999…，数学上整除。"""
+        留容差——满精度 2/3 在二进制浮点下是 ``2/3×48×4 = 127.999…``，
+        数学上整除；官方四位截断字面 0.6666 不在容差内（且其 MONAI
+        滑窗步长本就与 2/3 不同，见字段说明）。"""
         scaled = [
             self.decode_overlap * dimension * _LATENT_SPATIAL_COMPRESSION
             for dimension in self.decode_roi_size
@@ -216,7 +221,27 @@ class BaseSmokeConfig(BaseModel):
                 f"decode_overlap {self.decode_overlap} × roi "
                 f"{self.decode_roi_size} × {_LATENT_SPATIAL_COMPRESSION} 须"
                 f"逐维为整数（MONAI 滑窗缩放约束），得到 {scaled}"
+                "（官方四位截断字面 0.6666 不放行——满精度 2/3 才是同一"
+                "滑窗口径，请传 2/3）"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _output_is_distinct_from_inputs(self) -> "BaseSmokeConfig":
+        """报告落盘路径不得与任何输入工件重合：输入在报告写出前已全部
+        装载，重合路径会被 JSON 报告静默覆盖掉权重/转写配置——自检
+        「成功」即工件损毁。``resolve`` 同时归一别名形态（相对路径、
+        符号链接）。"""
+        output = self.output_json.resolve()
+        for field_name in (
+            "unet_ckpt", "unet_config_json", "vae_ckpt", "vae_config_json",
+        ):
+            if output == Path(getattr(self, field_name)).resolve():
+                raise ValueError(
+                    f"报告落盘路径 output_json 与输入工件 {field_name} "
+                    f"相同（{output}）：报告写出会覆盖模型工件，自检"
+                    "不得自毁输入"
+                )
         return self
 
     @property
@@ -327,6 +352,15 @@ class BaseSmokeRunner:
         self._unet = NetworkAssembler.unet(
             NetworkArtifact(config=unet_config, checkpoint=config.unet_ckpt),
         ).to(self._device)
+        # 定点 token 须落在装载出的类别名嵌入表内：schema 只约束 ge=0，
+        # 越界值到 nn.Embedding 才 IndexError（CLI 侧不成收敛的 exit 2）
+        class_table = getattr(self._unet, "num_class_embeds", None)
+        if class_table is not None and config.modality_token >= class_table:
+            raise ValueError(
+                f"modality_token {config.modality_token} 超出装载 UNet 的 "
+                f"类别名嵌入表（num_class_embeds={class_table}）：前向"
+                "必然越界（nn.Embedding IndexError），构造期拒绝"
+            )
         # 容器只整读一次（装载面装配内部另有一次按路径的读——那是
         # 生产装配 seam 的 API 形态；本层把元数据与参数量对账合并到
         # 同一次读上）：缩放因子与权重张量总量都从这里出
@@ -371,6 +405,13 @@ class BaseSmokeRunner:
                 raise ValueError(
                     "基座定点前向输出含非有限值（NaN/Inf）：装载出的网络不可用"
                 )
+            if tuple(velocity.shape) != (1, *self._config.latent_shape):
+                raise ValueError(
+                    f"基座定点前向 velocity 形状 {tuple(velocity.shape)} 与 "
+                    f"latent_shape 契约 {(1, *self._config.latent_shape)} "
+                    "不符（ODE 更新要求 velocity 与 latent 同形——工件对 "
+                    "out_channels/网格错配不得进入成功报告）"
+                )
             repeat_identical = bool(torch.equal(velocity, self._velocity()))
         if not repeat_identical:
             raise ValueError(
@@ -386,12 +427,41 @@ class BaseSmokeRunner:
         )
         image = self._fixed_image()
         encoded = self._encoder.encode(image, noise_seed=self._config.seed)
+        if not bool(torch.isfinite(encoded).all()):
+            raise ValueError(
+                "VAE 编码输出含非有限值（NaN/Inf）：fp16 autocast 或权重"
+                "异常产出的编码不可用，不得进入成功报告"
+            )
+        if tuple(encoded.shape) != tuple(self._config.latent_shape):
+            raise ValueError(
+                f"VAE 编码输出形状 {tuple(encoded.shape)} 与 latent_shape "
+                f"契约 {tuple(self._config.latent_shape)} 不符（VAE 工件对 "
+                "与 policy 网格不同构——latent 通道数/压缩比错配）"
+            )
         # 指纹在 CPU 原件上取（encode 契约 = CPU fp32），解码前搬运到
         # 设备——生产解码器的输入契约是设备驻留 latent（里程碑评测同款）
         encoded_sha256 = LatentFingerprint(encoded).to_step_stats(
             step_index=0, timestep=float(self._config.timestep),
         ).sha256
-        decoded = self._decoder.decode(encoded.to(self._device).unsqueeze(0))
+        # 解码器的输入契约是 policy 域（checkpoint scaled 域）：encoder
+        # 原始输出是存储域（未乘 scale_factor，data-preparation「latent
+        # 存储域」），先乘回再进 decode——decode 内部除回后恰好归位
+        # encoder 域，与生产 rollout 终点的消费口径一致，往返才闭环
+        policy_domain = encoded * self._readout.latent_scale_factor
+        decoded = self._decoder.decode(
+            policy_domain.to(self._device).unsqueeze(0),
+        )
+        if not bool(torch.isfinite(decoded).all()):
+            raise ValueError(
+                "VAE 解码输出含非有限值（NaN/Inf）：解码口径或权重异常，"
+                "不得进入成功报告"
+            )
+        if tuple(decoded.shape) != (1, *self._config.image_shape):
+            raise ValueError(
+                f"VAE 解码输出形状 {tuple(decoded.shape)} 与 image_shape "
+                f"契约 {(1, *self._config.image_shape)} 不符（VAE 上采样"
+                "结构与 latent 网格不同构）"
+            )
         report = BaseSmokeReport(
             device=str(self._device),
             seed=self._config.seed,
@@ -435,6 +505,7 @@ class BaseSmokeRunner:
         （非确定 ~8 GiB，见模块 docstring），而解码侧的 AC 只要求
         跑通 + fp16 autocast 口径，不需要逐位。"""
         previous_algorithms = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
         previous_benchmark = torch.backends.cudnn.benchmark
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.benchmark = False
@@ -442,7 +513,9 @@ class BaseSmokeRunner:
         try:
             yield
         finally:
-            torch.use_deterministic_algorithms(previous_algorithms)
+            torch.use_deterministic_algorithms(
+                previous_algorithms, warn_only=previous_warn_only,
+            )
             torch.backends.cudnn.benchmark = previous_benchmark
 
     def _velocity(self) -> torch.Tensor:
@@ -497,16 +570,29 @@ class BaseSmokeRunner:
         """解码域缩放因子：config 显式值优先，否则取容器元数据。
 
         两者皆缺席即显式拒绝——随手取 1.0 会让解码落在错误量级
-        （读数看着「跑通」实则口径失真）。"""
+        （读数看着「跑通」实则口径失真）；非有限正值（inf/负）同样
+        显式拒绝——inf 通过「>0」检查、解码除 inf 得全零 latent，形状
+        正确、数值有限的「成功」读数是最危险的静默失真。"""
         if self._config.latent_scale_factor is not None:
-            return self._config.latent_scale_factor, "config"
+            value = self._config.latent_scale_factor
+            self._reject_unusable_scale_factor(value, "config")
+            return value, "config"
         if checkpoint_value is None:
             raise ValueError(
                 f"latent scale factor 缺席：config 未显式给出，且 "
                 f"{self._config.unet_ckpt} 不是带 scale_factor 元数据的上游"
                 "训练容器——解码域缩放无从确定（请在 config 显式给出）"
             )
+        self._reject_unusable_scale_factor(checkpoint_value, "checkpoint")
         return checkpoint_value, "checkpoint"
+
+    @staticmethod
+    def _reject_unusable_scale_factor(value: float, source: str) -> None:
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"latent scale factor（{source} 来源）须为有限正数，得到 "
+                f"{value}：非有限/非正的除数会把解码静默推到错误量级"
+            )
 
     @staticmethod
     def _checkpoint_parameters(ckpt: Path) -> int:
