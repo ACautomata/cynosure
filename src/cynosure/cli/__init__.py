@@ -598,6 +598,7 @@ class CynosureCli:
         # 同属输入契约违反；执行期窄面在下方（OOM 等运行时故障不混入归因）
         try:
             encoder = PreparePipeline.build_encoder(config, self._prepare_device())
+            vocabulary = PreparePipeline.load_vocabulary(config)
         except (
             ValueError, FileNotFoundError, RuntimeError,
             pickle.UnpicklingError,
@@ -605,27 +606,44 @@ class CynosureCli:
             print(f"prepare 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         try:
-            report = PreparePipeline(config, encoder).run()
+            report = PreparePipeline(config, encoder, vocabulary).run()
         except (ValueError, FileNotFoundError) as exc:
             print(f"prepare 输入契约违反: {exc}", file=self._stderr)
             return _EXIT_USAGE_ERROR
         print(
-            f"prepare 完成（病例级 split seed={config.schedule.seed}："
+            f"prepare 完成（split seed={config.schedule.seed}："
             f"train {report.split_sizes['train']} / val "
             f"{report.split_sizes['val']} / test {report.split_sizes['test']}）:",
             file=self._stdout,
         )
         print(
             f"  - Real sample pool: {report.pool_manifest}"
-            f"（{report.pool_entries} 条，按序列分层）",
+            f"（{report.pool_entries} 条，按"
+            + (
+                "生成条件分层"
+                if report.condition_counts is not None
+                else "序列分层"
+            ) + "）",
             file=self._stdout,
         )
+        if report.condition_counts is not None:
+            detail = "、".join(
+                f"{condition}×{count}"
+                for condition, count in sorted(report.condition_counts.items())
+            )
+            print(f"    - 逐条件: {detail}", file=self._stdout)
         print(
             f"  - Held-out real: {report.heldout_manifest}"
             f"（{report.heldout_entries} 条，与 pool 病例级不相交、"
             "永不参与判别器更新）",
             file=self._stdout,
         )
+        if report.sampling_manifest is not None:
+            print(
+                f"  - 配额抽样留痕: {report.sampling_manifest}"
+                "（逐卷归属 + 评估集互斥守卫读数，#131）",
+                file=self._stdout,
+            )
         print(
             f"  - per-channel 标准化统计量: {report.channel_stats}"
             f"（mean/std × {len(report.mean)} 通道）",

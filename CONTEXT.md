@@ -89,12 +89,16 @@ MONAI 的 PatchGAN 判别器（Pix2PixHD 式），输出 patch logit 图而非�
 训练集影像经 VAE 预编码的 latent，作为判别器的「真」，固定不更新。
 
 **Real sample pool（真实样本库）**:
-训练集（本轮 = BraTS train split）全量影像经 VAE 预编码的 latent 集合，按序列 token 分层；判别器的「真」与评测参照都取自它。
+训练集影像经 VAE 预编码的 latent 集合，判别器的「真」与评测参照都取自它。分层键按域：BraTS 线 = train split（病例级 70%）全量、按序列 token 分层；MR-RATE 线 = 官方 train split 逐条件配额抽样（配额为上限、固定 seed、排序后抽样、幂等留痕）、按生成条件分层（11 格，每条件统一网格——同条件 latent 同形，异条件异形状随 `condition_shapes` 登记）。
 _Avoid_: 真样本集
 
 **Held-out real（留出真样本）**:
-基座 val split（BraTS 病例级 70/10/20 之 10%）影像经 VAE 预编码的 latent 工件，按序列分层；与 Real sample pool 病例级不相交、永久不参与判别器更新——保证 held-out AUC 是 out-of-sample 的 hacking 监控信号（reward-model 章，`prepare` 产出）。
+held-out 监控侧的预编码 latent 工件，与 Real sample pool 病例级不相交、永久不参与判别器更新——保证 held-out AUC 是 out-of-sample 的 hacking 监控信号（reward-model 章，`prepare` 产出）。来源按域：BraTS 线 = val split（病例级 70/10/20 之 10%）；MR-RATE 线 = train split 内 patient 级二分（`heldout_fraction` 配比）——与官方 val/test 评估留出池的不相交由官方 split 边界 + 装配期评估集互斥守卫共同保证（#73 原则）。
 _Avoid_: 验证集（val split 是划分段，held-out real 是其预编码工件）
+
+**配额抽样 manifest（Sampling manifest）**:
+MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#78 机制同款）：seed、数据 release 快照、逐条件配额与实抽计数、pool 与 held-out 逐卷归属（patient/study/series/modality/plane/condition/role）、评估集互斥守卫读数（series 键 + patient 级双守卫，合法装配恒 0）——prepare 幂等（同 seed 重跑零漂移）与 held-out 互斥「落档可查」的可审计登记面。
+_Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
 当前 policy rollout 的去噪输出 latent，作为判别器的「假」。
@@ -117,7 +121,7 @@ RM readiness gate 的产物：预训练后逐条件判定的「判别器在该�
 _Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
 
 **生成条件（Generation condition）**:
-RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 线条件单位仍是序列/有序对）：#81 终审白名单全量 11 个——T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。每条件是**五元组**（modality token / plane / 推荐 FOV / 统一网格 / 等效 spacing），唯一来源是仓库工件 `data/conditions/mrrate_conditions.json`（#127 工件化，取代 #119 的 config 内嵌词表——config 不内嵌词表、代码内无常量副本）：token 映射 9/10/11/20/16 为上游 `configs/modality_mapping.json` 权威、条件 token 由映射派生（skull-stripped 29–33 不进本轮生成词汇）；统一网格 = #78 普查工件逐条件众数 latent 网格 ×4、等效 spacing = FOV / 网格（条件属性）。装载面 = `cynosure.conditions.MrConditionVocabulary`（config 经 `artifacts.condition_vocabulary_json` 携带路径）：装载期字段级拒绝（缺格 / 网格不符 / 字段缺失），生产模式逐条件对账普查期望网格；小词汇表只能经 `fixture_mode=True` 显式装载。两套口径经 `experiment.dataset` 互斥激活（`BraTS2023` 默认、既有 BraTS 线行为不变；`MR-RATE` 必带词汇工件绑定、BraTS 携带即拒），MR-RATE 线只定义组1（上游无 MR ControlNet）。词表的运行时消费已部分接线：预处理半边 #130 已落地（`UpstreamPreprocessChain` 两臂旋钮——强度臂 BraTS `clip=True` / MR-RATE `clip=False` #71 裁决、resize 目标 BraTS dim 公式 / MR-RATE 词汇表统一网格绝对目标；`MrConditionVocabulary.spacing_condition` 条件属性解析面与 `latent_shape` 对偶，换算因子 `SPACING_CONDITION_SCALE` 提升至 config 单一来源）；rollout 条件组装、latent 形状按条件贯通 #129、prepare 数据链 #131 由后续票接线。完整口径见 `docs/spec/experiment-design.md`「条件词表口径」节。
+RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 线条件单位仍是序列/有序对）：#81 终审白名单全量 11 个——T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。每条件是**五元组**（modality token / plane / 推荐 FOV / 统一网格 / 等效 spacing），唯一来源是仓库工件 `data/conditions/mrrate_conditions.json`（#127 工件化，取代 #119 的 config 内嵌词表——config 不内嵌词表、代码内无常量副本）：token 映射 9/10/11/20/16 为上游 `configs/modality_mapping.json` 权威、条件 token 由映射派生（skull-stripped 29–33 不进本轮生成词汇）；统一网格 = #78 普查工件逐条件众数 latent 网格 ×4、等效 spacing = FOV / 网格（条件属性）。装载面 = `cynosure.conditions.MrConditionVocabulary`（config 经 `artifacts.condition_vocabulary_json` 携带路径）：装载期字段级拒绝（缺格 / 网格不符 / 字段缺失），生产模式逐条件对账普查期望网格；小词汇表只能经 `fixture_mode=True` 显式装载。两套口径经 `experiment.dataset` 互斥激活（`BraTS2023` 默认、既有 BraTS 线行为不变；`MR-RATE` 必带词汇工件绑定、BraTS 携带即拒），MR-RATE 线只定义组1（上游无 MR ControlNet）。词表的运行时消费已接线两半：预处理半边 #130 已落地（`UpstreamPreprocessChain` 两臂旋钮——强度臂 BraTS `clip=True` / MR-RATE `clip=False` #71 裁决、resize 目标 BraTS dim 公式 / MR-RATE 词汇表统一网格绝对目标；`MrConditionVocabulary.spacing_condition` 条件属性解析面与 `latent_shape` 对偶，换算因子 `SPACING_CONDITION_SCALE` 提升至 config 单一来源）；prepare 数据链 #131 已落地（配额抽样 / 评估集互斥守卫 / held-out 二分 / 条件分层工件，#121 票内；口径见 `docs/spec/data-preparation.md`「MR-RATE 换域」节）；rollout 条件组装与 latent 形状按条件贯通（#129）待接线。完整口径见 `docs/spec/experiment-design.md`「条件词表口径」节。
 _Avoid_: 把 skull-stripped 码当生成 token（生成分组恒用 whole-brain 条目）、在 BraTS config 里携带 MR 词汇工件（互斥携带即拒）、在代码里写 token/网格常量副本（唯一来源是工件）
 
 **梯度门控（Gradient gating）**:

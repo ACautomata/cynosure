@@ -260,6 +260,17 @@ class Fixture:
         )
         return artifacts
 
+    def write_condition_vocabulary(self, directory: Path) -> Path:
+        """仅落盘 MR 条件词汇表工件（prepare 场景的轻量通道：纯 JSON
+        不消费环境 RNG 流——全量 write_artifacts 的网络构造序不受影响）。"""
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "condition_vocabulary.json"
+        path.write_text(
+            json.dumps(_FIXTURE_MR_CONDITION_VOCABULARY, indent=2),
+            encoding="utf-8",
+        )
+        return path
+
     def config(
         self, artifacts_dir: Path, group: str = "modal-label",
         dataset: str = "BraTS2023",
@@ -295,17 +306,59 @@ class Fixture:
             "discriminator_config_json": str(artifacts_dir / "discriminator_config.json"),
             "discriminator_ckpt": str(artifacts_dir / "discriminator.pt"),
         }
+        # BraTS fixture 注入小 resize 基数（夹具影像尺寸不变）；MR-RATE 线
+        # 的 resize 目标 = 条件统一网格（词汇表携带），基数公式无语义
+        preprocessing: dict = (
+            {"intensity_clip": False} if dataset == "MR-RATE"
+            else {"resize_base": self.RESIZE_BASE}
+        )
+        reward: dict = {
+            "disc_num_layers_d": 1,
+            "disc_batch_size_k": 4,
+            "replay_buffer_capacity": 64,
+            "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
+            "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
+            "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
+            # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源
+            # （必填无默认）；fixture 产物路径 = 预训练 run 目录内的报告名
+            "pretrain_report_json": str(
+                artifacts_dir / "pretrain_run" / "pretrain_report.json"
+            ),
+            # RM readiness gate 的 fixture 低阈值（ADR-0007）：chance 带
+            # 上沿之上、自产小产物可达——门槛判定逻辑的 fixture 专属取值
+            # （fixture 不设豁免：train 门槛硬检查以同一条代码路径放行；
+            # 生产默认 0.65 不受影响）
+            "pretrain_gate_auc": 0.51,
+        }
         if dataset == "MR-RATE":
             # 条件词汇表工件绑定（#127 schema 守卫：MR-RATE 必填、
-            # BraTS 携带即拒——两套口径互斥激活）
+            # BraTS 携带即拒——两套口径互斥激活）+ prepare 装配输入
+            # 四件套与抽样留痕（#121/#131 schema 必填面）
             artifacts["condition_vocabulary_json"] = str(
                 artifacts_dir / "condition_vocabulary.json",
             )
+            artifacts["mrrate_metadata_csv"] = str(
+                artifacts_dir / "dataset" / "metadata.csv",
+            )
+            artifacts["mrrate_splits_csv"] = str(
+                artifacts_dir / "dataset" / "splits.csv",
+            )
+            artifacts["eval_manifest_csv"] = str(
+                artifacts_dir / "dataset" / "eval_manifest.csv",
+            )
+            artifacts["mrrate_data_snapshot"] = "fixture-snapshot"
+            reward["sampling_manifest_json"] = str(
+                artifacts_dir / "sampling_manifest.json",
+            )
+            reward["real_pool_quota"] = {
+                condition["name"]: 8 for condition in FIXTURE_MR_CONDITIONS
+            }
+            reward["heldout_fraction"] = 0.3
         return CynosureConfig.model_validate({
             "experiment": experiment,
             "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
-            "preprocessing": {"resize_base": self.RESIZE_BASE},
+            "preprocessing": preprocessing,
             "artifacts": artifacts,
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,
@@ -313,24 +366,7 @@ class Fixture:
                 "group_size_g": self.GROUP_SIZE_G,
                 "train_step_indices_m": sorted(self.TRAIN_STEP_INDICES_M),
             },
-            "reward": {
-                "disc_num_layers_d": 1,
-                "disc_batch_size_k": 4,
-                "replay_buffer_capacity": 64,
-                "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
-                "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
-                "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
-                # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源
-                # （必填无默认）；fixture 产物路径 = 预训练 run 目录内的报告名
-                "pretrain_report_json": str(
-                    artifacts_dir / "pretrain_run" / "pretrain_report.json"
-                ),
-                # RM readiness gate 的 fixture 低阈值（ADR-0007）：chance 带
-                # 上沿之上、自产小产物可达——门槛判定逻辑的 fixture 专属取值
-                # （fixture 不设豁免：train 门槛硬检查以同一条代码路径放行；
-                # 生产默认 0.65 不受影响）
-                "pretrain_gate_auc": 0.51,
-            },
+            "reward": reward,
             # N_baseline fixture 缩小（Baseline manifest 条目随全流程走）
             "schedule": {"seed": 0, "baseline_samples": 4},
         })

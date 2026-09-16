@@ -1,6 +1,6 @@
 # 数据准备方案：BraTS 加载对齐上游训练 recipe
 
-> 本章由 grilling 会话决议产出（2026-09-04）。上游（NV-Generate-CTMR fork）预处理链事实经只读代码核查；决策记录见 `docs/adr/0006-brats-preprocessing-upstream-recipe.md`。
+> 本章由 grilling 会话决议产出（2026-09-04）。上游（NV-Generate-CTMR fork）预处理链事实经只读代码核查；决策记录见 `docs/adr/0006-brats-preprocessing-upstream-recipe.md`。MR-RATE 换域段（文末）由地图 #67 / #121+#131 产出（2026-09-16）。
 
 ## 范围与原则
 
@@ -46,3 +46,29 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 1. **方向断言**：任一 BraTS case 加载后 affine 轴码 = RAS（BraTS 原生 ~89% LPS，flip-only 无轴置换，翻转后达成）。
 2. **形状契约**：真实 BraTS 影像经链后为 [1,256,256,128]，latent [4,64,64,32] 通过既有契约检查。
 3. **fixture 端到端**：`tests/test_prepare.py` 全链（含新 transform 步）通过，工件契约（序列分层、病例级不相交、幂等）不回归。
+
+## MR-RATE 换域：real sample pool + per-channel 统计量（#121/#131，spec #125 实现决策 3）
+
+地图 #67 的 prepare 数据链换域。装配语义按 `experiment.dataset` 分派到策略（`reward.mrrate` 的 `BratsAssembly` / `MrRateAssembly`）——编排骨架（计划 → 失效 → 编码 → 统计量 → 落盘）两域单份，BraTS 线语义零改动。
+
+### 预编码 resize/网格口径（#111 网格裁决的落地）
+
+- **裁决 = 多网格案（逐条件统一网格）**：#111 点名裁决点「单一网格案 vs 多网格案」由 spec #125 实现决策 1/3 定案——11 生成条件各有统一网格（条件词汇表工件 `data/conditions/mrrate_conditions.json` 携带，= #78 普查逐条件众数 latent 网格 ×4），rollout 条件解析形状（#129）、判别器输入按条件分层、里程碑评测与 prepare 编码同一网格口径。同条件内任意原生形状的 real 卷影像域 trilinear resample 到该条件统一网格后编码——**同条件出链 latent 形状唯一**，real/fake 同网格不喂「网格差异」判别捷径；条件间异形状（#78 普查实测逐格 5–11 种原生 latent 网格）在一份工件内按条件登记（`LatentManifest.condition_shapes`）。
+- **强度臂 = 官方 clip=False**（#71 裁决，NVIDIA v1 训练口径；两臂 embedding 不可互用）：MR-RATE 线 `preprocessing.intensity_clip=false`、BraTS 线恒 `true`（ADR-0006 fork 锚）——两域取值由 config schema 锁死，显式携带错误值即拒绝。
+- **spacing = 条件属性**：等效 spacing = 推荐 FOV / 统一网格（spec #125 决策 6），条目值 = 等效 spacing ×1e2，同条件严格同值——BraTS 线的 per-case zooms 侧车消费（组2 语义）在 MR-RATE 线由条件属性取代，堵死「spacing 差异」判别捷径；BraTS 线侧车机制原样保留。
+
+### 装配流程（`MrRateAssembly.plan()`，四步全确定性）
+
+1. **候选域**：series 级元数据 CSV × 官方 patient 级 splits CSV join（train split；patient 悬挂 = 元数据/splits 错版，可读拒绝）× 条件词汇表归属解析（`MrConditionVocabulary.resolve_condition`；MRA 全平面单格、SWI 仅 axial 在词汇，域外卷计数留痕不进工件）。
+2. **评估集互斥硬守卫**（#131 AC2）：候选域对 #78 评估清单（`artifacts.eval_manifest_csv`）做 series 键（study_uid + series_id）与 patient 集合双粒度零交集校验——任一命中即 fail-fast（官方 split 下 train 与 val/test 天然不相交，守卫防口径漂移静默吃掉互斥性）。守卫读数（键基数、命中数恒 0）随抽样 manifest 落档。
+3. **held-out 二分**（train split 内 patient 级，#73 原则/#121 AC3）：候选 patients 排序 + seed 洗牌 + 按 `reward.heldout_fraction` 切出 held-out 侧（同 patient 全部卷同侧 = 病例级不相交）；与评估留出池（官方 val+test）的不相交由 train split 边界 + 互斥守卫共同保证。held-out 池为空显式拒绝（失去 out-of-sample 信号语义）。
+4. **逐条件配额抽样**（pool 侧，#78 抽样机制同款）：条件内排序 + seed 洗牌 + 截取 `reward.real_pool_quota` 上限（头部模态各数千条、MRA 全量 ≈ 110 的登记形态；候选不足取全量，配额是上限非硬指标）。同 seed 重跑抽样 manifest 逐字节零漂移。
+
+### 工件契约（分层键泛化）
+
+- **Real sample pool / Held-out real manifest**（`LatentManifest` 泛化，可扩不改名）：MR-RATE 域条目带 `condition`（11 格名；BraTS 条目带 `modality`——恰一非空）、卷键 = `<study_uid>/<series_id>`、`conditions` 逐条件计数 + `condition_shapes` 逐条件 latent 形状登记（单一 `latent_shape` 恒 None——异形状的对照表）、spacing = 条件属性值。可被 reward 数据管线既有契约装载（`LatentManifest.load` + `RealPoolSampler.sample(condition=...)` 条件匹配采样——同条件同形，批 stack 前提）。
+- **per-channel 统计量**（#121 AC2）：MR-RATE pool 重算（异形状不影响 per-channel 归约），随工件落 `provenance`（数据域、release 快照 `artifacts.mrrate_data_snapshot`、强度臂 clip、resize 口径 = uniform-grid、上游锚 = NVIDIA v1 clip=False）。
+- **配额抽样留痕**（`SamplingManifest`，`reward.sampling_manifest_json`）：seed / 快照 / 配额 / 逐条件候选与实抽计数 / pool 与 held-out 逐卷归属（patient/study/series/modality/plane/condition/role）/ 互斥守卫读数——prepare 幂等与 held-out 互斥的「落档可查」登记面。
+- **容量装配守卫**（ADR-0008-03 口径，#121 AC5）：逐（条件, 全量）容量 ≥ `disc_batch_size_k × world_size`（条件全集 = 词汇表 11 格，稀疏模态小池触发口径——任一条件不足即装配期可读拒绝，开工前失败而非训练中途）。守卫落在 manifest **落盘之前**：失败时盘上 manifest 明确缺失（latents 已写但无索引指向），维持「要么全量一致、要么明确缺失」的工件契约。train 装配期的同款守卫（rank 切片口径）语义不变。
+
+输入工件四件套（MR 线 schema 必填、BraTS 携带即拒）：`mrrate_metadata_csv` / `mrrate_splits_csv` / `eval_manifest_csv` / `mrrate_data_snapshot`；影像落位 = `<dataset_root>/<study_uid>_<series_id>.nii.gz`（官方 zip 内文件名平铺，#132 生产落位同构）。fixture 通道 = `SyntheticMrRateDataset` 夹具（同布局缩小版，`tests/test_mr_prepare.py` 端到端）。

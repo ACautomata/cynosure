@@ -50,6 +50,8 @@ schema 语义（与 BraTS 线的隔离保证）：
 
 **装载层交付边界（#127）**：本段口径到工件装载与 schema 绑定为止。词表的运行时消费——rollout 条件组装（token 取数）、latent 形状按条件贯通（#129，`latent_shape(name)` 解析面已备）、预处理统一网格与 spacing 条件属性（#130）、prepare 数据链配额装配（#131）——由地图 #67 的后续施工票接线；BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
 
+**消费接线进度（#121/#131 交付，2026-09-16）**：预处理统一网格与强度臂参数化、prepare 数据链装配（官方 split join / 评估集互斥守卫 / patient 级 held-out 二分 / 逐条件配额抽样 / 条件分层工件 / 容量守卫）已落地——口径见 `data-preparation.md`「MR-RATE 换域」节。`latent_shape(name)` 的 rollout/评测侧消费（#129）仍待接线。
+
 ## 对照基线（no-RL）
 
 - **组1 基线** = 冻结 base UNet @ CFG=10；**组2 基线** = 冻结 base UNet + 冻结预训练 ControlNet。
@@ -70,6 +72,7 @@ schema 语义（与 BraTS 线的隔离保证）：
 
 - real = **BraTS train split（病例级 70%）全量 VAE 预编码 latent**，按序列 token 分层（GLI 全量约 1251 例 → train 约 800+，确切体量以基座 data/README 为准）；**不混入 MR-RATE 全库**（避免域漂移 + 库过大）。
 - 组1 按序列 token 分层；组2 按 4 序列分层。
+- **MR-RATE 换域线（地图 #67）的 real 样本库 = 独立口径**：官方 train split 逐条件配额抽样 + held-out train 内 patient 级二分 + 评估集互斥硬守卫，分层键 = 生成条件（11 格）——口径见 `data-preparation.md`「MR-RATE 换域」节（#121/#131）。
 
 ## 成功判据与早停准则
 

@@ -3,6 +3,7 @@
 失败替身。"""
 
 import copy
+import csv
 import hashlib
 import io
 import json
@@ -238,6 +239,120 @@ RAS_AFFINE = np.array(
 # 各向异性 zooms（issue #46，float32 精确值 (0.5, 1.0, 2.0)）：per-case spacing
 # 变化的观测载体——写死常量必假绿的判别性断言用它驱动数据变化
 ANISOTROPIC_AFFINE = np.diag([-0.5, -1.0, 2.0, 1.0])
+
+
+class SyntheticMrRateDataset:
+    """合成 MR-RATE 数据集（fixture 策略，#121/#131）：平铺影像树 +
+    元数据 / 官方 split / 评估清单三 CSV，与生产落位布局同构，供 MR
+    prepare 全循环在本地 CPU 跑。
+
+    布局契约（``reward.mrrate`` 消费面）：影像 =
+    ``<root>/<study_uid>_<series_id>.nii.gz``（官方 zip 内文件名平铺，
+    #132 生产落位同构）；三 CSV 列 = 本仓规范键列（#78 同款）。默认
+    布局 = 6 train patients（每 patient 1 study × 2 series：t1w/axial +
+    flair/axial 夹具网格）+ 2 val / 2 test patients（评估留出池，只登记
+    评估清单、不落影像）。"""
+
+    SERIES_SHAPE: tuple[int, int, int] = (64, 64, 32)
+    MR_SERIES: tuple[tuple[str, str, str], ...] = (
+        # (series_id, modality, plane)：条件词汇表的 2 夹具条件
+        ("t1w-raw-axi", "t1w", "AXIAL"),
+        ("flair-raw-axi", "flair", "AXIAL"),
+    )
+
+    def __init__(
+        self, root: Path, seed: int = 0,
+        *,
+        train_patients: int = 6,
+        heldout_pool_patients: int = 4,
+        eval_rows: list[dict[str, str]] | None = None,
+        extra_metadata_rows: list[dict[str, str]] | None = None,
+    ) -> None:
+        self._root = Path(root)
+        self._seed = seed
+        self._train_patients = train_patients
+        self._heldout_pool_patients = heldout_pool_patients
+        self._eval_rows = eval_rows
+        self._extra_metadata_rows = extra_metadata_rows or []
+
+    def write(self) -> Path:
+        """按 MR 布局落盘（确定性：seed + patient/序列下标派生子种子）。"""
+        self._root.mkdir(parents=True, exist_ok=True)
+        split_rows: list[tuple[str, str]] = []
+        metadata_rows: list[dict[str, str]] = []
+        for index in range(self._train_patients):
+            patient = f"P{index:02d}"
+            split_rows.append((patient, "train"))
+            study = f"ST{index:02d}"
+            for series_index, (series_id, modality, plane) in enumerate(
+                self.MR_SERIES,
+            ):
+                metadata_rows.append({
+                    "batch_id": f"batch{index % 28:02d}",
+                    "patient_uid": patient,
+                    "study_uid": study,
+                    "series_id": series_id,
+                    "modality": modality.upper(),
+                    "plane": plane,
+                })
+                volume = np.random.default_rng(
+                    (self._seed, index, series_index),
+                ).standard_normal(self.SERIES_SHAPE).astype(np.float32)
+                nib.save(
+                    nib.Nifti1Image(volume, RAS_AFFINE),
+                    self._root / f"{study}_{series_id}.nii.gz",
+                )
+        eval_rows = self._eval_rows
+        if eval_rows is None:
+            eval_rows = self._default_eval_rows()
+        for index in range(self._heldout_pool_patients):
+            split_rows.append((f"E{index:02d}", "val" if index % 2 else "test"))
+        with open(self._root / "splits.csv", "w", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["patient_uid", "split"])
+            writer.writerows(split_rows)
+        with open(self._root / "metadata.csv", "w", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=[
+                    "batch_id", "patient_uid", "study_uid", "series_id",
+                    "modality", "plane",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(metadata_rows)
+            writer.writerows(self._extra_metadata_rows)
+        with open(self._root / "eval_manifest.csv", "w", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=[
+                    "stratum", "sampling_role", "split", "batch_id",
+                    "patient_uid", "study_uid", "series_id", "modality",
+                    "plane", "array_shape", "array_spacing_mm", "array_fov_mm",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(eval_rows)
+        return self._root
+
+    def _default_eval_rows(self) -> list[dict[str, str]]:
+        """评估留出池样张：每 held-out patient 一卷（只登记清单、不落
+        影像——评估影像不进 prepare 数据域，#78/#131 口径）。"""
+        rows: list[dict[str, str]] = []
+        for index in range(self._heldout_pool_patients):
+            rows.append({
+                "stratum": "T1W/AXIAL",
+                "sampling_role": "stratified-n250",
+                "split": "val" if index % 2 else "test",
+                "batch_id": f"batch{index:02d}",
+                "patient_uid": f"E{index:02d}",
+                "study_uid": f"ES{index:02d}",
+                "series_id": "t1w-raw-axi",
+                "modality": "T1W",
+                "plane": "AXIAL",
+                "array_shape": "[256, 256, 128]",
+                "array_spacing_mm": "[1.0, 1.0, 1.0]",
+                "array_fov_mm": "[240.0, 240.0, 174.0]",
+            })
+        return rows
 
 # 组1、生产尺寸的最小合法 config（必填字段全部显式给出）
 MINIMAL_CONFIG_DICT: dict = {
