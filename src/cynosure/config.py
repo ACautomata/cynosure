@@ -62,6 +62,13 @@ UPSTREAM_RESIZE_BASE = 128
 round_number，data-preparation + ADR-0006）：生产定死值、schema 权威单一来源，
 fixture 经 fixture_mode=true 显式声明后可注入小基数替代。"""
 
+SPACING_CONDITION_SCALE: float = 1e2
+"""header zooms / 等效 spacing（mm）→ spacing 条件张量单位的换算因子
+（×1e2；policy-modeling 章「体素间距 ×1e2」的 schema 权威单一来源）。
+两臂消费共享：BraTS 臂 ``SpacingSidecar``（per-case raw zooms 侧车，
+issue #46）与 MR-RATE 臂 ``MrConditionVocabulary.spacing_condition``
+（条件属性解析面，#130，spec #125 决策 6）。"""
+
 
 class SpecField:
     """spec 配置项清单的字段声明：状态（status）+ 出处（source）标注。
@@ -1096,6 +1103,7 @@ __all__ = [
     "RewardConfig",
     "ScheduleConfig",
     "ShardingConfig",
+    "SPACING_CONDITION_SCALE",
     "SpecField",
     "UNCONDITIONAL_LABEL",
     "UPSTREAM_RESIZE_BASE",
