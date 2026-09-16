@@ -3,7 +3,11 @@
 只断言链的外部行为（spec「Testing Decisions」）：方向码 RAS（flip-only
 无轴置换）、dtype float32、强度 clip 域、dim 公式、fixture 基数注入。
 工件契约（序列分层 / 病例级不相交 / 幂等）由 prepare 端到端覆盖（Seam ②，
-tests/test_prepare.py）。spacing 侧车读取同属读图环节（issue #46）。"""
+tests/test_prepare.py）。spacing 侧车读取同属读图环节（issue #46）。
+
+强度臂与 resize 目标的域臂参数化（issue #130，#71 裁决）：BraTS 臂
+clip=True + dim 公式（默认构造，语义零改动）；MR-RATE 臂 clip=False +
+词汇表统一网格绝对目标——出链数值与形状唯一性逐条可验。"""
 
 from pathlib import Path
 
@@ -13,8 +17,10 @@ import pytest
 import torch
 from monai.data import MetaTensor
 
+from cynosure.conditions import MrConditionSpec, MrConditionVocabulary
 from cynosure.reward.preprocessing import SpacingSidecar, UpstreamPreprocessChain
 from tests.conftest import ANISOTROPIC_AFFINE, LPS_AFFINE, RAS_AFFINE
+from tests.test_condition_vocabulary import PRODUCTION_VOCAB_PATH
 
 # 各轴不等且全为 128 倍数：基数 128 的 resize 不变形状，末端形状即 RAS 后
 # 形状——若方向步发生轴置换，形状会重排，flip-only 断言由此可观测
@@ -174,3 +180,154 @@ class TestSpacingSidecar:
         """meta 无 raw header zooms（非 NIfTI 输入、读图契约破坏）显式失败。"""
         with pytest.raises(ValueError, match="zooms"):
             SpacingSidecar().read(MetaTensor(torch.zeros(1, 4, 4, 4)))
+
+
+# MR-RATE 臂测试用的生产条件（词汇表最小网格之一，整链 CPU 可负担）；
+# 期望值（网格 / spacing）在断言处独立登记——代码改词汇表登记即测出
+UNIFORM_GRID_CONDITION = "t1w/sagittal"
+UNIFORM_GRID: tuple[int, int, int] = (128, 256, 256)
+# = FOV (176, 250, 250) / 网格 (128, 256, 256) ×1e2（全部二进制精确）
+CONDITION_SPACING_X1E2: tuple[float, float, float] = (137.5, 97.65625, 97.65625)
+
+
+@pytest.fixture(scope="module")
+def mr_condition() -> MrConditionSpec:
+    """生产词汇表登记的统一网格条件（module 级装载：词汇表不可变视图）。"""
+    return MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH).by_name(
+        UNIFORM_GRID_CONDITION,
+    )
+
+
+class TestIntensityArmParametrization:
+    """强度臂按域参数化（issue #130，#71 裁决）：BraTS 臂 clip=True
+    （fork 有意偏差，默认构造）与 MR-RATE 臂 clip=False（官方口径）——
+    同一离群值输入，两臂出链数值互为反证。"""
+
+    @staticmethod
+    def _outlier_volume_path(chain_input: ChainInput) -> Path:
+        """0.1% 体素 = 100 的正态体：p99.5 落在正态尾部，离群值在百分位
+        窗口之外——窗口外高值是两臂分歧点（与既有 clip=True 测试同夹具）。"""
+        rng = np.random.default_rng(7)
+        volume = rng.standard_normal((32, 32, 32)).astype(np.float32)
+        volume[rng.random((32, 32, 32)) < 0.001] = 100.0
+        return chain_input.write("outliers.nii.gz", volume, LPS_AFFINE)
+
+    def test_mrrate_arm_keeps_beyond_window_values(
+        self, chain_input: ChainInput,
+    ) -> None:
+        """MR-RATE 臂（clip=False）：超越百分位窗口的高值线性外推 > 1.0，
+        保留不被截断（对齐真上游 scripts/transforms.py 语义）。"""
+        path = self._outlier_volume_path(chain_input)
+        image = UpstreamPreprocessChain(clip_intensity=False)(path)
+        assert image.min() >= 0.0
+        assert image.max() > 1.0
+
+    def test_brats_arm_clips_same_input(self, chain_input: ChainInput) -> None:
+        """BraTS 臂（clip=True，默认）：同一输入反证——窗口外高值封顶
+        1.0（两臂 embedding 不可互用的数值面）。"""
+        path = self._outlier_volume_path(chain_input)
+        image = UpstreamPreprocessChain()(path)
+        assert image.min() >= 0.0
+        assert image.max() <= 1.0
+
+
+class TestConditionUniformGridResample:
+    """逐条件统一网格 resample（issue #130）：MR-RATE 臂 resize 目标 =
+    词汇表登记的统一网格（RAS 轴序绝对目标），同条件任意原生形状出链
+    形状唯一——「条件 → latent 形状」契约的预处理半边。"""
+
+    @pytest.fixture
+    def mr_arm(
+        self, mr_condition: MrConditionSpec,
+    ) -> UpstreamPreprocessChain:
+        return UpstreamPreprocessChain(
+            clip_intensity=False, target_grid=mr_condition.grid_xyz,
+        )
+
+    def test_registered_grid_constant_matches_vocabulary(
+        self, mr_condition: MrConditionSpec,
+    ) -> None:
+        """对账守卫：测试独立登记的统一网格常量与词汇表登记值一致——
+        词汇表工件改登记时本文件期望值须同步复核（链目标本身的行为
+        断言见下方两个形状唯一性测试）。"""
+        assert mr_condition.grid_xyz == UNIFORM_GRID
+
+    def test_same_condition_different_native_shapes_yield_one_shape(
+        self, chain_input: ChainInput, mr_arm: UpstreamPreprocessChain,
+    ) -> None:
+        """同条件三个不同原生形状（LPS 翻转 / RAS 合规混入）出链形状
+        唯一 = 该条件统一网格。"""
+        for name, shape, affine in [
+            ("shape-a.nii.gz", (100, 180, 160), LPS_AFFINE),
+            ("shape-b.nii.gz", (96, 128, 240), RAS_AFFINE),
+            ("shape-c.nii.gz", (130, 130, 200), LPS_AFFINE),
+        ]:
+            path = chain_input.write(
+                name, chain_input.volume(shape, seed=1), affine,
+            )
+            image = mr_arm(path)
+            assert tuple(image.shape) == (1, *UNIFORM_GRID), shape
+
+    def test_axis_permuting_direction_lands_on_ras_grid(
+        self, chain_input: ChainInput, mr_arm: UpstreamPreprocessChain,
+    ) -> None:
+        """轴置换方向（MR-RATE 常见，fork issue #312 审计的坏形状来源）：
+        RAS 重定向置换存储轴后统一网格仍按 RAS 轴序落位——出链形状唯一
+        且轴码 RAS（统一网格是 RAS 轴序，绝对目标不依赖取轴口径）。"""
+        # 存储轴 x/y 指向互换（方向码 A/R/S → RAS 重定向置换前两存储轴）
+        swapped = np.array([
+            [0.0, 1.0, 0.0, 10.0],
+            [1.0, 0.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        path = chain_input.write(
+            "swapped.nii.gz", chain_input.volume((210, 96, 160), seed=2), swapped,
+        )
+        image = mr_arm(path)
+        assert tuple(nib.aff2axcodes(image.meta["affine"])) == ("R", "A", "S")
+        assert tuple(image.shape) == (1, *UNIFORM_GRID)
+
+    def test_brats_arm_dim_formula_semantics_untouched(
+        self, chain_input: ChainInput, mr_condition: MrConditionSpec,
+    ) -> None:
+        """BraTS 臂（target_grid 缺省）dim 公式语义不回归：BraTS 尺寸
+        输入照旧 256×256×128，而非词汇表统一网格。"""
+        path = chain_input.write(
+            "brats.nii.gz", chain_input.volume((240, 240, 155)), LPS_AFFINE,
+        )
+        image = UpstreamPreprocessChain()(path)
+        assert tuple(image.shape) == (1, 256, 256, 128)
+        assert mr_condition.grid_xyz != (256, 256, 128)  # 两臂目标确实不同
+
+
+class TestSpacingConditionAgainstPerCaseZooms:
+    """spacing 条件属性 vs per-case 侧车的对照（issue #130）：同条件两卷
+    携带不同 native zooms——差异真实存在于卷间（侧车可证），但 MR-RATE
+    臂的 spacing 语义值来自条件属性（FOV / 网格 ×1e2），两卷严格同值、
+    与 header zooms 无关——「不逐卷侧车」堵死 spacing 判别捷径。"""
+
+    def test_condition_spacing_identical_regardless_of_volume_zooms(
+        self, chain_input: ChainInput, mr_condition: MrConditionSpec,
+    ) -> None:
+        chain = UpstreamPreprocessChain(
+            clip_intensity=False, target_grid=mr_condition.grid_xyz,
+        )
+        per_case_sidecar_values = []
+        for name, zoom in [("volume-1.nii.gz", 0.5), ("volume-2.nii.gz", 3.0)]:
+            path = chain_input.write(
+                name,
+                chain_input.volume((128, 64, 64), seed=3),
+                np.diag([zoom, 1.0, 1.0, 1.0]),
+            )
+            # 侧车（BraTS 臂机制）读出的 per-case 值随卷而变——卷间差异
+            # 确实存在于 header
+            per_case_sidecar_values.append(SpacingSidecar().read(chain(path)))
+        assert per_case_sidecar_values[0] != per_case_sidecar_values[1]
+        # MR-RATE 臂的 spacing 语义值 = 条件属性：独立登记的 FOV/网格 ×1e2
+        # 期望值，与两卷的 header zooms 均不同（值不来自逐卷读取）
+        assert CONDITION_SPACING_X1E2 == pytest.approx(tuple(
+            fov / grid * 100.0
+            for fov, grid in zip(mr_condition.fov_mm, mr_condition.grid_xyz)
+        ))
+        assert CONDITION_SPACING_X1E2 not in per_case_sidecar_values

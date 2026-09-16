@@ -16,7 +16,12 @@ import torch
 from monai.data.utils import dense_patch_slices
 from monai.inferers.inferer import SlidingWindowInferer
 
-from cynosure.config import CynosureConfig, MODALITIES, ConfigLoader
+from cynosure.config import (
+    ConfigLoader,
+    CynosureConfig,
+    MODALITIES,
+    SPACING_CONDITION_SCALE,
+)
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward import (
@@ -27,7 +32,6 @@ from cynosure.reward import (
     SyntheticLatentEncoder,
 )
 from cynosure.reward.dataset import CaseSplitter
-from cynosure.reward.preprocessing import SPACING_CONDITION_SCALE
 from tests.conftest import (
     ANISOTROPIC_AFFINE,
     CliSession,

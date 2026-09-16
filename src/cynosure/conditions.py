@@ -22,6 +22,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cynosure.config import SPACING_CONDITION_SCALE
+
 MrPlane = Literal["axial", "sagittal", "coronal", "all-planes"]
 """生成条件的采集平面；all-planes 是 #81 读数格的并池口径（T2w 三格
 并池读数、MRA 全平面一格），ML 层面四值全域，格级允许集由词表定死。"""
@@ -352,3 +354,15 @@ class MrConditionVocabulary:
         """条件的 latent 形状 (4, X, Y, Z)：rollout 初始噪声与判别器
         输入的形状解析来源（#129 消费面）。"""
         return (LATENT_CHANNELS, *self.by_name(name).latent_grid)
+
+    def spacing_condition(self, name: str) -> tuple[float, float, float]:
+        """条件的 spacing 条件张量值（等效 spacing ×1e2，与 per-case 侧车
+        同一换算因子与条件单位）：real 侧 manifest 条目与 fake 侧 rollout
+        条件张量的同值来源（#130 消费面；spec #125 决策 6——spacing 是
+        条件属性而非逐卷侧车，值只依赖条件名，同条件任意两卷严格同值，
+        堵死「spacing 差异」判别捷径）。"""
+        i, j, k = (
+            value * SPACING_CONDITION_SCALE
+            for value in self.by_name(name).spacing_mm
+        )
+        return (i, j, k)
