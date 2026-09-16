@@ -190,6 +190,15 @@ class Artifacts(BaseModel):
         "BraTS config 携带即拒绝",
         default=None,
     )
+    source_commit: str | None = SpecField(
+        "运行时", "#121",
+        "产出 prepare 工件的代码版本标识（来源 commit）——由运行环境"
+        "（实验脚本 / CI）显式填入并随工件 provenance 落档（#121 AC2："
+        "provenance 的「来源 commit」承载；集群 rsync 部署无 .git，"
+        "不设运行时 git 自读的隐式通道）；缺省 None = 未声明，"
+        "provenance 该字段留空",
+        default=None,
+    )
 
 
 class Experiment(BaseModel):

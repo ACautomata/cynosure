@@ -68,6 +68,9 @@ class SamplingTrace:
     """逐条件 held-out 侧计数（per-condition AUC 归因的支撑留痕）。"""
     out_of_vocabulary_volumes: int
     """train split 内白名单条件域外卷数（信息性留痕，不进任何工件）。"""
+    non_train_volumes: int
+    """val/test split 的元数据卷数（评估留出池，不进 real 数据链候选；
+    生产元数据覆盖全 split 的常态——计数留痕供审计）。"""
     eval_exclusion_keys: int
     """评估集互斥守卫的 series 键基数（#78 评估清单行数）。"""
     eval_exclusion_series_hits: int
@@ -149,10 +152,10 @@ class MrRateSeriesCatalog:
         self._splits_csv = Path(splits_csv)
         self._vocabulary = vocabulary
 
-    def train_split_patients(self) -> set[str]:
-        """官方 train split 的 patient 集合（patient 级，同患者所有
-        study 同 split——mrrate-data-spec §6）。"""
-        patients: set[str] = set()
+    def split_patients(self) -> dict[str, str]:
+        """官方 splits.csv 的 patient → split 映射（patient 级，同患者
+        所有 study 同 split——mrrate-data-spec §6；值 casefold 归一）。"""
+        mapping: dict[str, str] = {}
         with open(self._splits_csv, encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             self._assert_columns(
@@ -160,14 +163,20 @@ class MrRateSeriesCatalog:
                 "官方 split",
             )
             for row in reader:
-                if row["split"].strip().casefold() == "train":
-                    patients.add(row["patient_uid"].strip())
-        if not patients:
+                mapping[row["patient_uid"].strip()] = (
+                    row["split"].strip().casefold()
+                )
+        if not mapping:
+            raise ValueError(
+                f"官方 splits.csv 无 patient 记录: {self._splits_csv}"
+                "（real 数据链的 train split 取数域为空）"
+            )
+        if "train" not in mapping.values():
             raise ValueError(
                 f"官方 splits.csv 无 train split 记录: {self._splits_csv}"
                 "（real 数据链只取官方 train split）"
             )
-        return patients
+        return mapping
 
     @staticmethod
     def _assert_columns(
@@ -182,17 +191,21 @@ class MrRateSeriesCatalog:
                 "#78 同款）"
             )
 
-    def train_candidates(self) -> tuple[list[SeriesRecord], int]:
-        """train split × 生成条件词汇表的候选域（排序后返回）+ 域外卷数。
+    def train_candidates(self) -> tuple[list[SeriesRecord], int, int]:
+        """train split × 生成条件词汇表的候选域（排序后返回）+
+        （白名单条件域外卷数, 非 train split 卷数）。
 
-        - patient 悬挂（元数据里的 patient 不在 splits.csv）→ 可读拒绝
-          （join 完整性：口径漂移与文件错版在这里暴露，不静默丢卷）；
-        - 白名单条件域外的卷（如 swi/sagittal）不进候选，计数留痕
-          （信息性，不进任何工件）。
+        - patient 悬挂（元数据里的 patient 不在 splits.csv **任何** split
+          ——join 完整性破坏，口径漂移与文件错版在这里暴露）→ 可读拒绝、
+          不静默丢卷；
+        - val/test split 的卷（评估留出池）不进 real 数据链候选，计数
+          留痕（合法常态——生产元数据覆盖全 split）；
+        - 白名单条件域外的卷（如 swi/sagittal）不进候选，计数留痕。
         """
-        patients = self.train_split_patients()
+        splits = self.split_patients()
         candidates: list[SeriesRecord] = []
         out_of_vocabulary = 0
+        non_train = 0
         with open(self._metadata_csv, encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             self._assert_columns(
@@ -201,12 +214,15 @@ class MrRateSeriesCatalog:
             )
             for row in reader:
                 patient_uid = row["patient_uid"].strip()
-                if patient_uid not in patients:
+                if patient_uid not in splits:
                     raise ValueError(
                         f"元数据卷 patient={patient_uid!r} 不在官方 "
                         f"splits.csv: {self._splits_csv}（join 完整性破坏"
                         "——元数据与 splits 错版/口径漂移，拒绝装配）"
                     )
+                if splits[patient_uid] != "train":
+                    non_train += 1  # 评估留出池卷：不进 real 数据链候选
+                    continue
                 modality = row["modality"].strip()
                 plane = row["plane"].strip()
                 condition = self._vocabulary.resolve_condition(modality, plane)
@@ -222,7 +238,7 @@ class MrRateSeriesCatalog:
                     condition=condition,
                 ))
         candidates.sort(key=SeriesRecord.sort_key)
-        return candidates, out_of_vocabulary
+        return candidates, out_of_vocabulary, non_train
 
     def split_sizes(self) -> dict[str, int]:
         """官方三分的 patient 数全貌（manifest split_sizes 留痕）。"""
@@ -336,6 +352,15 @@ class MrRateAssembly:
     ) -> None:
         self._config = config
         self._vocabulary = vocabulary
+        unknown_quota = sorted(
+            set(config.reward.real_pool_quota) - set(vocabulary.names()),
+        )
+        if unknown_quota:
+            raise ValueError(
+                f"real_pool_quota 含词汇表外的条件键 {unknown_quota}：拼错的"
+                "条件名会被静默忽略（该条件全量不设限，与「显式错误值即拒」"
+                f"哲学不符）；在册条件: {list(vocabulary.names())}"
+            )
         self._catalog = MrRateSeriesCatalog(
             config.artifacts.mrrate_metadata_csv,
             config.artifacts.mrrate_splits_csv,
@@ -347,7 +372,9 @@ class MrRateAssembly:
         )
 
     def plan(self) -> AssemblyPlan:
-        candidates, out_of_vocabulary = self._catalog.train_candidates()
+        candidates, out_of_vocabulary, non_train = (
+            self._catalog.train_candidates()
+        )
         if not candidates:
             raise ValueError(
                 "train split 候选域为空（元数据 × 官方 split × 生成条件"
@@ -370,6 +397,7 @@ class MrRateAssembly:
             census_quota_taken=self._census(pool_selected),
             heldout_counts=self._census(heldout_records),
             out_of_vocabulary_volumes=out_of_vocabulary,
+            non_train_volumes=non_train,
             eval_exclusion_keys=exclusion_keys,
             eval_exclusion_series_hits=series_hits,
             eval_exclusion_patient_hits=patient_hits,

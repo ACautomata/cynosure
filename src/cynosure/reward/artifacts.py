@@ -167,7 +167,8 @@ class LatentManifest(BaseModel):
         条件全集，prepare 装配期传入；缺省 = 计数表键集——0 条件不在
         表内的全量口径由调用方决定）。"""
         required = batch_size_k * world_size
-        if self.conditions:  # MR-RATE 域：逐条件
+        is_mr_rate = bool(self.conditions)
+        if is_mr_rate:  # MR-RATE 域：逐条件
             keys = (
                 expected_keys if expected_keys is not None
                 else tuple(sorted(self.conditions))
@@ -181,13 +182,17 @@ class LatentManifest(BaseModel):
         ]
         if starved:
             detail = ", ".join(f"{key}×{count}" for key, count in starved)
+            scope = "逐条件" if is_mr_rate else "逐模态"
+            hint = (
+                "增大 real pool 配额" if is_mr_rate else "增大 real pool"
+            )
             raise ValueError(
-                f"Real sample pool 容量不足：逐条件 real 容量须 ≥ "
+                f"Real sample pool 容量不足：{scope} real 容量须 ≥ "
                 f"disc_batch_size_k={batch_size_k} × world_size={world_size}"
                 f" = {required} 条（条件匹配采样后每 rank 独立供满无放回 "
                 "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
                 f"不变，不引入有放回采样补洞）；不足: {detail}。"
-                "增大 real pool 配额（或减小 disc_batch_size_k / 切片路数）"
+                f"{hint}（或减小 disc_batch_size_k / 切片路数）"
             )
 
     def expected_shape(self, entry: PoolEntry) -> tuple[int, int, int, int]:
@@ -311,6 +316,9 @@ class PrepareProvenance(BaseModel):
     data_snapshot: str | None = None
     """数据 release 快照标识（MR-RATE = 与评估集 #78 同一冻结快照；
     BraTS 线 None）。"""
+    source_commit: str | None = None
+    """来源 commit（产出工件的代码版本标识，config 显式声明注入；None =
+    未声明——集群 rsync 部署无 .git，不设运行时自读的隐式通道）。"""
     intensity_clip: bool
     """强度臂口径（BraTS True = ADR-0006 fork 锚；MR-RATE False = NVIDIA
     v1 官方口径，#71/#130 裁决）。"""
@@ -413,6 +421,9 @@ class SamplingManifest(BaseModel):
     """逐条件 held-out 侧计数（per-condition AUC 归因的支撑留痕）。"""
     out_of_vocabulary_volumes: int
     """train split 内白名单条件域外卷数（信息性留痕，不进任何工件）。"""
+    non_train_volumes: int = 0
+    """val/test split 的元数据卷数（评估留出池，不进 real 数据链候选；
+    生产元数据覆盖全 split 的常态——计数留痕供审计）。"""
     eval_exclusion_keys: int
     """评估集互斥守卫的 series 键基数（#78 评估清单行数）。"""
     eval_exclusion_series_hits: int

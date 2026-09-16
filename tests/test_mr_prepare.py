@@ -44,8 +44,10 @@ class MrPrepareScenario:
         *,
         train_patients: int = 6,
         eval_rows: list[dict[str, str]] | None = None,
+        extra_metadata_rows: list[dict[str, str]] | None = None,
         quota: dict[str, int] | None = None,
         heldout_fraction: float | None = None,
+        source_commit: str | None = None,
     ) -> CynosureConfig:
         fixtures_dir = self.work_dir / "fixtures"
         Fixture().write_condition_vocabulary(fixtures_dir)
@@ -54,11 +56,14 @@ class MrPrepareScenario:
             config.reward.real_pool_quota = quota
         if heldout_fraction is not None:
             config.reward.heldout_fraction = heldout_fraction
+        if source_commit is not None:
+            config.artifacts.source_commit = source_commit
         self._write_config(config)
         dataset = SyntheticMrRateDataset(
             config.artifacts.dataset_root,
             train_patients=train_patients,
             eval_rows=eval_rows,
+            extra_metadata_rows=extra_metadata_rows,
         )
         dataset.write()
         return config
@@ -119,6 +124,8 @@ class TestFixtureFullChain:
         assert stats.provenance.intensity_clip is False
         assert stats.provenance.resize_semantics == "uniform-grid"
         assert stats.provenance.data_snapshot == "fixture-snapshot"
+        # 未声明 source_commit（config 默认 None）→ 字段留空而非报错
+        assert stats.provenance.source_commit is None
         assert stats.num_latents == 8
         # 抽样留痕（#131）：互斥守卫读数落档、逐卷归属齐备
         sampling = SamplingManifest.model_validate(
@@ -251,6 +258,83 @@ class TestFixtureFullChain:
         result = mr_scenario.run_with_config(config)
         assert result.code == 2
         assert "影像缺失" in result.stderr
+
+    def test_non_train_split_metadata_volumes_skipped(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """生产形态：元数据覆盖全 split——val/test 患者卷是评估留出池，
+        不进 real 数据链候选（join 悬挂判定按 splits **全集**，非 train
+        集），计数留痕供审计；候选域不被污染、装配照常成功。"""
+        extra_rows = [
+            {
+                "batch_id": "batch90", "patient_uid": "E00",
+                "study_uid": "ES00", "series_id": "t1w-raw-axi",
+                "modality": "T1W", "plane": "AXIAL",
+            },
+            {
+                "batch_id": "batch91", "patient_uid": "E01",
+                "study_uid": "ES01", "series_id": "flair-raw-axi",
+                "modality": "FLAIR", "plane": "AXIAL",
+            },
+        ]
+        result = mr_scenario.run(extra_metadata_rows=extra_rows)
+        assert result.code == 0, result.stderr
+        config = CynosureConfig.model_validate_json(
+            mr_scenario.config_path.read_text(encoding="utf-8"),
+        )
+        sampling = SamplingManifest.model_validate(json.loads(
+            Path(config.reward.sampling_manifest_json).read_text(
+                encoding="utf-8",
+            ),
+        ))
+        assert sampling.non_train_volumes == 2
+        assert sampling.census_candidates == {
+            "t1w/axial": 6, "flair/axial": 6,
+        }
+        pool = LatentManifest.load(
+            config.reward.real_pool_manifest, "real_pool",
+        )
+        assert pool.conditions == {"t1w/axial": 4, "flair/axial": 4}
+
+    def test_dangling_patient_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """元数据 patient 不在 splits.csv 任何 split → join 完整性破坏，
+        可读拒绝（不静默丢卷）。"""
+        extra_rows = [
+            {
+                "batch_id": "batch99", "patient_uid": "ZZZ",
+                "study_uid": "ZS00", "series_id": "t1w-raw-axi",
+                "modality": "T1W", "plane": "AXIAL",
+            },
+        ]
+        result = mr_scenario.run(extra_metadata_rows=extra_rows)
+        assert result.code == 2
+        assert "不在官方" in result.stderr
+
+    def test_unknown_quota_key_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """配额键拼错条件名（词汇表外）→ 装配期可读拒绝：静默忽略等于
+        该条件全量不设限，与「显式错误值即拒」哲学不符。"""
+        result = mr_scenario.run(
+            quota={"t1w/axial": 8, "t1w/axiall": 8},
+        )
+        assert result.code == 2
+        assert "词汇表外" in result.stderr
+
+    def test_source_commit_recorded_in_provenance(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """provenance 的来源 commit（#121 AC2）：config 显式声明的代码
+        版本标识随工件落档（未声明路径的留空断言见 full_chain 场景）。"""
+        result = mr_scenario.run(source_commit="deadbeef")
+        assert result.code == 0, result.stderr
+        config = CynosureConfig.model_validate_json(
+            mr_scenario.config_path.read_text(encoding="utf-8"),
+        )
+        stats = ChannelStats.load(config.reward.channel_stats_json)
+        assert stats.provenance.source_commit == "deadbeef"
 
     def test_heldout_patient_level_disjoint(
         self, mr_scenario: MrPrepareScenario,

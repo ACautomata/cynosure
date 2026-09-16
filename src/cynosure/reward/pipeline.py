@@ -294,6 +294,7 @@ class PreparePipeline:
             census_quota_taken=trace.census_quota_taken,
             heldout_counts=trace.heldout_counts,
             out_of_vocabulary_volumes=trace.out_of_vocabulary_volumes,
+            non_train_volumes=trace.non_train_volumes,
             eval_exclusion_keys=trace.eval_exclusion_keys,
             eval_exclusion_series_hits=trace.eval_exclusion_series_hits,
             eval_exclusion_patient_hits=trace.eval_exclusion_patient_hits,
@@ -459,6 +460,7 @@ class PreparePipeline:
             provenance = PrepareProvenance(
                 dataset=self._config.experiment.dataset,
                 data_snapshot=self._config.artifacts.mrrate_data_snapshot,
+                source_commit=self._config.artifacts.source_commit,
                 intensity_clip=self._config.preprocessing.intensity_clip,
                 resize_semantics="uniform-grid",
                 upstream_anchor=(

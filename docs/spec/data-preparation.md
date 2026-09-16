@@ -59,7 +59,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 
 ### 装配流程（`MrRateAssembly.plan()`，四步全确定性）
 
-1. **候选域**：series 级元数据 CSV × 官方 patient 级 splits CSV join（train split；patient 悬挂 = 元数据/splits 错版，可读拒绝）× 条件词汇表归属解析（`MrConditionVocabulary.resolve_condition`；MRA 全平面单格、SWI 仅 axial 在词汇，域外卷计数留痕不进工件）。
+1. **候选域**：series 级元数据 CSV × 官方 patient 级 splits CSV join（悬挂判定按 splits **全集**——元数据患者不在任何 split = join 完整性破坏、可读拒绝；val/test split 卷是评估留出池、不进 real 数据链候选、计数留痕；生产元数据覆盖全 split 是常态）× 条件词汇表归属解析（`MrConditionVocabulary.resolve_condition`；MRA 全平面单格、SWI 仅 axial 在词汇，域外卷计数留痕不进工件）。
 2. **评估集互斥硬守卫**（#131 AC2）：候选域对 #78 评估清单（`artifacts.eval_manifest_csv`）做 series 键（study_uid + series_id）与 patient 集合双粒度零交集校验——任一命中即 fail-fast（官方 split 下 train 与 val/test 天然不相交，守卫防口径漂移静默吃掉互斥性）。守卫读数（键基数、命中数恒 0）随抽样 manifest 落档。
 3. **held-out 二分**（train split 内 patient 级，#73 原则/#121 AC3）：候选 patients 排序 + seed 洗牌 + 按 `reward.heldout_fraction` 切出 held-out 侧（同 patient 全部卷同侧 = 病例级不相交）；与评估留出池（官方 val+test）的不相交由 train split 边界 + 互斥守卫共同保证。held-out 池为空显式拒绝（失去 out-of-sample 信号语义）。
 4. **逐条件配额抽样**（pool 侧，#78 抽样机制同款）：条件内排序 + seed 洗牌 + 截取 `reward.real_pool_quota` 上限（头部模态各数千条、MRA 全量 ≈ 110 的登记形态；候选不足取全量，配额是上限非硬指标）。同 seed 重跑抽样 manifest 逐字节零漂移。
@@ -67,7 +67,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 ### 工件契约（分层键泛化）
 
 - **Real sample pool / Held-out real manifest**（`LatentManifest` 泛化，可扩不改名）：MR-RATE 域条目带 `condition`（11 格名；BraTS 条目带 `modality`——恰一非空）、卷键 = `<study_uid>/<series_id>`、`conditions` 逐条件计数 + `condition_shapes` 逐条件 latent 形状登记（单一 `latent_shape` 恒 None——异形状的对照表）、spacing = 条件属性值。可被 reward 数据管线既有契约装载（`LatentManifest.load` + `RealPoolSampler.sample(condition=...)` 条件匹配采样——同条件同形，批 stack 前提）。
-- **per-channel 统计量**（#121 AC2）：MR-RATE pool 重算（异形状不影响 per-channel 归约），随工件落 `provenance`（数据域、release 快照 `artifacts.mrrate_data_snapshot`、强度臂 clip、resize 口径 = uniform-grid、上游锚 = NVIDIA v1 clip=False）。
+- **per-channel 统计量**（#121 AC2）：MR-RATE pool 重算（异形状不影响 per-channel 归约），随工件落 `provenance`（数据域、release 快照 `artifacts.mrrate_data_snapshot`、来源 commit `artifacts.source_commit`（运行环境显式声明注入）、强度臂 clip、resize 口径 = uniform-grid、上游锚 = NVIDIA v1 clip=False）。
 - **配额抽样留痕**（`SamplingManifest`，`reward.sampling_manifest_json`）：seed / 快照 / 配额 / 逐条件候选与实抽计数 / pool 与 held-out 逐卷归属（patient/study/series/modality/plane/condition/role）/ 互斥守卫读数——prepare 幂等与 held-out 互斥的「落档可查」登记面。
 - **容量装配守卫**（ADR-0008-03 口径，#121 AC5）：逐（条件, 全量）容量 ≥ `disc_batch_size_k × world_size`（条件全集 = 词汇表 11 格，稀疏模态小池触发口径——任一条件不足即装配期可读拒绝，开工前失败而非训练中途）。守卫落在 manifest **落盘之前**：失败时盘上 manifest 明确缺失（latents 已写但无索引指向），维持「要么全量一致、要么明确缺失」的工件契约。train 装配期的同款守卫（rank 切片口径）语义不变。
 
