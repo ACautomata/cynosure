@@ -31,11 +31,11 @@ from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.pretrain import (
-    PretrainDriver,
     PretrainProvenance,
     PretrainReport,
     PretrainRun,
 )
+from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate

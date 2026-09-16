@@ -32,7 +32,7 @@ per-condition EMA 状态经 ``state``/``adopt`` 与 ResumeStore 对接
 import math
 from dataclasses import dataclass
 
-from cynosure.config import MODALITIES, Modality, RewardConfig
+from cynosure.config import RewardConfig
 
 
 @dataclass(frozen=True)
@@ -114,14 +114,17 @@ class OverfitMonitor:
     键，恢复逐位复原）。
     """
 
-    def __init__(self, config: RewardConfig) -> None:
+    def __init__(
+        self, config: RewardConfig, conditions: tuple[str, ...],
+    ) -> None:
         self._threshold = config.overfit_alert_divergence
-        self._ema: dict[Modality, DivergenceEma] = {}
+        self._ema: dict[str, DivergenceEma] = {}
         self._span = config.overfit_ema_span
+        self._conditions = tuple(conditions)
 
     def observe(
         self,
-        modality: Modality,
+        modality: str,
         *,
         train_pairwise_acc: float,
         heldout_auc: float,
@@ -171,9 +174,9 @@ class OverfitMonitor:
         ema_raw = state["ema"]
         if not isinstance(ema_raw, dict):
             raise ValueError(f"分叉监控状态 EMA 清单形态非法: {type(ema_raw)}")
-        restored: dict[Modality, DivergenceEma] = {}
+        restored: dict[str, DivergenceEma] = {}
         for modality, entry in ema_raw.items():
-            if modality not in MODALITIES:
+            if self._conditions and modality not in self._conditions:
                 raise ValueError(f"分叉监控状态 EMA 含非法条件: {modality!r}")
             if not isinstance(entry, dict) or set(entry) != {"value", "count"}:
                 raise ValueError(
@@ -197,7 +200,7 @@ class OverfitMonitor:
             restored[modality] = tracker
         self._ema = restored
 
-    def _tracker(self, modality: Modality) -> DivergenceEma:
+    def _tracker(self, modality: str) -> DivergenceEma:
         """该条件的 EMA 观测器（懒建：未观测条件不预置条目——落盘形态
         与「在线流从 run 起步」语义一致）。"""
         if modality not in self._ema:

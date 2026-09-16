@@ -394,11 +394,16 @@ class TestFixtureVocabularyChannel:
         )
         assert len(vocab.conditions) == 2
         assert {c.plane for c in vocab.conditions} == {"axial"}
-        # fixture 网格缩小（latent [4,16,16,8] 同口径）但与 fixture 全局
-        # latent 形状一致
-        for condition in vocab.conditions:
-            assert condition.grid_xyz == (64, 64, 32)
-            assert vocab.latent_shape(condition.name) == (4, 16, 16, 8)
+        # fixture 网格异形状（#129 全链验收的输入面）：t1w = [64,64,32]
+        # （latent (4,16,16,8) = fixture 全局形状）；flair = [32,32,64]
+        # （薄厚轴互换，latent (4,8,8,16)、锚 1024 ≠ 2048）
+        t1w = vocab.by_name("t1w/axial")
+        flair = vocab.by_name("flair/axial")
+        assert t1w.grid_xyz == (64, 64, 32)
+        assert vocab.latent_shape("t1w/axial") == (4, 16, 16, 8)
+        assert flair.grid_xyz == (32, 32, 64)
+        assert vocab.latent_shape("flair/axial") == (4, 8, 8, 16)
+        assert vocab.latent_numel("flair/axial") == 1024
 
     def test_fixture_tokens_match_production(self, tmp_path: Path) -> None:
         """fixture 文档值与生产工件交叉对账（两处登记不漂移）。"""
@@ -449,3 +454,33 @@ class TestFixtureVocabularyChannel:
         brats_config = fixture.config(tmp_path / "fixtures")
         assert brats_config.experiment.dataset == "BraTS2023"
         assert brats_config.artifacts.condition_vocabulary_json is None
+
+
+class TestLatentNumelPerCondition:
+    """数值锚逐条件派生面（#129）：sigma 日程锚 = 该条件空间 numel，
+    从条件词汇表单一派生入口消费（装载期与运行时同一锚语义，防日程
+    静默错位）。"""
+
+    def test_latent_numel_matches_spatial_numel(self) -> None:
+        vocab = MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
+        for condition in vocab.conditions:
+            shape = vocab.latent_shape(condition.name)
+            assert vocab.latent_numel(condition.name) == (
+                shape[1] * shape[2] * shape[3]
+            )
+
+    def test_conditions_have_multiple_distinct_anchors(self) -> None:
+        """生产词表的条件锚不止一种值（11 期望网格下 numel 有碰撞——
+        如 t1w/axial 与 t1w/sagittal 同为 131072——但绝不止一个值）：
+        逐条件锚校验的输入面真实存在，不是「单一锚换名」。"""
+        vocab = MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
+        anchors = {
+            vocab.latent_numel(condition.name)
+            for condition in vocab.conditions
+        }
+        assert len(anchors) > 1
+
+    def test_numel_unknown_condition_rejected(self) -> None:
+        vocab = MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
+        with pytest.raises(KeyError, match="not-in-vocabulary"):
+            vocab.latent_numel("not-in-vocabulary")

@@ -51,11 +51,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from cynosure.config import MODALITIES, ConfigLoader, Modality
+from cynosure.config import ConfigLoader
 from cynosure.distributed import DistributedContext
 from cynosure.reward.buffer import ReplayEntry
 
 if TYPE_CHECKING:
+    from cynosure.conditions import ConditionVocabulary
     from cynosure.config import CynosureConfig
     from cynosure.train.trainer import GranularGrpoTrainer
 
@@ -72,7 +73,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 6
+RESUME_STATE_FORMAT_VERSION = 7
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -90,7 +91,13 @@ v5：generators 清单 + ``disc_noise`` 流（ADR-0009-α 判别器训练期噪�
 v6：+ 过拟合分叉监控状态（ADR-0009-β）——per-condition 分叉 EMA 随
 分片落盘，恢复逐位复原（分叉 EMA 进 iter 事件、进续训 roundtrip 的
 逐位轨迹比对，状态不落盘即恢复后的指标流与告警序列失真）；旧 v5
-分片无该状态可回填，被版本对账显式拒绝。"""
+分片无该状态可回填，被版本对账显式拒绝。
+v7：replay buffer 两区 latents 从单一堆叠张量改为逐条目张量清单
+（#129「latent 形状按条件贯通」的存储侧）——异形状条件（MR-RATE
+多条件）的 buffer 条目形状随条件、无法堆叠成单张量；恢复对账逐
+条目经词汇表按条件校验形状（批内同条件即同形状）。旧 v6 分片的
+堆叠形态在异形状下无从表达、在同形状下与 v7 语义等价但形态不同，
+被版本对账显式拒绝（续训 roundtrip 的逐位一致以单一形态为锚）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -368,12 +375,15 @@ class ResumeStore:
     def _capture_zone(
         entries: list[ReplayEntry],
     ) -> dict[str, Any] | None:
-        """单分区落盘形态：latents 按区内序堆叠 + 逐条目目标模态标签
-        （空分区 = None；weights_only 兼容的 Tensor/list[str] 原语）。"""
+        """单分区落盘形态：latents 按区内序的**逐条目张量清单** + 逐
+        条目目标条件标签（空分区 = None；weights_only 兼容的
+        Tensor/list[str] 原语）。v7（#129）：逐条张量替代 v6 的单一
+        堆叠——异形状条件的条目形状随条件、堆叠不成立；同形状（BraTS
+        单域）下逐条清单与堆叠逐位等价。"""
         if not entries:
             return None
         return {
-            "latents": torch.stack([entry.latent for entry in entries]),
+            "latents": [entry.latent for entry in entries],
             "modalities": [entry.modality for entry in entries],
         }
 
@@ -451,32 +461,38 @@ class ResumeStore:
     def _restore_buffer(
         self, trainer: "GranularGrpoTrainer", saved: dict,
     ) -> None:
-        """buffer 两区内容恢复（v3：分区为 {latents, modalities} 成对
-        清单）：base 按固定容量严格对账后整体回填，recent 按连续同标签
-        段重放——逐段 push 与落盘时的整批 push 在 FIFO 序上等价（段内
-        插入序保持，段间序保持），恢复后两区内容与落盘逐位一致；恢复后
-        两区占用必须与落盘一致（容量漂移在显式错误处暴露，不静默截断）。"""
+        """buffer 两区内容恢复（v7：分区为逐条目 {latents, modalities}
+        成对清单——异形状条件的持久化形态，#129）：base 按固定容量严格
+        对账后整体回填，recent 按连续同标签段重放——逐段 push 与落盘时
+        的整批 push 在 FIFO 序上等价（段内插入序保持，段间序保持），
+        恢复后两区内容与落盘逐位一致；恢复后两区占用必须与落盘一致
+        （容量漂移在显式错误处暴露，不静默截断）。逐条目形状对账经
+        词汇表按条件校验（批内同条件即同形状；BraTS 单域 = 全局形状
+        特例）。"""
         buffer = trainer.rewards.buffer
-        expected_shape = tuple(trainer.config.latent_shape)
+        vocabulary = trainer.runtime.rollout.vocabulary
         base = saved["base"]
         if base is None:
-            raise ValueError("续训状态 base 分区缺失（v3 分片 base 须非空）")
+            raise ValueError("续训状态 base 分区缺失（v3+ 分片 base 须非空）")
         latents, modalities = self._validate_zone(
-            "base", base, expected_shape,
+            "base", base, vocabulary,
         )
-        if latents.shape[0] != buffer.base_capacity:
+        if len(latents) != buffer.base_capacity:
             raise ValueError(
-                f"续训状态 base 分区（{tuple(latents.shape)}）与 buffer 容量 "
-                f"{buffer.base_capacity} × latent {expected_shape} 不符"
+                f"续训状态 base 分区（{len(latents)} 条）与 buffer 容量 "
+                f"{buffer.base_capacity} 不符"
             )
-        buffer.fill_base(latents.to(trainer.device), modalities)
+        buffer.fill_base(
+            [latent.to(trainer.device) for latent in latents],
+            modalities,
+        )
         recent_count = 0
         recent = saved["recent"]
         if recent is not None:
             recent_latents, recent_modalities = self._validate_zone(
-                "recent", recent, expected_shape,
+                "recent", recent, vocabulary,
             )
-            recent_count = recent_latents.shape[0]
+            recent_count = len(recent_latents)
             # 连续同标签段重放：生产 push 是逐 iteration 整批单条件，
             # 同标签连续段合并 push 与逐批 extend 在 FIFO 序上等价——
             # 恢复后的 recent 内部序与落盘逐位一致（采样消耗 randperm
@@ -490,7 +506,12 @@ class ResumeStore:
                 ):
                     end += 1
                 buffer.push(
-                    recent_latents[index:end].to(trainer.device),
+                    torch.stack(
+                        [
+                            latent.to(trainer.device)
+                            for latent in recent_latents[index:end]
+                        ],
+                    ),
                     recent_modalities[index],
                 )
                 index = end
@@ -500,33 +521,47 @@ class ResumeStore:
 
     @staticmethod
     def _validate_zone(
-        name: str, zone: dict, expected_shape: tuple[int, ...],
-    ) -> tuple[torch.Tensor, list[Modality]]:
-        """v3 分区清单的输入契约：{latents, modalities} 成对、逐行
-        对齐、标签合法（Modality 取值域——返回值可直接交 fill_base 的
-        Sequence[Modality] 形参）。"""
+        name: str, zone: dict, vocabulary: "ConditionVocabulary",
+    ) -> tuple[list[torch.Tensor], list[str]]:
+        """v7 分区清单的输入契约：{latents, modalities} 成对（latents 为
+        逐条目张量清单——异形状条件的持久化形态）、逐行对齐、标签合法
+        （本域条件集——词汇表装载面的取值域）、逐条目形状与该条件词汇
+        表形状一致（批内同条件即同形状；返回值可直接交 fill_base /
+        push 的消费面）。"""
         if not isinstance(zone, dict) or set(zone) != {"latents", "modalities"}:
             raise ValueError(
-                f"续训状态 {name} 分区形态非法（v3 须为 {{latents, modalities}}）: "
+                f"续训状态 {name} 分区形态非法（v7 须为 {{latents, modalities}}）: "
                 f"{sorted(zone) if isinstance(zone, dict) else type(zone)}"
             )
         latents = zone["latents"]
         modalities = zone["modalities"]
-        if tuple(latents.shape[1:]) != expected_shape:
+        if not isinstance(latents, list) or any(
+            not isinstance(latent, torch.Tensor) for latent in latents
+        ):
             raise ValueError(
-                f"续训状态 {name} 分区形状 {tuple(latents.shape)} 与 latent "
-                f"{expected_shape} 不符"
+                f"续训状态 {name} 分区 latents 须为逐条目张量清单（v7 形态，"
+                f"异形状条件可持久化）: {type(latents)}"
             )
-        if len(modalities) != latents.shape[0]:
+        if len(modalities) != len(latents):
             raise ValueError(
                 f"续训状态 {name} 分区标签清单 {len(modalities)} 条与样本数 "
-                f"{latents.shape[0]} 条不符"
+                f"{len(latents)} 条不符"
             )
-        unknown = [m for m in modalities if m not in MODALITIES]
+        allowed = set(vocabulary.names())
+        unknown = [m for m in modalities if m not in allowed]
         if unknown:
             raise ValueError(
-                f"续训状态 {name} 分区含非法目标模态标签: {sorted(set(unknown))}"
+                f"续训状态 {name} 分区含非法目标条件标签: {sorted(set(unknown))}"
+                f"（本域条件集：{sorted(allowed)}）"
             )
+        for index, (latent, modality) in enumerate(zip(latents, modalities)):
+            expected = vocabulary.latent_shape(modality)
+            if tuple(latent.shape) != expected:
+                raise ValueError(
+                    f"续训状态 {name} 分区第 {index} 条形状 "
+                    f"{tuple(latent.shape)} 与该条件（{modality!r}）词汇表"
+                    f"形状 {expected} 不符（批内同条件即同形状，#129）"
+                )
         return latents, modalities
 
     def _restore_generators(

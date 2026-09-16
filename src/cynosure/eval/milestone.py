@@ -126,41 +126,62 @@ class MilestoneEvaluator:
     def evaluate(self) -> MilestoneMetrics:
         """当前 policy 的里程碑度量（条目前缀 K 条，与 Baseline 同 seed 同条件）。
 
-        距离按**目标序列分层**计算再宏平均（fid/kid = 各 target 距离的
+        距离按**目标条件分层**计算再宏平均（fid/kid = 各 target 距离的
         算术均值）：条件模型若忽略/交换模态标签而保持总体混合比例，
         全池聚合距离下 FID/KID 可以依旧好看——分层后每个 target 的合成
         分布对该 **target 自己**的参照分布计距，坍缩在主判据上直接
         可见；分层值本身随 ``criteria_summary`` 落盘（``fid_target_``
-        / ``kid_target_`` 前缀）。"""
+        / ``kid_target_`` 前缀）。
+
+        异形状批组织（#129）：条目按目标条件分组——组内同条件即同
+        形状，合成侧分组解码（cat 仅同条件批内发生）、参照侧分组
+        stack、读数逐条件产出；「里程碑评测按条件产出读数」在异形状
+        下是批组织的结构前提而非仅是统计口径。"""
         entries = self._manifest.entries_for_stage(self._stage)[
             : self._config.schedule.milestone_eval_samples
         ]
         samples = self._latent_sampler.sample(entries)
-        synthetic = self._decode(samples)  # [K, 1, X, Y, Z]
-        reference = torch.stack([
-            self._reals.volume(self._reference_case(sample), sample.target)
-            for sample in samples
-        ]).to(self._device).unsqueeze(1)  # [K, 1, X, Y, Z]（与合成侧同形，逐例对齐）
-        if reference.shape != synthetic.shape:
-            raise ValueError(
-                f"参照体栈 {tuple(reference.shape)} 与合成体栈 "
-                f"{tuple(synthetic.shape)} 形状不一致——两侧必须在同一影像"
-                f"空间（生产参照须经 prepare 预处理到模型影像空间后入参照"
-                f"库；dataset_root 原生 NIfTI 直读不构成对齐参照）"
+        groups: dict[str, list[EntrySample]] = {}
+        for sample in samples:
+            groups.setdefault(sample.target, []).append(sample)
+        per_target: dict[str, PlaneMetrics] = {}
+        decoded_groups: dict[str, torch.Tensor] = {}
+        for target, group in sorted(groups.items()):
+            synthetic = self._decode(group)  # [k, 1, X, Y, Z]（组内同形）
+            reference = torch.stack([
+                self._reals.volume(self._reference_case(sample), sample.target)
+                for sample in group
+            ]).to(self._device).unsqueeze(1)  # 与合成侧同形、逐例对齐
+            if reference.shape != synthetic.shape:
+                raise ValueError(
+                    f"目标条件 {target}: 参照体栈 {tuple(reference.shape)} 与"
+                    f"合成体栈 {tuple(synthetic.shape)} 形状不一致——两侧必须"
+                    "在同一影像空间（生产参照须经 prepare 预处理到模型影像"
+                    "空间后入参照库；dataset_root 原生 NIfTI 直读不构成对齐"
+                    "参照）"
+                )
+            decoded_groups[target] = synthetic
+            per_target[target] = self._plane_metrics(
+                synthetic[:, 0], reference[:, 0],
             )
-
-        positions: dict[str, list[int]] = {}
-        for position, sample in enumerate(samples):
-            positions.setdefault(sample.target, []).append(position)
-        per_target = {
-            target: self._plane_metrics(
-                synthetic[indices, 0], reference[indices, 0],
-            )
-            for target, indices in sorted(positions.items())
-        }
         macro = self._macro_average(per_target)
         ssim = mae = psnr = None
         if self._is_cross_modal:
+            # 组2 仅 BraTS 单域（各条件同形）：分组解码结果按**条目原序**
+            # 回排后整体配对——按条件名序 cat 会把 synthetic 行序重排
+            # （manifest 条目目标交错、轮转序非名字典序），与按 manifest
+            # 序 stack 的参照栈逐位错位（SSIM/MAE/PSNR 配错对）
+            row_of: dict[str, int] = {}
+            synthetic_rows: list[torch.Tensor] = []
+            for sample in samples:
+                row = row_of.get(sample.target, 0)
+                row_of[sample.target] = row + 1
+                synthetic_rows.append(decoded_groups[sample.target][row])
+            synthetic = torch.stack(synthetic_rows)
+            reference = torch.stack([
+                self._reals.volume(self._reference_case(sample), sample.target)
+                for sample in samples
+            ]).to(self._device).unsqueeze(1)
             ssim, mae, psnr = VolumePairFidelity().score(synthetic, reference)
         return MilestoneMetrics(
             fid=macro.fid, kid=macro.kid,

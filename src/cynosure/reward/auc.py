@@ -23,7 +23,6 @@ from dataclasses import dataclass
 
 import torch
 
-from cynosure.config import Modality
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer
@@ -124,21 +123,21 @@ class HeldOutAuc:
             for start in range(0, latents.shape[0], self.SCORE_CHUNK)
         ]).flatten()
 
-    def _pool_size(self, modality: Modality | None) -> int:
+    def _pool_size(self, modality: str | None) -> int:
         """该条件的 held-out 条目数（按条件过滤；None = 全池）。"""
         return (
             self._manifest.modalities.get(modality, 0)
             if modality is not None else self._real_sampler.size
         )
 
-    def condition_volume_count(self, modality: Modality) -> int:
+    def condition_volume_count(self, modality: str) -> int:
         """该条件的 held-out 卷数（条目数；装配守卫的查询面——预训练
         per-condition 轮转要求条件集每条件 held-out 非空，缺条目的
         条件在装配期显式拒绝而非首步测量时才炸，ADR-0008-04）。"""
         return self._pool_size(modality)
 
     def compute(
-        self, fake_latents: torch.Tensor, modality: Modality | None = None,
+        self, fake_latents: torch.Tensor, modality: str | None = None,
     ) -> float:
         """当前 fake 批 vs held-out real 的 patch 级 AUC。
 
@@ -163,7 +162,7 @@ class HeldOutAuc:
         return self.auc_from_scores(real_scores, fake_scores)
 
     def compute_volume_clusters(
-        self, fake_latents: torch.Tensor, modality: Modality | None = None,
+        self, fake_latents: torch.Tensor, modality: str | None = None,
     ) -> VolumeScoreClusters:
         """卷级分数聚类观测面（ADR-0008-02）：每卷一组 patch 分数 +
         fake 侧全量分数。

@@ -40,6 +40,7 @@ policy 的采样分布必须**逐组复刻基座（NV-Generate-CTMR 各阶段推
 
 - MONAI `RFlowScheduler` **无 sigma 数组**，全程 timestep 域 0..1000（1000=纯噪声）；噪声水平 **`s = t/1000`**（前向加噪 `x_t = (1−s)·x0 + s·noise`，速度目标 `v = x0 − noise`）。
 - `set_timesteps(num_inference_steps=30, input_img_size_numel=131072)`，`use_timestep_transform=true`——SD3 式 timestep transform 在 MONAI 内部触发，ratio 由 latent 尺寸决定（`(131072/32³)^(1/3) ≈ 1.587`）。
+- **数值锚逐条件（#129）**：锚语义不变（锚 = 采样体的空间 numel），组织逐条件化——BraTS 单域 = 全局锚 131072（单条件词汇特例）；MR-RATE 逐条件锚 = 词汇表该条件空间 numel（`ConditionVocabulary.latent_numel`），与 rollout 噪声形状同源派生（同一条件键取形状与锚——结构性防 transform 用错 numel 的静默错位；MR config 显式携带单域锚字段即字段级拒绝）。
 - ⚠️ **scale 陷阱**：config 里 `"scale": 1.4` 是**死参数**——MONAI 1.5.0 / 1.6.0 / dev 的 `set_timesteps`/`sample_timesteps` 调 `timestep_transform` 时均不传 `scale=`，实际生效 **1.0**。复刻日程必须按实际行为（1.0），照抄 config 字面会让整个日程错位。
 - 实操：直接调 MONAI `set_timesteps(30, input_img_size_numel=prod(latent.shape[2:]))` 读 `scheduler.timesteps`；轨迹游标自持（快照 timesteps 防共享调度器被复写、`next_timesteps` 按位取、末位补 0——参照 NV-Generate-CTMR domain 层薄封装）。
 

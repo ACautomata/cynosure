@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from cynosure.config import CynosureConfig
+from cynosure.conditions import ConditionVocabulary
 from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.decode import VolumeDecoder
 from cynosure.policy.numerics import AmpContext
@@ -33,45 +33,52 @@ PHASE_RESAMPLE = "resample"
 
 @dataclass(frozen=True)
 class EntrySample:
-    """一个 manifest 条目的 policy 采样产出（条目 + 目标序列 + Anchor 终点）。"""
+    """一个 manifest 条目的 policy 采样产出（条目 + 目标条件 + Anchor 终点）。"""
 
     entry: ManifestEntry
     target: str
-    """采样的目标序列（组2 = 锁定源病例的目标端）。"""
+    """采样的目标条件键（组1 = 条件名；组2 = 锁定源病例的目标端）。"""
     source_case: str | None
     """组2 锁定的源病例（组1 为 None）——配对参照的依据。"""
     terminal: torch.Tensor
-    """该条目的 Anchor 终点 latent [1, C, D, H, W]。"""
+    """该条目的 Anchor 终点 latent [1, C, D, H, W]（形状随条件，#129）。"""
 
 
 class ManifestLatentSampler:
     """manifest 条目的 policy latent 采样（条目噪声种子确定性）——里程碑
-    评测与 Baseline/重采的单一共享实现（同条目必得同 latent）。"""
+    评测与 Baseline/重采的单一共享实现（同条目必得同 latent）。
+
+    逐条目的初始噪声形状从条目条件键经 ``ConditionVocabulary`` 解析
+    （#129「latent 形状按条件贯通」：产出 latent 形状与各条件统一网格
+    一致；sigma 日程由 RolloutSampler 按条件名选择——同一条目键贯通
+    形状与日程，结构性防错位）。"""
 
     def __init__(
         self,
-        config: CynosureConfig,
         sampler: RolloutSampler,
         resolver: EntryConditionResolver,
         numerics: AmpContext,
+        vocabulary: ConditionVocabulary,
     ) -> None:
-        self._config = config
         self._sampler = sampler
         self._resolver = resolver
         self._numerics = numerics
+        self._vocabulary = vocabulary
 
     def sample(self, entries: list[ManifestEntry]) -> list[EntrySample]:
         """逐条目解析条件、按噪声种子采样 Anchor 终点（eval + no_grad +
         autocast，与训练 rollout 同口径）。噪声经 CPU generator 生成
-        （跨设备可复现）后随数值口径迁移到 policy 设备。"""
+        （跨设备可复现）后随数值口径迁移到 policy 设备；形状随条目
+        条件（同条件同形状，异条件条目各采各形）。"""
         samples: list[EntrySample] = []
         with torch.no_grad(), torch.autocast(
             self._numerics.device_type, dtype=self._numerics.dtype,
         ):
             for entry in entries:
                 condition, target = self._resolver.resolve(entry)
+                shape = self._vocabulary.latent_shape(target)
                 noise = torch.randn(
-                    (1, *self._config.latent_shape),
+                    (1, *shape),
                     generator=torch.Generator().manual_seed(entry.noise_seed),
                 ).to(self._numerics.device)
                 terminal = self._sampler.anchor_trajectory(noise, condition)[-1]
@@ -136,13 +143,13 @@ class ManifestVolumeSampler:
             volumes = self._volumes(chunk)
             if not self._write_enabled:
                 continue
-            for entry, volume in zip(chunk, volumes[:, 0]):
+            for entry, volume in zip(chunk, volumes):
                 relative = f"samples/stage{self._stage}/{phase}/{entry.index:04d}.pt"
                 target = self._paths.root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # clone 物化独立存储：条目体是批张量的 view，view 序列化
+                # clone 物化独立存储：条目体是分组批张量的 view，view 序列化
                 # 携带整块 backing storage（每文件膨胀 K 倍）
-                torch.save(volume.clone(), target)
+                torch.save(volume[0].clone(), target)
                 if phase == PHASE_BASELINE:
                     entry.baseline_sample = relative
                 else:
@@ -150,9 +157,19 @@ class ManifestVolumeSampler:
         if self._write_enabled:
             self._manifest.write(self._paths.manifest)
 
-    def _volumes(self, entries: list[ManifestEntry]) -> torch.Tensor:
-        """一批条目的解码像素体 [k, 1, X, Y, Z]（块内一次解码，与
-        里程碑评测同口径）。"""
+    def _volumes(self, entries: list[ManifestEntry]) -> list[torch.Tensor]:
+        """一批条目的解码像素体（逐条目 [1, X, Y, Z] 清单，按条目序）——
+        块内按条件分组解码（#129：同条件条目 cat 成批一次解码，异条件
+        分组边界即同形边界；「批内同条件即同形状」使分组内 cat 恒安全），
+        与里程碑评测同口径。"""
         samples = self._latent_sampler.sample(entries)
-        terminals = torch.cat([sample.terminal for sample in samples])
-        return self._decoder.decode(terminals)
+        decoded_by_position: dict[int, torch.Tensor] = {}
+        groups: dict[str, list[int]] = {}
+        for position, sample in enumerate(samples):
+            groups.setdefault(sample.target, []).append(position)
+        for positions in groups.values():
+            terminals = torch.cat([samples[p].terminal for p in positions])
+            decoded = self._decoder.decode(terminals)
+            for offset, position in enumerate(positions):
+                decoded_by_position[position] = decoded[offset:offset + 1]
+        return [decoded_by_position[i] for i in range(len(samples))]

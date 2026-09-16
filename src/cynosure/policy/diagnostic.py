@@ -23,10 +23,10 @@ from pydantic import BaseModel, ConfigDict
 from cynosure.config import CynosureConfig, MODALITIES
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping, RolloutCondition
-from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.schedules import SingleConditionSchedules
 
 CONDITION_SPACING: float = 100.0
 """诊断条件里的体素间距（1.0 × 1e2，policy-modeling 章：spacing ×1e2 恒传）。"""
@@ -151,17 +151,24 @@ class TrajectoryDiagnosticRunner:
             checkpoint=config.artifacts.unet_ckpt,
         ))
         unet.eval()
-        scheduler = NetworkAssembler.rflow_scheduler(
+        kernel = SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max)
+        self._config = config
+        # 单域诊断回路（BraTS/fixture 语义）走单条件日程表：任意条件名
+        # 共用 ADR-0002 全局锚日程，与改造前数值逐位一致
+        self._schedules = SingleConditionSchedules(
             num_inference_steps=config.policy.num_inference_steps,
             input_img_size_numel=config.policy.input_img_size_numel,
         )
-        kernel = SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max)
-        self._config = config
-        self._scheduler = scheduler
         self._kernel = kernel
-        self._cursor = TrajectoryCursor(scheduler)
+        self._cursor = self._schedules.cursor(None)
+        # MONAI step() 直接对照路径的调度器本体（parity 隔离单步算术的
+        # 真值锚列；与单条件日程表同一锚、同一日程）
+        self._monai_scheduler = NetworkAssembler.rflow_scheduler(
+            num_inference_steps=config.policy.num_inference_steps,
+            input_img_size_numel=config.policy.input_img_size_numel,
+        )
         self._field = CfgCombinedField(unet)
-        self._sampler = RolloutSampler(self._field, kernel, self._cursor)
+        self._sampler = RolloutSampler(self._field, kernel, self._schedules)
 
     def run(self) -> TrajectoryDiagnosticReport:
         with torch.no_grad():
@@ -202,7 +209,7 @@ class TrajectoryDiagnosticRunner:
         x = noises
         for index in range(self._cursor.num_steps):
             velocity = self._field.velocity(x, self._cursor.timestep(index), condition)
-            x, _ = self._scheduler.step(
+            x, _ = self._monai_scheduler.step(
                 velocity,
                 self._cursor.timestep(index),
                 x,

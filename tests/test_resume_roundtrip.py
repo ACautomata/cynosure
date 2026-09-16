@@ -208,14 +208,16 @@ class TestResumeStateChecklist:
             assert optimizer_state, name
             assert "exp_avg" in next(iter(optimizer_state.values()))
 
-        # buffer 两区（v3：条目带目标模态标签，latents + modalities 成对）：
+        # buffer 两区（v7：逐条目张量清单 + 目标条件标签成对）：
         # base 满容量（64//2）且每条件配额分布，recent = |M|×G×|Λ| + anchor = 25
         base = state["replay_buffer"]["base"]
-        assert base["latents"].shape == (32, 4, 16, 16, 8)
+        assert len(base["latents"]) == 32
+        assert all(t.shape == (4, 16, 16, 8) for t in base["latents"])
         assert len(base["modalities"]) == 32
         assert set(base["modalities"]) == set(MODALITIES)  # 配额量产全条件覆盖
         recent = state["replay_buffer"]["recent"]
-        assert recent["latents"].shape == (25, 4, 16, 16, 8)
+        assert len(recent["latents"]) == 25
+        assert all(t.shape == (4, 16, 16, 8) for t in recent["latents"])
         assert len(recent["modalities"]) == 25
         assert all(m in MODALITIES for m in recent["modalities"])
 
@@ -583,8 +585,8 @@ class TestResumeGuards:
         legacy = dict(state)
         legacy["format_version"] = 2
         legacy["replay_buffer"] = {
-            "base": state["replay_buffer"]["base"]["latents"],
-            "recent": state["replay_buffer"]["recent"]["latents"],
+            "base": torch.stack(state["replay_buffer"]["base"]["latents"]),
+            "recent": torch.stack(state["replay_buffer"]["recent"]["latents"]),
         }
         torch.save(legacy, scenario.run_dir / RESUME_STATE)
         result = scenario.resume()

@@ -17,6 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
@@ -323,13 +324,20 @@ class BaselineManifest(BaseModel):
 
     @staticmethod
     def _stage_conditions(config: CynosureConfig) -> dict[int, list]:
-        """group → {阶段号: 条件清单} 的执行映射（词汇表单一来源 =
-        ``config.stage_condition_vocabulary()``；本方法只叠加执行语义）。
+        """group → {阶段号: 条件清单} 的执行映射（词汇表单一来源：
+        BraTS = ``config.stage_condition_vocabulary()``；MR-RATE =
+        条件词汇表装配（``ConditionVocabulary.assemble`` 统一分派）的
+        names()（#129——schema 不读文件，装载发生在本 build 消费点，
+        与评测/policy 装配同口径）。本方法只叠加执行
+        语义。
 
         组3 指定 ``stage1_run_dir``（复用既有 stage-1 产物）时只建
         stage-2 条目：stage-1 不在本 run 执行，manifest 不留无人填充的
         null 条目（stage-1 样本对住在源 run 自己的 manifest）。"""
-        stages = config.stage_condition_vocabulary()
+        if config.experiment.dataset == "MR-RATE":
+            stages = {1: list(ConditionVocabulary.assemble(config).names())}
+        else:
+            stages = config.stage_condition_vocabulary()
         if (
             config.experiment.group == "sequential"
             and config.experiment.stage1_run_dir is not None

@@ -16,7 +16,7 @@
 import json
 from math import prod
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import (
     BaseModel,
@@ -24,6 +24,7 @@ from pydantic import (
     Field,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -907,6 +908,24 @@ class CynosureConfig(BaseModel):
         default_factory=DeploymentConfig,
     )
 
+    @model_serializer(mode="wrap")
+    def _serialize_without_mr_excluded_fields(
+        self, serializer: Callable[[Any], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """序列化的工件形态对账（#129）：MR-RATE 线的 config 产物
+        （model_dump_json 全量展开）不携带 BraTS 单域锚字段——
+        ``model_dump_json`` 的默认全量展开会把「未显式声明的默认值」
+        落成显式键，不经排除则 MR config 的 JSON 往返（落盘再装载）
+        被 ``_mr_rate_excludes_single_domain_anchors`` 误拒。排除即
+        「MR 工件不携带单域锚」纪律在序列化面的对称实现。"""
+        payload = serializer(self)
+        if self.experiment.dataset == "MR-RATE":
+            payload.pop("latent_shape", None)
+            policy = payload.get("policy")
+            if isinstance(policy, dict):
+                policy.pop("input_img_size_numel", None)
+        return payload
+
     @field_validator("latent_shape")
     @classmethod
     def _latent_shape_is_valid(
@@ -925,7 +944,17 @@ class CynosureConfig(BaseModel):
     def _numel_anchor_matches_latent(
         cls, policy: PolicyConfig, info: ValidationInfo,
     ) -> PolicyConfig:
-        """数值锚（ADR-0002）：input_img_size_numel 与 latent 空间 numel 同语义一致。"""
+        """数值锚（ADR-0002）：input_img_size_numel 与 latent 空间 numel
+        同语义一致。
+
+        BraTS 单域语义（唯一条件词汇特例）：全局锚 vs 全局形状。MR-RATE
+        线跳过本校验——锚逐条件派生自词汇表工件（
+        ``ConditionVocabulary.latent_numel``），config 单值字段在 MR 线
+        无消费（显式携带由 ``_mr_rate_excludes_single_domain_anchors``
+        在 model 层拒绝）。"""
+        experiment = info.data.get("experiment")
+        if experiment is not None and experiment.dataset == "MR-RATE":
+            return policy
         latent_shape = info.data.get("latent_shape")
         if latent_shape is None:
             return policy
@@ -989,6 +1018,38 @@ class CynosureConfig(BaseModel):
         return artifacts
 
     @model_validator(mode="after")
+    def _mr_rate_excludes_single_domain_anchors(self) -> "CynosureConfig":
+        """MR-RATE 线的单域锚字段互斥携带守卫（#129，装载期拒绝、错误
+        信息逐字段点名）：latent 形状与 sigma 日程数值锚逐条件派生自
+        条件词汇表工件（``ConditionVocabulary.latent_shape / latent_numel``
+        ），``latent_shape`` / ``policy.input_img_size_numel`` 是 BraTS
+        单域语义字段——MR config 显式声明即拒绝：防「以为全局单值锚仍
+        生效」的 sigma 日程静默错位（与 condition_vocabulary_json 互斥
+        携带同款哲学）。默认值（未显式声明）保留在 schema 上、MR 线
+        运行时零消费。检测走 ``model_fields_set``（field_validator 层
+        无法区分默认值与显式值——validate_default=True 下两者都过
+        validator；模型层 fields_set 才有精确语义），故守卫落 model
+        层、先例同 ``_inference_steps_match_mode``。"""
+        if self.experiment.dataset != "MR-RATE":
+            return self
+        if "latent_shape" in self.model_fields_set:
+            raise ValueError(
+                "字段 latent_shape：dataset=\"MR-RATE\" 的 latent 形状"
+                "逐条件派生自条件词汇表工件（#129），单域锚字段显式"
+                "声明即拒绝（BraTS 单域语义；防 sigma 日程静默错位）"
+                "——MR config 删除 latent_shape 字段即可"
+            )
+        if "input_img_size_numel" in self.policy.model_fields_set:
+            raise ValueError(
+                "字段 policy.input_img_size_numel：dataset=\"MR-RATE\" 的 "
+                "sigma 日程数值锚逐条件派生自条件词汇表工件（#129），"
+                "单域锚字段显式声明即拒绝（BraTS 单域语义；防 sigma 日程"
+                "静默错位）——MR config 删除 policy.input_img_size_numel "
+                "字段即可"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _inference_steps_match_mode(self) -> "CynosureConfig":
         """缩小采样日程的通道显式化：fixture_mode=false 时 num_inference_steps 钉 30。"""
         if not self.fixture_mode and self.policy.num_inference_steps != 30:
@@ -1008,7 +1069,22 @@ class CynosureConfig(BaseModel):
     def stage_condition_vocabulary(self) -> dict[int, list]:
         """组 → {阶段号: 条件词汇表} 的唯一映射（组1 四序列、组2 12 有序对、
         组3 两阶段各一份）——Baseline manifest 条目生成与本 validator 共同
-        消费（词汇表单一来源，组矩阵一变只改此处）。"""
+        消费（词汇表单一来源，组矩阵一变只改此处）。
+
+        BraTS 口径：条件集是代码内常量语义，schema 层可直接给出。
+        MR-RATE 口径（#129）：条件集来自条件词汇表工件（schema 不读
+        文件），本方法对 MR-RATE 显式拒绝——消费方经装配期的
+        ``ConditionVocabulary`` 装载取 ``names()``（BaselineManifest.
+        build 与评测装配同口径）；里程碑样本面的词汇表上界校验同理
+        挪到评测装配期（``_milestone_samples_match_manifest_support``
+        对 MR-RATE 跳过，不静默给 BraTS 四序列错数据）。"""
+        if self.experiment.dataset == "MR-RATE":
+            raise ValueError(
+                "MR-RATE 的条件集来自条件词汇表工件（config 不内嵌词表、"
+                "schema 不读文件）：stage_condition_vocabulary 仅 BraTS "
+                "口径——消费方请经 ConditionVocabulary 装载取 names() "
+                "（#129 装配期守卫）"
+            )
         pairs = [list(pair) for pair in self.experiment.cross_modal_pairs]
         return {
             "modal-label": {1: list(MODALITIES)},
@@ -1039,21 +1115,26 @@ class CynosureConfig(BaseModel):
         - **上界**：评测条目取 manifest 前缀，K > N_baseline 即静默
           缩水到盘上条目数——配置声明的评测样本量与实际评测面失真。
 
-        fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。"""
+        fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。
+        MR-RATE 跳过条件集下界校验（#129：条件集在词汇表工件、schema
+        不读文件）——该上界挪到评测装配期守卫（ManifestEvaluation.
+        build：K < len(vocabulary.names()) 即拒绝）；上界（K ≤
+        N_baseline）校验 MR-RATE 同样适用，照跑。"""
         if self.fixture_mode:
             return self
-        vocabulary = max(
-            len(conditions)
-            for conditions in self.stage_condition_vocabulary().values()
-        )
-        if self.schedule.milestone_eval_samples < vocabulary:
-            raise ValueError(
-                f"生产 config 下 schedule.milestone_eval_samples 须覆盖本组"
-                f"条件词汇表（{vocabulary} 个条件；manifest 条件轮转下 K "
-                f"不足即永久漏方向），得到 "
-                f"{self.schedule.milestone_eval_samples}；"
-                "缩小评测面属 fixture，须经顶层 fixture_mode=true 显式声明"
+        if self.experiment.dataset != "MR-RATE":
+            vocabulary = max(
+                len(conditions)
+                for conditions in self.stage_condition_vocabulary().values()
             )
+            if self.schedule.milestone_eval_samples < vocabulary:
+                raise ValueError(
+                    f"生产 config 下 schedule.milestone_eval_samples 须覆盖本组"
+                    f"条件词汇表（{vocabulary} 个条件；manifest 条件轮转下 K "
+                    f"不足即永久漏方向），得到 "
+                    f"{self.schedule.milestone_eval_samples}；"
+                    "缩小评测面属 fixture，须经顶层 fixture_mode=true 显式声明"
+                )
         if self.schedule.milestone_eval_samples > self.schedule.baseline_samples:
             raise ValueError(
                 f"生产 config 下 schedule.milestone_eval_samples 不得超过 "

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.config import (
     ConfigLoader,
     DEFAULT_CROSS_MODAL_PAIRS,
@@ -170,14 +171,13 @@ class TrainingLoopScenario:
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,
         )).to(device if device is not None else torch.device("cpu"))
-        scheduler = NetworkAssembler.rflow_scheduler(
-            num_inference_steps=config.policy.num_inference_steps,
-            input_img_size_numel=config.policy.input_img_size_numel,
-        )
         return RolloutSampler(
             CfgCombinedField(unet),
             SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max),
-            TrajectoryCursor(scheduler),
+            SingleConditionSchedules(
+                num_inference_steps=config.policy.num_inference_steps,
+                input_img_size_numel=config.policy.input_img_size_numel,
+            ),
         )
 
     def artifacts(self) -> RunArtifacts:
@@ -1024,11 +1024,14 @@ class TestDiscriminatorSideOrchestration:
             update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
             generator=torch.Generator().manual_seed(11),
             gating=DynamicWhitelist(
-                ConditionWhitelist.unrestricted(),  # 本测试不触白名单
+                ConditionWhitelist.unrestricted(tuple(MODALITIES)),  # 本测试不触白名单
                 _reward_config_for_gating(),
                 DistributedContext(0, 1, False),
+                conditions=tuple(MODALITIES),
             ),
-            overfit=OverfitMonitor(_reward_config_for_gating()),
+            overfit=OverfitMonitor(
+                _reward_config_for_gating(), conditions=tuple(MODALITIES),
+            ),
         )
         fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
         coordinator.update_step(fakes, "t2w")
@@ -1223,7 +1226,7 @@ class TestBufferBaseSeeding:
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         trainer = GranularGrpoTrainer(config, artifacts)
         trainer.seed_base_partition()
-        quota = base_condition_quota(config.reward.replay_buffer_capacity)
+        quota = base_condition_quota(config.reward.replay_buffer_capacity, MODALITIES)
         assert trainer.rewards.buffer.zone_modalities().base == quota
 
     def test_base_partition_entries_carry_target_labels(
