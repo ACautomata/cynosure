@@ -357,3 +357,32 @@ class TestChannelStatsProvenance:
             source_manifest="real_pool.json",
         )
         assert stats.provenance is None
+
+
+class TestChannelStatsChannelContract:
+    """per-channel 统计量的通道数一致性（两域共有的 defense：单形状契约与
+    逐条件异形状都不放宽「mean/std 逐通道成对」这一条）。"""
+
+    def test_mr_stats_loads_without_single_shape(self) -> None:
+        """MR-RATE 域 stats（latent_shape=None）照常装载：逐条件异形状下
+        无单一 latent_shape 可对照，通道数契约由编码期形状断言承担。"""
+        stats = ChannelStats(
+            mean=[0.0] * 4,
+            std=[1.0] * 4,
+            num_latents=8,
+            latent_shape=None,
+            source_manifest="real_pool.json",
+        )
+        assert stats.latent_shape is None
+
+    def test_mean_std_length_mismatch_rejected(self) -> None:
+        """mean 与 std 长度不等（逐通道成对性破坏）→ 两域一律拒绝：异形状
+        域少了一道 latent_shape 对照后，这条是仅存的通道面 defense。"""
+        with pytest.raises(ValidationError, match="长度必须相等"):
+            ChannelStats(
+                mean=[0.0] * 4,
+                std=[1.0] * 3,
+                num_latents=8,
+                latent_shape=None,
+                source_manifest="real_pool.json",
+            )

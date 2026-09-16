@@ -292,16 +292,17 @@ class LatentManifest(BaseModel):
                     "BraTS manifest 缺单一 latent_shape 契约（既有工件"
                     "形态必填；逐条件形状登记属 MR-RATE 域）"
                 )
-            modality_counts: dict[str, int] = {}
+            modality_counts: dict[Modality, int] = {}
             for entry in self.entries:
-                key = entry.stratification_key
-                modality_counts[key] = modality_counts.get(key, 0) + 1
+                modality = entry.modality
+                assert modality is not None  # 非条件条目即模态条目（恰一非空）
+                modality_counts[modality] = modality_counts.get(modality, 0) + 1
             if self.modalities and self.modalities != modality_counts:
                 raise ValueError(
                     f"modalities 计数 {self.modalities} 与条目实际分布 "
                     f"{modality_counts} 不符"
                 )
-            self.modalities = modality_counts  # type: ignore[assignment]
+            self.modalities = modality_counts
         return self
 
 
@@ -356,9 +357,22 @@ class ChannelStats(BaseModel):
 
     @model_validator(mode="after")
     def _channels_match_shape(self) -> "ChannelStats":
+        """per-channel 统计量的通道数一致性（两域共有的 defense）：
+
+        - mean 与 std 必须同长（两域恒成立——逐通道均值与标准差成对）；
+        - ``latent_shape`` 非 None 时（BraTS 域）长度须等于通道数；MR-RATE
+          域逐条件异形状故无单一 ``latent_shape``，通道数不在本工件内——
+          该域通道数契约由编码期形状断言承担（``_encode_one`` 对
+          ``vocabulary.latent_shape(condition)`` 的逐条件比对）。
+        """
+        if len(self.mean) != len(self.std):
+            raise ValueError(
+                f"mean/std 长度必须相等（逐通道成对），得到 "
+                f"mean={len(self.mean)} std={len(self.std)}"
+            )
         if self.latent_shape is not None:
             num_channels = self.latent_shape[0]
-            if len(self.mean) != num_channels or len(self.std) != num_channels:
+            if len(self.mean) != num_channels:
                 raise ValueError(
                     f"mean/std 长度必须等于 latent 通道数 {num_channels}，"
                     f"得到 mean={len(self.mean)} std={len(self.std)}"
