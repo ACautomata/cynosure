@@ -128,6 +128,18 @@ class ManifestEvaluation:
                 "轮转下 K 不足即永久漏尾部条件，早停判据对其失明——"
                 "增大评测样本面或显式声明 fixture_mode"
             )
+        # MR-RATE 参照影像库尚未交付（RealVolumeStore = BraTS 病例布局
+        # 的参照库，dataset_root 扫描与序列键都是 BraTS 语义）：两域条件
+        # 的采样与分层度量面已按词汇表贯通（#129），参照侧像素库随 MR
+        # 数据管线后续 ticket 交付后在装配处同点分派——显式拒绝而非让
+        # BraTS 布局扫描在 MR dataset_root 上炸出布局错误
+        if config.experiment.dataset == "MR-RATE":
+            raise ValueError(
+                "MR-RATE 线的里程碑参照影像库尚未交付（RealVolumeStore "
+                "是 BraTS 病例布局的参照库）：评测装配在此显式拒绝，"
+                "MR 参照库随 MR 数据管线后续 ticket 交付后在同一装配点"
+                "分派"
+            )
         resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
         latent_sampler = ManifestLatentSampler(sampler, resolver, amp, vocabulary)
         resolved_decoder = decoder if decoder is not None else cls._build_decoder(
@@ -190,9 +202,10 @@ class ManifestEvaluation:
     def _build_reals(
         config: CynosureConfig, pool: LatentManifest,
     ) -> RealVolumeStore:
-        """参照影像库：病例白名单 = pool train split 的病例集；预处理链
-        与 prepare 预编码同口径（resize 基数随 config——生产钉上游基数，
-        fixture 注入小基数保持夹具尺寸）。"""
+        """参照影像库（BraTS 单域语义——MR-RATE 在 build 期已显式拒绝，
+        MR 参照库交付后本构造面随装配处分派扩展）：病例白名单 = pool
+        train split 的病例集；预处理链与 prepare 预编码同口径（resize
+        基数随 config——生产钉上游基数，fixture 注入小基数保持夹具尺寸）。"""
         return RealVolumeStore(
             config.artifacts.dataset_root,
             case_ids={entry.case_id for entry in pool.entries},

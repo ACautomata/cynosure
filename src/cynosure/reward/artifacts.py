@@ -173,9 +173,20 @@ class LatentManifest(BaseModel):
         ``vocabulary.latent_shape(name)`` 解析、real 侧经本表解析，两来源
         不一致即错位对；全卷积判别器对此形状差异不报错）。单域（BraTS）
         工件不带逐条件表：全局 ``latent_shape`` 对账 = 单条件词汇特例，
-        本守卫不适用（缺表即返回）。
+        本守卫不适用（缺表即返回）。缺表放行仅限单条件域（
+        ``vocabulary.single_condition``）：多条件域缺表即拒绝——
+        ``load_latent`` 会静默回退全局对账，异形条件在 real 采样/gate
+        重算期才炸、同形条件带着错误的全局口径静默入训。
         """
         if self.condition_latent_shapes is None:
+            if not vocabulary.single_condition:
+                raise ValueError(
+                    f"多条件域的 {self.kind} 工件须携带逐条件形状契约 "
+                    "condition_latent_shapes：缺表则 load_latent 静默回退"
+                    "全局 latent_shape 对账——异形条件在判别器 real 采样/"
+                    "gate 重算期才炸、同形条件带着错误的全局口径静默入训；"
+                    "请按当前条件词汇表重建 manifest（携带逐条件契约）后入训"
+                )
             return
         expected = {
             name: vocabulary.latent_shape(name) for name in vocabulary.names()

@@ -146,6 +146,20 @@ class TrajectoryDiagnosticRunner:
                 "轨迹诊断当前仅覆盖组1（modal-label）采样场，得到组 "
                 f"{config.experiment.group}",
             )
+        if config.experiment.dataset == "MR-RATE":
+            # 诊断回路是 BraTS 单域的数值回归锚（单条件日程 + 全局形状
+            # 噪声 + 四序列条件；「与改造前数值逐位一致」）：MR 线的
+            # 逐条件诊断（PerConditionSchedules + 逐条件噪声/条件）属
+            # 后续 ticket——现路径会把 schema 默认单域锚（MR config 的
+            # latent_shape / input_img_size_numel 无语义默认值）与四序列
+            # 条件误当成 MR 诊断落盘，显式拒绝而非静默产出错域工件
+            #（CLI --dump-trajectory 经 _dump_trajectory 的 ValueError
+            # 收口转 usage error，不进入训练）
+            raise ValueError(
+                "轨迹诊断当前仅覆盖 BraTS 单域（单条件日程 + 全局形状"
+                f"锚），得到 dataset={config.experiment.dataset}——"
+                "MR-RATE 的逐条件诊断属后续 ticket",
+            )
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,

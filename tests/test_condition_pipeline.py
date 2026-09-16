@@ -735,6 +735,47 @@ class TestMilestoneEvaluationBuildGuard:
                 write_enabled=False,
             )
 
+    def test_mr_reference_store_rejected_explicitly(
+        self, tmp_path: Path, fixture_env,
+    ) -> None:
+        """MR-RATE 评测装配在参照影像库处显式拒绝：RealVolumeStore 是
+        BraTS 病例布局的参照库（dataset_root 扫描与序列键都是 BraTS
+        语义），MR config 此前走到 BratsSeriesLayout 扫描才炸出
+        「源数据集根目录不存在」的布局错误——装配期给出能力边界声明。"""
+        _, _, vocab, sampler, config = fixture_env
+        config.schedule.milestone_eval_samples = len(vocab.names())
+        pool_path = Path(config.reward.real_pool_manifest)
+        pool_path.parent.mkdir(parents=True, exist_ok=True)
+        pool_path.write_text(LatentManifest(
+            kind="real_pool",
+            encoder="fixture",
+            latent_shape=(4, 16, 16, 8),
+            split_seed=0,
+            split_sizes={"train": 0, "val": 0, "test": 0},
+            entries=[],
+            condition_latent_shapes={
+                name: vocab.latent_shape(name) for name in vocab.names()
+            },
+        ).model_dump_json(), encoding="utf-8")
+        with pytest.raises(ValueError, match="参照影像库"):
+            ManifestEvaluation.build(
+                config,
+                RunArtifacts.init(config, tmp_path / "run"),
+                sampler,
+                stage=1,
+                manifest=BaselineManifest(
+                    seed=0, group="modal-label",
+                    conditions=list(vocab.names()),
+                    entries=[
+                        ManifestEntry(
+                            index=0, condition="t1w/axial", noise_seed=0,
+                        ),
+                    ],
+                ),
+                amp=AmpContext(torch.device("cpu"), torch.bfloat16),
+                write_enabled=False,
+            )
+
 
 class MrPretrainArtifactsFixture:
     """MR-RATE 预训练产物夹具（#129 报告守卫与装配守卫共用）：real pool /
@@ -748,12 +789,15 @@ class MrPretrainArtifactsFixture:
     def write_manifest(
         path: Path, vocabulary: MrConditionVocabulary, kind: str,
         shape_override: tuple[int, int, int, int] | None = None,
+        with_condition_shapes: bool = True,
     ) -> Path:
         """按词汇表形状写一份逐条件 manifest（含 latent 本体）。
 
         ``shape_override`` = 全部条件改用另一套（「旧词表」）形状落盘：
         条目与契约自洽（装载期逐条目对账通过）、但与活动词汇表异形——
-        正是「词表工件改动而 manifest 未重建」的形态。"""
+        正是「词表工件改动而 manifest 未重建」的形态。
+        ``with_condition_shapes=False`` = 工件整体不携带逐条件形状契约：
+        「MR 工件缺表」的形态（load_latent 静默回退全局对账的入口）。"""
         shapes = {
             name: vocabulary.latent_shape(name) for name in vocabulary.names()
         }
@@ -772,17 +816,19 @@ class MrPretrainArtifactsFixture:
                     "latent": f"{latents_dir.name}/{file_name}",
                     "spacing": [100.0, 100.0, 100.0],
                 })
-        path.write_text(json.dumps({
+        payload = {
             "kind": kind,
             "encoder": "fixture-mr-pretrain",
             "latent_shape": [4, 16, 16, 8],
             "split_seed": 0,
             "split_sizes": {"train": len(entries)},
             "entries": entries,
-            "condition_latent_shapes": {
+        }
+        if with_condition_shapes:
+            payload["condition_latent_shapes"] = {
                 name: list(shape) for name, shape in shapes.items()
-            },
-        }), encoding="utf-8")
+            }
+        path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
     @staticmethod
@@ -912,6 +958,32 @@ class TestRealPoolVocabularyShapeGuard:
         )
         dist = DistributedContext.bootstrap()
         with pytest.raises(ValueError, match="词汇表"):
+            TrainingRuntime.assemble_rewards(
+                config,
+                AmpContext(
+                    device=torch.device("cpu"),
+                    dtype=AMP_DTYPES[config.policy.amp_dtype],
+                ),
+                TrainingRngStreams(
+                    dist.derive_seed(config.schedule.seed),
+                ).named(),
+                dist,
+            )
+
+    def test_missing_contract_rejected_at_assembly(
+        self, mr_pretrain_artifacts,
+    ) -> None:
+        """多条件域 manifest 缺逐条件形状契约：装配期拒绝——缺表则
+        ``load_latent`` 静默回退全局 ``latent_shape`` 对账，异形条件在
+        判别器 real 采样 / gate 重算期才炸、同形条件带着错误的全局口径
+        静默入训（判别器全卷积，形状差异自身不报错）。"""
+        vocab, config = mr_pretrain_artifacts
+        MrPretrainArtifactsFixture.write_manifest(
+            Path(config.reward.real_pool_manifest), vocab,
+            kind="real_pool", with_condition_shapes=False,
+        )
+        dist = DistributedContext.bootstrap()
+        with pytest.raises(ValueError, match="逐条件形状契约"):
             TrainingRuntime.assemble_rewards(
                 config,
                 AmpContext(

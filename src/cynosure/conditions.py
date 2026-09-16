@@ -245,6 +245,12 @@ class MrConditionVocabulary:
         self._tokens: MappingProxyType[str, int] = MappingProxyType(dict(tokens))
         self._by_name = {condition.name: condition for condition in self._conditions}
 
+    @property
+    def single_condition(self) -> bool:
+        """多条件域 = False：逐条件形状契约是 real 侧工件的必需品
+        （缺表即 ``assert_condition_shapes`` 装配期拒绝）。"""
+        return False
+
     @classmethod
     def load(
         cls, path: str | Path, *, fixture_mode: bool = False,
@@ -430,6 +436,15 @@ class ConditionVocabulary(Protocol):
         BraTS 组1 = 单位间距常量。"""
         ...
 
+    @property
+    def single_condition(self) -> bool:
+        """单条件域标记（形状契约必需性的判据，#129）：BraTS = True
+        （单条件词汇特例——任意条件恒全局形状，manifest 全局对账即
+        完备）；MR-RATE = False（逐条件形状/日程/spacing 消费面按条件
+        解析，real 侧工件必须携带逐条件形状契约，缺表即装配期拒绝）。
+        """
+        ...
+
     @classmethod
     def assemble(cls, config: CynosureConfig) -> "ConditionVocabulary":
         """两域词汇表的 config 驱动装配分派点（#129 消费侧单一来源）：
@@ -494,6 +509,12 @@ class BraTSConditionVocabulary:
     ) -> None:
         self._latent_shape = latent_shape
         self._mapping = mapping
+
+    @property
+    def single_condition(self) -> bool:
+        """单条件域 = True（单条件词汇特例：任意条件恒全局形状，
+        manifest 全局 ``latent_shape`` 对账即完备，缺逐条件表合法）。"""
+        return True
 
     def names(self) -> tuple[str, ...]:
         """BraTS 条件集 = 四序列固定序（stage_condition_vocabulary 同口径）。"""
