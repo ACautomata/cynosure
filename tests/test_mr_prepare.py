@@ -488,8 +488,8 @@ class TestAssemblyInputHardening:
     ) -> None:
         """splits.csv 同一 patient 两行且 split 冲突 → 拒绝：静默「后行
         覆盖」让 train 人群随行序漂移（本意 val/test 的 patient 混进 real
-        pool），而 split_sizes 仍把两行都计上。8 个 train patient 起底：
-        P00 转 val 后每条件仍有 5 卷 ≥ K，容量守卫不遮蔽本守卫的报错。"""
+        pool）。8 个 train patient 起底：P00 转 val 后每条件仍有 5 卷 ≥ K，
+        容量守卫不遮蔽本守卫的报错。"""
         config = mr_scenario.build_config(train_patients=8)
         splits_path = config.artifacts.mrrate_splits_csv
         original = splits_path.read_text(encoding="utf-8")
@@ -499,19 +499,41 @@ class TestAssemblyInputHardening:
         assert "P00" in result.stderr
         assert "重复" in result.stderr
 
-    def test_duplicate_split_row_same_value_rejected(
+    def test_study_granular_split_rows_accepted(
         self, mr_scenario: MrPrepareScenario,
     ) -> None:
-        """同 patient 重复行（split 值相同）→ 同样拒绝：patient → split
-        是映射不是行表，重复键即登记错误，且 split_sizes 留痕会把患者数
-        虚增。"""
+        """官方 splits.csv 是 **study 级**存储（#78 落档：98,334 行 =
+        73,516 患者——同一 patient 的多 study 各占一行），重复 patient 行
+        的值相同即合法、须接受；患者数按去重后的映射计而非按行计
+        （按行计把 split_sizes 虚增，留痕录得一个不存在的患者数）。"""
         config = mr_scenario.build_config()
         splits_path = config.artifacts.mrrate_splits_csv
         original = splits_path.read_text(encoding="utf-8")
-        splits_path.write_text(f"{original}P00,train\n", encoding="utf-8")
+        splits_path.write_text(
+            f"{original}P00,train\nP01,train\n", encoding="utf-8",
+        )
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 0, result.stderr
+        pool = LatentManifest.load(
+            config.reward.real_pool_manifest, "real_pool",
+        )
+        # 8 行 → 6 患者（P00/P01 各两行）；按行计会得到 train=8
+        assert pool.split_sizes == {"train": 6, "val": 2, "test": 2}
+
+    def test_split_label_outside_train_val_test_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """split 值不在 {train, val, test} → 拒绝：拼错的标签既非 train
+        （该患者的卷静默不进 real pool）又从三段计数里消失——患者被静默
+        丢掉，而 split_sizes 留痕自称是一份完整的三分普查。"""
+        config = mr_scenario.build_config()
+        splits_path = config.artifacts.mrrate_splits_csv
+        original = splits_path.read_text(encoding="utf-8")
+        splits_path.write_text(f"{original}P99,valid\n", encoding="utf-8")
         result = mr_scenario.run_with_config(config)
         assert result.code == 2
-        assert "P00" in result.stderr
+        assert "P99" in result.stderr
+        assert "valid" in result.stderr
 
     def test_empty_eval_manifest_rejected(
         self, mr_scenario: MrPrepareScenario,
@@ -606,3 +628,74 @@ class TestAssemblyInputHardening:
         result = mr_scenario.run_with_config(config)
         assert result.code == 2
         assert "mra/all-planes" in result.stderr
+
+    def test_cross_split_duplicate_series_key_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """同一 (study_uid, series_id) 跨 split 登记两次 → 拒绝：先出现的
+        非 train 行（val 患者的同名卷）在 split 过滤处被 `continue` 跳过，
+        后行的 train 归属被接受——同一枚物理卷既在评估留出池、又进 real
+        pool。唯一性须按**全部元数据行**把守，候选行上事后比对漏掉的正是
+        这条路径。8 个 train patient 起底：容量守卫不遮蔽本守卫的报错。"""
+        config = mr_scenario.build_config(train_patients=8)
+        metadata_path = config.artifacts.mrrate_metadata_csv
+        lines = metadata_path.read_text(encoding="utf-8").splitlines()
+        columns = lines[0].split(",")
+        rows = [line.split(",") for line in lines[1:]]
+        key_index, patient_index = columns.index("study_uid"), (
+            columns.index("patient_uid")
+        )
+        target = next(
+            row for row in rows
+            if (row[key_index], row[columns.index("series_id")]) == (
+                "ST00", "t1w-raw-axi",
+            )
+        )
+        forged = list(target)
+        forged[patient_index] = "E00"  # 落在 val split 的患者
+        metadata_path.write_text(
+            "\n".join(
+                ",".join(row) for row in [columns, forged, *rows]
+            ) + "\n",
+            encoding="utf-8",
+        )
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "ST00/t1w-raw-axi" in result.stderr
+
+    def test_capacity_guard_uses_declared_world_size(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """容量守卫按 config 声明的部署宽度判定（``K × world_size``）：
+        夹具池每条件 4 卷在 world=1 下刚好供满，声明 2 路即不足——train
+        装配期同款守卫按**真实 rank 数**拒绝同一份 manifest，prepare 侧
+        钉死 world=1 放行等于把「开工前失败」推迟到烧完全量预编码之后。"""
+        config = mr_scenario.build_config()
+        config.deployment.nproc_per_node = 2
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "容量不足" in result.stderr
+        assert "world_size=2" in result.stderr
+        assert not list((mr_scenario.work_dir / "fixtures").rglob("*.pt"))
+
+    def test_failed_plan_invalidates_artifacts(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """装配计划**自身**失败的路径同样不留上一轮工件：计划期（元数据
+        /split/互斥/影像存在性）失败早于失效旧件，会把上一轮的 manifest
+        与统计量原地留成一套「看起来有效」的产物——「要么全量一致、要么
+        明确缺失」须覆盖计划期失败，不能只覆盖编码期失败。"""
+        first = mr_scenario.run()
+        assert first.code == 0, first.stderr
+        config = CynosureConfig.model_validate_json(
+            mr_scenario.config_path.read_text(encoding="utf-8"),
+        )
+        victim = sorted(config.artifacts.dataset_root.glob("*.nii.gz"))[0]
+        victim.unlink()  # 计划期 _task 的影像存在性检查（早于编码）
+        second = mr_scenario.run_with_config(config)
+        assert second.code == 2
+        assert "影像缺失" in second.stderr
+        assert not Path(config.reward.real_pool_manifest).exists()
+        assert not Path(config.reward.heldout_real_manifest).exists()
+        assert not Path(config.reward.channel_stats_json).exists()
+        assert not Path(config.reward.sampling_manifest_json).exists()

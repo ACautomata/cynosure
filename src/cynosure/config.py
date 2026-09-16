@@ -201,6 +201,26 @@ class Artifacts(BaseModel):
         default=None,
     )
 
+    @field_validator("mrrate_data_snapshot")
+    @classmethod
+    def _data_snapshot_is_identifier(cls, value: str | None) -> str | None:
+        """快照标识非空白、首尾空白归一（#121 provenance / #131 抽样留痕
+        的凭据面）：None 留给「本域不适用」的互斥携带守卫判读；给出即须
+        是标识本身——空白串满足 ``is not None`` 的必填检查却什么都没登记
+        （工件自称登记了数据 release），首尾空白则原样落进工件、让跨工件
+        比对（prepare 与 #78 评估集同一快照）静默判否。"""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                f"artifacts.mrrate_data_snapshot 不得为空白串（得到 "
+                f"{value!r}）：该字段是「real 数据链与评估集同一冻结快照」"
+                "的凭据，空白值让 provenance 与抽样留痕自称登记了数据 "
+                "release 而无内容"
+            )
+        return normalized
+
 
 class Experiment(BaseModel):
     """三组实验矩阵（experiment-design 章）：group 三选一 + 各组定死语义。"""

@@ -869,6 +869,33 @@ class TestMrRateDataAssemblyBinding:
         assert config.reward.heldout_fraction == pytest.approx(0.1)
         assert config.reward.real_pool_quota == {}
 
+    def test_blank_data_snapshot_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """快照标识为空白串 → 拒绝：该字段的用途是「real 数据链与评估集
+        同一冻结快照」的凭据，空白串满足 `is not None` 的必填检查后照常
+        随 provenance 与抽样留痕落档——工件自称登记了数据 release、实际
+        什么都没登记，凭据面静默失效（快照标识是标识，不是自由文本）。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["artifacts"]["mrrate_data_snapshot"] = "   "
+        with pytest.raises(ValidationError) as exc:
+            CynosureConfig.model_validate(data)
+        assert (
+            "artifacts", "mrrate_data_snapshot",
+        ) in self._locations(exc.value)
+
+    def test_data_snapshot_whitespace_normalized(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """快照标识的首尾空白归一后入 config：该值原样落进 provenance 与
+        抽样留痕，是跨工件比对（prepare 与 #78 评估集同一快照）的键——
+        带空白的 " f6e39794" 与 "f6e39794" 是两个不相等的字符串，
+        比对静默判否。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["artifacts"]["mrrate_data_snapshot"] = "  f6e39794\n"
+        config = CynosureConfig.model_validate(data)
+        assert config.artifacts.mrrate_data_snapshot == "f6e39794"
+
     def test_mrrate_requires_assembly_artifacts(
         self, valid_config_dict: dict,
     ) -> None:

@@ -361,6 +361,11 @@ class Fixture:
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "preprocessing": preprocessing,
             "artifacts": artifacts,
+            # 部署宽度按夹具口径钉 1：prepare 装配期容量守卫按
+            # ``disc_batch_size_k × deployment.nproc_per_node`` 判定
+            # （#121 AC5），夹具全循环是单进程 CPU 跑——默认 4 会让每条件
+            # 4 卷的夹具池一律触发守卫（守卫本身没错，是声明宽度不符实）
+            "deployment": {"nproc_per_node": 1},
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,
                 "group_size_g": self.GROUP_SIZE_G,

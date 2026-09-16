@@ -28,11 +28,12 @@ import csv
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import get_args
 
 from cynosure.conditions import MrConditionVocabulary
 from cynosure.config import CynosureConfig, MODALITIES
 from cynosure.reward.artifacts import SamplingEntry, SamplingRole
-from cynosure.reward.dataset import BratsSeriesLayout, CaseSplitter
+from cynosure.reward.dataset import BratsSeriesLayout, CaseSplitter, SplitPart
 
 
 @dataclass
@@ -143,6 +144,10 @@ class MrRateSeriesCatalog:
         "study_uid", "series_id", "patient_uid", "modality", "plane",
     )
     SPLITS_COLUMNS: tuple[str, ...] = ("patient_uid", "split")
+    SPLIT_PARTS: tuple[str, ...] = get_args(SplitPart)
+    """官方 split 的取值域（= manifest ``split_sizes`` 的键词汇
+    ``SplitPart``，单一来源）：三段之外的标签既非 train 又落不进三段
+    计数，属文件错版而非新语义。"""
 
     def __init__(
         self, metadata_csv: Path, splits_csv: Path,
@@ -156,9 +161,13 @@ class MrRateSeriesCatalog:
         """官方 splits.csv 的 patient → split 映射（patient 级，同患者
         所有 study 同 split——mrrate-data-spec §6；值 casefold 归一）。
 
-        重复 patient 行（值相同或冲突）即拒绝：patient → split 是映射不是
-        行表，后行覆盖会让 train 人群随行序漂移（本意 val/test 的患者混进
-        real pool），且 ``split_sizes`` 把重复行也计上、留痕虚增。
+        文件本身是 **study 级**存储（#78 落档：98,334 行 = 73,516 患者），
+        同一 patient 多行是常态而非错误：split 值相同即接受（映射不因此
+        漂移），值冲突即拒绝——patient → split 是映射不是行表，冲突行让
+        train 人群随行序漂移（本意 val/test 的患者混进 real pool）。三段
+        （``SPLIT_PARTS``）之外的取值同样即拒：错版标签既非 train、又落不
+        进 ``split_sizes`` 的三段计数——该患者被静默丢掉，而留痕自称一份
+        完整的三分普查。
         """
         mapping: dict[str, str] = {}
         with open(self._splits_csv, encoding="utf-8") as fh:
@@ -170,15 +179,24 @@ class MrRateSeriesCatalog:
             for row in reader:
                 patient = row["patient_uid"].strip()
                 part = row["split"].strip().casefold()
+                if part not in self.SPLIT_PARTS:
+                    raise ValueError(
+                        f"官方 splits.csv 登记了 {self.SPLIT_PARTS} 之外的 "
+                        f"split={row['split'].strip()!r}（patient={patient!r}）:"
+                        f" {self._splits_csv}——错版标签既非 train（该患者的"
+                        "卷静默不进 real pool）又落不进 split_sizes 的三段"
+                        "计数（留痕自称完整的三分普查）；请用官方 split 文件"
+                    )
                 previous = mapping.get(patient)
                 if previous is not None:
+                    if previous == part:
+                        continue  # study 级文件：同 patient 多 study 各一行
                     raise ValueError(
-                        f"官方 splits.csv 重复登记 patient={patient!r}"
-                        f"（已登记 {previous!r}、本行 {part!r}）: "
+                        f"官方 splits.csv 重复登记 patient={patient!r} 且 "
+                        f"split 冲突（已登记 {previous!r}、本行 {part!r}）: "
                         f"{self._splits_csv}——patient → split 是映射不是行表："
-                        "重复行让 train 人群随行序漂移（本意 val/test 的患者"
-                        "混进 real pool）、split_sizes 把患者数虚增；"
-                        "请用去重后的官方 split 文件"
+                        "冲突行让 train 人群随行序漂移（本意 val/test 的患者"
+                        "混进 real pool）；请用去重后的官方 split 文件"
                     )
                 mapping[patient] = part
         if not mapping:
@@ -216,12 +234,14 @@ class MrRateSeriesCatalog:
         - val/test split 的卷（评估留出池）不进 real 数据链候选，计数
           留痕（合法常态——生产元数据覆盖全 split）；
         - 白名单条件域外的卷（如 swi/sagittal）不进候选，计数留痕；
-        - 重复卷键（同一 ``(study_uid, series_id)`` 两行）即拒绝——两行编码
-          到同一 latent 路径，manifest 会把同一枚物理卷当两卷计数与采样
+        - 卷键（同一 ``(study_uid, series_id)``）重复登记即拒绝，且按**全部
+          元数据行**把守：同一物理卷两行的归属可以不同（一行 train、另一行
+          val/test 或条件域外），谁进 real pool 取决于行序——先出现的
+          non-train 行在过滤处被跳过、后行的 train 归属被接受，该卷既是
+          评估留出池又进候选域；候选行内的重复还会编码到同一 latent 路径
           （统计量重复计入、容量守卫可被虚增行数骗过）。
 
-        卷键唯一性按**候选行**把守（非 train / 域外的重复行不进任何工件，
-        无实害）；键与条目键、latent 文件名同源（``SeriesRecord.case_id``）。
+        键与条目键、latent 文件名同源（``SeriesRecord.case_id``）。
         """
         splits = self.split_patients()
         candidates: list[SeriesRecord] = []
@@ -242,6 +262,20 @@ class MrRateSeriesCatalog:
                         f"splits.csv: {self._splits_csv}（join 完整性破坏"
                         "——元数据与 splits 错版/口径漂移，拒绝装配）"
                     )
+                study_uid = row["study_uid"].strip()
+                series_id = row["series_id"].strip()
+                series_key = (study_uid, series_id)
+                if series_key in seen_keys:
+                    raise ValueError(
+                        f"MR-RATE 元数据重复登记卷键 {study_uid}/{series_id}: "
+                        f"{self._metadata_csv}——同一物理卷两行的归属可以不同"
+                        "（一行 train、另一行 val/test 或条件域外），谁进 "
+                        "real pool 取决于行序：该卷既是评估留出池又进 real "
+                        "pool；候选行内的重复还会编码到同一 latent 路径"
+                        "（per-channel 统计量重复计入、逐条件容量守卫被虚增"
+                        "行数骗过）。请用去重后的元数据文件"
+                    )
+                seen_keys.add(series_key)
                 if splits[patient_uid] != "train":
                     non_train += 1  # 评估留出池卷：不进 real 数据链候选
                     continue
@@ -251,35 +285,25 @@ class MrRateSeriesCatalog:
                 if condition is None:
                     out_of_vocabulary += 1
                     continue
-                record = SeriesRecord(
+                candidates.append(SeriesRecord(
                     patient_uid=patient_uid,
-                    study_uid=row["study_uid"].strip(),
-                    series_id=row["series_id"].strip(),
+                    study_uid=study_uid,
+                    series_id=series_id,
                     modality=modality.casefold(),
                     plane=plane.casefold(),
                     condition=condition,
-                )
-                if record.series_key in seen_keys:
-                    raise ValueError(
-                        f"MR-RATE 元数据重复登记卷键 {record.case_id!r}: "
-                        f"{self._metadata_csv}——两行编码到同一 latent 路径，"
-                        "manifest 把同一枚物理卷当两卷计数与采样（per-channel"
-                        " 统计量重复计入、逐条件容量守卫可被虚增行数骗过）；"
-                        "请用去重后的元数据文件"
-                    )
-                seen_keys.add(record.series_key)
-                candidates.append(record)
+                ))
         candidates.sort(key=SeriesRecord.sort_key)
         return candidates, out_of_vocabulary, non_train
 
     def split_sizes(self) -> dict[str, int]:
-        """官方三分的 patient 数全貌（manifest split_sizes 留痕）。"""
-        counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
-        with open(self._splits_csv, encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                part = row["split"].strip().casefold()
-                if part in counts:
-                    counts[part] += 1
+        """官方三分的 patient 数全貌（manifest split_sizes 留痕）：与
+        ``split_patients`` **同源同读**——同一份文件不设第二个读面。本函数
+        原按 CSV 行计数，study 级文件下把患者数虚增；两个读面各自决定
+        「残缺输入怎么办」正是分叉的来源（2026-09-16 评审记录在案）。"""
+        counts = {part: 0 for part in self.SPLIT_PARTS}
+        for part in self.split_patients().values():
+            counts[part] += 1
         return counts
 
 

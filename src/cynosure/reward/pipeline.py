@@ -3,8 +3,11 @@
 幂等契约（ticket #18）：装配（扫描/划分/抽样）、合成/生产预编码、统计量
 归约全程确定性，重跑工件零漂移——prepare 产物是可重建的派生工件，覆盖
 写是预期语义（与 train run 目录的「不静默覆盖」不同）。latent 子树与
-manifest 随每次运行整体重建：先失效旧件、编码成功才落盘新件——任何时刻
-盘上要么全量一致、要么明确缺失，不留「索引指向缺失 latent」的悬挂工件。
+manifest 随每次运行整体重建：**先失效旧件**、编码成功才落盘新件——失效
+落在装配计划之前，计划期失败（元数据/split 错版、互斥命中、候选卷影像
+缺失）的路径同样清盘：任何时刻盘上要么全量一致、要么明确缺失，不留
+「索引指向缺失 latent」的悬挂工件，也不留「一次失败的运行 + 一套看起来
+有效的上一轮产物」。
 逐位幂等归测试口径（ADR-0011：生产 pipeline 不开确定性 kernel，生产
 预编码的 VAE 前向重跑有浮点噪声级漂移；seeded 后验采样与统计量归约
 本身仍逐位确定）。
@@ -13,7 +16,7 @@ manifest 随每次运行整体重建：先失效旧件、编码成功才落盘�
 ``experiment.dataset`` 分派到策略（``reward.mrrate`` 的 BratsAssembly /
 MrRateAssembly）——BraTS 线语义零改动（病例目录扫描 + 70/10/20），
 MR-RATE 线 = 官方 split join + 评估集互斥守卫 + patient 级 held-out
-二分 + 逐条件配额抽样。编排骨架（计划 → 失效 → 守卫 → 编码 →
+二分 + 逐条件配额抽样。编排骨架（失效 → 计划 → 守卫 → 编码 →
 统计量 → 落盘）两域单份；MR-RATE 域追加抽样 manifest 落盘与装配期守卫
 （逐条件容量 ≥ K×world + 逐条件 held-out 覆盖），守卫消费装配计划的
 计数口径、落在编码之前——稀疏条件与覆盖缺口在开工前失败。
@@ -194,13 +197,17 @@ class PreparePipeline:
         )
 
     def run(self) -> PrepareReport:
-        plan = self._assembly.plan()
         pool = self._build_summary("real_pool", self._config.reward.real_pool_manifest)
         heldout = self._build_summary(
             "heldout_real", self._config.reward.heldout_real_manifest,
         )
         self._invalidate(pool, heldout)  # 先失效旧件：编码成功才落新件
-        self._invalidate_derived(plan)  # 单文件派生件（统计量/抽样留痕）同批失效
+        self._invalidate_derived()  # 单文件派生件（统计量/抽样留痕）同批失效
+        # 失效先于装配计划：计划本身也会失败（元数据/split 错版、互斥命中、
+        # 候选卷影像缺失）——失败重跑若把上一轮工件原地留着，盘上就是
+        # 「一次失败的运行 + 一套看起来有效的产物」；「要么全量一致、要么
+        # 明确缺失」须覆盖计划期失败，不能只在编码期成立
+        plan = self._assembly.plan()
         # 装配期守卫落在编码**之前**：逐条件计数在装配计划里已经完备，
         # 稀疏模态小池与 held-out 覆盖缺口在开工前失败（spec「开工前失败
         # 而非训练中途」），不白烧一遍全量预编码、盘上不留半个 latent
@@ -265,8 +272,12 @@ class PreparePipeline:
         """MR-RATE 装配期守卫（编码之前、计数口径；#121 AC5）：
 
         - **逐条件容量**（ADR-0008-03）：逐（条件, 全量）容量 ≥
-          ``disc_batch_size_k × world_size``（全量口径 world=1、条件全集
-          = 词汇表 11 格）——稀疏模态小池任一条件不足即装配期可读拒绝；
+          ``disc_batch_size_k × world_size``，world_size 取 config 声明的
+          部署宽度（``deployment.nproc_per_node``）——train 装配期的同一
+          守卫按**真实 rank 数**判定同一份 manifest（
+          ``TrainingRuntime.assemble_rewards``），prepare 侧钉死 1 等于把
+          「开工前失败」推迟到烧完全量预编码之后才由 train 拒绝；条件全集
+          = 词汇表 11 格——稀疏模态小池任一条件不足即装配期可读拒绝；
         - **逐条件 held-out 覆盖**：pool 侧出现的条件在 held-out 侧须有卷。
           patient 级二分是条件无关的全局洗牌（排序 + seed 洗牌 + 按
           ``heldout_fraction`` 切片），稀疏条件的患者可能整批落 pool 侧
@@ -284,7 +295,7 @@ class PreparePipeline:
         LatentManifest.assert_capacity_counts(
             trace.census_quota_taken,
             self._config.reward.disc_batch_size_k,
-            1,  # 全量口径：prepare 落 pool 工件，rank 切片守卫在 train 装配期
+            self._config.deployment.nproc_per_node,
             self._vocabulary.names(),
         )
         uncovered = [
@@ -306,17 +317,18 @@ class PreparePipeline:
                 "schedule.seed 后重跑"
             )
 
-    def _invalidate_derived(self, plan: AssemblyPlan) -> None:
-        """单文件派生件与 latent 子树同批失效（per-channel 统计量；MR 域
-        另加配额抽样留痕）：编码期失败的路径若把上一轮的抽样 manifest 留
-        在原地，盘上就是「一次失败的运行 + 一份描述上一轮归属的审计工件」
-        ——「要么全量一致、要么明确缺失」须对全部产物成立。BraTS 域无抽样
-        留痕，统计量恒失效。"""
+    def _invalidate_derived(self) -> None:
+        """单文件派生件与 latent 子树同批失效（per-channel 统计量；配额
+        抽样留痕按 config 声明）：失败路径（装配计划期或编码期）若把上一轮
+        的抽样 manifest 留在原地，盘上就是「一次失败的运行 + 一份描述上一
+        轮归属的审计工件」——「要么全量一致、要么明确缺失」须对全部产物
+        成立。BraTS 域无抽样留痕（schema 的互斥绑定已钉死：MR-RATE 必填、
+        BraTS 携带即拒），此处按声明判读、不重复 dataset 分派；也不依赖装配
+        计划（失效落在计划之前——计划期失败的路径同样要清盘）。"""
         Path(self._config.reward.channel_stats_json).unlink(missing_ok=True)
-        if plan.is_mr_rate:
-            Path(self._config.reward.sampling_manifest_json).unlink(
-                missing_ok=True,
-            )
+        sampling_manifest = self._config.reward.sampling_manifest_json
+        if sampling_manifest is not None:
+            Path(sampling_manifest).unlink(missing_ok=True)
 
     def _write_sampling_manifest(self, plan) -> Path | None:
         """配额抽样留痕落盘（MR-RATE 域）：seed / 快照 / 配额 / 逐条件
