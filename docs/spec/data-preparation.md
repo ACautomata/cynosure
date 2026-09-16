@@ -25,7 +25,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 - **无 Spacing 重采样 / 无 CropForeground / 无 NormalizeIntensity / 禁 z-score**（fork census 明令：z-score 与 rflow-mr-brain v1 训练分布不一致）。物理 spacing 不保持，体数据靠 resize 改网格。
 - **无模态堆叠**：四序列（t1n/t1c/t2w/t2f）逐条独立处理、独立编码、独立 modality token（29/34/30/31，skull-stripped 码；cynosure `fixtures.py` 映射已一致）。
 
-编码侧事实（引用备查，**不在本次 scope**）：`SlidingWindowInferer(roi_size=[320,320,160], mode="gaussian", overlap=0.4)` 包 `encode_stage_2_inputs`，AMP autocast；latent 全局标量 scale_factor（=1/std(z)），复用 checkpoint 值、不重算，无 per-channel scale/shift。**cynosure 落点（T12 裁决，#140 复核改判 + #143 交付）**：原裁决「编码改**恒整前向** + 超界显式拒绝」的依据是 MONAI `SlidingWindowInferer` 多分辨率拼合为上采样分割网络设计、对下采样 encoder 把通道维折进空间维（实测 [4,16,16,8] 产出 [1,16,16,8]）；T12 复核探针（#140，MONAI 1.6 z_scale 路径）证伪该依据——z_scale 路径对下采样网络首窗输出自动探测缩放比、逐格产出期望 latent 形状。超界随改判交付**滑窗分支（b 语义，#143）**：`SlidingWindowInferer` 包 encoder 确定性前向，roi [320,320,160] 影像空间逐轴 clamp、overlap 0.4、sw_batch_size 1、gaussian（逐项锚 NVIDIA `create_training_data`），逐窗 (z_mu, z_sigma) 在 latent 网格高斯加权拼合后**单次** seeded 采样——对上游逐窗采样拼接（a 语义，接缝方差收缩）为记录在案偏离（保重跑零漂移幂等 + 接缝带方差均匀，CONTEXT.md「b 语义」词条）。豁免判定与上游 `dynamic_infer` 逐字同构：单样本空间体素数 ≤ prod(roi) 恒整前向、行为不变，BraTS [1,1,256,256,128]=8.39M ≤ 16.38M 生产全语料不触发滑窗。
+编码侧事实（引用备查，**不在本次 scope**）：`SlidingWindowInferer(roi_size=[320,320,160], mode="gaussian", overlap=0.4)` 包 `encode_stage_2_inputs`，AMP autocast；latent 全局标量 scale_factor（=1/std(z)），复用 checkpoint 值、不重算，无 per-channel scale/shift。**cynosure 落点（T12 裁决，#140 复核改判 + #143 交付）**：原裁决「编码改**恒整前向** + 超界显式拒绝」的依据是 MONAI `SlidingWindowInferer` 多分辨率拼合为上采样分割网络设计、对下采样 encoder 把通道维折进空间维（实测 [4,16,16,8] 产出 [1,16,16,8]）；T12 复核探针（#140，MONAI 1.6 z_scale 路径）证伪该依据——z_scale 路径对下采样网络首窗输出自动探测缩放比、逐格产出期望 latent 形状。超界随改判交付**滑窗分支（b 语义，#143）**：`SlidingWindowInferer` 包 encoder 确定性前向，roi [320,320,160] 影像空间逐轴 clamp、overlap 0.4、sw_batch_size 1、gaussian（逐项锚 NVIDIA `create_training_data`），逐窗 (z_mu, z_sigma) 在 latent 网格高斯加权拼合后**单次** seeded 采样——对上游逐窗采样拼接（a 语义，接缝方差收缩）为记录在案偏离（保重跑零漂移幂等 + 接缝带方差均匀，CONTEXT.md「b 语义」词条；改判裁决与探针证据链见 ADR-0010）。豁免判定与上游 `dynamic_infer` 逐字同构：单样本空间体素数 ≤ prod(roi) 恒整前向、行为不变，BraTS [1,1,256,256,128]=8.39M ≤ 16.38M 生产全语料不触发滑窗。
 
 ## cynosure 落点
 
@@ -37,7 +37,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 
 ## 边界（不在本方案内）
 
-- **生产 VAE encoder**：**已交付（T12, #27）**——`MaisiLatentEncoder`（`reward/encoder.py`，恒整前向 + 超界显式拒绝 + fp16 autocast，见上「cynosure 落点」）经 `PreparePipeline.build_encoder` 分派装载（`vae_config_json` + `vae_ckpt` 工件对 strict-load）；CLI 非 fixture 拒绝已移除。
+- **生产 VAE encoder**：**已交付（初版 T12/#27；滑窗分支 #143，ADR-0010 改判）**——`MaisiLatentEncoder`（`reward/encoder.py`，豁免/滑窗两分支 + fp16 autocast，见上「cynosure 落点」）经 `PreparePipeline.build_encoder` 分派装载（`vae_config_json` + `vae_ckpt` 工件对 strict-load）；CLI 非 fixture 拒绝已移除。
 - **decode 后逆变换**（合成影像 [256,256,128] → 回原生形状供 nnUNet/FID）→ eval ticket。
 - 上游 P1 的 modality label 扰动增强、MR-RATE replay 1:1 混合：属上游训练编排，非数据加载，不适用。
 
