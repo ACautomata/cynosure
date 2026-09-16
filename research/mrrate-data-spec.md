@@ -22,7 +22,7 @@
 | 6 | **标签映射** | `t1w/t2w/flair/swi/mra` → `mri_t1/t2/flair/swi/mra` = 9/10/11/20/16；skull-stripped = 29–33。**上游权威**（映射表就在上游仓库里，fork 只加了 BraTS 的 40–43） | 【上游】`configs/modality_mapping.json` |
 | 7 | **每序列双条目** | whole-brain + 现场 derive 的 skull-stripped（官方只发 `img/` + `seg/`，无现成 skull-stripped 文件） | 【MR-RATE】+【上游】`docs/inference.md:138` |
 | 8 | **条目数/体量** | 665,371 × 2 ≈ **1,330,742 条**；latent 存储 **~1.5–3 TB（fp16）/ 3–6 TB（fp32）**；原始 zip 整库 **8.1 TB** | §5 推算 |
-| 9 | **编码网格** | 恒整前向（本仓 T12 裁决），**不得**套上游 `SlidingWindowInferer`；latent 通道置末 `(X,Y,Z,4)` | 【上游】`:174-191` + 本仓 `docs/spec/data-preparation.md:28` |
+| 9 | **编码网格** | 与上游同分派：≤16.38M 整前向，超界走同参数滑窗（采样取 b 语义偏离；原 T12「恒整前向」裁决已改判，ADR-0010）；latent 通道置末 `(X,Y,Z,4)` | 【上游】`:174-191` + 本仓 `docs/spec/data-preparation.md:28` |
 | 10 | **许可** | 数据 **CC BY-NC-SA**（非商业 + ShareAlike）；模型 NVIDIA Open Model License（两者不同） | 【MR-RATE】卡片 |
 | 11 | **划分** | 留出集必须取官方 `splits.csv`（**patient 级**，同患者所有 study 同 split） | 【MR-RATE】guide |
 
@@ -88,7 +88,7 @@
 AMP fp16 → `SlidingWindowInferer(roi_size=[320,320,160], sw_batch_size=1, mode="gaussian", overlap=0.4)` 包 `encode_stage_2_inputs`（`:174-183`）→ `z.squeeze().transpose(1,2,3,0)` **通道置末** `(X,Y,Z,4)`，用 **resize 后的 affine** 存 `*_emb.nii.gz`（`:188-191`）。
 `dynamic_infer`（【上游】`utils.py:787-817`）：**总体素数 ≤ 320×320×160 = 16.38M 时走整前向**，否则才滑窗。
 
-> **本仓落点（勿照抄滑窗）**：`docs/spec/data-preparation.md:28` 已裁决**恒整前向 + 超界显式拒绝**（MONAI `SlidingWindowInferer` 的多分辨率拼合对上采样分割网络设计，对下采样 encoder 会把通道维折进空间维、静默产出错误 latent）。#67 沿用；>16.38M 体素的卷另立策略。
+> **本仓落点（原「勿照抄滑窗」裁决已改判，ADR-0010）**：T12 旧裁决「恒整前向 + 超界显式拒绝」（依据：MONAI 多分辨率拼合对下采样 encoder 会把通道维折进空间维、静默产出错误 latent）经 #140 复核探针证伪——MONAI 1.6 `z_scale` 路径对下采样网络逐格产出期望 latent 形状。#67 沿用上游同分派：≤16.38M 整前向、超界走同参数滑窗（`SlidingWindowInferer`，roi [320,320,160]/overlap 0.4/sw_batch_size 1/gaussian，采样取 b 语义偏离，#143 已交付）。
 
 **spacing 的准确口径**：训练侧读每个 latent 旁的侧车 `{"spacing":[...], "modality":"..."}`（【上游】`diff_model_train.py:120-121,450-451`，读入 ×1e2），值 = **resize 后的后置 spacing**。fork 的侧车写入器把这条写明了（【fork】`scripts/latent_sidecars.py:29-31`："it is the post-resize physical spacing the condition actually sees"）。→ 我们 rollout 喂 `spacing_tensor` 也必须用后置值；`docs/spec/data-preparation.md:34` 现写的"源 zooms ×1e2"对 MR-RATE 不成立（须改按 latent affine 计算）。
 
@@ -219,7 +219,7 @@ AMP fp16 → `SlidingWindowInferer(roi_size=[320,320,160], sw_batch_size=1, mode
 | **可变形状** | rollout/判别器/评测须接受 per-axis 32 倍数的 4D latent，并满足 §4.1 的推理 dim 允许集 |
 | **spacing 侧车** | 改用 latent affine 的后置 spacing（§3.3） |
 | **存储与 manifest** | 分片 manifest + shard 化 latent；按模态分层 |
-| **编码器** | 恒整前向；>16.38M 体素的卷另立分块策略 |
+| **编码器** | 豁免/滑窗两分支（上游同分派；b 语义采样偏离，ADR-0010 改判，#143 已交付） |
 | **FID 仪器** | 【上游】`compute_fid_2-5d_ct.py` **只有 CT 分支**；MR 支持是 fork 扩展。若 #67 要"上游自己的仪器"，须先确定用哪一版并把差异写清 |
 
 ### 不适用
@@ -228,7 +228,7 @@ AMP fp16 → `SlidingWindowInferer(roi_size=[320,320,160], sw_batch_size=1, mode
 |---|---|
 | `<48 slices` 规则 | 属全身版 `rflow-mr`（`data/README.md:143`），brain v1 无此约束 |
 | coreg / atlas / nvseg-ctmr 三仓库 | v1 只用 native-space（【MR-RATE】guide） |
-| 上游 `SlidingWindowInferer` 编码 | 对下采样 encoder 静默产出错误 latent（本仓 T12 裁决） |
+| 上游逐窗采样拼接编码（a 语义） | 本仓拼合后单次 seeded 采样（b 语义，记录在案偏离，ADR-0010） |
 | 按 batch 整批下载 | 290 GB/batch × 28；须 study-zip 粒度按需拉 |
 | z-score / spacing 重采样 / crop | 不在上游链中（照抄即对齐） |
 
