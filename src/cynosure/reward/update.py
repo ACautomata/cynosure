@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import torch
 
-from cynosure.config import Modality, RewardConfig
+from cynosure.config import RewardConfig
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayDraw, ReplayStore
 from cynosure.reward.sampler import RealSampling
@@ -41,7 +41,7 @@ class UpdateReport:
     num_replay: int
     num_base_replay: int
     num_recent_replay: int
-    modality: Modality
+    modality: str
     """本步更新的条件（目标模态）——update 归因轴与回放/real 两侧的
     过滤条件同源（ADR-0008 决策 1）。"""
     replay_degraded: bool
@@ -93,7 +93,7 @@ class OnlineUpdate:
         self._current_fraction = config.replay_current_fraction
 
     def step(
-        self, current_fakes: torch.Tensor, modality: Modality,
+        self, current_fakes: torch.Tensor, modality: str,
     ) -> UpdateReport:
         """一步更新：混采 fake 批（50% 当前 / 50% 回放）→ real 批 →
         LSGAN loss → AdamW step → 当前 fake 入近期分区。

@@ -12,6 +12,7 @@ from cynosure.fixtures import Fixture
 from cynosure.grpo import ClippedPolicyLoss
 from cynosure.grpo.update import StepwisePolicyUpdate
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.policy import (
     CfgCombinedField,
     RolloutCondition,
@@ -34,7 +35,7 @@ class TrainingScenario:
         self.sampler = RolloutSampler(
             CfgCombinedField(self.unet),
             SdeKernel(eta=0.7, s_max=0.999),
-            TrajectoryCursor(NetworkAssembler.rflow_scheduler(3, 2048)),
+            SingleConditionSchedules(3, 2048),
         )
         self.condition = RolloutCondition(
             label=torch.tensor([29]),

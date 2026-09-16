@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from pydantic import BaseModel, ConfigDict, PrivateAttr, ValidationError
 
-from cynosure.config import CynosureConfig, Modality
+from cynosure.conditions import ConditionVocabulary
+from cynosure.config import CynosureConfig
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats
 from cynosure.reward.scorer import RewardScorer
@@ -63,6 +64,15 @@ class PretrainProvenance(BaseModel):
     训练落盘的这份权重负责——启动期重算废止（ADR-0008 决策 5）后，
     「测量对象 = 装载对象」由装载期指纹对照把守（同形态换权重显式
     拒绝，见 ``PretrainReport.load_discriminator``）。"""
+    condition_vocabulary: str | None = None
+    """条件词汇表工件路径（多条件线在册；单域（BraTS）线的条件语义 =
+    代码内四序列常量、无工件可指纹，为 None）。"""
+    condition_vocabulary_sha256: str | None = None
+    """词汇表内容指纹（多条件线）：该线的 fake 形状/token/spacing/sigma
+    数值锚全部派生自本工件——工件内容漂移（token 或 FOV/网格改动）而
+    real 侧工件与权重未变时，报告的白名单与 AUC 就是对另一份 fake 分布
+    的测量，指纹对照在装载期显式拒绝（与 manifest/channel stats 同款
+    口径守卫）。"""
 
     @staticmethod
     def digest(path: Path) -> str:
@@ -91,16 +101,21 @@ class PretrainReport(BaseModel):
     ``assert_data_provenance``，#113）：per-condition AUC 与条件白名单
     在本组 fake 分布上测量，跨组消费是显式拒绝的错误、无配置开关可
     绕过。"""
-    latent_shape: tuple[int, int, int, int]
-    condition_auc: dict[Modality, float]
-    """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计）：
+    latent_shape: tuple[int, int, int, int] | None = None
+    """单域（BraTS）全局 latent 形状对账（单条件词汇特例）；多条件
+    （MR-RATE）线为 None——该线的形状口径由 ``provenance`` 的
+    ``condition_vocabulary_sha256`` 承载（形状逐条件派生自词表工件，
+    报告不落派生副本：唯一来源是工件本身）。"""
+    condition_auc: dict[str, float]
+    """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计；
+    条件名域 = 本域词汇表条件集——BraTS 四序列 / MR-RATE 生成条件名）：
     白名单内条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
     确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
     它是确认时刻的测量记录，上岗判定直接信任报告值，数据口径漂移由
     装载期指纹对照把守，ADR-0008 决策 5）；未过线条件 = 步数耗尽后对
     落盘 checkpoint 权重的补测值（同快照可对照，白名单空时拒绝报错的
     实测值来源）。"""
-    gate_whitelist: list[Modality]
+    gate_whitelist: list[str]
     """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
     轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
     （拒跑由 train gate 把守，诊断产物不丢）。"""
@@ -166,6 +181,11 @@ class PretrainReport(BaseModel):
         （manifest 重建、统计量换源）都让上岗判别力与预训练报告脱钩——
         warm-start 装载前显式拒绝，不给静默错位留缝（判别器形态指纹的
         对照在 ``load_discriminator``）。
+
+        多条件（MR-RATE）线加两道同旨对照（#129）：报告条件集须等于
+        本域词汇表条件集（per-condition 实测值的取值域），词表工件内容
+        指纹须与报告记录一致（fake 形状/token/spacing/sigma 锚的派生
+        来源——工件漂移而 real 侧未变同样让报告与上岗脱钩）。
         """
         if config.experiment.group != self.group:
             raise ValueError(
@@ -178,12 +198,36 @@ class PretrainReport(BaseModel):
                 "experiment.stage2_pretrain_report_json——绑定 cross-modal "
                 "预训练产物、不继承 stage-1 报告（#116））"
             )
-        if tuple(config.latent_shape) != self.latent_shape:
+        # 形状与条件域对照（多条件线，#129）：形状口径逐条件派生自词表
+        # 工件，故多条件报告记 None（派生副本不落报告）——单域（BraTS）
+        # 线无词表工件，报告记全局形状并与 config 逐值对照
+        vocabulary_path = config.artifacts.condition_vocabulary_json
+        if vocabulary_path is None:
+            if tuple(config.latent_shape) != self.latent_shape:
+                raise ValueError(
+                    f"latent 形状不符：报告 {self.latent_shape}，"
+                    f"当前 config {list(config.latent_shape)}（分辨率不在口径"
+                    "指纹与网络配置指纹的覆盖面内——预训练与上岗须同一 "
+                    "latent 口径）"
+                )
+        elif self.latent_shape is not None:
             raise ValueError(
-                f"latent 形状不符：报告 {list(self.latent_shape)}，"
-                f"当前 config {list(config.latent_shape)}（分辨率不在口径"
-                "指纹与网络配置指纹的覆盖面内——预训练与上岗须同一 "
-                "latent 口径）"
+                "多条件（MR-RATE）线的预训练报告不应携带单域全局 "
+                f"latent_shape：报告 {list(self.latent_shape)}——该线形状"
+                "逐条件派生自条件词汇表工件，口径由 provenance 的 "
+                "condition_vocabulary_sha256 承载（单域全局形状在换域线"
+                "没有语义）"
+            )
+        # 条件集对照：per-condition AUC 与白名单是对预训练时的条件集
+        # 测量的，取值域 = 本域词汇表条件集（换域/换词表消费即拒绝）
+        vocabulary = ConditionVocabulary.assemble(config)
+        names = set(vocabulary.names())
+        if set(self.condition_auc) != names:
+            raise ValueError(
+                "预训练报告条件集不符：报告 "
+                f"{sorted(self.condition_auc)}，当前词汇表 {sorted(names)}"
+                "（per-condition AUC 与条件白名单只对预训练时的条件集"
+                "成立——报告与上岗的条件域须同一口径）"
             )
         checks = (
             ("real_pool_manifest", config.reward.real_pool_manifest,
@@ -204,6 +248,22 @@ class PretrainReport(BaseModel):
             raise ValueError(
                 "预训练数据口径指纹不符（预训练与上岗须同一数据口径）: "
                 + "; ".join(mismatched)
+            )
+        # 词表工件指纹（多条件线的 fake 分布口径来源）：形状/token/
+        # spacing/sigma 锚全部派生自该工件——内容漂移而其余工件与权重
+        # 未变时，报告的白名单与 AUC 对的是另一份 fake 分布
+        current_vocabulary = (
+            None if vocabulary_path is None
+            else PretrainProvenance.digest(vocabulary_path)
+        )
+        recorded_vocabulary = self.provenance.condition_vocabulary_sha256
+        if current_vocabulary != recorded_vocabulary:
+            raise ValueError(
+                "条件词汇表指纹不符：报告 "
+                f"{recorded_vocabulary}，当前 {current_vocabulary}"
+                "（该线的 fake 形状/token/spacing/sigma 数值锚派生自词表"
+                "工件——工件内容改动即报告实测值对另一份 fake 分布负责，"
+                "须以当前工件重新预训练）"
             )
 
     def load_discriminator(

@@ -50,7 +50,10 @@ class OverfitFixture:
     @classmethod
     def monitor(cls, **reward_overrides) -> OverfitMonitor:
         """默认 knobs 的单条件监控器（阈值/跨度覆写经 reward_overrides）。"""
-        return OverfitMonitor(cls.reward_config(**reward_overrides))
+        return OverfitMonitor(
+            cls.reward_config(**reward_overrides),
+            conditions=("t1n", "t1c", "t2w", "t2f"),
+        )
 
 
 class TestDivergenceEma:
@@ -208,11 +211,14 @@ class TestAlertDoesNotAct:
 
     def test_crossing_alert_leaves_whitelist_and_sigma_untouched(self) -> None:
         config = OverfitFixture.reward_config()
-        monitor = OverfitMonitor(config)
+        monitor = OverfitMonitor(
+            config, conditions=("t1n", "t1c", "t2w", "t2f"),
+        )
         whitelist = DynamicWhitelist(
-            ConditionWhitelist.unrestricted(),
+            ConditionWhitelist.unrestricted(("t1n", "t1c", "t2w", "t2f")),
             config,
             DistributedContext(0, 1, False),
+            conditions=("t1n", "t1c", "t2w", "t2f"),
         )
         members_before = whitelist.whitelist.members
         sigma_before = config.disc_noise_sigma_max

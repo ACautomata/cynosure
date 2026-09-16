@@ -18,7 +18,6 @@ from typing import Protocol
 
 import torch
 
-from cynosure.config import Modality
 from cynosure.reward.artifacts import LatentManifest
 
 
@@ -36,7 +35,7 @@ class RealSampling(Protocol):
         ...
 
     def sample(
-        self, count: int, *, modality: Modality | None = None,
+        self, count: int, *, modality: str | None = None,
     ) -> torch.Tensor:
         """无放回均匀采 count 条 latent（``modality`` 给定时仅在该序列
         的条目内采样）。"""
@@ -65,7 +64,7 @@ class RealPoolSampler:
         return len(self._manifest.entries)
 
     def sample(
-        self, count: int, *, modality: Modality | None = None,
+        self, count: int, *, modality: str | None = None,
     ) -> torch.Tensor:
         """无放回均匀采 count 条 latent；超出候选条目数显式拒绝。
 

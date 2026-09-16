@@ -13,6 +13,7 @@ from monai.networks.schedulers import RFlowScheduler
 
 from cynosure.fixtures import Fixture, FIXTURE_UNET_CONFIG
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.policy import (
     BareConditionField,
     CfgCombinedField,
@@ -581,10 +582,11 @@ class TestRolloutSampler:
         self, fixture_unet: DiffusionModelUNetMaisi, scheduler: RFlowScheduler,
     ) -> RolloutSampler:
         torch.manual_seed(7)
-        cursor = TrajectoryCursor(scheduler)
         field = CfgCombinedField(fixture_unet)
         return RolloutSampler(
-            field, SdeKernel(eta=0.7, s_max=0.999), cursor,
+            field,
+            SdeKernel(eta=0.7, s_max=0.999),
+            SingleConditionSchedules(3, 2048),
         )
 
     @pytest.fixture
@@ -635,10 +637,12 @@ class TestRolloutSampler:
         输出与 anchor 下一步一致（batch 组织差异仅 fp32 舍入级；
         log-prob 在 η=0 无定义、由 kernel 显式拒绝）。"""
         torch.manual_seed(0)
-        cursor = TrajectoryCursor(scheduler)
         field = CfgCombinedField(fixture_unet)
         kernel = SdeKernel(eta=0.0, s_max=0.999)
-        sampler = RolloutSampler(field, kernel, cursor)
+        sampler = RolloutSampler(
+            field, kernel, SingleConditionSchedules(3, 2048),
+        )
+        cursor = SingleConditionSchedules(3, 2048).cursor(None)
         initial = torch.randn(1, *LATENT_SHAPE)
         anchor = sampler.anchor_trajectory(initial, conditions)
         velocity = field.group_velocity(
@@ -718,9 +722,12 @@ class TestGranularContinuation:
     def wide_sampler(
         self, fixture_unet: DiffusionModelUNetMaisi, wide_scheduler: RFlowScheduler,
     ) -> RolloutSampler:
-        cursor = TrajectoryCursor(wide_scheduler)
         field = CfgCombinedField(fixture_unet)
-        return RolloutSampler(field, SdeKernel(eta=0.7, s_max=0.999), cursor)
+        return RolloutSampler(
+            field,
+            SdeKernel(eta=0.7, s_max=0.999),
+            SingleConditionSchedules(self.NUM_STEPS, 2048),
+        )
 
     @pytest.fixture
     def conditions(self) -> RolloutCondition:

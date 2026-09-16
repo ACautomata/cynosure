@@ -42,7 +42,7 @@ from typing import Mapping
 import torch
 from pydantic import BaseModel, ConfigDict
 
-from cynosure.config import CynosureConfig, Modality
+from cynosure.config import CynosureConfig
 from cynosure.distributed import DistributedContext
 from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
 from cynosure.grpo import MgaiAdvantage, StepwisePolicyUpdate
@@ -119,8 +119,8 @@ class IterationLoop:
         self._amp = amp
 
     def base_partition_samples(
-        self, quota: Mapping[Modality, int],
-    ) -> tuple[torch.Tensor, list[Modality]]:
+        self, quota: Mapping[str, int],
+    ) -> tuple[list[torch.Tensor], list[str]]:
         """冻结初始 policy 的 base 分区供给（train 启动期一次，按每条件
         配额量产；返回样本批 + 逐样本目标模态标签）。"""
         return self.rollout.base_partition_samples(quota)
@@ -211,8 +211,11 @@ class GranularGrpoTrainer:
         # 回放供给装配期守卫（ADR-0008 决策 4，预训练 driver 同口径）：
         # 回放半区非零 + base 分区每条件配额 ≥ 回放半区需求（首次判别器
         # 更新时近期分区为空，按条件过滤的回放全量由 base 承担；无效
-        # 组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本）
-        assert_replay_supply(config.reward)
+        # 组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本）。
+        # 条件集 = 本域条件名清单（#129 经词汇表装配注入；装载发生在
+        # runtime 装配之前，两次装载各自独立实例、无副作用）
+        conditions = TrainingRuntime.assemble_vocabulary(config).names()
+        assert_replay_supply(config.reward, conditions)
         self.config = config
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
@@ -309,6 +312,7 @@ class GranularGrpoTrainer:
         标签；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。"""
         quota = base_condition_quota(
             self.config.reward.replay_buffer_capacity,
+            self.runtime.policy.conditions.targets(),
         )
         base_fakes, modalities = self.loop.base_partition_samples(quota)
         self.rewards.seed_base(base_fakes, modalities)

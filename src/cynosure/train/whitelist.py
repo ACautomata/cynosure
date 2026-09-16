@@ -14,10 +14,14 @@ resume 语境（``unrestricted``）：恢复点不重查白名单（续训状态
 """
 
 from types import MappingProxyType
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 
-from cynosure.config import MODALITIES, Modality
-from cynosure.pretrain.artifacts import PretrainReport
+if TYPE_CHECKING:
+    from cynosure.pretrain.artifacts import PretrainReport
+# 预训练报告契约的 import 为类型侧（TYPE_CHECKING）：runtime 依赖方向
+# 保持 pretrain → train 单向（driver 装配 train 组件），train 侧对报告的
+# 消费是 duck-typed 注解——防 train 包初始化经 whitelist 反向触发
+# pretrain 包装载成环。
 
 
 class ConditionWhitelist:
@@ -27,28 +31,30 @@ class ConditionWhitelist:
 
     def __init__(
         self,
-        members: tuple[Modality, ...],
-        measured: Mapping[Modality, float],
+        members: tuple[str, ...],
+        measured: Mapping[str, float],
     ) -> None:
         self._members = members
         self._measured = MappingProxyType(dict(measured))
 
     @classmethod
-    def from_report(cls, report: PretrainReport) -> "ConditionWhitelist":
+    def from_report(cls, report: "PretrainReport") -> "ConditionWhitelist":
         """train 新 run 语境：名单 = 报告白名单（gate 产物，轮转序），
         并携带 per-condition 实测快照（白名单空时的拒绝报错与诊断
         消费）。"""
         return cls(tuple(report.gate_whitelist), report.condition_auc)
 
     @classmethod
-    def unrestricted(cls) -> "ConditionWhitelist":
+    def unrestricted(cls, conditions: tuple[str, ...]) -> "ConditionWhitelist":
         """resume 占位：全条件放行（恢复点不重查白名单——issue #88；
-        Modality 全集即「不设条件闸」的表达）。预训练 driver 冷启动
+        本域条件集即「不设条件闸」的表达）。预训练 driver 冷启动
         装配同此占位（driver 自产 per-condition 判定，不消费 train 侧
-        名单）。无实测快照（报告未装载）。"""
-        return cls(tuple(MODALITIES), {})
+        名单）。无实测快照（报告未装载）。条件集 = 本域条件名清单
+        （#129 经 ConditionVocabulary.names() 注入，BraTS = 四序列、
+        MR-RATE = 词汇表条件集）。"""
+        return cls(tuple(conditions), {})
 
-    def __contains__(self, modality: Modality) -> bool:
+    def __contains__(self, modality: str) -> bool:
         """逐 iteration 查询面：该条件的 policy 更新当前是否放行。"""
         return modality in self._members
 
@@ -56,12 +62,12 @@ class ConditionWhitelist:
         return len(self._members)
 
     @property
-    def members(self) -> tuple[Modality, ...]:
+    def members(self) -> tuple[str, ...]:
         """名单成员只读视图（顺序 = 报告产出的轮转序）。"""
         return self._members
 
     @property
-    def measured(self) -> Mapping[Modality, float]:
+    def measured(self) -> Mapping[str, float]:
         """per-condition 实测快照（报告 ``condition_auc``——白名单空时
         拒绝报错的实测值来源；``unrestricted`` 占位为空）。"""
         return self._measured

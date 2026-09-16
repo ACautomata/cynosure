@@ -1,9 +1,14 @@
-"""判别器 warm-start 预训练（ADR-0007）：driver、run 目录与产物契约。
+"""判别器 warm-start 预训练（ADR-0007）：run 目录与产物契约、driver。
 
-- ``driver``：PretrainDriver——real = Real sample pool（kind 守卫装载）、
-  fake = base policy 冻结 rollout 量产（复用回放缓冲 base 分区采样入口），
-  以在线期同款 ``OnlineUpdate.step`` 原语密集步进至 held-out AUC 达 RM
-  readiness gate 或步数上限；单进程执行（World-1 退化路径），产物全局唯一；
+- ``driver``：PretrainDriver（经 ``cynosure.pretrain.driver`` 子模块
+  消费——不做包级 re-export：driver 运行时装配 train 组件
+  （``TrainingRuntime``），而 train 侧（runtime 的 warm-start 装载）也
+  消费本包 artifacts；包级急切 re-export 会让 train → pretrain 的包
+  初始化成环。子模块直进保持 runtime 依赖方向 acyclic）——real =
+  Real sample pool（kind 守卫装载）、fake = base policy 冻结 rollout
+  量产（复用回放缓冲 base 分区采样入口），以在线期同款
+  ``OnlineUpdate.step`` 原语密集步进至 held-out AUC 达 RM readiness
+  gate 或步数上限；单进程执行（World-1 退化路径），产物全局唯一；
 - ``artifacts``：PretrainRun（run 目录）与 PretrainReport（报告契约 +
   守卫重载入口：kind 不符 / 缺报告 / 形态指纹不符即拒绝装载）。
 """
@@ -14,10 +19,8 @@ from cynosure.pretrain.artifacts import (
     PretrainReport,
     PretrainRun,
 )
-from cynosure.pretrain.driver import PretrainDriver
 
 __all__ = [
-    "PretrainDriver",
     "PretrainPaths",
     "PretrainProvenance",
     "PretrainReport",

@@ -7,9 +7,12 @@
 奇数余数归 recent），某区样本不足时由另一区补足（训练首步 recent 为空，
 回放全量由 base 承担——spec 未明文的唯一可行退化路径，测试固化其行为）。
 
-条目带目标模态标签（ADR-0008 决策 2）：rollout 单 iteration 单条件，
-整批 fake 同标签；组2 跨模态条目按**目标模态**归因（source 影像不在
-Real sample pool，配对语义不存在）。回放采样可按本 iteration 条件过滤：
+条目带目标条件标签（ADR-0008 决策 2）：rollout 单 iteration 单条件，
+整批 fake 同标签同形状（批内同条件即同形状，#129）；组2 跨模态条目按
+**目标端**归因（source 影像不在 Real sample pool，配对语义不存在）。
+条件键 = ``ConditionVocabulary`` 的域名（BraTS = 序列名；MR-RATE =
+生成条件名）——同条件过滤天然保证批内同形状（回放 stack / 判别器
+fake 批 cat 的同形前提）。回放采样可按本 iteration 条件过滤：
 该条件候选充足则在该条件内维持两区各半、可互补语义；不足则显式拒绝
 （可区分「条件不足」与「总数不足」，绝不静默回退全池混采）。base 分区
 种子按每条件配额量产（``base_condition_quota``），装配期守卫每条件
@@ -24,16 +27,18 @@ from typing import Protocol, Sequence
 
 import torch
 
-from cynosure.config import MODALITIES, Modality, RewardConfig
+from cynosure.config import RewardConfig
 
 
 @dataclass(frozen=True)
 class ReplayEntry:
-    """单条回放条目：fake latent + 目标模态标签（ADR-0008 决策 2）。"""
+    """单条回放条目：fake latent + 目标条件标签（ADR-0008 决策 2）。"""
 
     latent: torch.Tensor
-    modality: Modality
-    """目标模态标签——组2 跨模态条目按目标模态归因（ADR-0008 决策 1）。"""
+    modality: str
+    """目标条件键（BraTS = 目标序列名；MR-RATE = 生成条件名）——组2
+    跨模态条目按目标端归因（ADR-0008 决策 1）；批内同条件即同形状
+    （#129），条件过滤后的 stack/cat 天然同形。"""
 
 
 @dataclass(frozen=True)
@@ -46,20 +51,20 @@ class ZoneSizes:
 
 @dataclass(frozen=True)
 class ZoneModalities:
-    """两区占用的按条件观测面：每目标模态 × 两区条目数（ADR-0008
+    """两区占用的按条件观测面：每目标条件 × 两区条目数（ADR-0008
     的 zone 标签观测——回放条件充足性的审计数据）。"""
 
-    base: dict[Modality, int]
-    recent: dict[Modality, int]
+    base: dict[str, int]
+    recent: dict[str, int]
 
 
 @dataclass(frozen=True)
 class ReplayDraw:
-    """一次回放采样的结果：样本批 + 逐样本目标模态标签（与行对齐）
+    """一次回放采样的结果：样本批 + 逐样本目标条件标签（与行对齐）
     + 两区来源数（混采占比审计数据）。"""
 
     samples: torch.Tensor
-    modalities: list[Modality]
+    modalities: list[str]
     num_base: int
     num_recent: int
 
@@ -83,7 +88,7 @@ class ReplayStore(Protocol):
         """两区占用的按条件观测面（每目标模态 × 两区条目数）。"""
         ...
 
-    def condition_supply(self, modality: Modality) -> int:
+    def condition_supply(self, modality: str) -> int:
         """该条件当前的全部回放候选数（两区合计）——Online update 的
         回放退化判定查询面（候选 < 回放半区需求 → 该步退化纯 current
         半区，ADR-0008-03），与 ``sample_replay`` 同走条件过滤。"""
@@ -98,49 +103,58 @@ class ReplayStore(Protocol):
         ...
 
     def fill_base(
-        self, latents: torch.Tensor, modalities: Sequence[Modality],
+        self, latents: Sequence[torch.Tensor], modalities: Sequence[str],
     ) -> None:
-        """初始冻结 policy 产出填充 base 分区（逐样本目标模态标签对齐）。"""
+        """初始冻结 policy 产出填充 base 分区（逐样本目标条件标签对齐）。"""
         ...
 
-    def push(self, latents: torch.Tensor, modality: Modality) -> None:
-        """新 fake 入近期分区（整批同条件：rollout 单 iteration 单条件）。"""
+    def push(self, latents: torch.Tensor, modality: str) -> None:
+        """新 fake 入近期分区（整批同条件：rollout 单 iteration 单条件，
+        整批同形状）。"""
         ...
 
     def sample_replay(
         self, count: int, generator: torch.Generator,
-        modality: Modality | None = None,
+        modality: str | None = None,
     ) -> ReplayDraw:
-        """回放采样（两区混采；``modality`` 给定时候选收窄为该条件）。"""
+        """回放采样（两区混采；``modality`` 给定时候选收窄为该条件——
+        同条件过滤保证批内同形状）。"""
         ...
 
 
-def base_condition_quota(capacity: int) -> dict[Modality, int]:
+def base_condition_quota(
+    capacity: int, conditions: Sequence[str],
+) -> dict[str, int]:
     """base 分区每条件配额（参数 = buffer 总容量，与
     ``config.replay_buffer_capacity`` 同口径；内部对半取 base 容量后
-    均匀分派到各目标模态，余数按 MODALITIES 顺序逐个 +1——确定性，
+    均匀分派到各目标条件，余数按条件集顺序逐个 +1——确定性，
     配额和恒等于 base 容量，fill_base 按配额量产后恰好填满）。
+    条件集 = 本域条件名清单（BraTS = 四序列；MR-RATE = 词汇表条件集，
+    #129 经 ``ConditionVocabulary.names()`` 注入，不设代码内副本）。
 
     ADR-0008 决策 4 的量产依据：base 分区种子须每条件覆盖回放半区
     需求（装配守卫见 ``assert_replay_supply``），否则首个判别器更新
     在某条件上将无回放候选可用。
     """
     base_capacity = capacity // 2
-    per, extra = divmod(base_capacity, len(MODALITIES))
+    per, extra = divmod(base_capacity, len(conditions))
     return {
-        modality: per + (1 if index < extra else 0)
-        for index, modality in enumerate(MODALITIES)
+        condition: per + (1 if index < extra else 0)
+        for index, condition in enumerate(conditions)
     }
 
 
-def assert_replay_supply(config: RewardConfig) -> None:
+def assert_replay_supply(
+    config: RewardConfig, conditions: Sequence[str],
+) -> None:
     """装配期回放供给守卫（train 装配与预训练 driver 同口径，
     ADR-0008 决策 4）：无效组合在装配期显式拒绝，而非让昂贵 rollout
     先行、更新时才缺样本。
 
     两条线：回放半区非零（K ≥ 2）；base 分区每条件配额 ≥ 回放半区
     需求——首次判别器更新时近期分区为空，回放全量由 base 承担，按
-    条件过滤后某条件的回放候选不得少于半区需求。
+    条件过滤后某条件的回放候选不得少于半区需求。条件集 = 本域条件
+    名清单（#129 经 ``ConditionVocabulary.names()`` 注入）。
     """
     replay_count = config.disc_batch_size_k - math.ceil(
         config.disc_batch_size_k * config.replay_current_fraction,
@@ -150,14 +164,14 @@ def assert_replay_supply(config: RewardConfig) -> None:
             f"回放供给不足：disc_batch_size_k={config.disc_batch_size_k}"
             " 的回放半区为 0 条（K 须 ≥2）"
         )
-    quota = base_condition_quota(config.replay_buffer_capacity)
+    quota = base_condition_quota(config.replay_buffer_capacity, conditions)
     weakest = min(quota.values())
     if weakest < replay_count:
         raise ValueError(
             f"回放供给不足：base 分区每条件配额 {weakest} 条"
             f"（replay_buffer_capacity={config.replay_buffer_capacity} → base "
             f"分区 {config.replay_buffer_capacity // 2} 条均匀分派 "
-            f"{len(MODALITIES)} 目标模态）< 判别器更新回放半区 "
+            f"{len(conditions)} 目标条件）< 判别器更新回放半区 "
             f"{replay_count} 条（disc_batch_size_k="
             f"{config.disc_batch_size_k}）：ADR-0008 决策 4 装配期守卫——"
             "某条件回放候选不足半区需求，按条件过滤的回放将无米下锅；"
@@ -198,7 +212,7 @@ class ReplayBuffer:
             recent=self._modality_counts(self._recent),
         )
 
-    def condition_supply(self, modality: Modality) -> int:
+    def condition_supply(self, modality: str) -> int:
         """该条件当前的全部回放候选数（两区合计——退化判定查询面，
         ADR-0008-03）。"""
         base_pool, recent_pool = self._condition_candidates(modality)
@@ -213,31 +227,33 @@ class ReplayBuffer:
         return list(self._recent)
 
     def fill_base(
-        self, latents: torch.Tensor, modalities: Sequence[Modality],
+        self, latents: Sequence[torch.Tensor], modalities: Sequence[str],
     ) -> None:
         """初始冻结 policy 产出填满 base 分区（一次性，逐样本标签对齐）。
 
+        ``latents`` = 逐条目 [C, D, H, W] 张量清单（#129：异形状条件的
+        持久化形态——批量堆叠张量同样是合法清单，同形状下逐条迭代等价）。
         不足容量或重复填充显式拒绝——base 分区固定语义是防遗忘的根基，
         不静默接受残缺或覆写。
         """
         if self._base:
             raise ValueError("base 分区已填满（固定语义：一次填充、之后不可变）")
-        if latents.shape[0] < self._base_capacity:
+        if len(latents) < self._base_capacity:
             raise ValueError(
                 f"base 分区容量 {self._base_capacity}，"
-                f"初始 fake {latents.shape[0]} 条不足"
+                f"初始 fake {len(latents)} 条不足"
             )
-        if len(modalities) != latents.shape[0]:
+        if len(modalities) != len(latents):
             raise ValueError(
                 f"base 分区填充的标签清单 {len(modalities)} 条与样本数 "
-                f"{latents.shape[0]} 条不符（逐样本一一对应）"
+                f"{len(latents)} 条不符（逐样本一一对应）"
             )
         self._base = [
             ReplayEntry(latents[index].detach().clone(), modalities[index])
             for index in range(self._base_capacity)
         ]
 
-    def push(self, latents: torch.Tensor, modality: Modality) -> None:
+    def push(self, latents: torch.Tensor, modality: str) -> None:
         """新 fake 入近期分区（FIFO：超容自动挤出最老；整批同条件——
         rollout 单 iteration 单条件）。"""
         self._recent.extend(
@@ -247,7 +263,7 @@ class ReplayBuffer:
 
     def sample_replay(
         self, count: int, generator: torch.Generator,
-        modality: Modality | None = None,
+        modality: str | None = None,
     ) -> ReplayDraw:
         """回放采样：base / recent 均匀分配（奇数余数归 recent）。
 
@@ -293,7 +309,7 @@ class ReplayBuffer:
         )
 
     def _condition_candidates(
-        self, modality: Modality | None,
+        self, modality: str | None,
     ) -> tuple[list[ReplayEntry], list[ReplayEntry]]:
         """两区候选：``modality`` 给定时各区收窄为该条件的条目。"""
         if modality is None:
@@ -304,8 +320,8 @@ class ReplayBuffer:
         )
 
     @staticmethod
-    def _modality_counts(entries: Sequence[ReplayEntry]) -> dict[Modality, int]:
-        counts: dict[Modality, int] = {}
+    def _modality_counts(entries: Sequence[ReplayEntry]) -> dict[str, int]:
+        counts: dict[str, int] = {}
         for entry in entries:
             counts[entry.modality] = counts.get(entry.modality, 0) + 1
         return counts

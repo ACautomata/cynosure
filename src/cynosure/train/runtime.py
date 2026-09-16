@@ -20,6 +20,7 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 
 import torch
 
+from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.distributed import (
     DistributedContext,
@@ -30,11 +31,15 @@ from cynosure.distributed import (
 )
 from cynosure.grpo import ClippedPolicyLoss, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
-from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.schedules import (
+    ConditionSchedules,
+    PerConditionSchedules,
+    SingleConditionSchedules,
+)
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.auc import HeldOutAuc
@@ -143,6 +148,7 @@ class TrainingRuntime:
             rewards.update.scorer,
             generators["rollout"],
             condition_sampler=policy.conditions,
+            vocabulary=cls.assemble_vocabulary(config),
             device_type=amp.device_type,
             autocast_dtype=amp.dtype,
             device=amp.device,
@@ -164,18 +170,39 @@ class TrainingRuntime:
         )
 
     @classmethod
+    def assemble_vocabulary(cls, config: CynosureConfig) -> ConditionVocabulary:
+        """条件词汇表装配（公开装配缝：预训练 driver 等不经本运行时的
+        消费方同口径消费）——两域装载分派本体在
+        ``ConditionVocabulary.assemble``（消费侧单一来源）。"""
+        return ConditionVocabulary.assemble(config)
+
+    @classmethod
     def assemble_sampler(cls, config: CynosureConfig, field: VelocityField) -> RolloutSampler:
-        """policy 采样封装装配（netbuild 日程 + 本组采样场 + SDE 核）。
+        """policy 采样封装装配（日程表 + 本组采样场 + SDE 核）。
 
         公开装配缝：train 运行时与预训练 driver（单进程 world-1 语境）
         共用同一份装配代码——采样日程/核参数的调整单点生效。"""
         policy = config.policy
-        scheduler = NetworkAssembler.rflow_scheduler(
-            num_inference_steps=policy.num_inference_steps,
-            input_img_size_numel=policy.input_img_size_numel,
-        )
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
-        return RolloutSampler(field, kernel, TrajectoryCursor(scheduler))
+        return RolloutSampler(
+            field, kernel, cls.assemble_schedules(config),
+        )
+
+    @classmethod
+    def assemble_schedules(cls, config: CynosureConfig) -> ConditionSchedules:
+        """sigma 日程装配（#129 逐条件锚，ADR-0002 语义逐条件化）：
+        MR-RATE = 逐条件日程表（锚 = 条件词汇表该条件的空间 numel，
+        与 rollout 噪声形状结构性同源）；BraTS = 单条件日程表（单域
+        语义 = 单条件词汇特例，全局锚日程的等价形态——数值零漂移）。"""
+        if config.experiment.dataset == "MR-RATE":
+            return PerConditionSchedules(
+                num_inference_steps=config.policy.num_inference_steps,
+                vocabulary=cls.assemble_vocabulary(config),
+            )
+        return SingleConditionSchedules(
+            num_inference_steps=config.policy.num_inference_steps,
+            input_img_size_numel=config.policy.input_img_size_numel,
+        )
 
     @classmethod
     def assemble_rewards(
@@ -224,18 +251,30 @@ class TrainingRuntime:
         scorer = cls._assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
-        # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐模态容量
+        # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐条件容量
         # ≥ K×world_size——条带切片后每 rank 视图 ≥ K 的等价条件，判定放
         # 全量保失败路径全 rank 一致（RankSlicedPool 切片前校验同款理由）；
-        # 切片视图供 RealPoolSampler 消费（分布式 = 本 rank 条带切片，
-        # 单进程 = 全池恒等）
+        # 条件集 = 本域条件名清单（#129 经词汇表装配注入）；切片视图供
+        # RealPoolSampler 消费（分布式 = 本 rank 条带切片，单进程 = 全池恒等）
+        vocabulary = cls.assemble_vocabulary(config)
         real_pool = LatentManifest.load(
             config.reward.real_pool_manifest, kind="real_pool",
         )
         real_pool.assert_condition_capacity(
             config.reward.disc_batch_size_k, dist.world_size,
+            vocabulary.names(),
         )
-        real_view = RankSlicedPool(real_pool, dist).view()
+        heldout_real = LatentManifest.load(
+            config.reward.heldout_real_manifest, kind="heldout_real",
+        )
+        # 逐条件形状契约与活动词汇表的装配期对照（#129 消费侧守卫）：
+        # fake 侧形状经 vocabulary.latent_shape(name) 解析、real 侧经
+        # manifest 的 condition_latent_shapes 装载，两来源同名异形（词表
+        # 工件改动而 manifest 未重建）此前只在首次判别器拼接时才炸——
+        # 装配期显式拒绝（held-out 侧同款：分簇/AUC 的 real 侧同源）
+        real_pool.assert_condition_shapes(vocabulary)
+        heldout_real.assert_condition_shapes(vocabulary)
+        real_view = RankSlicedPool(real_pool, dist, vocabulary.names()).view()
         update = OnlineUpdate(
             scorer=scorer,
             buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
@@ -252,9 +291,7 @@ class TrainingRuntime:
             noise_generator=generators["disc_noise"],
         )
         auc = HeldOutAuc(
-            heldout_manifest=LatentManifest.load(
-                config.reward.heldout_real_manifest, kind="heldout_real",
-            ),
+            heldout_manifest=heldout_real,
             scorer=scorer,
             generator=generators["heldout_auc"],
             device=amp.device,
@@ -268,14 +305,17 @@ class TrainingRuntime:
             initial=(
                 ConditionWhitelist.from_report(report)
                 if report is not None
-                else ConditionWhitelist.unrestricted()
+                else ConditionWhitelist.unrestricted(vocabulary.names())
             ),
             config=config.reward,
             dist=dist,
+            conditions=vocabulary.names(),
         )
         return RewardCoordinator(
             update, auc, generators["fake_shuffle"], gating,
-            overfit=OverfitMonitor(config.reward),
+            overfit=OverfitMonitor(
+                config.reward, conditions=vocabulary.names(),
+            ),
         )
 
     @staticmethod

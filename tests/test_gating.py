@@ -54,6 +54,7 @@ class GatingFixture:
             ConditionWhitelist(tuple(members), measured or {}),
             cls.reward_config(**reward_overrides),
             dist if dist is not None else DistributedContext(0, 1, False),
+            conditions=("t1n", "t1c", "t2w", "t2f"),
         )
 
 

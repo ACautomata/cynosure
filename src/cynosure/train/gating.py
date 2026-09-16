@@ -32,7 +32,7 @@ AUC 流（iter 事件已按目标模态归因）经 EMA 平滑后的滞回判定
 
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from cynosure.config import MODALITIES, Modality, RewardConfig
+from cynosure.config import RewardConfig
 from cynosure.train.whitelist import ConditionWhitelist
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ class Observation(NamedTuple):
     """逐 rank 提交的门控观测载荷（all_gather 的提交物）：目标条件、
     held-out AUC 测量、本条件是否被门控——集体跳过决定的 OR 归约输入。"""
 
-    modality: Modality
+    modality: str
     auc: float
     gated: bool
 
@@ -124,28 +124,29 @@ class DynamicWhitelist:
         initial: ConditionWhitelist,
         config: RewardConfig,
         dist: "DistributedContext",
+        conditions: tuple[str, ...],
     ) -> None:
         self._config = config
         self._dist = dist
+        self._conditions = tuple(conditions)
         self._current = ConditionWhitelist(
             self._ordered(initial.members), initial.measured,
         )
-        self._ema: dict[Modality, ConditionAucEma] = {}
+        self._ema: dict[str, ConditionAucEma] = {}
 
-    @staticmethod
-    def _ordered(members) -> tuple[Modality, ...]:
-        """名单成员归一到 MODALITIES 固定序（轮转序的子序列）：动态增删
-        不破坏名单的确定性顺序——诊断显示序与恢复 roundtrip 的逐位一致
-        都依赖它。"""
+    def _ordered(self, members) -> tuple[str, ...]:
+        """名单成员归一到本域条件集固定序（轮转序的子序列，#129 经
+        ConditionVocabulary.names() 注入）：动态增删不破坏名单的确定性
+        顺序——诊断显示序与恢复 roundtrip 的逐位一致都依赖它。"""
         wanted = set(members)
-        return tuple(m for m in MODALITIES if m in wanted)
+        return tuple(m for m in self._conditions if m in wanted)
 
     @property
     def whitelist(self) -> ConditionWhitelist:
         """当前生效名单快照（逐 iteration 门控查询的单点）。"""
         return self._current
 
-    def observe(self, modality: Modality, auc: float) -> bool:
+    def observe(self, modality: str, auc: float) -> bool:
         """集体观测一步 + 集体门控决定（本 iteration 是否全体跳过
         policy 更新）。
 
@@ -200,16 +201,16 @@ class DynamicWhitelist:
                 f"{sorted(state) if isinstance(state, dict) else type(state)}"
             )
         members = state["members"]
-        unknown = [m for m in members if m not in MODALITIES]
+        unknown = [m for m in members if m not in self._conditions]
         if unknown:
             raise ValueError(f"门控状态含非法名单成员: {sorted(set(unknown))}")
         ema_raw = state["ema"]
         if not isinstance(ema_raw, dict):
             raise ValueError(f"门控状态 EMA 清单形态非法: {type(ema_raw)}")
         span = self._config.gating_ema_span
-        restored: dict[Modality, ConditionAucEma] = {}
+        restored: dict[str, ConditionAucEma] = {}
         for modality, entry in ema_raw.items():
-            if modality not in MODALITIES:
+            if modality not in self._conditions:
                 raise ValueError(f"门控状态 EMA 含非法条件: {modality!r}")
             if (
                 not isinstance(entry, dict)
@@ -245,7 +246,7 @@ class DynamicWhitelist:
         ``submissions`` 已按 rank 序排列（all_gather 的稳定序），均值
         与判定逐条确定——同输入下各次执行逐位一致（同 seed 双 run 的
         门控决定一致不变式）。"""
-        grouped: dict[Modality, list[float]] = {}
+        grouped: dict[str, list[float]] = {}
         for observation in submissions:
             grouped.setdefault(observation.modality, []).append(
                 float(observation.auc),
@@ -272,7 +273,7 @@ class DynamicWhitelist:
                 self._ordered(members), self._current.measured,
             )
 
-    def _tracker(self, modality: Modality) -> ConditionAucEma:
+    def _tracker(self, modality: str) -> ConditionAucEma:
         """该条件的 EMA 观测器（懒建：未观测条件不预置条目——落盘形态
         与「在线流从 run 起步」语义一致）。"""
         if modality not in self._ema:

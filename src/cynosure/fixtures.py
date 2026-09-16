@@ -114,13 +114,15 @@ FIXTURE_MR_CONDITIONS: list[dict] = [
     },
     {
         "name": "flair/axial", "modality": "flair", "plane": "axial",
-        "fov_mm": [64.0, 64.0, 32.0], "fov_source": "fixture",
-        "grid_xyz": [64, 64, 32],
+        "fov_mm": [32.0, 32.0, 64.0], "fov_source": "fixture",
+        "grid_xyz": [32, 32, 64],
     },
 ]
-"""fixture 小词汇表（#127 fixture 通道）：2 个条件、缩小统一网格
-（latent [4,16,16,8] 同口径：dims/4 = (16,16,8)）。条件与网格随 fixture
-latent 形状对齐（异形状按条件贯通是 #129 的施工面）；普查对账豁免——
+"""fixture 小词汇表（#127 fixture 通道）：2 个生成条件、**异形状**统一
+网格（#129 全链验收的输入面）——t1w/axial [64,64,32] → latent
+(4,16,16,8)（= ``Fixture.LATENT_SHAPE``，与 BraTS fixture 网络工件同
+形）；flair/axial [32,32,64] → latent (4,8,8,16)（薄厚轴互换，空间
+numel 1024 ≠ 2048 → 逐条件 sigma 日程真实分化）。普查对账豁免——
 fixture 网格无普查对应，装载走 fixture_mode=True 通道。"""
 
 _FIXTURE_MR_CONDITION_VOCABULARY: dict = {
@@ -301,15 +303,13 @@ class Fixture:
             artifacts["condition_vocabulary_json"] = str(
                 artifacts_dir / "condition_vocabulary.json",
             )
-        return CynosureConfig.model_validate({
+        payload: dict = {
             "experiment": experiment,
-            "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "preprocessing": {"resize_base": self.RESIZE_BASE},
             "artifacts": artifacts,
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,
-                "input_img_size_numel": self.INPUT_IMG_SIZE_NUMEL,
                 "group_size_g": self.GROUP_SIZE_G,
                 "train_step_indices_m": sorted(self.TRAIN_STEP_INDICES_M),
             },
@@ -333,4 +333,12 @@ class Fixture:
             },
             # N_baseline fixture 缩小（Baseline manifest 条目随全流程走）
             "schedule": {"seed": 0, "baseline_samples": 4},
-        })
+        }
+        if dataset == "BraTS2023":
+            # 单域锚字段只属 BraTS 语义（#129 互斥携带守卫：MR 线显式
+            # 声明即字段级拒绝）——形状/锚逐条件派生自词汇表工件
+            payload["latent_shape"] = list(self.LATENT_SHAPE)
+            payload["policy"]["input_img_size_numel"] = (
+                self.INPUT_IMG_SIZE_NUMEL
+            )
+        return CynosureConfig.model_validate(payload)

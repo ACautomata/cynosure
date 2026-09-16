@@ -488,10 +488,10 @@ class TestRealCapacityGuard:
 
     def test_capacity_at_exact_k_passes(self) -> None:
         """每模态恰好 K 条：守卫放行（无放回采 K 条可行）。"""
-        self._manifest({m: 4 for m in MODALITIES}).assert_condition_capacity(4)
+        self._manifest({m: 4 for m in MODALITIES}).assert_condition_capacity(4, 1, list(MODALITIES))
 
     def test_capacity_above_k_passes(self) -> None:
-        self._manifest({m: 110 for m in MODALITIES}).assert_condition_capacity(8)
+        self._manifest({m: 110 for m in MODALITIES}).assert_condition_capacity(8, 1, list(MODALITIES))
 
     def test_starved_modality_rejected_with_readable_error(self) -> None:
         """单条件不足即拒（总量够、单条件不够不是放行理由——条件匹配
@@ -500,7 +500,7 @@ class TestRealCapacityGuard:
             {"t1n": 2, "t1c": 4, "t2w": 4, "t2f": 4},
         )
         with pytest.raises(ValueError, match="容量不足") as exc_info:
-            manifest.assert_condition_capacity(4)
+            manifest.assert_condition_capacity(4, 1, list(MODALITIES))
         message = str(exc_info.value)
         assert "t1n" in message and "2" in message and "4" in message
         assert "disc_batch_size_k" in message  # 可行动：点名 config knob
@@ -509,16 +509,16 @@ class TestRealCapacityGuard:
         """某模态 0 条（稀疏模态切片断供的极端）：显式拒绝，不静默空采。"""
         manifest = self._manifest({"t1n": 4, "t1c": 4, "t2w": 4, "t2f": 0})
         with pytest.raises(ValueError, match="t2f"):
-            manifest.assert_condition_capacity(4)
+            manifest.assert_condition_capacity(4, 1, list(MODALITIES))
 
     def test_multi_rank_demand_is_k_times_world_size(self) -> None:
         """逐（rank 切片, 模态）语义：判定按全量做、需量 = K×world_size
         （条带切片每 rank 视图 ≥ K 的等价条件，且失败路径全 rank 一致）——
         世界 2 路下每模态 6 条 < 8 被拒（rank 切片后最弱视图 3 < 4）。"""
         manifest = self._manifest({m: 6 for m in MODALITIES})
-        manifest.assert_condition_capacity(4, 1)  # 单进程：6 ≥ 4 放行
+        manifest.assert_condition_capacity(4, 1, list(MODALITIES))  # 单进程：6 ≥ 4 放行
         with pytest.raises(ValueError, match="容量不足") as exc_info:
-            manifest.assert_condition_capacity(4, 2)
+            manifest.assert_condition_capacity(4, 2, list(MODALITIES))
         message = str(exc_info.value)
         assert "world_size=2" in message and "8" in message
 
@@ -526,13 +526,71 @@ class TestRealCapacityGuard:
         """等价性锁：守卫放行的全量在真实条带切片后每 rank 视图每模态
         ≥ K（K=4、world=2、每模态 9 条 → 切片 5/4——最弱视图恰过线）。"""
         manifest = self._manifest({m: 9 for m in MODALITIES})
-        manifest.assert_condition_capacity(4, 2)
+        manifest.assert_condition_capacity(4, 2, list(MODALITIES))
         for rank in (0, 1):
             view = RankSlicedPool(
-                manifest, DistributedContext(rank, 2, True),
+                manifest, DistributedContext(rank, 2, True), MODALITIES,
             ).view()
             for modality in MODALITIES:
                 assert view.modalities[modality] >= 4
+
+
+class TestConditionLayeredSlicing:
+    """rank 切片的分层轴 = 活动条件集（#129）：MR-RATE 多条件池按词汇表
+    条件名分层——按 BraTS 四序列代码内副本切片会让每条目条件计数为零，
+    换域线多 rank 运行在装配期被全 rank 一致地拒绝（不可达）。"""
+
+    CONDITIONS: tuple[str, ...] = (
+        "t1w/axial", "t1w/coronal", "flair/axial", "swi/axial",
+    )
+
+    def _mr_manifest(self) -> LatentManifest:
+        """每条件 2 条、条件异形状的 MR 池（world=2 条带切片的输入面）。"""
+        entries = [
+            PoolEntry(
+                case_id=f"case-{name}-{index}",
+                modality=name,
+                latent=f"real_pool_latents/{name}-{index}.pt",
+                spacing=(100.0, 100.0, 100.0),
+            )
+            for name in self.CONDITIONS for index in range(2)
+        ]
+        return LatentManifest(
+            kind="real_pool",
+            encoder="mr-slice-test",
+            latent_shape=(4, 16, 16, 8),
+            split_seed=0,
+            split_sizes={"train": len(entries)},
+            entries=entries,
+            condition_latent_shapes={
+                name: (4, 16, 16, 8) for name in self.CONDITIONS
+            },
+        )
+
+    def test_condition_bands_distribute_entries_by_rank(self) -> None:
+        """每条件内部 entries[rank::world]：各片覆盖全部条件、逐条件 1 条。"""
+        view = RankSlicedPool(
+            self._mr_manifest(), DistributedContext(1, 2, True),
+            self.CONDITIONS,
+        ).view()
+        assert [entry.case_id for entry in view.entries] == [
+            f"case-{name}-1" for name in self.CONDITIONS
+        ]
+        assert view.modalities == {name: 1 for name in self.CONDITIONS}
+
+    def test_brats_condition_copy_rejects_mr_pool(self) -> None:
+        """分层轴退回 BraTS 四序列副本 → 每条目条件计数为零、全 rank
+        一致拒绝（报错点名缺的正是池里的条件）——代码内副本是换域线多
+        rank 不可达的根因，本测试锁定分层轴的注入面。"""
+        with pytest.raises(
+            ValueError, match="不足以支撑 2-路 rank 切片",
+        ) as exc_info:
+            RankSlicedPool(
+                self._mr_manifest(), DistributedContext(0, 2, True),
+                MODALITIES,
+            ).view()
+        message = str(exc_info.value)
+        assert "t1n×0" in message and "t2f×0" in message
 
 
 class TestLossDecreases:

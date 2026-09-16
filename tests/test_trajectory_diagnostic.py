@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from cynosure.fixtures import Fixture
+from cynosure.policy import TrajectoryDiagnosticRunner
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -151,6 +152,21 @@ class TestDiagnosticArtifact:
         )
         assert result.code == 2
         assert "modality" in result.stderr
+
+
+class TestDiagnosticDomainGuard:
+    """诊断回路的数据域守卫：诊断是 BraTS 单域的数值回归锚（单条件
+    日程 + 全局形状噪声 + 四序列条件），MR-RATE 的逐条件诊断属后续
+    ticket——构造期显式拒绝，而非把 schema 默认单域锚（latent_shape /
+    input_img_size_numel 默认值，MR config 里无语义字段）与四序列条件
+    误当成 MR 诊断落盘 trajectory.json。"""
+
+    def test_mr_rate_rejected_at_construction(self, tmp_path: Path) -> None:
+        fixture_dir = tmp_path / "fixtures"
+        Fixture().write_artifacts(fixture_dir)
+        config = Fixture().config(fixture_dir, dataset="MR-RATE")
+        with pytest.raises(ValueError, match="BraTS 单域"):
+            TrajectoryDiagnosticRunner(config)
 
 
 class TestEtaZeroParity:
