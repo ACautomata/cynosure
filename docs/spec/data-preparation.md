@@ -33,7 +33,7 @@ fork `create_training_data.py:55-96` `create_transforms` 的六步链：
 - **dim 公式参数化**：resize 基数（上游 128）做成可注入参数。fixture config 注入小基数——fixture 影像尺寸不变，但 orientation/强度/dtype 步在 fixture 下全走；链逻辑单份、测试覆盖全链。**fixture 不是对齐对象**，其参数独立于上游。
 - **spacing 侧车**：prepare 逐 case 读 NIfTI header `get_zooms()[:3]` × 1e2 存入 manifest（per-case）；rollout 侧源条件的 `spacing_tensor` 接线 manifest（替换现恒定 fixture 值）。BraTS 1mm iso → `[100.0, 100.0, 100.0]`，与现 fixture 值巧合相同，但语义从「写死」变「来自数据」。
 - **train/val 划分**：保持 cynosure 现状（排序 + seed 洗牌病例级 70/10/20，`reward/dataset.py`）。上游 fold 字段机制的生成脚本已退休不可考，不复刻伪对齐；两边「病例级 70/10/20」划分原则一致（`experiment-design.md:63` 本取自 fork 事实）。
-- **latent 存储域**：manifest 存 **seeded 后验采样 z**（`z_mu + eps(noise_seed)·z_sigma`，上游 `encode_stage_2_inputs` 的确定性重写；种子按（schedule seed, 病例, 序列）内容寻址，重跑零漂移），**未乘 scale_factor**；checkpoint scale_factor 的域缩放语义归 policy 采样 ticket，判别器侧 fake 由 rollout 相在消费点除回归位。域裁决依据（T12 集群探针）：raw z_mu 全局 std≈0.48 与 policy rollout 终点域 std≈0.94 分布级错配，采样 z std≈1.00 同域——判别器 real/fake 比较要求两侧同为后验采样分布。组2 源条件 latent 同取此域（组2 专用裁决随其 ticket）。
+- **latent 存储域**：manifest 存 **seeded 后验采样 z**（`z_mu + eps(noise_seed)·z_sigma`，上游 `encode_stage_2_inputs` 的确定性重写；种子按（schedule seed, 病例, 序列）内容寻址，重跑零漂移——**逐位**归测试口径，生产 pipeline 的 VAE 前向有浮点噪声级漂移，ADR-0011），**未乘 scale_factor**；checkpoint scale_factor 的域缩放语义归 policy 采样 ticket，判别器侧 fake 由 rollout 相在消费点除回归位。域裁决依据（T12 集群探针）：raw z_mu 全局 std≈0.48 与 policy rollout 终点域 std≈0.94 分布级错配，采样 z std≈1.00 同域——判别器 real/fake 比较要求两侧同为后验采样分布。组2 源条件 latent 同取此域（组2 专用裁决随其 ticket）。
 
 ## 边界（不在本方案内）
 

@@ -45,7 +45,7 @@ latent → 像素域的 VAE 解码，只发生在评测路径（Baseline 采样�
 _Avoid_: Dynamic_Inferer、逐 iteration 解码
 
 **预编码（Encode）**:
-影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写，幂等重跑），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构，BraTS 全语料恒整前向）；超界走滑窗分支（b 语义，NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4；ADR-0010 改判、#143 交付）。
+影像体 → latent 的 VAE 编码，发生在 prepare 阶段（`PreparePipeline._encode_one` 是全仓唯一读原始 NIfTI 的位置）；产物 = seeded 后验采样 z（上游 `encode_stage_2_inputs` 的确定性重写；幂等重跑 = 语义层，生产 pipeline 的 VAE 前向有浮点噪声级漂移，逐位归测试口径——ADR-0011），存储域不乘 scale_factor。豁免判定 = 单样本体素数 ≤ prod(roi)（影像单通道，与上游逐字同构，BraTS 全语料恒整前向）；超界走滑窗分支（b 语义，NVIDIA 语义锚 roi=[320,320,160]、overlap 0.4；ADR-0010 改判、#143 交付）。
 _Avoid_: 编码器推理、「超界显式拒绝」作现状引用
 
 **b 语义（blend-then-sample）**:
