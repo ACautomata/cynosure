@@ -98,6 +98,45 @@ FIXTURE_MODALITY_MAPPING: dict[str, int] = {"t1n": 29, "t1c": 34, "t2w": 30, "t2
 """基座 modality_mapping 的文档值（config Artifacts.modality_mapping_json
 同口径：t1n/t1c/t2w/t2f → 29/34/30/31），fixture 以工件形式落盘。"""
 
+FIXTURE_MR_MODALITY_TOKENS: dict[str, int] = {
+    "t1w": 9, "t2w": 10, "flair": 11, "swi": 20, "mra": 16,
+}
+"""fixture MR-RATE token 映射的文档值（生产工件
+``data/conditions/mrrate_conditions.json`` 同口径：上游
+modality_mapping.json whole-brain 条目），随 fixture 条件词汇表工件落盘
+——数值一致性由 test_condition_vocabulary 交叉对账守卫。"""
+
+FIXTURE_MR_CONDITIONS: list[dict] = [
+    {
+        "name": "t1w/axial", "modality": "t1w", "plane": "axial",
+        "fov_mm": [64.0, 64.0, 32.0], "fov_source": "fixture",
+        "grid_xyz": [64, 64, 32],
+    },
+    {
+        "name": "flair/axial", "modality": "flair", "plane": "axial",
+        "fov_mm": [64.0, 64.0, 32.0], "fov_source": "fixture",
+        "grid_xyz": [64, 64, 32],
+    },
+]
+"""fixture 小词汇表（#127 fixture 通道）：2 个条件、缩小统一网格
+（latent [4,16,16,8] 同口径：dims/4 = (16,16,8)）。条件与网格随 fixture
+latent 形状对齐（异形状按条件贯通是 #129 的施工面）；普查对账豁免——
+fixture 网格无普查对应，装载走 fixture_mode=True 通道。"""
+
+_FIXTURE_MR_CONDITION_VOCABULARY: dict = {
+    "kind": "mrrate-condition-vocabulary",
+    "issue": "#127",
+    "upstream_reference": (
+        "NV-Generate-CTMR configs/modality_mapping.json whole-brain 条目"
+    ),
+    "grid_semantics": (
+        "fixture 小词汇表：统一网格随 fixture latent [4,16,16,8] 缩小；"
+        "非 11 条件全量，普查对账豁免（fixture_mode=True 装载通道）"
+    ),
+    "modality_tokens": FIXTURE_MR_MODALITY_TOKENS,
+    "conditions": FIXTURE_MR_CONDITIONS,
+}
+
 _ZERO_CONV_REINIT_STD = 0.02
 """全零卷积权重的重初始化尺度（见 Fixture.unet 的说明）。"""
 
@@ -115,6 +154,7 @@ class FixtureArtifacts:
     vae_ckpt: Path
     vae_config_json: Path
     modality_mapping_json: Path
+    condition_vocabulary_json: Path
 
 
 class Fixture:
@@ -186,6 +226,7 @@ class Fixture:
             vae_ckpt=directory / "vae.pt",
             vae_config_json=directory / "vae_config.json",
             modality_mapping_json=directory / "modality_mapping.json",
+            condition_vocabulary_json=directory / "condition_vocabulary.json",
         )
         torch.save(self.unet().state_dict(), artifacts.unet_ckpt)
         artifacts.unet_config_json.write_text(
@@ -210,10 +251,18 @@ class Fixture:
         artifacts.modality_mapping_json.write_text(
             json.dumps(FIXTURE_MODALITY_MAPPING, indent=2), encoding="utf-8",
         )
+        # MR-RATE 条件词汇表（#127 fixture 通道）：小词汇表工件落盘，
+        # 仅可经 fixture_mode=True 装载（生产 11 条件全量之外的词表属
+        # fixture，显式声明纪律与 resize_base 同款）
+        artifacts.condition_vocabulary_json.write_text(
+            json.dumps(_FIXTURE_MR_CONDITION_VOCABULARY, indent=2),
+            encoding="utf-8",
+        )
         return artifacts
 
     def config(
         self, artifacts_dir: Path, group: str = "modal-label",
+        dataset: str = "BraTS2023",
     ) -> CynosureConfig:
         """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。
 
@@ -221,32 +270,43 @@ class Fixture:
         工件对（schema 强制），组1 携带亦无害（modal-label 训练不消费）。
         组3 另携带 stage-2 报告绑定（#116，schema 必填）：指向工件库序贯
         变体的第二份预训练产物（cross-modal 报告，``FixtureArtifactLibrary``
-        真跑 pretrain driver 产出）。"""
-        experiment: dict = {"group": group}
+        真跑 pretrain driver 产出）。
+        ``dataset`` 选数据域（#127）：BraTS2023（默认，条件语义 = 四序列
+        常量）或 MR-RATE（条件词汇表 = fixture 小词汇表工件，schema 强制
+        ``condition_vocabulary_json`` 绑定；生产工件为 11 条件全量）。
+        MR-RATE 线只定义组1。"""
+        experiment: dict = {"group": group, "dataset": dataset}
         if group == "sequential":
             experiment["stage2_pretrain_report_json"] = str(
                 artifacts_dir / "pretrain_run_stage2" / "pretrain_report.json",
+            )
+        artifacts: dict = {
+            "unet_ckpt": str(artifacts_dir / "unet.pt"),
+            # VAE 工件对：里程碑解码评测与 Baseline/重采的解码装配源
+            "vae_ckpt": str(artifacts_dir / "vae.pt"),
+            "vae_config_json": str(artifacts_dir / "vae_config.json"),
+            "net_config_json": str(artifacts_dir / "unet_config.json"),
+            "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
+            "dataset_root": str(artifacts_dir / "dataset"),
+            # ControlNet 工件与 write_artifacts 同构：组2/组3 的 policy 装配源
+            "controlnet_ckpt": str(artifacts_dir / "controlnet.pt"),
+            "controlnet_config_json": str(artifacts_dir / "controlnet_config.json"),
+            # 判别器工件与 write_artifacts 同构：fixture 打分/在线更新装载源
+            "discriminator_config_json": str(artifacts_dir / "discriminator_config.json"),
+            "discriminator_ckpt": str(artifacts_dir / "discriminator.pt"),
+        }
+        if dataset == "MR-RATE":
+            # 条件词汇表工件绑定（#127 schema 守卫：MR-RATE 必填、
+            # BraTS 携带即拒——两套口径互斥激活）
+            artifacts["condition_vocabulary_json"] = str(
+                artifacts_dir / "condition_vocabulary.json",
             )
         return CynosureConfig.model_validate({
             "experiment": experiment,
             "latent_shape": list(self.LATENT_SHAPE),
             "fixture_mode": True,  # 缩小采样日程（3 步 ODE）的显式声明通道
             "preprocessing": {"resize_base": self.RESIZE_BASE},
-            "artifacts": {
-                "unet_ckpt": str(artifacts_dir / "unet.pt"),
-                # VAE 工件对：里程碑解码评测与 Baseline/重采的解码装配源
-                "vae_ckpt": str(artifacts_dir / "vae.pt"),
-                "vae_config_json": str(artifacts_dir / "vae_config.json"),
-                "net_config_json": str(artifacts_dir / "unet_config.json"),
-                "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
-                "dataset_root": str(artifacts_dir / "dataset"),
-                # ControlNet 工件与 write_artifacts 同构：组2/组3 的 policy 装配源
-                "controlnet_ckpt": str(artifacts_dir / "controlnet.pt"),
-                "controlnet_config_json": str(artifacts_dir / "controlnet_config.json"),
-                # 判别器工件与 write_artifacts 同构：fixture 打分/在线更新装载源
-                "discriminator_config_json": str(artifacts_dir / "discriminator_config.json"),
-                "discriminator_ckpt": str(artifacts_dir / "discriminator.pt"),
-            },
+            "artifacts": artifacts,
             "policy": {
                 "num_inference_steps": self.NUM_INFERENCE_STEPS,
                 "input_img_size_numel": self.INPUT_IMG_SIZE_NUMEL,

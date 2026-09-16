@@ -33,65 +33,17 @@ Modality = Literal["t1n", "t1c", "t2w", "t2f"]
 MODALITIES: tuple[Modality, ...] = ("t1n", "t1c", "t2w", "t2f")
 """组1 模态标签条件与组2 跨模态方向共用的四序列清单（定死，experiment-design）。"""
 
-MrModality = Literal["t1w", "t2w", "flair", "swi", "mra"]
-"""MR-RATE 五模态（地图 #67 换域线）；token 映射锚上游
-``configs/modality_mapping.json``（mrrate-data-spec §3.4）。"""
+REGISTERED_DATASETS: tuple[str, ...] = ("BraTS2023", "MR-RATE")
+"""已登记数据域（#127 泛化：dataset 从 Literal 定死放宽为 str + 登记
+validator——新增数据域扩本登记处并接线其条件词汇来源，不再动类型层；
+BraTS2023 的词汇 = 代码内四序列常量语义，MR-RATE 的词汇 =
+条件词汇表工件 ``artifacts.condition_vocabulary_json``）。
 
-MR_MODALITIES: tuple[MrModality, ...] = ("t1w", "t2w", "flair", "swi", "mra")
-"""MR-RATE 模态集（定死五模态；#81 swap 探针五 token 全 responsive 的证明面）。"""
-
-MrSequenceForm = Literal["whole-brain", "skull-stripped"]
-"""序列词表条目的形态：whole-brain 官方直发 + 现场 derive 的 skull-stripped
-（官方只发 img/ + seg/，mrrate-data-spec 约束 #7）。"""
-
-MrPlane = Literal["axial", "sagittal", "coronal", "all-planes"]
-"""生成条件的采集平面；all-planes 是 #81 读数格的并池口径（T2w 三格
-并池读数、MRA 全平面一格），ML 层面四值全域，格级允许集由词表定死。"""
-
-MR_MODALITY_TOKENS: dict[MrModality, int] = {
-    "t1w": 9, "t2w": 10, "flair": 11, "swi": 20, "mra": 16,
-}
-"""MR-RATE whole-brain token 映射（定死，上游权威）：mri_t1/t2/flair/
-swi/mra = 9/10/11/20/16（NV-Generate-CTMR ``configs/modality_mapping.json``）。"""
-
-MR_SKULL_STRIPPED_TOKENS: dict[MrModality, int] = {
-    "t1w": 29, "t2w": 30, "flair": 31, "swi": 32, "mra": 33,
-}
-"""MR-RATE skull-stripped token 映射（定死，上游 29–33 权威）。生成条件
-用 whole-brain 条目（#81 swap 探针生成口径）；skull-stripped 是 prepare
-数据链的双产条目（mrrate-data-spec 约束 #7）。"""
-
-MR_CONDITION_GROUPS: tuple[tuple[str, MrModality, MrPlane], ...] = (
-    ("t1w/axial", "t1w", "axial"),
-    ("t1w/sagittal", "t1w", "sagittal"),
-    ("t1w/coronal", "t1w", "coronal"),
-    ("t2w/axial", "t2w", "axial"),
-    ("t2w/sagittal", "t2w", "sagittal"),
-    ("t2w/coronal", "t2w", "coronal"),
-    ("flair/axial", "flair", "axial"),
-    ("flair/sagittal", "flair", "sagittal"),
-    ("flair/coronal", "flair", "coronal"),
-    ("swi/axial", "swi", "axial"),
-    ("mra/all-planes", "mra", "all-planes"),
-)
-"""RL 条件白名单 = 全部 11 个生成条件（#81 终审：9 读数格欠训、0 饱和、
-0 标签存疑；T2w 三平面独立成格、读数并池，SWI 仅轴位可得，MRA 全平面
-一格）。分组 token 不单独定死——恒取该模态 whole-brain 条目
-（``MR_MODALITY_TOKENS``，#81 swap 生成口径），单一来源防双份漂移。"""
-
-
-def _mr_sequence_token_table() -> dict[tuple[MrModality, MrSequenceForm], int]:
-    """MR-RATE 序列词表定死表：每序列双条目（whole-brain + skull-stripped，
-    上游 29–33）。schema 默认值与定死 validator 共用的单一来源——两侧
-    引用同一张表，期望集永不漂移（#119）。"""
-    return {
-        (modality, form): token
-        for modality in MR_MODALITIES
-        for form, token in (
-            ("whole-brain", MR_MODALITY_TOKENS[modality]),
-            ("skull-stripped", MR_SKULL_STRIPPED_TOKENS[modality]),
-        )
-    }
+MR-RATE 的条件词表口径（五模态集 / token 映射 9/10/11/20/16 / 11 生成
+条件五元组）已整体迁出本模块：工件
+``data/conditions/mrrate_conditions.json`` 是唯一来源，装载面在
+``cynosure.conditions.MrConditionVocabulary``（#127；#119 的 config 内嵌
+词表 ``MrRateConditioning`` 退役）。"""
 
 # 组1 采样场（ADR-0002 定死）：CFG=10 组合场，v_cfg = v_uncond + 10·(v_cond − v_uncond)
 CFG_MODAL_LABEL: float = 10.0
@@ -126,193 +78,6 @@ class SpecField:
             json_schema_extra={"status": status, "source": source},
             **field_kwargs,
         )
-
-
-class MrSequenceEntry(BaseModel):
-    """MR-RATE 序列词表的一条目：（模态, 形态, token）。
-
-    每序列双条目——whole-brain（官方直发）+ skull-stripped（现场
-    derive，官方只发 img/ + seg/）；条目集合的定死对账在
-    ``MrRateConditioning`` 词表级 validator（mrrate-data-spec 约束 #6/#7）。
-    """
-
-    model_config = ConfigDict(extra="forbid", validate_default=True)
-
-    modality: MrModality = SpecField(
-        "定死", "mrrate-data-spec",
-        "MR-RATE 五模态之一（t1w/t2w/flair/swi/mra）",
-    )
-    form: MrSequenceForm = SpecField(
-        "定死", "mrrate-data-spec",
-        "条目形态：whole-brain 官方直发 / skull-stripped 现场 derive",
-    )
-    token: int = SpecField(
-        "定死", "mrrate-data-spec",
-        "modality token（上游 modality_mapping.json 权威；0 = unknown "
-        "是上游保留码，MR 词表条目必须为正）",
-        gt=0,
-    )
-
-
-class MrConditionGroup(BaseModel):
-    """MR-RATE 生成条件分组（RL 条件白名单成员，#81）。
-
-    条件 = (模态, 平面) 生成格；token 恒为该模态 whole-brain 条目
-    （#81 swap 探针的生成口径——skull-stripped 码属 prepare 数据链的
-    双产条目，不进生成分组）。集合的定死对账在 ``MrRateConditioning``
-    词表级 validator。
-    """
-
-    model_config = ConfigDict(extra="forbid", validate_default=True)
-
-    name: str = SpecField(
-        "定死", "#81",
-        "条件分组键（小写「模态/平面」，如 t1w/axial、mra/all-planes）——"
-        "per-condition gating（ADR-0008）的按条件统计与轮转消费面",
-    )
-    modality: MrModality = SpecField(
-        "定死", "#81", "条件的目标模态（token 取数键）",
-    )
-    plane: MrPlane = SpecField(
-        "定死", "#81",
-        "采集平面；all-planes 是并池读数口径（T2w 三格并池、MRA 全平面）",
-    )
-    token: int = SpecField(
-        "定死", "#81", "生成 token = 该模态 whole-brain 条目 token", gt=0,
-    )
-
-
-def _default_mr_sequences() -> list[MrSequenceEntry]:
-    """序列词表定死默认：5 模态 × 双条目 = 10 条（每次构造新实例——
-    词表容器不跨 config 实例共享，#119 互不污染验收项）。"""
-    return [
-        MrSequenceEntry(modality=modality, form=form, token=token)
-        for (modality, form), token in _mr_sequence_token_table().items()
-    ]
-
-
-def _default_mr_condition_groups() -> list[MrConditionGroup]:
-    """11 生成条件分组定死默认（#81 白名单全量；每次构造新实例）。"""
-    return [
-        MrConditionGroup(
-            name=name, modality=modality, plane=plane,
-            token=MR_MODALITY_TOKENS[modality],
-        )
-        for name, modality, plane in MR_CONDITION_GROUPS
-    ]
-
-
-class MrRateConditioning(BaseModel):
-    """MR-RATE 条件词表（issue #119，地图 #67 下游施工 1/7）。
-
-    换域线的条件口径整体：五模态集 / whole-brain token 映射（上游
-    ``modality_mapping.json`` 权威）/ 每序列双条目序列词表（whole-brain
-    + skull-stripped 29–33）/ 11 生成条件分组（#81 白名单）。四字段全
-    部定死对账（改值即字段级拒绝，同 ``cross_modal_pairs`` 先例）；
-    ``default_factory`` 每次实例化独立构造容器——两套口径与两次加载
-    之间无共享可变状态。schema 装载层：词表的运行时消费（RolloutCondition
-    组装 / prepare 数据链 / 预训练 per-condition 分组）由后续票接线。
-    """
-
-    model_config = ConfigDict(extra="forbid", validate_default=True)
-
-    modalities: list[MrModality] = SpecField(
-        "定死", "mrrate-data-spec",
-        "MR-RATE 模态集（定死五模态，#81 五 token 全 responsive 的证明面）",
-        default_factory=lambda: list(MR_MODALITIES),
-    )
-    modality_tokens: dict[str, int] = SpecField(
-        "定死", "mrrate-data-spec",
-        "whole-brain token 映射 t1w/t2w/flair/swi/mra → 9/10/11/20/16"
-        "（上游权威；#73 背景事实：五 token 全在 MR-RATE 训练分布内）",
-        default_factory=lambda: dict(MR_MODALITY_TOKENS),
-    )
-    sequences: list[MrSequenceEntry] = SpecField(
-        "定死", "mrrate-data-spec",
-        "序列词表：每序列双条目（whole-brain + skull-stripped），10 条"
-        "定死对账上游 29–33（skull-stripped 是 prepare 数据链的双产条目）",
-        default_factory=_default_mr_sequences,
-    )
-    conditions: list[MrConditionGroup] = SpecField(
-        "定死", "#81",
-        "11 生成条件分组（#81 白名单全量：9 读数格欠训 0 饱和 0 标签存疑；"
-        "T2w 三平面独立成格、SWI 仅轴位、MRA 全平面一格）",
-        default_factory=_default_mr_condition_groups,
-    )
-
-    @field_validator("modalities")
-    @classmethod
-    def _modalities_fixed_to_five(
-        cls, value: list[MrModality],
-    ) -> list[MrModality]:
-        if tuple(value) != MR_MODALITIES:
-            raise ValueError(
-                "MR-RATE 模态集定死为五模态 "
-                f"{MR_MODALITIES}（mrrate-data-spec），得到 {tuple(value)}"
-            )
-        return value
-
-    @field_validator("modality_tokens")
-    @classmethod
-    def _tokens_fixed_to_upstream_mapping(
-        cls, value: dict[str, int],
-    ) -> dict[str, int]:
-        if dict(value) != MR_MODALITY_TOKENS:
-            raise ValueError(
-                "MR-RATE token 映射定死为上游权威 "
-                f"{MR_MODALITY_TOKENS}（configs/modality_mapping.json），"
-                f"得到 {dict(value)}"
-            )
-        return value
-
-    @field_validator("sequences")
-    @classmethod
-    def _sequences_fixed_to_double_entries(
-        cls, value: list[MrSequenceEntry],
-    ) -> list[MrSequenceEntry]:
-        actual = {(entry.modality, entry.form): entry.token for entry in value}
-        expected = _mr_sequence_token_table()
-        # 基数先行：list 压 dict 对账前查长度——重复条目会静默坍缩
-        # （12 条压成 10 键），「每序列双条目」的计数约束必须显式强制
-        if len(value) != len(expected) or actual != expected:
-            raise ValueError(
-                "MR-RATE 序列词表定死为每序列双条目（whole-brain + "
-                f"skull-stripped，上游 29–33，共 {len(expected)} 条），期望 "
-                f"{expected}，得到 {len(value)} 条 {actual}"
-            )
-        return value
-
-    @field_validator("conditions")
-    @classmethod
-    def _conditions_fixed_to_issue81_whitelist(
-        cls, value: list[MrConditionGroup],
-    ) -> list[MrConditionGroup]:
-        actual = {
-            (group.name): (group.modality, group.plane, group.token)
-            for group in value
-        }
-        expected = {
-            name: (modality, plane, MR_MODALITY_TOKENS[modality])
-            for name, modality, plane in MR_CONDITION_GROUPS
-        }
-        # 基数先行：防重复分组名静默坍缩（#119 评审实测漏洞）——
-        # 11 分组的计数约束必须显式强制
-        if len(value) != len(expected) or actual != expected:
-            raise ValueError(
-                "11 生成条件分组定死为 #81 白名单全量（9 读数格欠训、"
-                f"T2w 三平面独立成格、SWI 仅轴位、MRA 全平面，共 "
-                f"{len(expected)} 个），期望 {sorted(expected)}，得到 "
-                f"{len(value)} 个 {sorted(actual)}"
-            )
-        for group in value:
-            if group.token != MR_MODALITY_TOKENS[group.modality]:
-                raise ValueError(
-                    f"条件分组 {group.name} 的 token {group.token} 与模态"
-                    f"映射不符：生成 token 必须是 {group.modality} 的 "
-                    "whole-brain 条目（#81 swap 生成口径，skull-stripped "
-                    "码不进生成分组）"
-                )
-        return value
 
 
 class Artifacts(BaseModel):
@@ -377,6 +142,15 @@ class Artifacts(BaseModel):
         "的在线训练）",
         default=None,
     )
+    condition_vocabulary_json: Path | None = SpecField(
+        "运行时", "#125 + #127",
+        "MR-RATE 条件词汇表工件（11 生成条件五元组：modality token / "
+        "plane / 推荐 FOV / 统一网格 / 等效 spacing；唯一来源，代码内无"
+        "词表副本）。仅 dataset=MR-RATE 有语义且必填（schema 守卫）；"
+        "BraTS config 携带即拒绝。装载面 = cynosure.conditions."
+        "MrConditionVocabulary（普查期望网格对账在装载期）",
+        default=None,
+    )
 
 
 class Experiment(BaseModel):
@@ -394,21 +168,16 @@ class Experiment(BaseModel):
         "实验基座 = rflow-mr-brain_v1（BraTS2023 与 MR-RATE 两域共用冻结基座）",
         default="rflow-mr-brain_v1",
     )
-    dataset: Literal["BraTS2023", "MR-RATE"] = SpecField(
+    dataset: str = SpecField(
         "定死", "experiment-design + #67",
-        "数据集 = BraTS2023（下游 nnUNet 仪器与跨模态 ControlNet 同域）/ "
-        "MR-RATE（地图 #67 换域：同基座的组1 模态标签 RL 后训练，条件"
-        "词表经 conditioning 段装载，#119）——两套口径的互斥选择开关",
+        "数据域（登记域 validator 守卫，已登记 "
+        + " / ".join(REGISTERED_DATASETS) + "，未登记值字段级拒绝）："
+        "BraTS2023（下游 nnUNet 仪器与跨模态 ControlNet 同域，条件语义 = "
+        "四序列常量）/ MR-RATE（地图 #67 换域：同基座的组1 模态标签 RL "
+        "后训练，条件词汇表经 artifacts.condition_vocabulary_json 工件装载，"
+        "#127）——两套口径的互斥选择开关。#127 泛化：从 Literal 定死放宽为 "
+        "str + 登记域 validator，新增数据域扩登记处与词汇接线，不动类型层",
         default="BraTS2023",
-    )
-    conditioning: MrRateConditioning | None = SpecField(
-        "定死", "mrrate-data-spec + #81",
-        "MR-RATE 条件词表（仅 dataset=MR-RATE 有语义）：五模态集 / "
-        "token 映射（9/10/11/20/16，上游 modality_mapping.json 权威）/ "
-        "每序列双条目序列词表（whole-brain + skull-stripped 29–33）/ "
-        "11 生成条件分组（#81 白名单）。缺省自动填充定死词表（单一来源，"
-        "config 不必抄录）；BraTS config 携带即拒绝",
-        default=None,
     )
     cross_modal_pairs: list[tuple[Modality, Modality]] = SpecField(
         "定死", "experiment-design",
@@ -429,6 +198,19 @@ class Experiment(BaseModel):
         default=None,
     )
 
+    @field_validator("dataset")
+    @classmethod
+    def _dataset_is_registered(cls, value: str) -> str:
+        """dataset 登记域守卫（#127 泛化形态）：类型层 Literal 退役后，
+        未登记的数据域在装载期字段级拒绝——拼错域名不再静默流入
+        分派逻辑。"""
+        if value not in REGISTERED_DATASETS:
+            raise ValueError(
+                f"dataset {value!r} 未登记（已登记域：{REGISTERED_DATASETS}；"
+                "新增数据域须扩登记处并接线其条件词汇来源，#127）"
+            )
+        return value
+
     @field_validator("cross_modal_pairs")
     @classmethod
     def _pairs_are_the_ordered_12(
@@ -441,31 +223,6 @@ class Experiment(BaseModel):
                 "cross_modal_pairs 定死为四序列 12 个有序 src→tgt 对，"
                 f"期望 {sorted(expected)}，得到 {sorted(seen)}"
             )
-        return value
-
-    @field_validator("conditioning")
-    @classmethod
-    def _conditioning_section_matches_dataset(
-        cls, value: MrRateConditioning | None, info: ValidationInfo,
-    ) -> MrRateConditioning | None:
-        """两套口径经 dataset 互斥激活（#119 验收：互不污染）：
-
-        - BraTS config 携带 MR 词表即拒绝——拼错 dataset 时两套口径
-          静默共存比显式拒绝危险（同 stage1_run_dir 守卫哲学）；
-        - MR-RATE 缺 conditioning 自动填充上游权威定死词表——词表
-          单一来源（schema 默认值），config 文件不必抄录定死值。
-        """
-        dataset = info.data.get("dataset")
-        if dataset != "MR-RATE":
-            if value is not None:
-                raise ValueError(
-                    "conditioning 段（MR-RATE 条件词表）仅对 "
-                    f"dataset=\"MR-RATE\" 有语义，得到 dataset={dataset}"
-                    "（两套口径互斥激活：BraTS config 携带 MR 词表即拒绝）"
-                )
-            return value
-        if value is None:
-            return MrRateConditioning()
         return value
 
     @model_validator(mode="after")
@@ -1203,6 +960,34 @@ class CynosureConfig(BaseModel):
                 )
         return artifacts
 
+    @field_validator("artifacts")
+    @classmethod
+    def _condition_vocabulary_matches_dataset(
+        cls, artifacts: Artifacts, info: ValidationInfo,
+    ) -> Artifacts:
+        """条件词汇表工件与 dataset 互斥绑定（#119 互斥哲学在工件形态
+        下的延续）：MR-RATE 缺工件即拒绝（11 生成条件的取数域无从装配）；
+        BraTS 携带即拒绝（拼错 dataset 时两套口径静默共存比显式拒绝
+        危险，同 conditioning 段先例）。"""
+        experiment = info.data.get("experiment")
+        if experiment is None:
+            return artifacts
+        if experiment.dataset == "MR-RATE":
+            if artifacts.condition_vocabulary_json is None:
+                raise ValueError(
+                    "dataset=\"MR-RATE\" 须提供 artifacts."
+                    "condition_vocabulary_json（11 生成条件五元组工件，"
+                    "#127；词表唯一来源，config 不内嵌词表）"
+                )
+        elif artifacts.condition_vocabulary_json is not None:
+            raise ValueError(
+                "artifacts.condition_vocabulary_json（MR-RATE 条件词汇表"
+                f"工件）仅对 dataset=\"MR-RATE\" 有语义，得到 dataset="
+                f"{experiment.dataset}（两套口径互斥激活：BraTS config "
+                "携带 MR 词汇工件即拒绝）"
+            )
+        return artifacts
+
     @model_validator(mode="after")
     def _inference_steps_match_mode(self) -> "CynosureConfig":
         """缩小采样日程的通道显式化：fixture_mode=false 时 num_inference_steps 钉 30。"""
@@ -1304,19 +1089,10 @@ __all__ = [
     "Experiment",
     "GrpoConfig",
     "MODALITIES",
-    "MR_CONDITION_GROUPS",
-    "MR_MODALITIES",
-    "MR_MODALITY_TOKENS",
-    "MR_SKULL_STRIPPED_TOKENS",
     "Modality",
-    "MrConditionGroup",
-    "MrModality",
-    "MrPlane",
-    "MrRateConditioning",
-    "MrSequenceEntry",
-    "MrSequenceForm",
     "PolicyConfig",
     "PreprocessingConfig",
+    "REGISTERED_DATASETS",
     "RewardConfig",
     "ScheduleConfig",
     "ShardingConfig",

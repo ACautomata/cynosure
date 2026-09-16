@@ -1,0 +1,104 @@
+{
+  "kind": "mrrate-condition-vocabulary",
+  "issue": "#127",
+  "upstream_reference": "NV-Generate-CTMR configs/modality_mapping.json（whole-brain 条目 mri_t1/t2/flair/swi/mra → 9/10/11/20/16；skull-stripped 29–33 不进本轮生成词汇）+ docs/inference.md「Recommended FOV for MR rflow-mr-brain」表（RAS 轴序）",
+  "grid_semantics": "统一网格 = #78 普查工件（census_grid_csv）逐条件众数 latent 网格 ×4（影像域，RAS 轴序，薄轴按 FOV 归位）；等效 spacing = 推荐 FOV / 统一网格（条件属性，spec #125 实现决策 1/6）。装载期逐条件对账普查众数，缺格/网格不符/字段缺失即拒绝。",
+  "census_grid_csv": "../eval/mrrate-baseline/census_latent_grid_distribution.csv",
+  "modality_tokens": {
+    "t1w": 9,
+    "t2w": 10,
+    "flair": 11,
+    "swi": 20,
+    "mra": 16
+  },
+  "conditions": [
+    {
+      "name": "t1w/axial",
+      "modality": "t1w",
+      "plane": "axial",
+      "fov_mm": [240.0, 240.0, 174.0],
+      "fov_source": "official docs/inference.md（T1 axial 中位 FOV）",
+      "grid_xyz": [256, 256, 128]
+    },
+    {
+      "name": "t1w/sagittal",
+      "modality": "t1w",
+      "plane": "sagittal",
+      "fov_mm": [176.0, 250.0, 250.0],
+      "fov_source": "official docs/inference.md（T1 sagittal 中位 FOV）",
+      "grid_xyz": [128, 256, 256]
+    },
+    {
+      "name": "t1w/coronal",
+      "modality": "t1w",
+      "plane": "coronal",
+      "fov_mm": [240.0, 200.0, 240.0],
+      "fov_source": "official docs/inference.md（T1 coronal 中位 FOV）",
+      "grid_xyz": [512, 256, 512]
+    },
+    {
+      "name": "t2w/axial",
+      "modality": "t2w",
+      "plane": "axial",
+      "fov_mm": [240.0, 240.0, 158.0],
+      "fov_source": "official docs/inference.md（T2 axial 中位 FOV）",
+      "grid_xyz": [512, 512, 128]
+    },
+    {
+      "name": "t2w/sagittal",
+      "modality": "t2w",
+      "plane": "sagittal",
+      "fov_mm": [162.0, 240.0, 240.0],
+      "fov_source": "official docs/inference.md（T2 sagittal 中位 FOV）",
+      "grid_xyz": [128, 256, 256]
+    },
+    {
+      "name": "t2w/coronal",
+      "modality": "t2w",
+      "plane": "coronal",
+      "fov_mm": [200.0, 180.0, 200.0],
+      "fov_source": "official docs/inference.md（T2 coronal 中位 FOV）",
+      "grid_xyz": [256, 128, 256]
+    },
+    {
+      "name": "flair/axial",
+      "modality": "flair",
+      "plane": "axial",
+      "fov_mm": [250.0, 250.0, 175.0],
+      "fov_source": "official docs/inference.md（FLAIR axial 中位 FOV）",
+      "grid_xyz": [256, 256, 128]
+    },
+    {
+      "name": "flair/sagittal",
+      "modality": "flair",
+      "plane": "sagittal",
+      "fov_mm": [176.0, 250.0, 250.0],
+      "fov_source": "official docs/inference.md（FLAIR sagittal 中位 FOV）",
+      "grid_xyz": [128, 512, 512]
+    },
+    {
+      "name": "flair/coronal",
+      "modality": "flair",
+      "plane": "coronal",
+      "fov_mm": [250.0, 200.0, 250.0],
+      "fov_source": "official docs/inference.md（FLAIR coronal 中位 FOV）",
+      "grid_xyz": [384, 256, 384]
+    },
+    {
+      "name": "swi/axial",
+      "modality": "swi",
+      "plane": "axial",
+      "fov_mm": [230.0, 230.0, 145.0],
+      "fov_source": "official docs/inference.md（SWI axial 中位 FOV）",
+      "grid_xyz": [256, 256, 128]
+    },
+    {
+      "name": "mra/all-planes",
+      "modality": "mra",
+      "plane": "all-planes",
+      "fov_mm": [158.4, 220.0, 220.0],
+      "fov_source": "#78 评估 manifest array_fov_mm 逐轴中位（MRA 无 all-planes 官方行；#80 基线同口径实测）",
+      "grid_xyz": [128, 384, 384]
+    }
+  ]
+}

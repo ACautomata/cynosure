@@ -25,30 +25,30 @@
 - **训练规模**：每组默认 **~200–500 iteration**（先跑 50 iter sanity 再扩），rollout = 条件组 × G=12 方向；三组共用同一量级保证横向可比。实际吞吐以 `orchestration.md` 的 rollout profile 为准。
 - **判别器**：每组 RL 各自独立的在线判别器与回放缓冲（判别器在线跟踪当前 policy 的 fake 分布，跨组/跨阶段不复用）。
 
-## 条件词表口径（MR-RATE 换域线，#119）
+## 条件词表口径（MR-RATE 换域线，#119 → #127 工件化）
 
-地图 #67 的 MR-RATE 上游域 RL 后训练基线与本页 BraTS 三组矩阵**共用同一基座**（rflow-mr-brain_v1），条件口径两套并存、经 `experiment.dataset` **互斥激活**（schema 层二选一，改动词表值即字段级拒绝）：
+地图 #67 的 MR-RATE 上游域 RL 后训练基线与本页 BraTS 三组矩阵**共用同一基座**（rflow-mr-brain_v1），条件口径两套并存、经 `experiment.dataset` **互斥激活**（schema 层二选一：词汇工件绑定与登记域校验在装载期字段级拒绝）：
 
 | 口径 | 数据集字段 | 模态词表 | token 映射 | 条件单位 |
 |---|---|---|---|---|
 | BraTS（本页矩阵，行为不变） | `BraTS2023`（默认） | 四序列 t1n/t1c/t2w/t2f | 29/34/30/31（工件装载，`artifacts.modality_mapping_json`） | 组1 = 序列；组2 = 12 有序对 |
-| MR-RATE（地图 #67） | `MR-RATE` | 五模态 t1w/t2w/flair/swi/mra | whole-brain 9/10/11/20/16 + skull-stripped 29–33 | 11 生成条件（#81 白名单） |
+| MR-RATE（地图 #67） | `MR-RATE` | 五模态 t1w/t2w/flair/swi/mra | whole-brain 9/10/11/20/16（工件装载，`artifacts.condition_vocabulary_json`；skull-stripped 29–33 不进本轮生成词汇） | 11 生成条件（#81 白名单，五元组工件） |
 
-MR-RATE 词表四要素全部入 config schema（`experiment.conditioning` 段，`src/cynosure/config.py` 的 `MrRateConditioning`）：
+MR-RATE 词表四要素（#119 定过口径）自 **#127 起整体工件化**——唯一来源是仓库登记工件 `data/conditions/mrrate_conditions.json`，config 不内嵌词表、代码内无常量副本：
 
-- **模态集**：t1w/t2w/flair/swi/mra 五模态（#81 swap 探针五 token 全 responsive 的证明面）；
-- **token 映射**：whole-brain `t1w/t2w/flair/swi/mra → 9/10/11/20/16`，**上游权威**（NV-Generate-CTMR `configs/modality_mapping.json`，`research/mrrate-data-spec.md` §3.4）；
-- **序列词表**：每序列**双条目**——whole-brain（官方直发）+ skull-stripped（29–33，现场 derive：官方只发 `img/` + `seg/`）；skull-stripped 条目属 prepare 数据链的双产形态；
-- **生成条件分组**：11 个 (模态, 平面) 格 = #81 终审白名单全量（9 读数格欠训、0 饱和、0 标签存疑）：T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。分组 token 恒为 whole-brain 条目（#81 swap 生成口径，skull-stripped 码不进生成分组）。
+- **token 映射**：whole-brain `t1w/t2w/flair/swi/mra → 9/10/11/20/16`，**上游权威**（NV-Generate-CTMR `configs/modality_mapping.json`，`research/mrrate-data-spec.md` §3.4）；条件 token 由映射按模态派生（文件内不重复登记，单一来源）；skull-stripped 29–33 不进本轮生成词汇（prepare 数据链双产条目的消费口径由数据装配票承接）；
+- **生成条件五元组**：11 个 (modality token, plane, 推荐 FOV, 统一网格, 等效 spacing) 格 = #81 终审白名单全量（T1w/T2w/FLAIR 各三平面 + SWI/AXIAL + MRA/ALL-PLANES）。统一网格 = #78 普查工件逐条件众数 latent 网格 ×4（RAS 轴序，薄轴按 FOV 归位）；等效 spacing = 推荐 FOV / 统一网格（条件属性，spec #125 决策 6）。FOV 数值：10 格取官方 docs/inference.md 推荐 FOV 表，MRA（无 all-planes 官方行）取 #78 评估 manifest 中位（#80 实测口径）；工件逐条件带 `fov_source` 标注；
+- **装载面**：`cynosure.conditions.MrConditionVocabulary.load(path)`（`artifacts.condition_vocabulary_json` 提供路径）。装载期校验：字段缺失/多余即 pydantic 字段级拒绝；token 映射须恰好覆盖五模态（缺模态可读拒绝）；统一网格逐轴 32 倍数（UNet 跳连约束）；FOV 薄轴与网格薄轴同位；等效 spacing ∈ [0.4, 5.0] mm（上游 check_input_mr 域）；生产模式（`fixture_mode=False`）恒要求 11 条件全量且**逐条件网格与 #78 普查期望网格（众数）一致**——缺格、多格、网格不符即拒绝，「条件 → latent 形状」以普查工件为权威对照；
+- **fixture 通道**：非 11 条件全量的小词汇表只能经 `fixture_mode=True` 显式装载（同 `resize_base` 显式声明纪律）；fixture 工件由 `Fixture.write_artifacts` 落盘（2 条件小网格）。
 
 schema 语义（与 BraTS 线的隔离保证）：
 
-- **缺省自动填充**：MR config 不必抄录词表，`conditioning` 缺席时 schema 以定死默认值填充（单一来源）；
-- **互斥携带即拒**：BraTS config 携带 `conditioning` 段即拒绝（拼错 dataset 时两套口径静默共存比显式拒绝危险）；MR-RATE 词表字段改值（含分组集合偏离白名单）即字段级拒绝；
-- **无共享可变状态**：词表容器经 `default_factory` 每实例独立构造，同进程先后加载互不污染；
+- **绑定互斥**：`dataset=MR-RATE` 时 `artifacts.condition_vocabulary_json` 必填（缺词表绑定 = 生成条件取数域无从装配）；BraTS config 携带即拒绝（拼错 dataset 时两套口径静默共存比显式拒绝危险）；
+- **dataset 登记域**：`experiment.dataset` 从 Literal 定死放宽为 str + 登记域 validator（`REGISTERED_DATASETS`，#127 泛化）——未登记域字段级拒绝；新增数据域扩登记处并接线其词汇来源，不再动类型层；BraTS 取值与全部既有语义零变化（回归测试守住「泛化不改语义」）；
+- **无共享可变状态**：词表装载产物不可变（frozen 值对象 + 只读映射视图），同进程先后装载互不污染；
 - **MR-RATE 线只定义组1**：上游无 MR ControlNet，非 modal-label 组别即拒绝（跨模态/序贯是 BraTS 语义）。
 
-**装载层交付边界（#119）**：本段口径只到 schema 校验。词表的运行时消费——RolloutCondition 组装（组条件 label 取数）、prepare 数据链（双条目序列的装载与编码）、预训练 per-condition 分组（ADR-0008 的按条件统计键）——由地图 #67 的后续施工票接线；BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
+**装载层交付边界（#127）**：本段口径到工件装载与 schema 绑定为止。词表的运行时消费——rollout 条件组装（token 取数）、latent 形状按条件贯通（#129，`latent_shape(name)` 解析面已备）、预处理统一网格与 spacing 条件属性（#130）、prepare 数据链配额装配（#131）——由地图 #67 的后续施工票接线；BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
 
 ## 对照基线（no-RL）
 
