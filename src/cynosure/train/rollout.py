@@ -45,7 +45,12 @@ from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.scorer import LatentScorer
 
 _BASE_BATCH = 8
-"""base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）。"""
+"""base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）；
+基准口径 = 64³ 空间网格（BraTS 单域锚）。大网格条件经
+``RolloutPhase._base_batch_for`` 按空间体积缩批——量产前向的激活
+显存随 batch × 体积增长，多网格域（MR-RATE 逐条件统一网格，#111
+裁决）直接套单域常数会把大网格条件推向 OOM（#122 首跑集群实录：
+t1w/coronal [4,128,64,128] batch=8 前向单次分配 12 GB）。"""
 
 
 @dataclass(frozen=True)
@@ -499,7 +504,9 @@ class RolloutPhase:
                 shape = self._vocabulary.latent_shape(condition_name)
                 produced = 0
                 while produced < count:
-                    batch = min(_BASE_BATCH, count - produced)
+                    batch = min(
+                        self._base_batch_for(shape), count - produced,
+                    )
                     condition = self._condition_sampler.sample_target(
                         condition_name, generator,
                     )
@@ -513,6 +520,19 @@ class RolloutPhase:
                     produced += batch
         # base 分区与近期分区同一 reward 域（real pool 存储域）
         return latents, condition_names
+
+    @staticmethod
+    def _base_batch_for(
+        shape: tuple[int, int, int, int], reference: int = _BASE_BATCH,
+    ) -> int:
+        """条件形状的量产批量（体积感知缩放，#122 首跑 OOM 修复）：
+        基准 = 64³ 空间（BraTS 单域锚）× ``_BASE_BATCH`` 批；实际批 =
+        基准批 × (基准体积 / 本条件空间体积) 截到 [1, 基准]——前向激活
+        显存随 batch × 体积增长，缩批以单次前向体积近似守恒；小网格
+        只截顶、不放大（基准批量本身是 CFG 双前向的标定口径）。"""
+        reference_spatial = 64 * 64 * 32
+        spatial = shape[1] * shape[2] * shape[3]
+        return max(1, min(reference, reference * reference_spatial // spatial))
 
     def _to_pool_domain(self, latent: torch.Tensor) -> torch.Tensor:
         """rollout 终点（policy scaled 采样域）→ real pool 存储域：

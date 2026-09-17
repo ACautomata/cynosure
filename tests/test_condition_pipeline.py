@@ -151,6 +151,18 @@ class TestRolloutShapesFollowConditions:
         for latent, name in zip(fakes, names):
             assert tuple(latent.shape) == vocab.latent_shape(name)
 
+    def test_base_batch_scales_with_condition_volume(self) -> None:
+        """量产批量按条件空间体积缩放（#122 首跑 OOM 修复）：基准 =
+        64³ 空间（BraTS 单域锚）× 8 批；大网格条件缩批防前向激活 OOM
+        （t1w/coronal 空间 [128,64,128] = 基准体积 8 倍，单域批量常数
+        在 MR-RATE 多网格域把量产前向推向 OOM——T12 集群实录）；小
+        网格截到基准批量、不放大。"""
+        assert RolloutPhase._base_batch_for((4, 64, 64, 32)) == 8
+        assert RolloutPhase._base_batch_for((4, 128, 64, 128)) == 1
+        assert RolloutPhase._base_batch_for((4, 128, 128, 32)) == 2
+        assert RolloutPhase._base_batch_for((4, 32, 96, 96)) == 3
+        assert RolloutPhase._base_batch_for((4, 32, 32, 16)) == 8
+
 
 class TestBaselineSamplingShapes:
     """eval/baseline 采样：逐条目噪声形状从条目条件解析（验收 1 后半）。"""
