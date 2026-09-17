@@ -144,10 +144,29 @@ class LatentManifest(BaseModel):
         不动，不引入有放回采样补洞。条件集经注入（#129：BraTS = 四序列、
         MR-RATE = 词汇表条件集），本类不设代码内副本。
         """
+        self.assert_capacity_counts(
+            self.modalities, batch_size_k, world_size, conditions,
+        )
+
+    @classmethod
+    def assert_capacity_counts(
+        cls, counts: dict[str, int], batch_size_k: int, world_size: int,
+        conditions: list[str] | tuple[str, ...],
+    ) -> None:
+        """容量守卫的算术本体（``assert_condition_capacity`` 与 prepare
+        装配计划期守卫共用的唯一实现）：manifest 侧传自身分层计数，
+        prepare 侧传装配计划计数——**编码之前**即可判定（生产体量下先
+        编码整池再报错是白烧加速卡；spec「开工前失败而非训练中途」的
+        字面口径），两入口的判据与报错不设第二份。
+
+        prepare 侧传的是**配额抽样后**的实取计数：配额本身也会触发本
+        守卫（候选充足但 real_pool_quota < K×world），故报错同时点名配额
+        与数据量两条修法——只报「增大 real pool」会把修法指错方向。
+        """
         required = batch_size_k * world_size
         starved: list[tuple[str, int]] = []
         for condition in conditions:
-            count = self.modalities.get(condition, 0)
+            count = counts.get(condition, 0)
             if count < required:
                 starved.append((condition, count))
         if starved:
@@ -160,7 +179,10 @@ class LatentManifest(BaseModel):
                 f" = {required} 条（条件匹配采样后每 rank 独立供满无放回 "
                 "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
                 f"不变，不引入有放回采样补洞）；不足: {detail}。"
-                "增大 real pool（或减小 disc_batch_size_k / 切片路数）"
+                "计数是抽样后的实取卷数——先看该条件是否被配额截断"
+                "（MR-RATE 线 reward.real_pool_quota）：截断则增大配额，"
+                "候选本身不足才需增大 real pool（或减小 disc_batch_size_k "
+                "/ 切片路数）"
             )
 
     def assert_condition_shapes(
@@ -282,6 +304,31 @@ class LatentManifest(BaseModel):
         return self
 
 
+class PrepareProvenance(BaseModel):
+    """prepare 工件的 provenance 留痕（#121 AC2：来源快照 + 预处理口径
+    随工件落盘——统计量可追溯其数据域、快照与编码链口径）。"""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    dataset: str
+    """数据域登记名（REGISTERED_DATASETS）。"""
+    data_snapshot: str | None = None
+    """数据 release 快照标识（MR-RATE = 与评估集 #78 同一冻结快照；
+    BraTS 线 None）。"""
+    source_commit: str | None = None
+    """来源 commit（产出工件的代码版本标识，config 显式声明注入；None =
+    未声明——集群 rsync 部署无 .git，不设运行时自读的隐式通道）。"""
+    intensity_clip: bool
+    """强度臂口径（BraTS True = ADR-0006 fork 锚；MR-RATE False = NVIDIA
+    v1 官方口径，#71/#130 裁决）。"""
+    resize_semantics: Literal["formula-round-base", "uniform-grid"]
+    """resize 口径：BraTS = RAS 后逐轴 round 到基数倍数；MR-RATE = 逐条件
+    统一网格（#111 网格裁决的多网格案落地，与 rollout 口径一致）。"""
+    upstream_anchor: str
+    """上游锚标注（recipe 级分线：BraTS 锚 fork、MR-RATE 锚 NVIDIA v1，
+    CONTEXT.md「上游锚」词条）。"""
+
+
 class ChannelStats(BaseModel):
     """判别器输入 per-channel 标准化统计量（来自 Real sample pool 所用训练集）。"""
 
@@ -294,6 +341,9 @@ class ChannelStats(BaseModel):
     latent_shape: tuple[int, int, int, int]
     source_manifest: str
     """来源 pool manifest 的路径（相对本文件）。"""
+    provenance: PrepareProvenance | None = None
+    """数据域 + 快照 + 预处理口径（#121 AC2；既有 BraTS 工件无此字段
+    照常装载——可扩不可改名）。"""
 
     @field_validator("std")
     @classmethod
@@ -317,3 +367,70 @@ class ChannelStats(BaseModel):
         return cls.model_validate(
             json.loads(Path(path).read_text(encoding="utf-8")),
         )
+
+
+SamplingRole = Literal["pool", "heldout"]
+"""抽样条目的装配归属：pool = 判别器「真」训练侧；heldout = out-of-sample
+监控侧（train split 内 patient 级二分，永不参与判别器更新）。"""
+
+
+class SamplingEntry(BaseModel):
+    """配额抽样留痕的单卷条目（#131：#78 抽样机制同款的逐卷归属登记）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    patient_uid: str
+    study_uid: str
+    series_id: str
+    modality: str
+    """模态名（casefold 后的元数据原值，MR-RATE 五模态域）。"""
+    plane: str
+    """采集平面（casefold 后的元数据原值；MRA 卷不作条件判定依据）。"""
+    condition: str
+    """归属生成条件（词汇表 11 格名）。"""
+    role: SamplingRole
+
+
+class SamplingManifest(BaseModel):
+    """MR-RATE 配额抽样留痕工件（#131，#78 抽样机制同款）：固定 seed、
+    排序后抽样、逐卷归属与守卫读数落档——prepare 幂等（同 seed 重跑
+    零漂移）与 held-out 互斥（病例级不相交、与评估留出池不相交）的
+    可审计登记面。"""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    kind: Literal["mrrate-sampling-manifest"] = "mrrate-sampling-manifest"
+    seed: int
+    """抽样与二分 seed（= schedule.seed，随工件留痕）。"""
+    data_snapshot: str
+    """数据 release 快照标识（与评估集同一冻结快照，#78 口径一致）。"""
+    quota: dict[str, int]
+    """逐条件配额上限（config reward.real_pool_quota 原样留痕；未登记
+    条件 = 全量不设限）。"""
+    heldout_fraction: float
+    """train split 内 patient 级二分的 held-out 份额。"""
+    heldout_quota_volumes: int
+    """逐条件 held-out 侧卷数上限（config reward.heldout_quota_volumes
+    原样留痕——held-out 池是监控集，预训练按条件读全量卷级聚类，
+    无上限即按 10% patient 二分的体量膨胀）。"""
+    census_candidates: dict[str, int]
+    """逐条件候选域计数（互斥守卫后、抽样前；held-out 二分基数的
+    同源口径）。"""
+    census_quota_taken: dict[str, int]
+    """逐条件 pool 侧实抽计数（配额为上限——候选不足取全量）。"""
+    heldout_counts: dict[str, int]
+    """逐条件 held-out 侧**实取**计数（配额为上限——候选不足取全量；
+    支撑度判定与 per-condition AUC 归因的留痕）。"""
+    out_of_vocabulary_volumes: int
+    """train split 内白名单条件域外卷数（信息性留痕，不进任何工件）。"""
+    non_train_volumes: int = 0
+    """val/test split 的元数据卷数（评估留出池，不进 real 数据链候选；
+    生产元数据覆盖全 split 的常态——计数留痕供审计）。"""
+    eval_exclusion_keys: int
+    """评估集互斥守卫的 series 键基数（#78 评估清单行数）。"""
+    eval_exclusion_series_hits: int
+    """候选域与评估集 series 键（study_uid, series_id）的命中数——合法
+    装配恒 0（守卫 fail-fast 在先），非 0 读数即守卫未执行。"""
+    eval_exclusion_patient_hits: int
+    """候选域与评估集 patient 集的命中数（第二道防线，合法装配恒 0）。"""
+    entries: list[SamplingEntry]

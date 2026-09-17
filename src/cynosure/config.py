@@ -159,6 +159,67 @@ class Artifacts(BaseModel):
         "MrConditionVocabulary（普查期望网格对账在装载期）",
         default=None,
     )
+    mrrate_metadata_csv: Path | None = SpecField(
+        "运行时", "#125 + #131",
+        "MR-RATE series 级元数据 CSV（列：study_uid / series_id / "
+        "patient_uid / modality / plane；官方 batchXX_metadata.csv 的键列"
+        "子集）——prepare 配额抽样的候选域来源。仅 dataset=MR-RATE 有语义"
+        "且必填（schema 守卫）；BraTS config 携带即拒绝",
+        default=None,
+    )
+    mrrate_splits_csv: Path | None = SpecField(
+        "运行时", "#125 + #131",
+        "MR-RATE 官方 patient 级 split CSV（列：patient_uid / split；"
+        "官方 splits.csv）——real 数据链只取 train split（病例级，同患者"
+        "所有 study 同 split），留出集与 held-out 互斥的官方优先来源。"
+        "仅 dataset=MR-RATE 有语义且必填；BraTS config 携带即拒绝",
+        default=None,
+    )
+    eval_manifest_csv: Path | None = SpecField(
+        "运行时", "#125 + #131 + #78",
+        "MR-RATE 评估集 manifest（#78 工件 eval_manifest.csv）——装配期"
+        "评估集互斥硬守卫的键源（study_uid + series_id 键、patient 级"
+        "双守卫）。仅 dataset=MR-RATE 有语义且必填；BraTS config 携带即"
+        "拒绝",
+        default=None,
+    )
+    mrrate_data_snapshot: str | None = SpecField(
+        "运行时", "#125 + #131",
+        "MR-RATE 数据 release 快照标识（与评估集 #78 同一冻结快照，如 "
+        "HF revision）——随 prepare 工件 provenance 留痕，real 数据链与"
+        "评估集分类口径一致的凭据。仅 dataset=MR-RATE 有语义且必填；"
+        "BraTS config 携带即拒绝",
+        default=None,
+    )
+    source_commit: str | None = SpecField(
+        "运行时", "#121",
+        "产出 prepare 工件的代码版本标识（来源 commit）——由运行环境"
+        "（实验脚本 / CI）显式填入并随工件 provenance 落档（#121 AC2："
+        "provenance 的「来源 commit」承载；集群 rsync 部署无 .git，"
+        "不设运行时 git 自读的隐式通道）；缺省 None = 未声明，"
+        "provenance 该字段留空",
+        default=None,
+    )
+
+    @field_validator("mrrate_data_snapshot")
+    @classmethod
+    def _data_snapshot_is_identifier(cls, value: str | None) -> str | None:
+        """快照标识非空白、首尾空白归一（#121 provenance / #131 抽样留痕
+        的凭据面）：None 留给「本域不适用」的互斥携带守卫判读；给出即须
+        是标识本身——空白串满足 ``is not None`` 的必填检查却什么都没登记
+        （工件自称登记了数据 release），首尾空白则原样落进工件、让跨工件
+        比对（prepare 与 #78 评估集同一快照）静默判否。"""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                f"artifacts.mrrate_data_snapshot 不得为空白串（得到 "
+                f"{value!r}）：该字段是「real 数据链与评估集同一冻结快照」"
+                "的凭据，空白值让 provenance 与抽样留痕自称登记了数据 "
+                "release 而无内容"
+            )
+        return normalized
 
 
 class Experiment(BaseModel):
@@ -563,6 +624,47 @@ class RewardConfig(BaseModel):
         "运行时", "reward-model",
         "判别器输入 per-channel 标准化统计量（来自 Real sample pool 所用训练集；prepare 产出）",
     )
+    real_pool_quota: dict[str, int] = SpecField(
+        "tunable", "#125 + #131",
+        "MR-RATE real pool 逐条件配额上限（键 = 生成条件名，值 = 抽样"
+        "卷数上限；词表内未登记的条件 = 全量不设限——头部模态各数千条、"
+        "MRA 全量 ≈ 110 的登记形态）。固定 seed、排序后抽样、配额为上限"
+        "而非硬指标（候选不足取全量，容量下限由装配期容量守卫把守）。"
+        "仅 MR-RATE 线有语义，BraTS 线（train split 全量，无配额语义）"
+        "不消费",
+        default_factory=dict,
+    )
+    heldout_fraction: float = SpecField(
+        "tunable", "#125 + #131 + #73",
+        "MR-RATE held-out real 的 train split 内 patient 级二分配比"
+        "（(0,1) 开区间）：候选 patients 排序 + seed 洗牌后按此份额切出"
+        "held-out 侧——病例级不相交、永不参与判别器更新；与官方 val/test"
+        "评估留出池天然不相交（官方 split 优先，#73 原则）。仅 MR-RATE "
+        "线有语义，BraTS 线二分 = 70/10/20 写死（CaseSplitter）不消费",
+        default=0.1, gt=0.0, lt=1.0,
+    )
+    heldout_quota_volumes: int = SpecField(
+        "tunable", "#121 + #131 + ADR-0008-04",
+        "MR-RATE held-out real 的逐条件卷数上限（配额为上限非硬指标："
+        "候选不足取全量）。held-out 池是监控集、不是越大越好——生产 "
+        "10% patient 二分把头条件留成上万卷，而预训练每步按条件读取该"
+        "条件 held-out **全量**卷级聚类（HeldOutAuc.compute_volume_"
+        "clusters 整条件 stack 上卡，数万卷 × 单卷最大 latent ≈ 数十 "
+        "GiB 且每步重扫）：超过本上限的额外卷对池化 AUC 点估计无实质"
+        "贡献（精度由 min(real, fake) 主导），却让磁盘与显存线性膨胀。"
+        "512 = 支撑度界（gate_support_min_volumes）一个数量级之上的起步"
+        "值，MR-RATE 预训练曲线校准后定版。仅 MR-RATE 线有语义，BraTS "
+        "线 held-out = val split 全量（CaseSplitter）不消费",
+        default=512, ge=1,
+    )
+    sampling_manifest_json: Path | None = SpecField(
+        "运行时", "#125 + #131",
+        "MR-RATE 配额抽样留痕工件（#78 抽样机制同款：seed / 逐条件候选"
+        "与抽取计数 / pool 与 held-out 逐卷归属 / 评估集互斥守卫读数/"
+        "数据快照）——prepare 幂等与 held-out 互斥的可审计落档。仅 "
+        "dataset=MR-RATE 有语义且必填；BraTS config 携带即拒绝",
+        default=None,
+    )
     pretrain_gate_auc: float = SpecField(
         "tunable", "ADR-0007",
         "RM readiness gate 门槛阈值：预训练 per-condition held-out AUC 的"
@@ -657,6 +759,19 @@ class RewardConfig(BaseModel):
         default=0.2, gt=0.0, lt=1.0,
     )
 
+    @field_validator("real_pool_quota")
+    @classmethod
+    def _quota_entries_positive(cls, value: dict[str, int]) -> dict[str, int]:
+        """逐条件配额须为正（0 与负数 = 抽不出任何卷的死配额，属配置
+        错误而非「关闭该条件」——条件缺席用不登记键表达）。"""
+        starved = sorted(key for key, count in value.items() if count < 1)
+        if starved:
+            raise ValueError(
+                f"real_pool_quota 配额须 ≥ 1（配额是抽样上限，死配额属"
+                f"配置错误；关闭条件用不登记键表达）: {starved}"
+            )
+        return value
+
     @model_validator(mode="after")
     def _gating_hysteresis_band(self) -> "RewardConfig":
         """动态门控的滞回带形状：exit < enter（滞回带非空，防名单在
@@ -703,8 +818,8 @@ class PreprocessingConfig(BaseModel):
     """prepare 读图编码的上游 recipe 参数（data-preparation spec + ADR-0006）。
 
     transform 链本体在 ``cynosure.reward.preprocessing``（MONAI 六步语义重写，
-    零依赖）；config 只携带可注入参数：resize 基数。链中不存在 spacing 重采样 /
-    foreground crop / z-score，均为对齐结论、无参数可暴露。
+    零依赖）；config 只携带可注入参数：resize 基数与强度臂 clip。链中不存在
+    spacing 重采样 / foreground crop / z-score，均为对齐结论、无参数可暴露。
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -715,8 +830,21 @@ class PreprocessingConfig(BaseModel):
         "size 从 RAS 重定向后的空间形状读取；生产钉上游基数"
         f"（{UPSTREAM_RESIZE_BASE}，BraTS 240×240×155 → 256×256×128），"
         "fixture 注入小基数使夹具影像尺寸不变（须经 fixture_mode=true "
-        "显式声明）",
+        "显式声明）。仅 BraTS 线有语义——MR-RATE 线 resize 目标 = 逐条件"
+        "统一网格（词汇表工件携带），本字段取值偏离上游基数即拒绝"
+        "（schema 守卫）",
         default=UPSTREAM_RESIZE_BASE, ge=1,
+    )
+    intensity_clip: bool = SpecField(
+        "定死", "#130 + ADR-0006 + #71",
+        "强度臂 clip 口径（#130 参数化）：BraTS 线 clip=True 是 ADR-0006"
+        "裁决的 fork recipe 锚（fork issue #251 记录在案偏差）；MR-RATE "
+        "线 clip=False 是 NVIDIA v1 官方口径（上游 transforms.py 原文，"
+        "#71 裁决：对齐基座训练域）——两臂 embedding 不可互用，两域各自"
+        "锁死裁决值（schema 守卫，显式携带错误值即拒绝）。另：MR-RATE 线"
+        "的 resize_base 无语义（resize 目标 = 逐条件统一网格），取值偏离"
+        "上游基数即拒绝",
+        default=True,
     )
     encode_roi_size: list[int] = SpecField(
         "定死", "data-preparation + T12 复核探针",
@@ -874,6 +1002,17 @@ class DeploymentConfig(BaseModel):
     )
 
 
+_MR_ASSEMBLY_ARTIFACTS: tuple[str, ...] = (
+    "mrrate_metadata_csv",
+    "mrrate_splits_csv",
+    "eval_manifest_csv",
+    "mrrate_data_snapshot",
+)
+"""MR-RATE prepare 装配输入工件四件套的字段名（#121/#131）：MR-RATE
+线必填、BraTS 线携带即拒的互斥绑定清单（模块级常量——类体下划线属性
+会被 pydantic 当 private attr 收编，validator 里不可迭代）。"""
+
+
 class CynosureConfig(BaseModel):
     """cynosure 全量运行配置：train / eval / prepare / pretrain 四子命令共享同一 schema。"""
 
@@ -1023,6 +1162,165 @@ class CynosureConfig(BaseModel):
                 "携带 MR 词汇工件即拒绝）"
             )
         return artifacts
+
+
+    @field_validator("artifacts")
+    @classmethod
+    def _mr_assembly_artifacts_match_dataset(
+        cls, artifacts: Artifacts, info: ValidationInfo,
+    ) -> Artifacts:
+        """MR-RATE prepare 装配输入工件四件套与 dataset 互斥绑定（#121/
+        #131，spec #125 实现决策 3）：MR-RATE 缺任一件即拒绝（配额抽样
+        与评估集互斥守卫的取数域无从装配）；BraTS 携带即拒绝（MR 输入
+        工件指向不存在的布局，携带即口径混乱信号）。"""
+        experiment = info.data.get("experiment")
+        if experiment is None:
+            return artifacts
+        if experiment.dataset == "MR-RATE":
+            missing = [
+                name for name in _MR_ASSEMBLY_ARTIFACTS
+                if getattr(artifacts, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "dataset=\"MR-RATE\" 须提供 MR prepare 装配输入工件"
+                    f"（artifacts.{' / artifacts.'.join(missing)}）："
+                    "配额抽样 manifest、评估集互斥守卫与 provenance 留痕"
+                    "的取数域（#131）"
+                )
+        else:
+            carried = [
+                name for name in _MR_ASSEMBLY_ARTIFACTS
+                if getattr(artifacts, name) is not None
+            ]
+            if carried:
+                raise ValueError(
+                    "artifacts."
+                    f"{' / artifacts.'.join(carried)}（MR-RATE prepare "
+                    "装配输入工件）仅对 dataset=\"MR-RATE\" 有语义，得到 "
+                    f"dataset={experiment.dataset}（两套口径互斥激活："
+                    "BraTS config 携带 MR 装配工件即拒绝）"
+                )
+        return artifacts
+
+    @field_validator("preprocessing")
+    @classmethod
+    def _intensity_arm_matches_dataset(
+        cls, preprocessing: PreprocessingConfig, info: ValidationInfo,
+    ) -> PreprocessingConfig:
+        """强度臂两域锁死（#130 参数化）+ MR 线 resize 口径互斥（#121/
+        #131）：BraTS 臂 clip=True 是 ADR-0006 裁决的 fork recipe 锚
+        （fork issue #251 记录在案偏差），MR-RATE 臂 clip=False 是
+        NVIDIA v1 官方口径（#71 裁决：对齐基座训练域）——两臂 embedding
+        不可互用，显式携带错误值即拒绝（静默换 recipe 比显式拒绝危险）。
+        MR 线 resize 目标 = 逐条件统一网格（词汇表工件携带），resize 基数
+        公式无语义——偏离上游基数的取值即拒绝（显式性无法跨 JSON
+        roundtrip 判读：dump 会把默认值写成显式键，故守卫落值域；
+        防两套 resize 口径静默共存）。"""
+        experiment = info.data.get("experiment")
+        if experiment is None:
+            return preprocessing
+        if experiment.dataset == "MR-RATE":
+            if preprocessing.intensity_clip:
+                raise ValueError(
+                    "dataset=\"MR-RATE\" 的强度臂须 clip=False（NVIDIA v1 "
+                    "官方口径，#71/#130 裁决：对齐基座训练域；clip=True "
+                    "臂属 BraTS 线，两臂 embedding 不可互用），显式置 "
+                    "preprocessing.intensity_clip=true 即拒绝"
+                )
+            if preprocessing.resize_base != UPSTREAM_RESIZE_BASE:
+                raise ValueError(
+                    "MR-RATE 线的 resize 目标 = 逐条件统一网格（条件词汇"
+                    "表工件携带，spec #125 实现决策 3），preprocessing."
+                    "resize_base 基数公式（BraTS 口径）无语义——取值偏离"
+                    f"上游基数 {UPSTREAM_RESIZE_BASE} 即拒绝，防两套 "
+                    "resize 口径静默共存"
+                )
+        elif not preprocessing.intensity_clip:
+            raise ValueError(
+                "dataset=\"BraTS2023\" 的强度臂须 clip=True（ADR-0006 "
+                "裁决的 fork recipe 锚，fork issue #251 记录在案偏差）："
+                "显式置 preprocessing.intensity_clip=false 等于换基座"
+                "训练分布，须先经 ADR 层重论证"
+            )
+        return preprocessing
+
+    @field_validator("reward")
+    @classmethod
+    def _mr_sampling_manifest_matches_dataset(
+        cls, reward: RewardConfig, info: ValidationInfo,
+    ) -> RewardConfig:
+        """配额抽样留痕工件与 dataset 互斥绑定（#131）：MR-RATE 必填
+        （prepare 幂等与 held-out 互斥的可审计落档缺位即拒绝）；BraTS
+        携带即拒绝（同 MR 装配工件守卫哲学）。"""
+        experiment = info.data.get("experiment")
+        if experiment is None:
+            return reward
+        if experiment.dataset == "MR-RATE":
+            if reward.sampling_manifest_json is None:
+                raise ValueError(
+                    "dataset=\"MR-RATE\" 须提供 reward.sampling_manifest_"
+                    "json（配额抽样留痕工件路径：seed / 逐条件计数 / "
+                    "pool 与 held-out 逐卷归属 / 互斥守卫读数，#131——"
+                    "held-out 互斥「落档可查」的登记面）"
+                )
+        elif reward.sampling_manifest_json is not None:
+            raise ValueError(
+                "reward.sampling_manifest_json（MR-RATE 配额抽样留痕"
+                f"工件）仅对 dataset=\"MR-RATE\" 有语义，得到 dataset="
+                f"{experiment.dataset}（两套口径互斥激活：BraTS config "
+                "携带即拒绝）"
+            )
+        return reward
+
+    @field_validator("reward")
+    @classmethod
+    def _prepare_paths_are_distinct(
+        cls, reward: RewardConfig, info: ValidationInfo,
+    ) -> RewardConfig:
+        """prepare 的读面与写面路径两两不同（别名 = 数据毁损面，#121/
+        #131）。
+
+        prepare 的失效步**先于**装配计划：它 unlink 输出路径（pool /
+        held-out manifest、统计量、抽样留痕）并 rmtree 派生 latent 子树。
+        输出路径别名一件**输入**工件 → 那份输入在装配读到它之前已被删除
+        （跑一次 prepare 删一份数据；同仓的失效-先于-计划改判正是为了让
+        计划期失败也清盘，别名让这条纪律反过来咬输入）；两件输出别名同一
+        路径 → 抽样留痕落在全流程最后写出，把先落盘的工件覆盖成另一份
+        schema 而 prepare 照报成功（train 随后装载不到 pool）。判据取
+        ``resolve()`` 后的路径：相对/绝对、``..`` 与符号链接指向的同一份
+        文件即同一路径。"""
+        artifacts = info.data.get("artifacts")
+        if artifacts is None:
+            return reward
+        named = (
+            ("artifacts.vae_ckpt", artifacts.vae_ckpt),
+            ("artifacts.vae_config_json", artifacts.vae_config_json),
+            ("artifacts.condition_vocabulary_json",
+             artifacts.condition_vocabulary_json),
+            ("artifacts.mrrate_metadata_csv", artifacts.mrrate_metadata_csv),
+            ("artifacts.mrrate_splits_csv", artifacts.mrrate_splits_csv),
+            ("artifacts.eval_manifest_csv", artifacts.eval_manifest_csv),
+            ("reward.real_pool_manifest", reward.real_pool_manifest),
+            ("reward.heldout_real_manifest", reward.heldout_real_manifest),
+            ("reward.channel_stats_json", reward.channel_stats_json),
+            ("reward.sampling_manifest_json", reward.sampling_manifest_json),
+        )
+        owners: dict[Path, str] = {}
+        for name, path in named:
+            if path is None:
+                continue
+            resolved = Path(path).resolve()
+            previous = owners.setdefault(resolved, name)
+            if previous != name:
+                raise ValueError(
+                    f"prepare 的输入/输出路径重复：{previous} 与 {name} 指向"
+                    f"同一路径 {resolved}——prepare 的失效步会先 unlink 这些"
+                    "路径（别名一件输入 = 跑一次 prepare 删一份数据），而"
+                    "抽样留痕落在最后写出（别名一件输出 = 覆盖先落盘的工件"
+                    "而 prepare 报成功）。请给每个工件各自的路径"
+                )
+        return reward
 
     @model_validator(mode="after")
     def _mr_rate_excludes_single_domain_anchors(self) -> "CynosureConfig":

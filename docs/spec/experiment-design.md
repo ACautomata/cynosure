@@ -58,6 +58,8 @@ schema 语义（与 BraTS 线的隔离保证）：
 - **real pool 切片轴与预训练报告条件域**：rank 条带切片的分层轴 = 活动条件集（`RankSlicedPool` 经装配注入条件名，不设四序列代码内副本——换域线多 rank 运行的结构前提）；real pool / held-out manifest 的逐条件形状契约在装配期与词汇表逐条件对照（同名异形 = 词表工件改动而 manifest 未重建，装配期显式拒绝而非等到判别器拼接 real 与 fake 时才炸）。预训练报告的条件域随之泛化：`condition_auc` / `gate_whitelist` 键 = 本域条件名（BraTS 线仍是四序列、行为不变；MR-RATE 条件名此前被四序列字面量域挡在 schema 外，MR 预训练在收尾处 ValidationError、报告落不了盘）；多条件线报告不记单域全局 `latent_shape`（形状逐条件派生自词表工件，口径由 provenance 的 `condition_vocabulary_sha256` 承载），装载守卫另加条件集对照与词表内容指纹（工件漂移而 real 侧工件未变时，报告的白名单与实测值对另一份 fake 分布负责）。**域边界同批收口**：多条件域 real 工件必须携带逐条件形状契约（缺表即装配期拒绝——缺表会让 `load_latent` 静默回退全局 `latent_shape` 对账，异形条件在 real 采样/gate 重算期才炸、同形条件带着错误的全局口径入训；判据 = `ConditionVocabulary.single_condition`）；尚未交付的 MR 面在构造/装配期显式拒绝，不把能力边界藏成 BraTS 布局扫描或单域默认锚的错误——prepare 管线（`PreparePipeline`，BraTS 病例布局 + 四序列预编码）、里程碑参照影像库（`ManifestEvaluation.build`，`RealVolumeStore` 是 BraTS 布局参照库）、轨迹诊断（`TrajectoryDiagnosticRunner`，单条件日程 + 全局形状噪声 + 四序列条件）三处。
 - **仍由后续票接线**：预处理统一网格与 spacing 条件属性的消费面（#130）、prepare 数据链配额装配（#131）。BraTS 线的全部既有消费点（`MODALITIES`、`stage_condition_vocabulary` 等）不接管、不修改。
 
+**消费接线进度（#121/#131 交付，2026-09-16）**：预处理统一网格与强度臂参数化、prepare 数据链装配（官方 split join / 评估集互斥守卫 / patient 级 held-out 二分 / 逐条件配额抽样 / 条件分层工件 / 容量守卫）已落地——口径见 `data-preparation.md`「MR-RATE 换域」节。`latent_shape(name)` 的 rollout/评测侧消费（#129）仍待接线。
+
 ## 对照基线（no-RL）
 
 - **组1 基线** = 冻结 base UNet @ CFG=10；**组2 基线** = 冻结 base UNet + 冻结预训练 ControlNet。
@@ -78,6 +80,7 @@ schema 语义（与 BraTS 线的隔离保证）：
 
 - real = **BraTS train split（病例级 70%）全量 VAE 预编码 latent**，按序列 token 分层（GLI 全量约 1251 例 → train 约 800+，确切体量以基座 data/README 为准）；**不混入 MR-RATE 全库**（避免域漂移 + 库过大）。
 - 组1 按序列 token 分层；组2 按 4 序列分层。
+- **MR-RATE 换域线（地图 #67）的 real 样本库 = 独立口径**：官方 train split 逐条件配额抽样 + held-out train 内 patient 级二分 + 评估集互斥硬守卫，分层键 = 生成条件（11 格）——口径见 `data-preparation.md`「MR-RATE 换域」节（#121/#131）。
 
 ## 成功判据与早停准则
 

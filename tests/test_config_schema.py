@@ -714,6 +714,16 @@ class TestMrRateConditionVocabularyBinding:
         data["artifacts"]["condition_vocabulary_json"] = (
             "data/conditions/mrrate_conditions.json"
         )
+        # MR prepare 装配输入工件四件套 + 抽样留痕 + 强度臂（#121/#131
+        # schema 必填面；装配绑定语义由 TestMrRateDataAssemblyBinding 守卫）
+        data["artifacts"]["mrrate_metadata_csv"] = "mrrate/metadata.csv"
+        data["artifacts"]["mrrate_splits_csv"] = "mrrate/splits.csv"
+        data["artifacts"]["eval_manifest_csv"] = (
+            "data/eval/mrrate-baseline/eval_manifest.csv"
+        )
+        data["artifacts"]["mrrate_data_snapshot"] = "MR-RATE@v1.0"
+        data["reward"]["sampling_manifest_json"] = "prepare/sampling_manifest.json"
+        data.setdefault("preprocessing", {})["intensity_clip"] = False
         return data
 
     def test_mrrate_config_passes_with_vocabulary_binding(
@@ -802,6 +812,208 @@ class TestMrRateConditionVocabularyBinding:
         assert dumped["experiment"]["dataset"] == "BraTS2023"
 
 
+class TestMrRateDataAssemblyBinding:
+    """MR-RATE prepare 数据装配的 config 绑定（#121/#131，spec #125 实现决策 3）。
+
+    MR-RATE prepare 的输入工件四件套（series 级元数据 CSV / 官方 patient
+    级 splits CSV / #78 评估清单 / 数据 release 快照标识）与装配 knobs
+    （逐条件配额、held-out 二分配比、抽样留痕路径）经 dataset 互斥绑定：
+    MR-RATE 必填、BraTS 携带即拒——同 condition_vocabulary_json 的两套
+    口径互斥激活哲学。强度臂 clip 参数化（#130）：BraTS 臂 clip=True 是
+    ADR-0006 裁决（fork recipe 偏差），MR-RATE 臂 clip=False 是 NVIDIA
+    v1 官方口径（#71 裁决：对齐基座训练域）——两臂各自锁死裁决值，
+    显式携带错误值即拒绝（静默换 recipe 比显式拒绝危险）。
+    """
+
+    MR_ARTIFACT_FIELDS = (
+        "mrrate_metadata_csv",
+        "mrrate_splits_csv",
+        "eval_manifest_csv",
+        "mrrate_data_snapshot",
+    )
+
+    @staticmethod
+    def _locations(exc: ValidationError) -> list[tuple]:
+        return [err["loc"] for err in exc.errors()]
+
+    @classmethod
+    def _mr_config_dict(cls, valid_config_dict: dict) -> dict:
+        """MR-RATE prepare 全字段齐备的合法 config 样板。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["dataset"] = "MR-RATE"
+        data["artifacts"]["condition_vocabulary_json"] = (
+            "data/conditions/mrrate_conditions.json"
+        )
+        data["artifacts"]["mrrate_metadata_csv"] = "mrrate/metadata.csv"
+        data["artifacts"]["mrrate_splits_csv"] = "mrrate/splits.csv"
+        data["artifacts"]["eval_manifest_csv"] = (
+            "data/eval/mrrate-baseline/eval_manifest.csv"
+        )
+        data["artifacts"]["mrrate_data_snapshot"] = "MR-RATE@v1.0"
+        data["reward"]["sampling_manifest_json"] = "prepare/sampling_manifest.json"
+        data.setdefault("preprocessing", {})["intensity_clip"] = False
+        # 单域锚字段属 BraTS 语义（#129 互斥携带即拒）：形状/锚逐条件
+        # 派生自条件词汇表工件
+        data.pop("latent_shape", None)
+        data.get("policy", {}).pop("input_img_size_numel", None)
+        return data
+
+    def test_mrrate_assembly_config_passes(
+        self, valid_config_dict: dict,
+    ) -> None:
+        config = CynosureConfig.model_validate(
+            self._mr_config_dict(valid_config_dict),
+        )
+        assert config.experiment.dataset == "MR-RATE"
+        assert config.preprocessing.intensity_clip is False
+        assert config.reward.heldout_fraction == pytest.approx(0.1)
+        assert config.reward.real_pool_quota == {}
+
+    def test_blank_data_snapshot_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """快照标识为空白串 → 拒绝：该字段的用途是「real 数据链与评估集
+        同一冻结快照」的凭据，空白串满足 `is not None` 的必填检查后照常
+        随 provenance 与抽样留痕落档——工件自称登记了数据 release、实际
+        什么都没登记，凭据面静默失效（快照标识是标识，不是自由文本）。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["artifacts"]["mrrate_data_snapshot"] = "   "
+        with pytest.raises(ValidationError) as exc:
+            CynosureConfig.model_validate(data)
+        assert (
+            "artifacts", "mrrate_data_snapshot",
+        ) in self._locations(exc.value)
+
+    def test_data_snapshot_whitespace_normalized(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """快照标识的首尾空白归一后入 config：该值原样落进 provenance 与
+        抽样留痕，是跨工件比对（prepare 与 #78 评估集同一快照）的键——
+        带空白的 " f6e39794" 与 "f6e39794" 是两个不相等的字符串，
+        比对静默判否。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["artifacts"]["mrrate_data_snapshot"] = "  f6e39794\n"
+        config = CynosureConfig.model_validate(data)
+        assert config.artifacts.mrrate_data_snapshot == "f6e39794"
+
+    def test_mrrate_requires_assembly_artifacts(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """MR config 缺任一装配输入工件 → 字段级拒绝：配额抽样与互斥
+        守卫的取数域无从装配（同 condition_vocabulary_json 守卫哲学）。"""
+        for field in self.MR_ARTIFACT_FIELDS:
+            data = self._mr_config_dict(valid_config_dict)
+            data["artifacts"][field] = None
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("artifacts",) in self._locations(exc_info.value)
+            assert field in str(exc_info.value)
+
+    def test_mrrate_requires_sampling_manifest_path(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = self._mr_config_dict(valid_config_dict)
+        data["reward"]["sampling_manifest_json"] = None
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward",) in self._locations(exc_info.value)
+        assert "sampling_manifest_json" in str(exc_info.value)
+
+    def test_brats_rejects_assembly_artifacts(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """BraTS config 携带 MR 装配工件即拒绝：MR 输入工件指向不存在的
+        布局，携带即口径混乱信号（两套口径互斥激活）。"""
+        for field in self.MR_ARTIFACT_FIELDS:
+            data = copy.deepcopy(valid_config_dict)
+            data["artifacts"][field] = "mrrate/stub.csv"
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("artifacts",) in self._locations(exc_info.value)
+            assert "MR-RATE" in str(exc_info.value)
+
+    def test_brats_rejects_sampling_manifest_path(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["reward"]["sampling_manifest_json"] = "prepare/sampling.json"
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward",) in self._locations(exc_info.value)
+        assert "MR-RATE" in str(exc_info.value)
+
+    def test_mrrate_rejects_clip_true(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """MR 臂 clip=True 拒绝：clip=False 是基座 v1 训练口径（#71/
+        #130 裁决），clip=True 臂属 BraTS 线（fork 偏差）——两臂 embedding
+        不可互用，混臂等于换基座训练分布。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["preprocessing"]["intensity_clip"] = True
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("preprocessing",) in self._locations(exc_info.value)
+        assert "clip" in str(exc_info.value)
+
+    def test_brats_rejects_clip_false(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """BraTS 臂 clip=False 拒绝：clip=True 是 ADR-0006 裁决的 fork
+        recipe 锚——显式换 recipe 须重论证（ADR 层），schema 层先拒。"""
+        data = copy.deepcopy(valid_config_dict)
+        data.setdefault("preprocessing", {})["intensity_clip"] = False
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("preprocessing",) in self._locations(exc_info.value)
+        assert "ADR-0006" in str(exc_info.value)
+
+    def test_mrrate_rejects_resize_base(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """MR 线 resize 目标 = 逐条件统一网格（词汇表携带），resize 基数
+        公式（BraTS 口径）无语义——显式携带即拒绝，防两套 resize 口径
+        静默共存（哪一套在链里生效不可从工件判读）。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data.setdefault("preprocessing", {})["resize_base"] = 16
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("preprocessing",) in self._locations(exc_info.value)
+        assert "统一网格" in str(exc_info.value)
+
+    def test_heldout_fraction_open_unit_interval(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """held-out 二分配比须在 (0,1) 开区间：0 = held-out 池恒空
+        （out-of-sample 信号语义消失，同 CaseSplitter 空拒绝哲学）、
+        ≥1 = real pool 恒空。"""
+        for bad in (0.0, 1.0, -0.1, 1.5):
+            data = self._mr_config_dict(valid_config_dict)
+            data["reward"]["heldout_fraction"] = bad
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("reward", "heldout_fraction") in self._locations(
+                exc_info.value,
+            )
+
+    def test_real_pool_quota_must_be_positive(
+        self, valid_config_dict: dict,
+    ) -> None:
+        data = self._mr_config_dict(valid_config_dict)
+        data["reward"]["real_pool_quota"] = {"t1w/axial": 0}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("reward", "real_pool_quota") in self._locations(exc_info.value)
+
+    def test_mrrate_assembly_json_roundtrip(
+        self, valid_config_dict: dict,
+    ) -> None:
+        config = CynosureConfig.model_validate(
+            self._mr_config_dict(valid_config_dict),
+        )
+        revived = CynosureConfig.model_validate_json(config.model_dump_json())
+        assert revived == config
+
+
 class TestStatusAnnotations:
     ALL_MODELS = [
         CynosureConfig,
@@ -853,6 +1065,8 @@ class TestMrRateAnchorsPerCondition:
         return {
             "experiment": {"group": "modal-label", "dataset": "MR-RATE"},
             "fixture_mode": True,
+            # 强度臂两域锁死（#130/#71）：MR 线须显式 clip=False
+            "preprocessing": {"intensity_clip": False},
             "artifacts": {
                 "unet_ckpt": str(tmp_path / "unet.pt"),
                 "vae_ckpt": str(tmp_path / "vae.pt"),
@@ -862,6 +1076,11 @@ class TestMrRateAnchorsPerCondition:
                 "condition_vocabulary_json": str(
                     tmp_path / "condition_vocabulary.json"
                 ),
+                # prepare 装配输入四件套（#121/#131 schema 必填面）
+                "mrrate_metadata_csv": str(tmp_path / "metadata.csv"),
+                "mrrate_splits_csv": str(tmp_path / "splits.csv"),
+                "eval_manifest_csv": str(tmp_path / "eval_manifest.csv"),
+                "mrrate_data_snapshot": "MR-RATE@v1.0",
             },
             "reward": {
                 "disc_batch_size_k": 4,
@@ -871,6 +1090,9 @@ class TestMrRateAnchorsPerCondition:
                 "channel_stats_json": str(tmp_path / "channel_stats.json"),
                 "pretrain_report_json": str(tmp_path / "report.json"),
                 "pretrain_gate_auc": 0.51,
+                "sampling_manifest_json": str(
+                    tmp_path / "sampling_manifest.json"
+                ),
             },
             "schedule": {"seed": 0, "baseline_samples": 4},
         }

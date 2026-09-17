@@ -13,7 +13,13 @@
 数值语义见 docs/spec/reward-model.md 与 ADR-0001。
 """
 
-from cynosure.reward.artifacts import ChannelStats, LatentManifest, PoolEntry
+from cynosure.reward.artifacts import (
+    ChannelStats,
+    LatentManifest,
+    PoolEntry,
+    PrepareProvenance,
+    SamplingManifest,
+)
 from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
 from cynosure.reward.buffer import (
     ReplayBuffer,
@@ -72,6 +78,7 @@ __all__ = [
     "OnlineUpdate",
     "PoolEntry",
     "PreparePipeline",
+    "PrepareProvenance",
     "PrepareReport",
     "RealPoolSampler",
     "RealSampling",
@@ -80,6 +87,7 @@ __all__ = [
     "ReplayEntry",
     "ReplayStore",
     "RewardScorer",
+    "SamplingManifest",
     "SupportRule",
     "SyntheticLatentEncoder",
     "UpdateReport",

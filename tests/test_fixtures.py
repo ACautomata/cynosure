@@ -64,6 +64,10 @@ class TestFixtureConfig:
         assert config.policy.group_size_g == 12  # G 是方向数，与网络尺寸无关
         assert config.policy.input_img_size_numel == 2048  # = prod((16,16,8)) 数值锚
         assert config.reward.disc_num_layers_d == 1  # fixture 第三维 8 撑不住 2
+        # 部署宽度按夹具口径钉 1（#121 AC5 守卫的判定宽度）：prepare 装配期
+        # 容量守卫按 ``disc_batch_size_k × nproc_per_node`` 判定，夹具全循环
+        # 是单进程 CPU 跑——默认 4 会让每条件 4 卷的夹具池一律触发守卫
+        assert config.deployment.nproc_per_node == 1
 
     def test_config_artifacts_point_into_fixture_dir(self, tmp_path: Path) -> None:
         config = Fixture().config(tmp_path)

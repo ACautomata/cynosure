@@ -407,6 +407,21 @@ class MrConditionVocabulary:
         )
         return (i, j, k)
 
+    def resolve_condition(self, modality: str, plane: str) -> str | None:
+        """（模态, 平面）元数据键 → 生成条件名的归属解析（#131 消费面：
+        prepare 配额抽样的候选域归类）；域外返回 None。
+
+        - MRA 不看平面（all-planes 单格，全平面卷同归一格，#81 读数格）；
+        - 头部模态按「模态/平面」精确归格（SWI 仅 axial 在词汇表——
+          sagittal/coronal 卷自然落域外）；
+        - 大小写按元数据原值宽容（官方 CSV 大写枚举，casefold 归一）。
+        """
+        modality = modality.strip().casefold()
+        plane = plane.strip().casefold()
+        name = (
+            "mra/all-planes" if modality == "mra" else f"{modality}/{plane}"
+        )
+        return name if name in self._by_name else None
 
 class ConditionVocabulary(Protocol):
     """生成条件词汇表的运行时协议（#129「形状按条件贯通全链」的

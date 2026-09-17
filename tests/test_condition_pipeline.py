@@ -523,6 +523,8 @@ class TestMilestoneHeterogeneousReadings:
         data = {
             "experiment": {"group": "modal-label", "dataset": "MR-RATE"},
             "fixture_mode": True,
+            # 强度臂两域锁死（#130/#71）：MR 线须显式 clip=False
+            "preprocessing": {"intensity_clip": False},
             "artifacts": {
                 "unet_ckpt": "u.pt",
                 "vae_ckpt": "v.pt",
@@ -530,6 +532,11 @@ class TestMilestoneHeterogeneousReadings:
                 "modality_mapping_json": "m.json",
                 "dataset_root": "data",
                 "condition_vocabulary_json": "vocab.json",
+                # prepare 装配输入四件套（#121/#131 schema 必填面）
+                "mrrate_metadata_csv": "metadata.csv",
+                "mrrate_splits_csv": "splits.csv",
+                "eval_manifest_csv": "eval_manifest.csv",
+                "mrrate_data_snapshot": "MR-RATE@v1.0",
             },
             "reward": {
                 "disc_batch_size_k": 4,
@@ -539,6 +546,7 @@ class TestMilestoneHeterogeneousReadings:
                 "channel_stats_json": "c.json",
                 "pretrain_report_json": "r.json",
                 "pretrain_gate_auc": 0.51,
+                "sampling_manifest_json": "sampling_manifest.json",
             },
             "schedule": {
                 "seed": 0, "baseline_samples": 4,

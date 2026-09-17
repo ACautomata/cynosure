@@ -245,16 +245,18 @@ class TestPrepareContract:
         assert stats.latent_shape == pool.latent_shape
 
 
-class TestPrepareDomainGuard:
-    """MR-RATE 的 prepare 管线尚未交付（本管线 = BraTS 病例布局扫描 +
-    四序列预编码）：CLI 显式拒绝——此前走到 BratsSeriesLayout 扫描才炸出
-    BraTS 布局错误（「源数据集根目录不存在」/「病例缺序列」），报错归因
-    与 MR 域的真实原因不符。"""
+class TestPrepareDomainDispatch:
+    """MR-RATE prepare 已交付（#121/#131）：域分派到 MrRateAssembly（官方
+    split join + 条件词汇表候选域），不再在构造期拒绝。输入缺件按 **MR
+    数据链**口径可读拒绝（缺失的 MR 元数据/splits 工件被点名），而非走到
+    BratsSeriesLayout 扫描才炸出 BraTS 布局错误（「源数据集根目录不存在」/
+    「病例缺序列」）——报错归因与 MR 域的真实原因相符。"""
 
-    def test_mr_rate_config_rejected(
+    def test_mr_rate_inputs_missing_rejected_readably(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         fixture_dir = tmp_path / "fixtures"
+        # fixture 落的是 BraTS 病例布局，不含 MR 元数据/splits 工件
         Fixture().write_artifacts(fixture_dir)
         config = Fixture().config(fixture_dir, dataset="MR-RATE")
         config_path = tmp_path / "mr_config.json"
@@ -263,7 +265,7 @@ class TestPrepareDomainGuard:
         )
         result = cli.run("prepare", "--config", str(config_path))
         assert result.code == 2
-        assert "MR-RATE" in result.stderr
+        assert "splits.csv" in result.stderr
 
 
 class TestPrepareIdempotency:
