@@ -26,6 +26,7 @@ import torch
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.train.trainer import PhaseTimer
 from tests.conftest import CliSession, SyntheticMrRateDataset
 
 CONDITIONS = ["t1w/axial", "flair/axial"]
@@ -407,8 +408,6 @@ class TestCostReadingShape:
     def test_phase_timer_marks_named_phases(self) -> None:
         """``PhaseTimer`` 的边界语义：逐次 mark 产出对应相位、值为非负
         秒数，未打点的相位不出现。"""
-        from cynosure.train.trainer import PhaseTimer
-
         timer = PhaseTimer()
         timer.mark("rollout")
         timer.mark("policy_update")
