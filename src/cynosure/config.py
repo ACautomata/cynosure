@@ -899,8 +899,12 @@ class ScheduleConfig(BaseModel):
         "里程碑解码评测样本数（取 Baseline manifest 条目的前缀，同 seed 同条件，"
         "使里程碑 FID/KID 跨里程碑可比）。小样本相对信号：K 只服务于训练期"
         "跨里程碑 plateau 比较（特征空间高维、K 小则协方差秩亏，绝对值噪声"
-        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）",
-        default=8, ge=2,
+        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）。"
+        "默认钉 12 = 组2/组3 条件词汇表宽——三组（组1 四序列、组2/组3 12 有序"
+        "对）与 MR-RATE 11 条件的样本面下界在全数据集/全组生效，纯默认 "
+        "config 即通过生产守卫（K ≥ 词汇表、K ≤ N_baseline），缩小评测面"
+        "属 fixture 须显式声明",
+        default=12, ge=2,
     )
     decode_batch_size: int = SpecField(
         "tunable", "本 spec 补钉",

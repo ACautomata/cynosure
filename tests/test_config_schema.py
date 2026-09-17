@@ -69,10 +69,46 @@ class TestValidConfigs:
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
+        # 日程默认面与生产守卫自洽（纯默认即合法）：N_baseline /
+        # max_iterations 缺省 = 生产口径下界，milestone_eval_samples
+        # 缺省 12 = 组2/组3 词汇表宽（K ≥ 词汇表守卫全组生效）
+        assert config.schedule.baseline_samples == 200
+        assert config.schedule.max_iterations == 200
+        assert config.schedule.milestone_eval_samples == 12
         assert config.sharding.strategy == "fsdp"
         # 部署行（orchestration + ADR-0005）：单实例 4 卡、产物根在持久分区下
         assert config.deployment.nproc_per_node == 4
         assert config.deployment.output_root == Path("/root/private_data/cynosure")
+
+    def test_default_schedule_validates_for_every_group(self) -> None:
+        """纯默认 schedule（只填 seed）在三组全合法——默认面与生产守卫
+        自洽：milestone_eval_samples 缺省 12 覆盖组1 四序列与组2/组3
+        12 有序对（亦覆盖 MR-RATE 11 条件的装配期同款下界），N_baseline /
+        max_iterations 缺省即生产口径。默认 config 不应撞上自己的 schema
+        守卫（#123 首跑曾以缩小值踩中同类拒绝、train 集体 exit 2）。"""
+        group_artifacts = {
+            "modal-label": {},
+            "cross-modal": {
+                "controlnet_ckpt": "ckpts/controlnet.pt",
+                "controlnet_config_json": "configs/controlnet.json",
+            },
+            "sequential": {
+                "controlnet_ckpt": "ckpts/controlnet.pt",
+                "controlnet_config_json": "configs/controlnet.json",
+            },
+        }
+        for group, extra_artifacts in group_artifacts.items():
+            data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+            data["experiment"]["group"] = group
+            data["artifacts"].update(extra_artifacts)
+            if group == "sequential":  # stage-2 报告绑定（#116 schema 必填）
+                data["experiment"]["stage2_pretrain_report_json"] = (
+                    "pretrain_run_stage2/pretrain_report.json"
+                )
+            config = CynosureConfig.model_validate(data)
+            assert config.schedule.milestone_eval_samples == 12
+            assert config.schedule.baseline_samples == 200
+            assert config.schedule.max_iterations == 200
 
     def test_cross_modal_pairs_default_is_ordered_12(self) -> None:
         config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
@@ -358,7 +394,8 @@ class TestRejection:
         data["experiment"]["group"] = "cross-modal"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8 < 12 对
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:  # 显式 K=8 < 12 对
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
         data["schedule"]["milestone_eval_samples"] = 12
@@ -390,7 +427,8 @@ class TestRejection:
         data["experiment"]["stage2_pretrain_report_json"] = (
             "pretrain_run_stage2/pretrain_report.json"
         )
-        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:  # 显式 K=8 < 12 对
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
         data["schedule"]["milestone_eval_samples"] = 12
