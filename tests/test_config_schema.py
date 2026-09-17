@@ -28,6 +28,8 @@ class TestValidConfigs:
         assert config.policy.num_inference_steps == 30
         assert config.policy.input_img_size_numel == 131072
         assert config.policy.group_size_g == 12
+        # 前向激活预算缺省 = 装配期按设备总显存自动探测（显式值覆盖）
+        assert config.policy.forward_activation_budget_gib is None
         assert config.policy.sde_eta == pytest.approx(0.7)
         assert config.policy.sde_s_max == pytest.approx(0.999)
         assert config.policy.train_step_indices_m == set(range(2, 16))
@@ -637,6 +639,20 @@ class TestRejection:
         data["policy"] = {"group_size_g": 1}
         with pytest.raises(ValidationError):
             CynosureConfig.model_validate(data)
+
+    def test_forward_activation_budget_positive(self, valid_config_dict: dict) -> None:
+        """前向激活预算 ≤ 0 无意义（分块塌到逐样本、等于禁用批量）：显式
+        拒绝；缺省 None = 装配期按设备总显存自动探测（#123 首跑 OOM 修复）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"forward_activation_budget_gib": 0}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("policy", "forward_activation_budget_gib") in self._locations(
+            exc_info.value,
+        )
+        data["policy"]["forward_activation_budget_gib"] = 40
+        config = CynosureConfig.model_validate(data)
+        assert config.policy.forward_activation_budget_gib == pytest.approx(40.0)
 
     def test_eta_non_negative(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)

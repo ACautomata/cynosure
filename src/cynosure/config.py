@@ -380,8 +380,22 @@ class PolicyConfig(BaseModel):
     group_size_g: int = SpecField(
         "tunable", "policy-modeling",
         "G（Group 大小）：组内共享初始噪声的方向数"
-        "（显存不够降 6–8 或逐 k 释放；fixture 亦保持 12）",
+        "（fixture 亦保持 12；显存不足经 forward_activation_budget_gib "
+        "按体积分块解决——降 G 是改变算法口径的最后手段）",
         default=12, ge=2,
+    )
+    forward_activation_budget_gib: float | None = SpecField(
+        "tunable", "本 spec 补钉",
+        "rollout 续跑的单次 policy 前向激活预算（GiB）：ODE 续跑按 "
+        "latent 体素分块，峰值显存以块为界（G 方向整批 × 大 FOV latent "
+        "的单次前向是 OOM 级分配，#123 首跑实测）。约束面仅此一处——"
+        "其余 policy 前向（扰动步的全组复用评估、log-prob 评估）本为 "
+        "batch=1 或组内共享，不吃 G 倍激活。缺省 None = 装配期按设备总"
+        "显存自动探测（常量比例，同设备可复现；共享实例按总显存探测不"
+        "反映他进程占用，须显式钉值）；显式值覆盖探测，设备总显存可探测"
+        "时（CUDA）超过即装配期拒绝（常驻权重/优化器态/缓冲与碎片余量"
+        "另占，不在本预算内）",
+        default=None, gt=0.0,
     )
     sde_eta: float = SpecField(
         "扫描接口", "policy-modeling",

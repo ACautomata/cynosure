@@ -22,6 +22,51 @@ from cynosure.policy.kernel import SdeKernel, SdeTransition
 from cynosure.policy.schedules import ConditionSchedules
 
 
+_ACTIVATION_BYTES_PER_LATENT_VOXEL = 4 * 1024
+"""单次前向激活的经验系数（字节 / latent 体素 / 前向样本）：#123 首跑
+OOM 探针在生产 UNet（180.5M 参数、bf16 autocast、no_grad）实测
+≈3.2 KiB（三个 latent 形状 × 三档批量落同一直线），取整上界 4 KiB 留
+余量。显存占用与权重值无关；网络结构变化时在此重标。"""
+
+AUTO_FORWARD_ACTIVATION_FRACTION = 0.6
+"""自动探测口径（``forward_activation_budget_gib`` 缺省时）：单次前向
+激活预算 = 该比例 × 设备总显存——余下四成留给常驻（权重、优化器态、
+缓冲）与分配器碎片。按总显存而非当前空闲探测：同设备上可复现；反过来
+共享实例的实际可用显存可能远低于总显存（他进程占用不进本口径），此类
+场景须显式钉 ``forward_activation_budget_gib``。"""
+
+DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES = 40 * 2**30
+"""无设备探测面（CPU fixture / 未传 device）时的回落预算：探针曲线上
+最大生产条件的 40 GiB 档（16 样本即 53 GiB，20 以上在 64 GiB 卡上 OOM）。"""
+
+
+def budget_from_total_memory(total_bytes: int) -> int:
+    """设备总显存 → 前向激活预算（纯函数：探测与测试共用）。"""
+    return max(1, int(total_bytes * AUTO_FORWARD_ACTIVATION_FRACTION))
+
+
+def cuda_total_memory(device: "torch.device | None") -> int | None:
+    """设备总显存（字节）：无 CUDA 探测面（CPU fixture / 未传设备 / CUDA
+    栈不可用）返回 ``None``——自动探测与装配期上界校验共用的唯一取数点
+    （同一件五条件判定曾在 sampler 与 TrainingRuntime 各写一份）。"""
+    if (
+        device is not None
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    ):
+        return torch.cuda.get_device_properties(device).total_memory
+    return None
+
+
+def auto_forward_activation_budget(device: "torch.device | None") -> int:
+    """按设备总显存自动探测前向激活预算；无 CUDA 设备（CPU fixture 口径）
+    回落 ``DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES``。"""
+    total = cuda_total_memory(device)
+    if total is None:
+        return DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES
+    return budget_from_total_memory(total)
+
+
 class RolloutSampler:
     """Anchor 轨迹 / 单步扰动 / ODE 续跑的 rollout 编排。"""
 
@@ -30,11 +75,20 @@ class RolloutSampler:
         field: VelocityField,
         kernel: SdeKernel,
         schedules: ConditionSchedules,
+        forward_activation_budget: int | None = None,
     ) -> None:
         self._field = field
         self._kernel = kernel
         self._schedules = schedules
         self._deterministic = SdeKernel.deterministic(s_max=kernel.s_max)
+        # 前向激活预算（字节）：装配方按 config/设备探测注入（单一解析点
+        # = ``TrainingRuntime.forward_activation_budget``）；缺省回落常量
+        # ——诊断回路与测试直构同样带分块保护
+        self._forward_budget = (
+            DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES
+            if forward_activation_budget is None
+            else forward_activation_budget
+        )
 
     def anchor_trajectory(
         self,
@@ -109,7 +163,43 @@ class RolloutSampler:
         日程 ``suffix = sigma_schedule[eta_step+2::g]`` 从 index+2 起才
         抽稀——跳过该细步会漏掉普通续跑的第一个端点），之后访问点相隔
         λ（大步 Δs = 相邻访问位 σ 之差、velocity 在段起点评估），末段
-        一律从最后位置直达 σ=0 终点。"""
+        一律从最后位置直达 σ=0 终点。
+
+        分块（#123 首跑 OOM 修复）：G 方向整批 × 大 FOV latent 的单次
+        前向在 64 GiB 卡上是 OOM 级分配（实测 2G=20 即超），故超预算的
+        批量按 ``_forward_chunk`` 切子批逐块续跑——ODE 逐样本独立，逐块
+        与原语义一致（小形状不触发，fixture 口径逐位不变）。"""
+        chunk = self._forward_chunk(latents.shape, latents.shape[0])
+        if chunk >= latents.shape[0]:
+            return self._continue_batch(latents, index, condition, stride)
+        return torch.cat(
+            [
+                self._continue_batch(part, index, condition, stride)
+                for part in latents.split(chunk, dim=0)
+            ],
+            dim=0,
+        )
+
+    def _forward_chunk(self, shape: torch.Size, batch: int) -> int:
+        """ODE 续跑的分块上限（#123 首跑 OOM 修复）：单次 UNet 前向的激活
+        显存随「前向样本数 × 空间体素数」增长（CFG 配对使前向样本 = 2 ×
+        本分块），故分块 = 预算 // (2 × 系数 × 体素数)，截到 [1, batch]。
+
+        ``shape`` = 待续跑 latent 的 [C, D, H, W]（消费面传张量形状）。"""
+        voxels = int(shape[-3]) * int(shape[-2]) * int(shape[-1])
+        cap = self._forward_budget // (
+            2 * _ACTIVATION_BYTES_PER_LATENT_VOXEL * voxels
+        )
+        return max(1, min(batch, cap))
+
+    def _continue_batch(
+        self,
+        latents: torch.Tensor,
+        index: int,
+        condition: RolloutCondition,
+        stride: int,
+    ) -> torch.Tensor:
+        """单块续跑（分块调度在 ``continue_to_terminal``；本方法只负责逐块积分）。"""
         cursor = self._schedules.cursor(condition.name)
         x = latents
         current = index + 1

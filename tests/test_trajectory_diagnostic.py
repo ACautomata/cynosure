@@ -13,6 +13,7 @@ import pytest
 
 from cynosure.fixtures import Fixture
 from cynosure.policy import TrajectoryDiagnosticRunner
+from cynosure.train import RunArtifacts
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -58,12 +59,11 @@ class DiagnosticScenario:
         )
 
     def events(self) -> list[dict]:
-        return [
-            json.loads(line)
-            for line in (self._tmp_path / RUN_DIR / "metrics.jsonl")
-            .read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        """指标流取数走工件层（``RunArtifacts.read_events``，与
+        test_train_loop 同面）——不在这里手写一份 jsonl 解析。"""
+        return RunArtifacts(
+            RunArtifacts.layout(self._tmp_path / RUN_DIR),
+        ).read_events()
 
     def iter_events(self) -> list[dict]:
         """run 目录指标流里的 iter 事件（相位分解断言的取数面）。"""

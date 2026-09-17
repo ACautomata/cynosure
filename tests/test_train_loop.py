@@ -23,9 +23,13 @@ from pathlib import Path
 import pytest
 import torch
 
+from cynosure.policy.sampler import (
+    DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES,
+)
 from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.config import (
     ConfigLoader,
+    CynosureConfig,
     DEFAULT_CROSS_MODAL_PAIRS,
     MODALITIES,
     RewardConfig,
@@ -51,6 +55,7 @@ from cynosure.train import (
     RewardCoordinator,
     RunArtifacts,
 )
+from cynosure.train.runtime import TrainingRuntime
 from cynosure.train.whitelist import ConditionWhitelist
 from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.rollout import (
@@ -67,6 +72,25 @@ from tests.conftest import (
     RecordingScorer,
     RecordingUpdate,
 )
+
+
+class TestForwardActivationBudgetResolution:
+    """前向激活预算的装配期解析（#123 首跑 OOM 修复的单一解析点）：
+    config 显式值优先，缺省按设备总显存自动探测。"""
+
+    def test_pinned_value_wins(self, valid_config_dict: dict) -> None:
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"forward_activation_budget_gib": 36}
+        config = CynosureConfig.model_validate(data)
+        assert TrainingRuntime.forward_activation_budget(config) == 36 * 2**30
+
+    def test_default_falls_back_without_cuda_device(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """无 CUDA 设备（CPU fixture 口径）：回落默认常量，分块保护恒在。"""
+        config = CynosureConfig.model_validate(valid_config_dict)
+        budget = TrainingRuntime.forward_activation_budget(config)
+        assert budget == DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES
 
 
 class TrainingLoopScenario:

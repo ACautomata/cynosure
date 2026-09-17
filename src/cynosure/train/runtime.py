@@ -34,7 +34,11 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
-from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.sampler import (
+    RolloutSampler,
+    auto_forward_activation_budget,
+    cuda_total_memory,
+)
 from cynosure.policy.schedules import (
     ConditionSchedules,
     PerConditionSchedules,
@@ -134,7 +138,9 @@ class TrainingRuntime:
             ),
             resume=resume,
         )
-        sampler = cls.assemble_sampler(config, policy.field)
+        sampler = cls.assemble_sampler(
+            config, policy.field, device=amp.device,
+        )
         updater = StepwisePolicyUpdate(
             sampler=sampler,
             optimizer=policy.optimizer,
@@ -177,16 +183,54 @@ class TrainingRuntime:
         return ConditionVocabulary.assemble(config)
 
     @classmethod
-    def assemble_sampler(cls, config: CynosureConfig, field: VelocityField) -> RolloutSampler:
+    def assemble_sampler(
+        cls,
+        config: CynosureConfig,
+        field: VelocityField,
+        device: "torch.device | None" = None,
+    ) -> RolloutSampler:
         """policy 采样封装装配（日程表 + 本组采样场 + SDE 核）。
 
         公开装配缝：train 运行时与预训练 driver（单进程 world-1 语境）
-        共用同一份装配代码——采样日程/核参数的调整单点生效。"""
+        共用同一份装配代码——采样日程/核参数的调整单点生效。
+
+        ``device`` 参与前向激活预算解析（``forward_activation_budget``）：
+        config 显式值优先、缺省按设备总显存自动探测；无 CUDA 设备
+        （CPU fixture 口径）回落默认常量。"""
         policy = config.policy
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
         return RolloutSampler(
             field, kernel, cls.assemble_schedules(config),
+            forward_activation_budget=cls.forward_activation_budget(
+                config, device,
+            ),
         )
+
+    @classmethod
+    def forward_activation_budget(
+        cls,
+        config: CynosureConfig,
+        device: "torch.device | None" = None,
+    ) -> int:
+        """rollout 前向激活预算的单一解析点（字节）：
+        ``policy.forward_activation_budget_gib`` 显式值优先——**设备总显存
+        可探测时**（CUDA）超过即拒绝（永远装不下，装配期早失败优于运行中
+        OOM）；无探测面（CPU fixture / 未传设备）只保正值约束，不做该上界
+        校验。缺省按设备总显存自动探测（``AUTO_FORWARD_ACTIVATION_FRACTION``
+        ——按总显存而非空闲，共享实例上须显式钉值）。"""
+        pinned = config.policy.forward_activation_budget_gib
+        if pinned is None:
+            return auto_forward_activation_budget(device)
+        budget = int(pinned * 2**30)
+        total = cuda_total_memory(device)
+        if total is not None and budget > total:
+            raise ValueError(
+                f"policy.forward_activation_budget_gib={pinned} 超过本"
+                f"设备总显存 {total / 2**30:.1f} GiB——单次前向的激活"
+                "预算不可能装下（常驻权重/优化器态/缓冲与碎片余量"
+                "另占）：调低该值或改用缺省自动探测"
+            )
+        return budget
 
     @classmethod
     def assemble_schedules(cls, config: CynosureConfig) -> ConditionSchedules:
