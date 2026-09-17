@@ -118,3 +118,17 @@ velocity sha256 `f44eeb55…`、两次前向与两次独立进程运行逐位一
 `diff_unet_3d_rflow-mr-brain_v1.pt`：NVIDIA Open Model License（HF 模型
 卡）；`autoencoder_v1.pt`：同 NV-Generate-CT 发布条款。上游代码只读
 参照、永不 import。
+
+## modality_mapping.json（MR-RATE 线装载面工件）
+
+上游 `configs/modality_mapping.json`（真上游 `da438fe`）的转写子集：
+whole-brain MR 五模态条目（`mri_t1/t2/flair/swi/mra` → 9/10/11/20/16，
+#119 权威口径）+ BraTS 四序列 skull-stripped 条目（29/34/30/31 中的
+29/34/31；`t2w` 键在本工件取 MR 值 10——同键两域不同 token，MR-RATE
+线的文件以本线口径为准）。
+
+装载语义（`cynosure.conditions.ModalityMapping`）：构造期校验只要求
+BraTS 四序列键在册（`t2w` 重复键语义见上）；**MR-RATE 线的条件 token
+实际取数走条件词汇表工件的 `modality_tokens`**（单一来源，#127）——
+本文件是 `ModalityMapping.load` 的装载面满足 + 跨域映射留档，不是
+MR token 的消费来源。

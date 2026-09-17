@@ -16,3 +16,6 @@ build/
 
 # 实例执行脚本不入仓（CLAUDE.md 纪律：执行/临时脚本只落 run 目录 scripts/）
 scripts/
+
+# 实验 run 目录（脚本/notes/一次性 config 工件；发布走 experiment-release）
+run/
