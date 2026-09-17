@@ -17,8 +17,10 @@ manifest 落档可审计。
 - **held-out real 在 train split 内二分**（病例级不相交、按条件分层落档、
   永不参与判别器更新）——与评估留出池（官方 val+test）的不相交由
   train split 边界 + 互斥守卫共同保证（#73 原则、#121 AC3）；
-- **配额为上限**：头部模态各数千条、MRA 全量 ≈ 110——候选不足取全量，
-  硬下限由装配期容量守卫（``assert_condition_capacity``）把守。
+- **配额为上限**：pool 侧头部模态各数千条、MRA 全量 ≈ 110，held-out 侧
+  按条件同值封顶（监控集不是越大越好——预训练按条件读全量卷级聚类），
+  两侧候选不足均取全量；硬下限由装配期容量守卫
+  （``assert_condition_capacity``）把守。
 
 零依赖原则不变：影像路径约定 = ``<dataset_root>/<study_uid>_<series_id>
 .nii.gz``（官方 zip 内文件名的平铺落盘布局，#132 生产落位同构）。
@@ -26,6 +28,7 @@ manifest 落档可审计。
 
 import csv
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import get_args
@@ -66,7 +69,8 @@ class SamplingTrace:
     census_quota_taken: dict[str, int]
     """逐条件 pool 侧实抽计数（配额为上限——候选不足取全量）。"""
     heldout_counts: dict[str, int]
-    """逐条件 held-out 侧计数（per-condition AUC 归因的支撑留痕）。"""
+    """逐条件 held-out 侧**实取**计数（配额为上限——候选不足取全量；
+    per-condition AUC 归因与支撑度判定的留痕）。"""
     out_of_vocabulary_volumes: int
     """train split 内白名单条件域外卷数（信息性留痕，不进任何工件）。"""
     non_train_volumes: int
@@ -177,6 +181,10 @@ class MrRateSeriesCatalog:
                 "官方 split",
             )
             for row in reader:
+                self._assert_cells(
+                    row, self.SPLITS_COLUMNS, self._splits_csv, "官方 split",
+                    reader.line_num,
+                )
                 patient = row["patient_uid"].strip()
                 part = row["split"].strip().casefold()
                 if part not in self.SPLIT_PARTS:
@@ -224,6 +232,26 @@ class MrRateSeriesCatalog:
                 "#78 同款）"
             )
 
+    @staticmethod
+    def _assert_cells(
+        row: dict[str, str | None], required: tuple[str, ...], path: Path,
+        label: str, line: int,
+    ) -> None:
+        """CSV 数据行必需格守卫（短行走可读拒绝，不裸 AttributeError）。
+
+        ``csv.DictReader`` 对字段数不足的行用 ``restval=None`` 补齐缺格，
+        读面随后 ``row["plane"].strip()`` 炸成 AttributeError——裸
+        traceback 逃出 prepare 的输入契约拒绝面（CLI 只把 ValueError /
+        FileNotFoundError 报成「输入契约违反」）。与列守卫同址：同一读面的
+        两次残缺判定收在一处，不让三个读面各判一次「缺了怎么办」。"""
+        missing = [c for c in required if row.get(c) is None]
+        if missing:
+            raise ValueError(
+                f"{label} CSV 第 {line} 行缺格 {missing}: {path}——表头有列"
+                "不等于每行都有值（短行/截断文件），缺格在读取处炸出的是"
+                "AttributeError 而非本仓的输入契约拒绝"
+            )
+
     def train_candidates(self) -> tuple[list[SeriesRecord], int, int]:
         """train split × 生成条件词汇表的候选域（排序后返回）+
         （白名单条件域外卷数, 非 train split 卷数）。
@@ -239,13 +267,19 @@ class MrRateSeriesCatalog:
           val/test 或条件域外），谁进 real pool 取决于行序——先出现的
           non-train 行在过滤处被跳过、后行的 train 归属被接受，该卷既是
           评估留出池又进候选域；候选行内的重复还会编码到同一 latent 路径
-          （统计量重复计入、容量守卫可被虚增行数骗过）。
+          （统计量重复计入、容量守卫可被虚增行数骗过）；
+        - 同一 ``study_uid`` 登记了两个 ``patient_uid`` 即拒绝（study 是
+          患者的一次检查、只属于一个 patient）：两个不同的 series 各自都
+          能过卷键唯一性，patient 级二分却能把它们分到两侧——同一患者的
+          解剖同时进 real pool 与 held-out 池，而抽样留痕仍自称病例级
+          不相交。
 
         键与条目键、latent 文件名同源（``SeriesRecord.case_id``）。
         """
         splits = self.split_patients()
         candidates: list[SeriesRecord] = []
         seen_keys: set[tuple[str, str]] = set()
+        study_owners: dict[str, str] = {}
         out_of_vocabulary = 0
         non_train = 0
         with open(self._metadata_csv, encoding="utf-8") as fh:
@@ -255,6 +289,10 @@ class MrRateSeriesCatalog:
                 "MR-RATE 元数据",
             )
             for row in reader:
+                self._assert_cells(
+                    row, self.METADATA_COLUMNS, self._metadata_csv,
+                    "MR-RATE 元数据", reader.line_num,
+                )
                 patient_uid = row["patient_uid"].strip()
                 if patient_uid not in splits:
                     raise ValueError(
@@ -276,6 +314,18 @@ class MrRateSeriesCatalog:
                         "行数骗过）。请用去重后的元数据文件"
                     )
                 seen_keys.add(series_key)
+                owner = study_owners.setdefault(study_uid, patient_uid)
+                if owner != patient_uid:
+                    raise ValueError(
+                        f"MR-RATE 元数据同一 study 登记了两个 patient："
+                        f"{study_uid} 分别属于 {owner!r} 与 {patient_uid!r} "
+                        f"({self._metadata_csv})——study 是患者的一次检查、"
+                        "只属于一个 patient；两个不同的 series 各自都能过"
+                        "卷键唯一性，patient 级二分却能把它们分到两侧：同一"
+                        "患者的解剖同时进 real pool 与 held-out 池，而抽样"
+                        "留痕仍自称病例级不相交。请用 patient_uid 列一致的"
+                        "元数据文件"
+                    )
                 if splits[patient_uid] != "train":
                     non_train += 1  # 评估留出池卷：不进 real 数据链候选
                     continue
@@ -339,6 +389,10 @@ class EvalSetExclusion:
                 "#78 评估清单",
             )
             for row in reader:
+                MrRateSeriesCatalog._assert_cells(
+                    row, self.EVAL_COLUMNS, self._path, "#78 评估清单",
+                    reader.line_num,
+                )
                 rows += 1
                 series_keys.add(
                     (row["study_uid"].strip(), row["series_id"].strip()),
@@ -412,9 +466,10 @@ class MrRateAssembly:
     """MR-RATE 域装配策略（prepare 编排骨架的 MR 分派实现）。
 
     plan() 流程：候选域（catalog）→ 互斥守卫（exclusion）→ patient 二分
-    （heldout split）→ pool 侧逐条件配额抽样（排序后 seed 洗牌截取，配额
-    为上限）→ 编码任务计划。逐卷归属与全部守卫读数随计划留痕（pipeline
-    消费落抽样 manifest）。"""
+    （heldout split）→ **两侧**逐条件配额抽样（pool 侧按
+    ``real_pool_quota`` 逐条件登记、held-out 侧按 ``heldout_quota_volumes``
+    全条件同值；排序后 seed 洗牌截取，配额为上限）→ 编码任务计划。逐卷
+    归属与全部守卫读数随计划留痕（pipeline 消费落抽样 manifest）。"""
 
     def __init__(
         self,
@@ -459,14 +514,19 @@ class MrRateAssembly:
         pool_records, heldout_records = self._partition_by_patient(
             candidates, heldout_patients,
         )
-        pool_selected = self._apply_quota(pool_records)
+        pool_selected = self._apply_quota(
+            pool_records, self._config.reward.real_pool_quota,
+        )
+        heldout_selected = self._apply_quota(
+            heldout_records, self._heldout_limits(),
+        )
         ordered_pool = self._ordered(pool_selected)
-        ordered_heldout = self._ordered(heldout_records)
+        ordered_heldout = self._ordered(heldout_selected)
         root = Path(self._config.artifacts.dataset_root)
         trace = SamplingTrace(
             census_candidates=self._census(candidates),
             census_quota_taken=self._census(pool_selected),
-            heldout_counts=self._census(heldout_records),
+            heldout_counts=self._census(heldout_selected),
             out_of_vocabulary_volumes=out_of_vocabulary,
             non_train_volumes=non_train,
             eval_exclusion_keys=exclusion_keys,
@@ -515,27 +575,45 @@ class MrRateAssembly:
             target.append(record)
         return pool, heldout
 
+    def _heldout_limits(self) -> dict[str, int]:
+        """held-out 侧逐条件配额（``reward.heldout_quota_volumes`` 标量
+        落到每个条件）：held-out 池是监控集，**不是越大越好**——生产
+        「10% patient」二分把头条件留成上万卷，而预训练每步按条件读取
+        该条件 held-out **全量**卷级聚类（``HeldOutAuc.
+        compute_volume_clusters`` 整条件 stack 上卡：数万卷 × 单卷最大
+        latent ≈ 数十 GiB，且每步重扫一遍）。配额为上限非硬指标（候选
+        不足取全量），支撑度判定读到的仍是该条件 held-out 的实取卷数。"""
+        cap = self._config.reward.heldout_quota_volumes
+        return {name: cap for name in self._vocabulary.names()}
+
     def _apply_quota(
-        self, pool_records: list[SeriesRecord],
+        self,
+        records: list[SeriesRecord],
+        limits: Mapping[str, int],
     ) -> list[SeriesRecord]:
         """逐条件配额抽样（#78 机制同款）：条件内排序 + seed 洗牌 + 截取
         配额上限（候选不足取全量；洗牌只决定选谁，条目序由 ``_ordered``
-        统一重排保持确定性可读）。"""
-        quota = self._config.reward.real_pool_quota
+        统一重排保持确定性可读）。``limits`` = 逐条件卷数上限（pool 侧 =
+        ``reward.real_pool_quota`` 逐条件登记、未登记即不设限；held-out
+        侧 = ``reward.heldout_quota_volumes`` 全条件同值）。两侧共用同一
+        抽样机制与同一洗牌键——两侧卷集按 patient 二分互斥，共享键不引入
+        任何耦合。"""
         selected: list[SeriesRecord] = []
         for condition in self._vocabulary.names():
-            records = sorted(
-                (r for r in pool_records if r.condition == condition),
+            matching = sorted(
+                (r for r in records if r.condition == condition),
                 key=SeriesRecord.sort_key,
             )
-            limit = quota.get(condition)
+            limit = limits.get(condition)
             if limit is not None:
-                shuffled = list(records)
+                shuffled = list(matching)
                 random.Random(
                     f"{self._config.schedule.seed}|{condition}",
                 ).shuffle(shuffled)
-                records = sorted(shuffled[:limit], key=SeriesRecord.sort_key)
-            selected.extend(records)
+                matching = sorted(
+                    shuffled[:limit], key=SeriesRecord.sort_key,
+                )
+            selected.extend(matching)
         return selected
 
     def _ordered(self, records: list[SeriesRecord]) -> list[SeriesRecord]:

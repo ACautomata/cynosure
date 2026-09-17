@@ -343,6 +343,7 @@ class PreparePipeline:
             data_snapshot=self._config.artifacts.mrrate_data_snapshot,
             quota=self._config.reward.real_pool_quota,
             heldout_fraction=self._config.reward.heldout_fraction,
+            heldout_quota_volumes=self._config.reward.heldout_quota_volumes,
             census_candidates=trace.census_candidates,
             census_quota_taken=trace.census_quota_taken,
             heldout_counts=trace.heldout_counts,

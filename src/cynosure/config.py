@@ -643,6 +643,20 @@ class RewardConfig(BaseModel):
         "线有语义，BraTS 线二分 = 70/10/20 写死（CaseSplitter）不消费",
         default=0.1, gt=0.0, lt=1.0,
     )
+    heldout_quota_volumes: int = SpecField(
+        "tunable", "#121 + #131 + ADR-0008-04",
+        "MR-RATE held-out real 的逐条件卷数上限（配额为上限非硬指标："
+        "候选不足取全量）。held-out 池是监控集、不是越大越好——生产 "
+        "10% patient 二分把头条件留成上万卷，而预训练每步按条件读取该"
+        "条件 held-out **全量**卷级聚类（HeldOutAuc.compute_volume_"
+        "clusters 整条件 stack 上卡，数万卷 × 单卷最大 latent ≈ 数十 "
+        "GiB 且每步重扫）：超过本上限的额外卷对池化 AUC 点估计无实质"
+        "贡献（精度由 min(real, fake) 主导），却让磁盘与显存线性膨胀。"
+        "512 = 支撑度界（gate_support_min_volumes）一个数量级之上的起步"
+        "值，MR-RATE 预训练曲线校准后定版。仅 MR-RATE 线有语义，BraTS "
+        "线 held-out = val split 全量（CaseSplitter）不消费",
+        default=512, ge=1,
+    )
     sampling_manifest_json: Path | None = SpecField(
         "运行时", "#125 + #131",
         "MR-RATE 配额抽样留痕工件（#78 抽样机制同款：seed / 逐条件候选"
@@ -1257,6 +1271,55 @@ class CynosureConfig(BaseModel):
                 f"{experiment.dataset}（两套口径互斥激活：BraTS config "
                 "携带即拒绝）"
             )
+        return reward
+
+    @field_validator("reward")
+    @classmethod
+    def _prepare_paths_are_distinct(
+        cls, reward: RewardConfig, info: ValidationInfo,
+    ) -> RewardConfig:
+        """prepare 的读面与写面路径两两不同（别名 = 数据毁损面，#121/
+        #131）。
+
+        prepare 的失效步**先于**装配计划：它 unlink 输出路径（pool /
+        held-out manifest、统计量、抽样留痕）并 rmtree 派生 latent 子树。
+        输出路径别名一件**输入**工件 → 那份输入在装配读到它之前已被删除
+        （跑一次 prepare 删一份数据；同仓的失效-先于-计划改判正是为了让
+        计划期失败也清盘，别名让这条纪律反过来咬输入）；两件输出别名同一
+        路径 → 抽样留痕落在全流程最后写出，把先落盘的工件覆盖成另一份
+        schema 而 prepare 照报成功（train 随后装载不到 pool）。判据取
+        ``resolve()`` 后的路径：相对/绝对、``..`` 与符号链接指向的同一份
+        文件即同一路径。"""
+        artifacts = info.data.get("artifacts")
+        if artifacts is None:
+            return reward
+        named = (
+            ("artifacts.vae_ckpt", artifacts.vae_ckpt),
+            ("artifacts.vae_config_json", artifacts.vae_config_json),
+            ("artifacts.condition_vocabulary_json",
+             artifacts.condition_vocabulary_json),
+            ("artifacts.mrrate_metadata_csv", artifacts.mrrate_metadata_csv),
+            ("artifacts.mrrate_splits_csv", artifacts.mrrate_splits_csv),
+            ("artifacts.eval_manifest_csv", artifacts.eval_manifest_csv),
+            ("reward.real_pool_manifest", reward.real_pool_manifest),
+            ("reward.heldout_real_manifest", reward.heldout_real_manifest),
+            ("reward.channel_stats_json", reward.channel_stats_json),
+            ("reward.sampling_manifest_json", reward.sampling_manifest_json),
+        )
+        owners: dict[Path, str] = {}
+        for name, path in named:
+            if path is None:
+                continue
+            resolved = Path(path).resolve()
+            previous = owners.setdefault(resolved, name)
+            if previous != name:
+                raise ValueError(
+                    f"prepare 的输入/输出路径重复：{previous} 与 {name} 指向"
+                    f"同一路径 {resolved}——prepare 的失效步会先 unlink 这些"
+                    "路径（别名一件输入 = 跑一次 prepare 删一份数据），而"
+                    "抽样留痕落在最后写出（别名一件输出 = 覆盖先落盘的工件"
+                    "而 prepare 报成功）。请给每个工件各自的路径"
+                )
         return reward
 
     @model_validator(mode="after")

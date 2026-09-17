@@ -402,13 +402,18 @@ class SamplingManifest(BaseModel):
     条件 = 全量不设限）。"""
     heldout_fraction: float
     """train split 内 patient 级二分的 held-out 份额。"""
+    heldout_quota_volumes: int
+    """逐条件 held-out 侧卷数上限（config reward.heldout_quota_volumes
+    原样留痕——held-out 池是监控集，预训练按条件读全量卷级聚类，
+    无上限即按 10% patient 二分的体量膨胀）。"""
     census_candidates: dict[str, int]
     """逐条件候选域计数（互斥守卫后、抽样前；held-out 二分基数的
     同源口径）。"""
     census_quota_taken: dict[str, int]
     """逐条件 pool 侧实抽计数（配额为上限——候选不足取全量）。"""
     heldout_counts: dict[str, int]
-    """逐条件 held-out 侧计数（per-condition AUC 归因的支撑留痕）。"""
+    """逐条件 held-out 侧**实取**计数（配额为上限——候选不足取全量；
+    支撑度判定与 per-condition AUC 归因的留痕）。"""
     out_of_vocabulary_volumes: int
     """train split 内白名单条件域外卷数（信息性留痕，不进任何工件）。"""
     non_train_volumes: int = 0

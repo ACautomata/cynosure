@@ -252,6 +252,7 @@ class TestSamplingManifest:
             data_snapshot="MR-RATE@v1.0",
             quota={"t1w/axial": 2},
             heldout_fraction=0.3,
+            heldout_quota_volumes=512,
             census_candidates={"t1w/axial": 4},
             census_quota_taken={"t1w/axial": 2},
             heldout_counts={"t1w/axial": 1},

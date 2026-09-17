@@ -699,3 +699,97 @@ class TestAssemblyInputHardening:
         assert not Path(config.reward.heldout_real_manifest).exists()
         assert not Path(config.reward.channel_stats_json).exists()
         assert not Path(config.reward.sampling_manifest_json).exists()
+
+
+class TestThirdReviewHardening:
+    """PR #163 评审 5225318744 的四条守卫补强：输出路径别名、study 单一
+    患者归属、短行缺格、held-out 侧配额——一律装载期/装配期 fail-fast。"""
+
+    def test_sampling_manifest_path_alias_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """抽样留痕路径与 pool manifest 同名 → 拒绝：抽样 manifest 落在
+        全流程**最后**一次写出，别名把刚落盘的 pool manifest 覆盖成一份
+        SamplingManifest，而 prepare 照报成功——train 随后装载不到 pool。"""
+        config = mr_scenario.build_config()
+        config.reward.sampling_manifest_json = config.reward.real_pool_manifest
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "sampling_manifest_json" in result.stderr
+
+    def test_output_path_aliasing_input_rejected_before_deletion(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """输出路径别名一件**输入**工件 → 拒绝：失效步（先于装配计划）
+        会 unlink 那份输入，装配随后才读它——别名即「跑一次 prepare 删
+        一份数据」，输入文件被删掉之后 prepare 才失败。"""
+        config = mr_scenario.build_config()
+        metadata_path = config.artifacts.mrrate_metadata_csv
+        config.reward.sampling_manifest_json = metadata_path
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "sampling_manifest_json" in result.stderr
+        assert metadata_path.exists()  # 输入未被失效步删除
+
+    def test_study_with_conflicting_patient_owner_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """同一 study_uid 的两行登记了不同 patient_uid → 拒绝：卷键唯一
+        性只把守 ``(study_uid, series_id)``，两个不同的 series 各自合法，
+        但一个 study 只属于一个患者——patient 级洗牌能把这两卷分到两侧，
+        同一患者的解剖同时进 real pool 与 held-out 池，而抽样留痕仍自称
+        病例级不相交。"""
+        forged = {
+            "batch_id": "batch01", "patient_uid": "P01", "study_uid": "ST00",
+            "series_id": "t1w-raw-axi-v2", "modality": "T1W", "plane": "AXIAL",
+        }
+        result = mr_scenario.run(extra_metadata_rows=[forged])
+        assert result.code == 2
+        assert "ST00" in result.stderr
+        assert "P00" in result.stderr and "P01" in result.stderr
+
+    def test_truncated_metadata_row_rejected(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """元数据短行（末尾格缺失）→ 可读拒绝：``csv.DictReader`` 用
+        ``restval=None`` 补齐缺格，读面随后 ``row["plane"].strip()`` 炸成
+        AttributeError——裸 traceback 逃出 prepare 的输入契约拒绝面
+        （CLI 只把 ValueError/FileNotFoundError 报成「输入契约违反」）。"""
+        config = mr_scenario.build_config()
+        metadata_path = config.artifacts.mrrate_metadata_csv
+        with open(metadata_path, "a", encoding="utf-8") as fh:
+            fh.write("batch99,P00,ST99,s99,T1W\n")  # 缺 plane 格
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "plane" in result.stderr
+
+    def test_heldout_quota_caps_each_condition(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """held-out 侧逐条件配额：生产体量下 10% patient 二分把头条件留成
+        上万卷，held-out manifest 无上限——预训练每步 ``compute_volume_
+        clusters`` 把该条件 held-out **全量**卷 stack 上卡（数万卷 × 单卷
+        最大 latent ≈ 数十 GiB），磁盘同样按此膨胀。"""
+        config = mr_scenario.build_config(
+            train_patients=12, heldout_fraction=0.5,
+        )
+        config.reward.heldout_quota_volumes = 2
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 0, result.stderr
+        heldout = LatentManifest.load(
+            config.reward.heldout_real_manifest, "heldout_real",
+        )
+        # 6 held-out patients × 每条件 1 series = 每条件 6 卷 → 截到配额 2
+        assert heldout.modalities == {"t1w/axial": 2, "flair/axial": 2}
+        manifest = SamplingManifest.model_validate_json(
+            Path(config.reward.sampling_manifest_json).read_text(
+                encoding="utf-8",
+            ),
+        )
+        assert manifest.heldout_quota_volumes == 2
+        assert manifest.heldout_counts == {"t1w/axial": 2, "flair/axial": 2}
+        # 截取是 seed 决定的（洗牌只决定选谁、条目序统一重排）：同 seed
+        # 重跑工件逐字节零漂移（#78 抽样机制先例同款断言）
+        before = Path(config.reward.heldout_real_manifest).read_bytes()
+        assert mr_scenario.run_with_config(config).code == 0
+        assert Path(config.reward.heldout_real_manifest).read_bytes() == before
