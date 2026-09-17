@@ -153,10 +153,16 @@ class TestRolloutShapesFollowConditions:
 
     def test_base_batch_scales_with_condition_volume(self) -> None:
         """量产批量按条件空间体积缩放（#122 首跑 OOM 修复）：基准 =
-        64³ 空间（BraTS 单域锚）× 8 批；大网格条件缩批防前向激活 OOM
-        （t1w/coronal 空间 [128,64,128] = 基准体积 8 倍，单域批量常数
-        在 MR-RATE 多网格域把量产前向推向 OOM——T12 集群实录）；小
-        网格截到基准批量、不放大。"""
+        64×64×32 空间（BraTS 单域锚）× 8 批；大网格条件缩批防前向激活
+        OOM（t1w/coronal 空间 [128,64,128] = 基准体积 8 倍，单域批量
+        常数在 MR-RATE 多网格域把量产前向推向 OOM——T12 集群实录）；
+        小网格截到基准批量、不放大。
+
+        私有算术的定点测试（与「只测外部行为」的偏离及其理由）：量产
+        批量不进任何输出（条数/形状与分批无关），OOM 行为无法在小规模
+        单测里复现——缩放算术只能在此档直接钉住；批量本身的正误由
+        fixture 全循环（test_base_partition_shapes_follow_quota）以
+        输出面覆盖。"""
         assert RolloutPhase._base_batch_for((4, 64, 64, 32)) == 8
         assert RolloutPhase._base_batch_for((4, 128, 64, 128)) == 1
         assert RolloutPhase._base_batch_for((4, 128, 128, 32)) == 2

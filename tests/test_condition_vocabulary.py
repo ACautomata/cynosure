@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from cynosure.conditions import (
     PRODUCTION_CONDITION_COUNT,
+    ModalityMapping,
     MrConditionVocabulary,
 )
 from cynosure.fixtures import Fixture
@@ -30,6 +31,9 @@ PRODUCTION_CENSUS_PATH = (
 )
 EVAL_MANIFEST_PATH = (
     _REPO_ROOT / "data/eval/mrrate-baseline/eval_manifest.csv"
+)
+MR_MODALITY_MAPPING_PATH = (
+    _REPO_ROOT / "configs/mrrate-base/modality_mapping.json"
 )
 
 # 上游权威（NV-Generate-CTMR configs/modality_mapping.json 的 MR-RATE
@@ -120,6 +124,19 @@ class TestProductionVocabularyLoads:
     @classmethod
     def _vocab(cls) -> MrConditionVocabulary:
         return MrConditionVocabulary.load(PRODUCTION_VOCAB_PATH)
+
+    def test_modality_mapping_artifact_loads(self) -> None:
+        """MR 线 modality mapping 装载工件（configs/mrrate-base/）经
+        ``ModalityMapping.load`` 走通：四序列键满足构造校验（BraTS
+        口径值）；MR 五模态条目在册留档（本线的条件 token 实际取数走
+        词表工件的 ``modality_tokens``，#127 单一来源——本工件是装载面
+        满足 + 跨域映射留档，非 MR token 的消费来源）。"""
+        mapping = ModalityMapping.load(MR_MODALITY_MAPPING_PATH)
+        assert mapping.label("t1n") == 29
+        assert mapping.label("t1c") == 34
+        assert mapping.label("t2f") == 31
+        # 同键两域不同 token：本工件取 MR 值（本线口径优先，README 登记）
+        assert mapping.label("t2w") == 10
 
     def test_loads_eleven_whitelist_conditions(self) -> None:
         vocab = self._vocab()

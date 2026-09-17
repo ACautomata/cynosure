@@ -35,7 +35,8 @@ CONDITIONS = ["t1w/axial", "flair/axial"]
 
 class MrPretrainScenario:
     """一次 MR pretrain 端到端场景：合成 MR-RATE 数据集 → CLI prepare →
-    CLI pretrain（reward 覆写可注入）→ run 目录工件。
+    CLI pretrain（reward 覆写可注入）→ run 目录工件（访问器风格与
+    ``test_pretrain.PretrainScenario`` 一致）。
 
     ``fixtures_dir`` 可注入共享（噪声对比的两 run 必须同一份网络工件：
     判别器初始化来自同一 checkpoint 文件，σ_max 才是唯一差异变量）。"""
@@ -45,61 +46,73 @@ class MrPretrainScenario:
         *, fixtures_dir: Path | None = None,
     ) -> None:
         self._cli = cli
-        self.work_dir = Path(tmp_path)
+        self._work_dir = Path(tmp_path)
         self._shared_fixtures_dir = fixtures_dir
+        self._config: CynosureConfig | None = None
+        self._vocabulary: Path | None = None
+        self._run_dir: Path | None = None
 
     def run(
         self,
         *,
-        train_patients: int = 6,
         reward_overrides: dict | None = None,
     ) -> CynosureConfig:
         """跑 prepare + pretrain 两段 CLI，返回驱动 pretrain 的 config。"""
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        fixtures_dir = self._shared_fixtures_dir or (
-            self.work_dir / "fixtures"
+        self._work_dir.mkdir(parents=True, exist_ok=True)
+        fixtures_dir = (
+            self._shared_fixtures_dir or self._work_dir / "fixtures"
         )
         if self._shared_fixtures_dir is None:
-            self.vocabulary_path = Fixture().write_artifacts(
-                fixtures_dir,
-            ).condition_vocabulary_json
-        else:
-            # 共享工件（噪声对比的控制变量面）：调用方已写好、不重写
-            #（重写会重掷网络权重，σ_max 不再是唯一差异）
-            self.vocabulary_path = (
-                fixtures_dir / "condition_vocabulary.json"
-            )
+            torch.manual_seed(7)  # fixture 网络「固定 seed」机制（库场景先例）
+            Fixture().write_artifacts(fixtures_dir)
+        # 共享工件（噪声对比的控制变量面）：调用方已写好、不重写
+        # （重写会重掷网络权重，σ_max 不再是唯一差异）
+        self._vocabulary = fixtures_dir / "condition_vocabulary.json"
         config = Fixture().config(fixtures_dir, dataset="MR-RATE")
         if reward_overrides:
             config.reward = config.reward.model_copy(update=reward_overrides)
         SyntheticMrRateDataset(config.artifacts.dataset_root).write()
-        prepare_config_path = self.work_dir / "prepare_config.json"
+        prepare_config_path = self._work_dir / "prepare_config.json"
         prepare_config_path.write_text(
             config.model_dump_json(indent=2), encoding="utf-8",
         )
         prepare = self._cli.run("prepare", "--config", str(prepare_config_path))
         assert prepare.code == 0, prepare.stderr
         pretrain_config = config.model_copy(deep=True)
-        self.run_dir = self.work_dir / "pretrain_run"
+        self._run_dir = self._work_dir / "pretrain_run"
         pretrain_config.reward.pretrain_report_json = str(
-            self.run_dir / "pretrain_report.json",
+            self._run_dir / "pretrain_report.json",
         )
-        pretrain_config_path = self.work_dir / "pretrain_config.json"
+        pretrain_config_path = self._work_dir / "pretrain_config.json"
         pretrain_config_path.write_text(
             pretrain_config.model_dump_json(indent=2), encoding="utf-8",
         )
-        self.result = self._cli.run(
+        result = self._cli.run(
             "pretrain", "--config", str(pretrain_config_path),
         )
-        assert self.result.code == 0, self.result.stderr
-        self.config = pretrain_config
+        assert result.code == 0, result.stderr
+        self._config = pretrain_config
         return pretrain_config
 
+    def config(self) -> CynosureConfig:
+        assert self._config is not None
+        return self._config
+
+    def vocabulary_path(self) -> Path:
+        assert self._vocabulary is not None
+        return self._vocabulary
+
+    def run_dir_path(self) -> Path:
+        assert self._run_dir is not None
+        return self._run_dir
+
     def report(self) -> PretrainReport:
-        return PretrainReport.load(Path(self.config.reward.pretrain_report_json))
+        return PretrainReport.load(
+            Path(self.config().reward.pretrain_report_json),
+        )
 
     def events(self) -> list[dict]:
-        lines = (self.run_dir / "metrics.jsonl").read_text(
+        lines = (self.run_dir_path() / "metrics.jsonl").read_text(
             encoding="utf-8",
         ).splitlines()
         return [json.loads(line) for line in lines if line.strip()]
@@ -137,7 +150,7 @@ class TestMrPretrainEndToEnd:
             config.artifacts.condition_vocabulary_json,
         )
         assert provenance.condition_vocabulary_sha256 == (
-            PretrainProvenance.digest(scenario.vocabulary_path)
+            PretrainProvenance.digest(scenario.vocabulary_path())
         )
         # checkpoint 照常落盘，且守卫重载路径走通（词表指纹对照生效）
         scorer = report.load_discriminator(config)
@@ -184,11 +197,11 @@ class TestMrPretrainEndToEnd:
         )
         # 噪声注入生效的直接证据：同 seed 下 σ_max 唯一差异 → 权重分叉
         noisy_state = torch.load(
-            noisy.run_dir / "checkpoints" / "pretrain_discriminator.pt",
+            noisy.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
             map_location="cpu", weights_only=True,
         )
         clean_state = torch.load(
-            clean.run_dir / "checkpoints" / "pretrain_discriminator.pt",
+            clean.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
             map_location="cpu", weights_only=True,
         )
         assert noisy_state.keys() == clean_state.keys()
@@ -209,11 +222,11 @@ class TestMrPretrainEndToEnd:
         # 报告落盘后改动词表工件内容（语义等价的空白差异也算漂移——
         # 指纹对照按字节内容，不是语义 diff）
         drifted = json.loads(
-            scenario.vocabulary_path.read_text(encoding="utf-8"),
+            scenario.vocabulary_path().read_text(encoding="utf-8"),
         )
         drifted["grid_semantics"] = drifted["grid_semantics"] + "（漂移）"
-        scenario.vocabulary_path.write_text(
+        scenario.vocabulary_path().write_text(
             json.dumps(drifted, indent=2), encoding="utf-8",
         )
         with pytest.raises(ValueError, match="条件词汇表指纹不符"):
-            report.assert_data_provenance(scenario.config)
+            report.assert_data_provenance(scenario.config())
