@@ -704,11 +704,24 @@ class RewardConfig(BaseModel):
         "train 上岗门槛的守卫装载源，预训练 run 目录产物）。必填无默认——"
         "RL 不带 warm-start 工件在 schema 层就无法启动",
     )
+    condition_gate_enabled: bool = SpecField(
+        "运行时", "ADR-0008",
+        "条件闸总开关（维护者裁决，2026-09-17；ADR-0008 决策 5/7/8 的"
+        "统一关闭形态）：false = held-out AUC 不作为任何更新开关——"
+        "RM readiness gate 的上岗判定不再拒绝开跑、运行时白名单恒为"
+        "本域全条件放行、动态恢复停步，policy 每 iteration 对目标条件"
+        "全量更新。AUC 仍照常测量并落 iter 事件（heldout_auc 字段）与"
+        "分叉监控（ADR-0009 只报警），观测面不因关闸而退化为空白——"
+        "关的是「AUC 驱动决定」，不是「AUC 被测量」。true = 既定口径"
+        "（决策 5/7/8 全链生效，白名单空拒绝开跑）",
+        default=True,
+    )
     gating_dynamic_recovery: bool = SpecField(
         "tunable", "ADR-0008",
         "白名单动态恢复（ADR-0008 决策 8）：在线 per-condition AUC 流驱动 "
         "EMA 滞回判定，名单自动进出；false = 静态白名单降级路径（名单恒为"
-        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）",
+        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）。"
+        "condition_gate_enabled=false 时本项无消费面（名单无门控语义）",
         default=True,
     )
     gating_enter_auc: float = SpecField(

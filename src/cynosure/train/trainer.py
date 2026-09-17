@@ -77,6 +77,35 @@ class StageTag:
     checkpoint_prefix: str = ""
 
 
+class PhaseTimer:
+    """单 iteration 内的相位墙钟计时器（#123 tracer 的成本读数面）。
+
+    相位边界显式打点，产出 ``{相位名: 秒数}`` 的逐 iter 分解——成本读数
+    的「每 iter 卡时分解」在 RL 主循环里的落点（rollout 是真正的绑定项，
+    没有分解就只能读到总耗时）。计时是纯观测：不打点即无该相位条目，
+    对执行序无任何影响。
+
+    语义与 ``elapsed_s`` 同界：从构造（= iteration 起点）到最后一个
+    ``mark``。周期 checkpoint / 里程碑评测 / 迭代末 barrier 在区间外，
+    不落入任何相位（与 ``elapsed_s`` 的既有口径一致）。
+    """
+
+    def __init__(self) -> None:
+        self._marks: dict[str, float] = {}
+        self._last = time.monotonic()
+
+    def mark(self, phase: str) -> None:
+        """结束当前相位并开启下一相位。"""
+        now = time.monotonic()
+        self._marks[phase] = now - self._last
+        self._last = now
+
+    @property
+    def marks(self) -> dict[str, float]:
+        """已打点相位的只读快照（相位名 → 秒数）。"""
+        return dict(self._marks)
+
+
 class TrainingLogProbPair(BaseModel):
     """训练侧 log-prob 对：rollout 记录的 π_old vs 更新时（同权重、
     更新循环开始前）重算值——测试面 #3 的诊断载体。"""
@@ -366,8 +395,13 @@ class GranularGrpoTrainer:
         update_interval = self.config.reward.disc_update_interval_n_d
         for iteration in range(start_iteration, self.config.schedule.max_iterations):
             started = time.monotonic()
+            # 成本读数的相位分解（#123）：计时是纯观测，相位边界即执行序
+            # 的既有分界（第 1 相 rollout / AUC 测量 / 门控回合 / 第 2 相
+            # policy 更新 / 判别器更新），不改变任何执行顺序
+            phases = PhaseTimer()
             self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
             record = self.loop.run_iteration()
+            phases.mark("rollout")
             if self._dump:
                 pairs.extend(self.loop.consistency_pairs(record, iteration))
             # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
@@ -378,6 +412,7 @@ class GranularGrpoTrainer:
             heldout_auc = self.rewards.heldout_auc(
                 record.new_fakes, record.modality,
             )
+            phases.mark("heldout_auc")
             # 门控观测（ADR-0008 决策 8）：AUC 流喂入动态白名单——rank 0
             # 更新 EMA 并滞回判定（越 enter 恢复 / 跌破 exit 重新门控），
             # 门控状态快照广播镜像全体。返回值 = 全 rank 集体门控决定
@@ -387,6 +422,7 @@ class GranularGrpoTrainer:
             policy_gated = self.rewards.gating.observe(
                 record.modality, heldout_auc,
             )
+            phases.mark("gating")
             # 梯度门控（ADR-0008 决策 7）：目标条件不在白名单 → 跳过本
             # iteration 的 policy 更新（不引入第二重 reward/KL/参考模型）；
             # rollout、fake 入 buffer、判别器更新、iter 事件照常——被门控
@@ -395,6 +431,7 @@ class GranularGrpoTrainer:
             loss_terms: dict[str, float] = {}
             if not policy_gated:
                 loss_terms = self.loop.update_policy(record)
+            phases.mark("policy_update")
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
             # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器；
             # 门控不影响判别器节奏）；
@@ -432,6 +469,7 @@ class GranularGrpoTrainer:
                         train_pairwise_acc=report.train_pairwise_acc,
                         heldout_auc=heldout_auc,
                     )
+            phases.mark("discriminator")
             batch_size_k = self.config.reward.disc_batch_size_k
             zone_sizes = self.rewards.buffer.zone_sizes()
             events: list[IterEvent | OverfitAlertEvent] = [IterEvent(
@@ -461,6 +499,7 @@ class GranularGrpoTrainer:
                 overfit_divergence_ema=divergence_ema,
                 lr=self.config.policy.policy_lr,
                 elapsed_s=time.monotonic() - started,
+                phase_seconds=phases.marks,
             )]
             if alert_event is not None:
                 # 告警排本 rank iter 事件之后（归并序 = iter 后随同 rank 告警）

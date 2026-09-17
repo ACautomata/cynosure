@@ -87,6 +87,15 @@ class IterEvent(BaseModel):
     """Replay buffer 近期分区当前占用（FIFO 滚动观测面）。"""
     lr: float
     elapsed_s: float
+    phase_seconds: dict[str, float] = Field(default_factory=dict)
+    """逐 iter 卡时分解（#123 tracer 首跑的成本读数面）：本 iteration 各
+    相位的墙钟秒数，键 = 相位名（``rollout`` / ``heldout_auc`` /
+    ``gating`` / ``policy_update`` / ``discriminator``，可扩）。
+    覆盖区间与 ``elapsed_s`` 同界——[iteration 起点, 本事件构造]：周期
+    checkpoint、里程碑解码评测与迭代末 barrier 在该区间之外（随既有
+    ``elapsed_s`` 口径，不单列）。各相位之和 ≤ ``elapsed_s``（差额 =
+    相位边界上的簿记开销，不追求逐字节闭合）。空 dict = 调用方未做
+    相位计量（测试/替身直调场景）。观测面扩展：事件契约可扩不可改名。"""
 
 
 class MilestoneEvent(BaseModel):

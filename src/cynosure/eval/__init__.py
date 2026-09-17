@@ -81,11 +81,15 @@ class EvaluationPhase(Protocol):
 class ManifestEvaluation:
     """``EvaluationPhase`` 的 manifest 驱动实现：Baseline 采样 / 里程碑
     评测 / RL 后重采的单点持有——两相位与里程碑共用同一 manifest 条目
-    （同 seed 同条件，差异唯一归因于 RL）。"""
+    （同 seed 同条件，差异唯一归因于 RL）。
+
+    监控相（里程碑评测）协作者可为空：无里程碑触发点的 run（``schedule``
+    判定，见 ``_monitoring_reachable``）不装配参照影像库与特征提取器，
+    只保留不依赖二者的 Baseline / 重采两相位。"""
 
     def __init__(
         self,
-        evaluator: MilestoneEvaluator,
+        evaluator: MilestoneEvaluator | None,
         volume_sampler: ManifestVolumeSampler,
     ) -> None:
         self._evaluator = evaluator
@@ -113,12 +117,19 @@ class ManifestEvaluation:
         # 两域内联分派）：rollout 条件解析与逐条目 latent 形状的共同
         # 取数面（#129 形状按条件贯通）
         vocabulary = cls._assemble_vocabulary(config)
+        # 监控相（里程碑解码评测）的两道装配守卫与同一前提绑定：本 run
+        # 是否存在里程碑触发点——不触发里程碑的 run 不消费监控相，其
+        # 样本面与参照库的装配要求随之不适用（#123：把监控相的资源/
+        # 配置前置强加给不消费它的 run，会让主循环 tracer 被下游监控票
+        # 的交付物阻塞）
+        monitoring_reachable = cls._monitoring_reachable(config)
         # 里程碑样本面守卫（schema 校验的 MR-RATE 承接面，#129）：
         # 条目按条件轮转，K < 词汇表条件数即永久漏尾部条件——生产 config
         # 在评测装配期显式拒绝（schema 不读词表工件，BraTS 的下界校验
         # 仍在 schema 层）；fixture 豁免（评测面以盘上条目为准）。
         if (
-            not config.fixture_mode
+            monitoring_reachable
+            and not config.fixture_mode
             and config.schedule.milestone_eval_samples < len(vocabulary.names())
         ):
             raise ValueError(
@@ -131,33 +142,38 @@ class ManifestEvaluation:
         # MR-RATE 参照影像库尚未交付（RealVolumeStore = BraTS 病例布局
         # 的参照库，dataset_root 扫描与序列键都是 BraTS 语义）：两域条件
         # 的采样与分层度量面已按词汇表贯通（#129），参照侧像素库随 MR
-        # 数据管线后续 ticket 交付后在装配处同点分派——显式拒绝而非让
-        # BraTS 布局扫描在 MR dataset_root 上炸出布局错误
-        if config.experiment.dataset == "MR-RATE":
+        # 数据管线后续 ticket（#124 监控链路）交付后在装配处同点分派
+        # ——显式拒绝而非让 BraTS 布局扫描在 MR dataset_root 上炸出
+        # 布局错误
+        if config.experiment.dataset == "MR-RATE" and monitoring_reachable:
             raise ValueError(
                 "MR-RATE 线的里程碑参照影像库尚未交付（RealVolumeStore "
-                "是 BraTS 病例布局的参照库）：评测装配在此显式拒绝，"
-                "MR 参照库随 MR 数据管线后续 ticket 交付后在同一装配点"
-                "分派"
+                "是 BraTS 病例布局的参照库）：本 run 会走到里程碑、评测"
+                "装配在此显式拒绝，MR 参照库随 MR 数据管线后续 ticket 交付"
+                "后在同一装配点分派（不触发里程碑的 run 不装配监控相）"
             )
         resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
         latent_sampler = ManifestLatentSampler(sampler, resolver, amp, vocabulary)
         resolved_decoder = decoder if decoder is not None else cls._build_decoder(
             config, amp.device,
         )
-        resolved_extractor = (
-            extractor if extractor is not None
-            else cls._build_extractor(config, amp.device)
-        )
-        evaluator = MilestoneEvaluator(
-            config,
-            stage,
-            latent_sampler,
-            resolved_decoder,
-            resolved_extractor,
-            cls._build_reals(config, pool),
-            manifest,
-            amp.device,
+        # 监控相协作者按运行可达性装配：无里程碑触发点的 run 不构造特征
+        # 提取器与参照影像库（生产上二者各自需要 RadImageNet 权重与
+        # 参照库工件——把监控相的资源需求强加给不消费它的 run，会让
+        # 主循环 tracer 被下游监控票的交付物阻塞）
+        evaluator = (
+            MilestoneEvaluator(
+                config,
+                stage,
+                latent_sampler,
+                resolved_decoder,
+                extractor if extractor is not None
+                else cls._build_extractor(config, amp.device),
+                cls._build_reals(config, pool),
+                manifest,
+                amp.device,
+            )
+            if monitoring_reachable else None
         )
         volume_sampler = ManifestVolumeSampler(
             stage,
@@ -179,8 +195,34 @@ class ManifestEvaluation:
         self._volume_sampler.sample_resample()
 
     def milestone_metrics(self) -> MilestoneMetrics:
-        """当前 policy 的里程碑度量（``milestone`` 事件的取数面）。"""
+        """当前 policy 的里程碑度量（``milestone`` 事件的取数面）。
+
+        监控相缺席（本 run 无里程碑触发点）时显式报错而非返回空读数：
+        缺席是装配前提不满足，不是「无操作」——静默的空读数会让早停判据
+        在无量测输入下做出判断。"""
+        if self._evaluator is None:
+            raise ValueError(
+                "本 run 未装配监控相（schedule.max_iterations < "
+                "schedule.milestone_interval：训练循环无里程碑触发点，"
+                "里程碑读数不存在消费时机）——里程碑消费面不可达"
+            )
         return self._evaluator.evaluate()
+
+    @staticmethod
+    def _monitoring_reachable(config: CynosureConfig) -> bool:
+        """本 run 是否存在里程碑触发点（监控相可达性的装配期判定）。
+
+        训练循环的里程碑触发条件 = 完成数整除 ``milestone_interval``
+        （iteration 从 1 起计数），故「存在 k ∈ [1, max_iterations] 使
+        k % interval == 0」等价于 ``max_iterations ≥ milestone_interval``
+        ——续训同理：起点之后的剩余区间的可达性由同一对 (max_iterations,
+        interval) 决定，起点本身不进入装配期判据（装配早于恢复，起点
+        尚不可知；用全区间判定是保守方向——判定为可达而实际没走到，
+        至多多装配一个不消费的监控相，反向漏判则会让里程碑在运行中途
+        才炸）。"""
+        return (
+            config.schedule.max_iterations >= config.schedule.milestone_interval
+        )
 
     @staticmethod
     def _assemble_vocabulary(config: CynosureConfig) -> ConditionVocabulary:
