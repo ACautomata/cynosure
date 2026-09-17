@@ -5,7 +5,7 @@ MR 线的 prepare → pretrain 两段在既有测试里各自单测过
 BraTS fixture 端到端），但两段在 MR 线的**贯通**从未验证——prepare
 产出的逐条件异形状工件（``condition_latent_shapes`` 契约）流进 pretrain
 装配（词表装载、轮转条件集守卫、条件匹配采样、报告条件域与词表指纹）
-的执行序是本票首跑的前置。三个测试面（spec「Testing Decisions」：只测
+的执行序是本票首跑的前置。四个测试面（spec「Testing Decisions」：只测
 外部行为，主 seam = CLI 命令级与工件契约级）：
 
 1. **恒达标快速路径**（gate 0.01）：prepare → pretrain 贯通，报告按
@@ -13,7 +13,11 @@ BraTS fixture 端到端），但两段在 MR 线的**贯通**从未验证——p
    单域 latent_shape）且守卫重载走通；
 2. **密集步进路径**（gate 0.99 不可达）：per-condition 轮转落事件流、
    噪声注入 knobs（ADR-0009-α）在 MR 线 pretrain 路径消费；
-3. **守卫重载拒绝**：词表工件内容漂移的报告守卫被指纹对照拒绝。
+3. **守卫重载拒绝**：词表工件内容漂移的报告守卫被指纹对照拒绝；
+4. **白名单空 → 拒跑**（#133 AC）：预训练 gate 不可达 → 报告白名单空
+   （报告与 checkpoint 照常落盘供诊断）→ train 侧（进程内构造、评测相
+   注入替身——MR 参照影像库未交付的装配守卫先行）白名单空在 run 期
+   首个动作前拒绝（逐条件实测值 + 报告路径）。
 
 BraTS 线与既有 MR prepare 测试零改动。"""
 
@@ -26,7 +30,9 @@ import torch
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
+from cynosure.train import GranularGrpoTrainer, RunArtifacts
 from tests.conftest import CliSession, SyntheticMrRateDataset
+from tests.test_milestone_eval import StubEvaluation
 
 
 CONDITIONS = ["t1w/axial", "flair/axial"]
@@ -230,3 +236,57 @@ class TestMrPretrainEndToEnd:
         )
         with pytest.raises(ValueError, match="条件词汇表指纹不符"):
             report.assert_data_provenance(scenario.config())
+
+    def test_empty_whitelist_train_refusal(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """AC（#133）：白名单空 → 拒跑语义在 MR-RATE 口径验证过（fixture
+        注入空场景，不赌生产）。预训练 gate 不可达（0.99）耗尽步数上限 →
+        报告白名单空、gate_passed=False，报告与 checkpoint 照常落盘供诊断
+        （driver 侧不拒跑——ADR-0008-04 语义）；拒跑由 train gate 把守
+        （ADR-0008-05）。
+
+        seam 说明：train 走进程内构造（``GranularGrpoTrainer`` + 评测相
+        注入替身）而非 CLI——MR 线的里程碑参照影像库未交付（评测装配对
+        dataset=MR-RATE 显式拒绝，随监控链路票交付），CLI 全链在构造期
+        先被该守卫挡下；gate 判定位于评测装配之后的 run 期，经替身注入
+        才能在 MR 词汇表口径下到达。本测试因此同时钉住两件事：MR 线
+        train 侧装配全链可打穿（warm-start 守卫：词表指纹/组别绑定/
+        无单域 latent_shape 口径——多条件报告喂进运行时白名单），且
+        白名单空在 run 期第一动作（base 分区量产之前）即拒绝。CLI 层
+        的 exit 2 + run 目录回滚外壳由 #88 在 BraTS 线验收（同一 gate
+        同一报错路径），不在此重复。演进义务：MR 参照影像库交付、
+        评测装配守卫移除后，本语义须回归 CLI 全链 seam 补测（exit 2 +
+        run 目录回滚在 MR 口径的直测）。"""
+        scenario = MrPretrainScenario(cli, tmp_path)
+        config = scenario.run(reward_overrides={
+            "pretrain_gate_auc": 0.99,  # 不可达：白名单空
+            "pretrain_max_steps": 2,
+        })
+        report = scenario.report()
+        assert report.gate_whitelist == []
+        assert report.gate_passed is False
+        # 诊断产物不丢：per-condition 实测快照 + checkpoint 照常落盘
+        assert set(report.condition_auc) == set(CONDITIONS)
+        assert (scenario.run_dir_path() / "checkpoints"
+                / "pretrain_discriminator.pt").is_file()
+        # train 侧装配（MR 词汇表口径）打穿至 gate：warm-start 装载守卫
+        # 全过（报告与本 config 同源工件），白名单从报告接线
+        run_dir = tmp_path / "train_run"
+        artifacts = RunArtifacts.init(config, run_dir)
+        trainer = GranularGrpoTrainer(
+            config, artifacts,
+            evaluation=StubEvaluation(fids=[]),
+            device=torch.device("cpu"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            trainer.run()
+        message = str(exc_info.value)
+        assert "RM readiness gate" in message
+        assert "条件白名单为空" in message
+        for modality, value in report.condition_auc.items():
+            assert f"held-out AUC[{modality}]: {value:.4f}" in message
+        assert str(config.reward.pretrain_report_json) in message
+        # 拒绝发生在昂贵启动动作之前：指标流零事件（base 分区量产与
+        # Baseline 采样均未执行）
+        assert artifacts.paths.metrics.stat().st_size == 0
