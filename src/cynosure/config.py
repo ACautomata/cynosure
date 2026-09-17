@@ -120,7 +120,10 @@ class Artifacts(BaseModel):
     )
     modality_mapping_json: Path = SpecField(
         "运行时", "policy-modeling",
-        "modality token 映射（t1n/t1c/t2w/t2f → 29/34/30/31）",
+        "modality token 映射（BraTS 线加载面要求 t1n/t1c/t2w/t2f → "
+        "29/34/30/31；MR-RATE 线的条件 token 实际取数走条件词汇表工件的 "
+        "modality_tokens——本工件在该线是加载面满足 + 跨域映射留档，"
+        "见 configs/mrrate-base/modality_mapping.json 与 README）",
     )
     controlnet_ckpt: Path | None = SpecField(
         "运行时", "experiment-design",
