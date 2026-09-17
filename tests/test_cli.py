@@ -335,6 +335,12 @@ class TestMetricsStream:
         with pytest.raises(ValidationError):
             self._iter_event(loss={"policy": float("inf")})
 
+    def test_iter_event_rejects_non_finite_phase_seconds(self) -> None:
+        """逐 iter 卡时分解同受非有限浮点拒绝（事件契约的 NaN/Inf 守卫
+        对新增的 dict 字段同样生效）。"""
+        with pytest.raises(ValidationError):
+            self._iter_event(phase_seconds={"rollout": float("nan")})
+
     def test_milestone_event_rejects_non_finite_fid(self) -> None:
         with pytest.raises(ValidationError):
             MilestoneEvent(iteration=50, fid=float("inf"))

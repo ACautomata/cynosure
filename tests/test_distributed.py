@@ -45,6 +45,7 @@ from cynosure.train import (
 from cynosure.train.rng import TrainingRngStreams
 from cynosure.distributed import DistributedContext, RankSlicedPool
 from tests.conftest import (
+    WALL_CLOCK_EVENT_FIELDS,
     CliSession,
     FixturePrepareScenario,
     enforce_deterministic_kernels,
@@ -225,7 +226,8 @@ class SpawnedTrainWorld:
 
 class CrossPathEquivalence:
     """跨路径等价性判定：结构字段严格一致、浮点字段在重算路径噪声容差
-    内一致；wall-clock elapsed_s 不参与对比。适用面 = 任何两个独立执行
+    内一致；墙钟字段（``elapsed_s`` / ``phase_seconds``，见
+    ``WALL_CLOCK_EVENT_FIELDS``）不参与对比。适用面 = 任何两个独立执行
     语境的重算对比（分布式 vs 单进程、跨进程世界对——含多 rank 续训
     roundtrip 的两世界事件对比）。逐位断言保留给同进程重放（单进程
     续训 roundtrip，RunTrajectory）与各 rank 权重同步（RankResumeShards）
@@ -249,7 +251,7 @@ class CrossPathEquivalence:
         for first, second in zip(left, right):
             assert set(first) == set(second)
             for key in first:
-                if key == "elapsed_s":
+                if key in WALL_CLOCK_EVENT_FIELDS:
                     continue
                 a, b = first[key], second[key]
                 if isinstance(a, float) and isinstance(b, float):
