@@ -551,10 +551,13 @@ class TestAssemblyInputHardening:
     ) -> None:
         """容量守卫先于编码（「开工前失败」的字面口径）：逐条件实抽数
         在装配计划里已经可知，生产体量下先编码整池再报错 = 白烧加速卡
-        数小时——失败时盘上不留任何 latent。"""
+        数小时——失败时盘上不留任何 latent。报错须点名配额（判据是
+        **配额后**的实取计数：本用例 6 个 pool 患者足够 K=4，是配额把它
+        截到 2——修法是增大配额而非补数据）。"""
         result = mr_scenario.run(quota={"t1w/axial": 2, "flair/axial": 8})
         assert result.code == 2
         assert "容量不足" in result.stderr
+        assert "reward.real_pool_quota" in result.stderr
         assert not list((mr_scenario.work_dir / "fixtures").rglob("*.pt"))
 
     def test_failed_rerun_invalidates_sampling_manifest(

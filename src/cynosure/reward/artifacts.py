@@ -158,6 +158,10 @@ class LatentManifest(BaseModel):
         prepare 侧传装配计划计数——**编码之前**即可判定（生产体量下先
         编码整池再报错是白烧加速卡；spec「开工前失败而非训练中途」的
         字面口径），两入口的判据与报错不设第二份。
+
+        prepare 侧传的是**配额抽样后**的实取计数：配额本身也会触发本
+        守卫（候选充足但 real_pool_quota < K×world），故报错同时点名配额
+        与数据量两条修法——只报「增大 real pool」会把修法指错方向。
         """
         required = batch_size_k * world_size
         starved: list[tuple[str, int]] = []
@@ -175,7 +179,10 @@ class LatentManifest(BaseModel):
                 f" = {required} 条（条件匹配采样后每 rank 独立供满无放回 "
                 "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
                 f"不变，不引入有放回采样补洞）；不足: {detail}。"
-                "增大 real pool（或减小 disc_batch_size_k / 切片路数）"
+                "计数是抽样后的实取卷数——先看该条件是否被配额截断"
+                "（MR-RATE 线 reward.real_pool_quota）：截断则增大配额，"
+                "候选本身不足才需增大 real pool（或减小 disc_batch_size_k "
+                "/ 切片路数）"
             )
 
     def assert_condition_shapes(

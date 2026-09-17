@@ -229,7 +229,7 @@ class PreparePipeline:
         self._write_stats(plan, mean, std, len(pool_entries))
         sampling_manifest = self._write_sampling_manifest(plan)
         condition_counts = (
-            dict(self._condition_counts(pool_entries)) if plan.is_mr_rate else None
+            self._condition_counts(pool_entries) if plan.is_mr_rate else None
         )
         return PrepareReport(
             pool_manifest=pool.manifest_path,
