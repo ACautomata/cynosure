@@ -18,6 +18,8 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 - 指标归并器（EventMerger，rank 0 顺序写出）。
 """
 
+from collections.abc import Callable
+
 import torch
 
 from cynosure.conditions import ConditionVocabulary
@@ -138,8 +140,14 @@ class TrainingRuntime:
             ),
             resume=resume,
         )
+        # 分块上限的 rank 一致化（#165 review P1）：分布式下 rollout 续跑
+        # 的前向调用次数必须跨 rank 一致（FSDP 集合序列绑定调用次数），
+        # 注入全 rank 取最小；单进程恒等 None（本地预算直接生效）
         sampler = cls.assemble_sampler(
             config, policy.field, device=amp.device,
+            chunk_sync=(
+                dist.all_reduce_min if dist.distributed else None
+            ),
         )
         updater = StepwisePolicyUpdate(
             sampler=sampler,
@@ -188,6 +196,7 @@ class TrainingRuntime:
         config: CynosureConfig,
         field: VelocityField,
         device: "torch.device | None" = None,
+        chunk_sync: "Callable[[int], int] | None" = None,
     ) -> RolloutSampler:
         """policy 采样封装装配（日程表 + 本组采样场 + SDE 核）。
 
@@ -196,7 +205,10 @@ class TrainingRuntime:
 
         ``device`` 参与前向激活预算解析（``forward_activation_budget``）：
         config 显式值优先、缺省按设备总显存自动探测；无 CUDA 设备
-        （CPU fixture 口径）回落默认常量。"""
+        （CPU fixture 口径）回落默认常量。``chunk_sync`` 是分块上限的
+        rank 一致化回调——分布式 build 注入 ``dist.all_reduce_min``
+        （#165 review P1：FSDP 集合序列绑定前向调用次数）；单进程语境
+        缺省 None，本地预算直接生效。"""
         policy = config.policy
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
         return RolloutSampler(
@@ -204,6 +216,7 @@ class TrainingRuntime:
             forward_activation_budget=cls.forward_activation_budget(
                 config, device,
             ),
+            chunk_sync=chunk_sync,
         )
 
     @classmethod

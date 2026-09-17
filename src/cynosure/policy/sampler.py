@@ -13,6 +13,8 @@ sigma 日程经 ``ConditionSchedules`` 按条件名选择（#129 逐条件锚）
 log-prob 经同一入口，扰动与重算的日程口径逐位一致。
 """
 
+from collections.abc import Callable
+
 import torch
 
 from cynosure.policy.condition import RolloutCondition
@@ -76,6 +78,7 @@ class RolloutSampler:
         kernel: SdeKernel,
         schedules: ConditionSchedules,
         forward_activation_budget: int | None = None,
+        chunk_sync: "Callable[[int], int] | None" = None,
     ) -> None:
         self._field = field
         self._kernel = kernel
@@ -89,6 +92,13 @@ class RolloutSampler:
             if forward_activation_budget is None
             else forward_activation_budget
         )
+        # 分块上限的 rank 一致化回调（分布式装配注入
+        # ``DistributedContext.all_reduce_min``；单进程/诊断回路缺省
+        # None = 本地预算直接生效）：本地预算只约束显存上界，而 FSDP
+        # 逐前向参数 all-gather 的调用序列与「前向调用次数」绑定——
+        # 条件逐 rank 独立采样时本地 cap 分叉即集合序列错配挂死
+        # （#165 review P1，sugon train2 2026-09-17 实录）
+        self._chunk_sync = chunk_sync
 
     def anchor_trajectory(
         self,
@@ -185,11 +195,21 @@ class RolloutSampler:
         显存随「前向样本数 × 空间体素数」增长（CFG 配对使前向样本 = 2 ×
         本分块），故分块 = 预算 // (2 × 系数 × 体素数)，截到 [1, batch]。
 
+        分布式下本地预算先经 ``chunk_sync`` 取**全 rank 最小**（#165
+        review P1）：条件逐 rank 独立采样使各 rank 的体素数（→ 本地
+        cap）不同，各自分块则前向调用次数分叉 → FSDP 参数 all-gather
+        调用序列错配挂死。取最小后调用次数必然一致；子批只小不大，
+        任何一侧的显存上界语义都不破。本方法的调用频率是结构常数
+        （每 iter 的 |M|×|Λ| 次续跑、各 rank 相同），满足集合操作
+        同频前提。
+
         ``shape`` = 待续跑 latent 的 [C, D, H, W]（消费面传张量形状）。"""
         voxels = int(shape[-3]) * int(shape[-2]) * int(shape[-1])
         cap = self._forward_budget // (
             2 * _ACTIVATION_BYTES_PER_LATENT_VOXEL * voxels
         )
+        if self._chunk_sync is not None:
+            cap = self._chunk_sync(cap)
         return max(1, min(batch, cap))
 
     def _continue_batch(

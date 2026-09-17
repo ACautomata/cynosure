@@ -35,15 +35,21 @@ import pytest
 import torch
 
 from cynosure.cli import CynosureCli
+from cynosure.conditions import MrConditionVocabulary
 from cynosure.config import ConfigLoader, MODALITIES
 from cynosure.fixtures import Fixture
+from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.schedules import PerConditionSchedules
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.train import (
+    MrConditionSampler,
     RunArtifacts,
     TrainingRuntime,
 )
 from cynosure.train.rng import TrainingRngStreams
-from cynosure.distributed import DistributedContext, RankSlicedPool
+from cynosure.distributed import DistributedContext, PolicySharding, RankSlicedPool
 from tests.conftest import (
     WALL_CLOCK_EVENT_FIELDS,
     CliSession,
@@ -965,3 +971,158 @@ class TestTwoRankResume:
         for rank in range(2):
             assert resumed_shards.state(rank)["iteration"] == 4
             assert baseline_shards.state(rank)["iteration"] == 4
+
+
+class RolloutChunkWorker:
+    """单 rank 的 rollout 分块一致性执行体（``TrainWorldWorker`` 的近亲：
+    env 注入与确定性口径同款，执行体不是 CLI 而是一次 FSDP 采样场上的
+    ``continue_to_terminal``）：按本 rank 序号从异形词表钉死条件——生产
+    里这一分歧来自 per-rank 派生 seed 下的条件均匀轮转（#125），钉死为
+    结构事实以保循环确定性——回报本 rank 的前向调用数。实例可 pickle
+    （spawn Process 以它为 target）。"""
+
+    def __init__(
+        self, rank: int, world: int, port: int, fixture_dir: Path,
+        budget: int, queue, num_threads: int,
+    ) -> None:
+        self.rank = rank
+        self.world = world
+        self.port = port
+        self.fixture_dir = fixture_dir
+        self.budget = budget
+        self.queue = queue
+        self.num_threads = num_threads
+
+    def __call__(self) -> None:
+        torch.set_num_threads(self.num_threads)
+        enforce_deterministic_kernels()
+        os.environ.update(
+            RANK=str(self.rank),
+            LOCAL_RANK=str(self.rank),
+            WORLD_SIZE=str(self.world),
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=str(self.port),
+        )
+        try:
+            payload = {"code": 0, "stderr": "", **self._run()}
+        except Exception as exc:  # worker 崩溃的诊断面：异常文本回传
+            payload = {"code": 1, "stderr": f"{type(exc).__name__}: {exc}"}
+        self.queue.put({"rank": self.rank, **payload})
+
+    def _run(self) -> dict:
+        context = DistributedContext.bootstrap()
+        vocabulary = MrConditionVocabulary.load(
+            self.fixture_dir / "condition_vocabulary.json", fixture_mode=True,
+        )
+        torch.manual_seed(7)  # fixture 网络固定 seed：跨 rank 逐位一致初始权重
+        network = PolicySharding(context, gradient_checkpointing=False).wrap(
+            Fixture().unet().eval(),
+        )
+        forwards: list[int] = []
+        network.register_forward_hook(lambda _m, _inp, _out: forwards.append(1))
+        device = context.local_device()
+        sampler = RolloutSampler(
+            CfgCombinedField(network),
+            SdeKernel(eta=0.7, s_max=0.999),
+            PerConditionSchedules(
+                num_inference_steps=Fixture.NUM_INFERENCE_STEPS,
+                vocabulary=vocabulary,
+            ),
+            forward_activation_budget=self.budget,
+            # 复刻 TrainingRuntime.build 的接线（分布式注入全 rank 取最小；
+            # 单进程 None）：本测试的分布式承重面
+            chunk_sync=(
+                context.all_reduce_min if context.distributed else None
+            ),
+        )
+        condition = MrConditionSampler(
+            vocabulary, torch.Generator().manual_seed(0), device,
+        ).sample_target(vocabulary.names()[self.rank % len(vocabulary.names())])
+        shape = vocabulary.latent_shape(condition.name_or_raise())
+        latents = torch.randn(
+            12, *shape,
+            generator=torch.Generator().manual_seed(100 + self.rank),
+        ).to(device)
+        sampler.continue_to_terminal(latents, index=1, condition=condition)
+        # 跨 rank 对账（本身也是集合可达性检验：前向调用序列一旦错配，
+        # 本调用即挂死或报错，由主进程 join 超时收尸转红）
+        received = context.all_gather([len(forwards)])
+        return {"forwards": len(forwards), "all_forwards": received}
+
+
+class TestRolloutChunkRankConsistency:
+    """rollout 分块调度与 FSDP 集合操作的跨 rank 一致性（#165 review P1）。
+
+    生产形态（sugon train2 2026-09-17 实录）：per-rank 派生 seed 下
+    ``MrConditionSampler`` 各 rank 抽到异形条件 → ``_forward_chunk`` 按
+    本 rank 形状取值 → ``continue_to_terminal`` 的前向调用次数跨 rank
+    不同 → FSDP 逐前向参数 all-gather 的调用序列错配 → 全 rank 集体
+    挂死在集合操作上（iter 0 rollout 结束前后 log 静默，watchdog 40 min
+    后 abort）。既有 world=2 用例全部跑单形状词表（各 rank 条件恒同形
+    → 分块恒同），全绿也探不到——本测试按 rank 钉死异形条件补上该
+    结构。断言：全 rank 完成续跑且**前向调用数跨 rank 一致**——分块
+    必须 rank 一致（个别 rank 的子批大小允许不同：参数 all-gather 尺寸
+    与批无关，与集合序列绑定的是调用次数）。
+    """
+
+    _JOIN_TIMEOUT_S = 240.0
+    """死锁转红的上限：绿路径在 fixture 规模下秒级完成，超时即视为
+    集合操作互等的挂死形态（与 SpawnedTrainWorld 的 join 兜底同语义，
+    取值远短于全文件默认的 1 小时——本测试只跑一次续跑）。"""
+
+    _next_port = _worker_port_base()
+
+    def test_continue_forward_counts_match_across_ranks(
+        self, tmp_path: Path,
+    ) -> None:
+        fixture = Fixture()
+        fixture_dir = tmp_path / "fixtures"
+        fixture.write_artifacts(fixture_dir)
+        # 预算钉 64 MiB：t1w/axial（2048 体素）本地 chunk=4、flair/axial
+        # （1024 体素）本地 chunk=8——2:1 体素比在该预算下必然产生分歧
+        # chunk（2 = CFG 配对、4 KiB = 每 latent 体素激活经验上界，即
+        # sampler._forward_chunk 的预算公式）
+        budget = 4 * 2 * 4096 * 2048
+        world = 2
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        num_threads = torch.get_num_threads()
+        type(self)._next_port += 1
+        port = type(self)._next_port
+        processes = [
+            context.Process(target=RolloutChunkWorker(
+                rank, world, port, fixture_dir, budget, queue, num_threads,
+            ))
+            for rank in range(world)
+        ]
+        for process in processes:
+            process.start()
+        collected: dict[int, dict] = {}
+        for _ in range(world):
+            try:
+                payload = queue.get(timeout=self._JOIN_TIMEOUT_S)
+            except _QueueEmpty:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5.0)
+                stuck = ", ".join(
+                    f"rank {rank}: {collected[rank]['stderr']}"
+                    for rank in sorted(collected)
+                ) or "（无任何 worker 回传：前向序列错配的集合互等）"
+                raise AssertionError(
+                    f"worker 回传超时（{self._JOIN_TIMEOUT_S}s，分块前向"
+                    f"调用序列跨 rank 错配的挂死形态）: {stuck}"
+                )
+            collected[payload["rank"]] = payload
+        for process in processes:
+            process.join(timeout=30.0)
+        assert all(
+            payload["code"] == 0 for payload in collected.values()
+        ), collected
+        counts = {
+            rank: payload["forwards"] for rank, payload in collected.items()
+        }
+        assert len(set(counts.values())) == 1, (
+            f"前向调用数跨 rank 错配（FSDP 集合序列必然失配）: {counts}"
+        )

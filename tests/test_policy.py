@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from collections.abc import Callable
 from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
@@ -607,12 +608,14 @@ class TestForwardActivationChunking:
     @staticmethod
     def _sampler(
         field: object, budget: int | None,
+        chunk_sync: "Callable[[int], int] | None" = None,
     ) -> RolloutSampler:
         return RolloutSampler(
             field,  # type: ignore[arg-type]  # 测试桩实现 velocity 面
             SdeKernel(eta=0.7, s_max=0.999),
             SingleConditionSchedules(3, 2048),
             forward_activation_budget=budget,
+            chunk_sync=chunk_sync,
         )
 
     def test_oversized_production_condition_is_chunked(
@@ -670,6 +673,30 @@ class TestForwardActivationChunking:
         assert [call["batch"] for call in recording.calls] == [2] * 12
         deviation = (whole - chunked).abs().max().item()
         assert deviation <= 1e-5 * whole.abs().max().item()
+
+    def test_chunk_sync_pulls_cap_to_rank_minimum(self) -> None:
+        """rank 一致化注入（#165 review P1）：``chunk_sync`` 对本 rank
+        预算上限取全 rank 最小——本地 cap 5、他 rank 更小时分块跟着
+        收紧，前向调用次数跨 rank 一致（FSDP 逐前向参数 all-gather 的
+        序列与调用次数绑定，各 rank 条件形状独立采样下本地各自取值即
+        集合序列错配挂死）；子批只小不大，显存上界语义不破。"""
+        unet = ZeroVelocityUnet()
+        sampler = self._sampler(
+            CfgCombinedField(unet), 40 * 2**30,
+            chunk_sync=lambda cap: min(cap, 2),
+        )
+        latents = torch.randn(12, 4, 128, 64, 128)
+        out = sampler.continue_to_terminal(
+            latents, index=1,
+            condition=RolloutCondition(
+                label=torch.tensor([29]), spacing=SPACING,
+            ),
+        )
+        batches = [call["batch"] for call in unet.calls]
+        assert len(batches) == 6          # 本地 cap 5 → 全 rank 最小 2：块数 ceil(12/2)
+        assert max(batches) == 4          # 每块前向样本 = 2 × 2（CFG 配对）
+        assert sum(batches) == 24         # 逐块覆盖全部方向，无重复
+        assert out.shape == latents.shape
 
     def test_chunk_floors_at_one_sample(self) -> None:
         """超大头体积（> 预算/系数）：分块不塌到 0——逐样本续跑，不因
