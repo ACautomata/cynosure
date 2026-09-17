@@ -36,7 +36,9 @@ CONDITIONS = ["t1w/axial", "flair/axial"]
 PHASES = (
     "rollout", "heldout_auc", "gating", "policy_update", "discriminator",
 )
-"""逐 iter 卡时分解的相位键（#123：iter 事件 ``phase_seconds``）。"""
+"""逐 iter 卡时分解的相位键（#123：iter 事件 ``phase_seconds``；
+未开 ``--dump-trajectory`` 的口径——开了诊断另加 ``trajectory`` 相，
+见 test_trajectory_diagnostic）。"""
 
 
 class MrTrainScenario:

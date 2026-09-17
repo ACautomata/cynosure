@@ -396,14 +396,20 @@ class GranularGrpoTrainer:
         for iteration in range(start_iteration, self.config.schedule.max_iterations):
             started = time.monotonic()
             # 成本读数的相位分解（#123）：计时是纯观测，相位边界即执行序
-            # 的既有分界（第 1 相 rollout / AUC 测量 / 门控回合 / 第 2 相
-            # policy 更新 / 判别器更新），不改变任何执行顺序
+            # 的既有分界（第 1 相 rollout / 诊断轨迹（--dump-trajectory 时
+            # 自占 trajectory 相）/ AUC 测量 / 门控回合 / 第 2 相 policy
+            # 更新 / 判别器更新），不改变任何执行顺序
             phases = PhaseTimer()
             self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
             record = self.loop.run_iteration()
             phases.mark("rollout")
             if self._dump:
                 pairs.extend(self.loop.consistency_pairs(record, iteration))
+                # 一致性诊断自占相位（PR #165 review）：consistency_pairs
+                # 的 policy 前向与张量归本是诊断开销，不并入 heldout_auc
+                # ——诊断运行的 AUC 卡时才不被诊断开销吹胀；未开 dump 不
+                # 打点即无该相位条目（PhaseTimer 既有口径）
+                phases.mark("trajectory")
             # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
             # 判别器快照（更新后测同一 fake 批会把 in-sample 拟合计入 AUC，
             # 联合 hacking 签名失真）；real 侧按本 iteration 采样的目标

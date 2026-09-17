@@ -450,6 +450,29 @@ class TestRejection:
         data["schedule"]["milestone_eval_samples"] = 500
         CynosureConfig.model_validate(data)  # fixture 豁免
 
+    def test_milestone_samples_checks_require_milestone_reachability(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """里程碑样本面守卫与监控相装配同一前提绑定（PR #165 review）：
+        不触发里程碑的 run（max_iterations < milestone_interval）不装配
+        监控相、评测样本面无消费时机——上下界校验随之不适用（与
+        ManifestEvaluation._monitoring_reachable 同一判据）；触发面存在
+        时照常强制（对照分支防一刀切放空）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["max_iterations"] = 10  # < 默认 milestone_interval=50
+        data["schedule"]["milestone_eval_samples"] = 8  # < 12 有序对
+        CynosureConfig.model_validate(data)  # 不可达：守卫不适用
+        data["schedule"]["milestone_eval_samples"] = 250  # > N_baseline=200
+        CynosureConfig.model_validate(data)  # 上界同闸
+        data["schedule"]["max_iterations"] = 200  # 触发面存在（≥ 50）
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
+
     def test_auc_chance_epsilon_below_half(self, valid_config_dict: dict) -> None:
         """AUC 近 chance 判定带半径 ≥0.5 即恒真：hacking 签名失去判别力，拒绝。"""
         data = copy.deepcopy(valid_config_dict)

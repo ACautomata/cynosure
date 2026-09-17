@@ -982,6 +982,24 @@ class ScheduleConfig(BaseModel):
             )
         return value
 
+    @property
+    def milestones_reachable(self) -> bool:
+        """本日程是否存在里程碑触发点（单一判据，两处消费）。
+
+        训练循环的里程碑触发条件 = 完成数整除 ``milestone_interval``
+        （iteration 从 1 起计数），故「存在 k ∈ [1, max_iterations] 使
+        k % interval == 0」等价于 ``max_iterations ≥ milestone_interval``
+        ——续训同理：起点之后的剩余区间的可达性由同一对 (max_iterations,
+        interval) 决定，起点本身不进入判据（装配/校验早于恢复，起点尚
+        不可知；用全区间判定是保守方向——判为可达而实际没走到，至多多
+        装配一个不消费的监控相，反向漏判则会让里程碑在运行中途才炸）。
+
+        消费方：监控相装配（``eval.ManifestEvaluation.
+        _monitoring_reachable``）与 schema 层里程碑样本面守卫
+        （``CynosureConfig._milestone_samples_match_manifest_support``
+        ，PR #165 review：两层同一不变量须同一前提）。"""
+        return self.max_iterations >= self.milestone_interval
+
 
 class ShardingConfig(BaseModel):
     """分布式分片（orchestration 章 + ADR-0003）：torchrun + FSDP 同卡交替。"""
@@ -1441,11 +1459,16 @@ class CynosureConfig(BaseModel):
           缩水到盘上条目数——配置声明的评测样本量与实际评测面失真。
 
         fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。
+        守卫以里程碑可达为前提（``ScheduleConfig.milestones_reachable``
+        ，PR #165 review）：不触发里程碑的 run 不装配监控相、评测样本面
+        无消费时机，两界随之不适用。
         MR-RATE 跳过条件集下界校验（#129：条件集在词汇表工件、schema
         不读文件）——该上界挪到评测装配期守卫（ManifestEvaluation.
         build：K < len(vocabulary.names()) 即拒绝）；上界（K ≤
         N_baseline）校验 MR-RATE 同样适用，照跑。"""
         if self.fixture_mode:
+            return self
+        if not self.schedule.milestones_reachable:
             return self
         if self.experiment.dataset != "MR-RATE":
             vocabulary = max(

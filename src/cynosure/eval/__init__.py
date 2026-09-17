@@ -212,17 +212,10 @@ class ManifestEvaluation:
     def _monitoring_reachable(config: CynosureConfig) -> bool:
         """本 run 是否存在里程碑触发点（监控相可达性的装配期判定）。
 
-        训练循环的里程碑触发条件 = 完成数整除 ``milestone_interval``
-        （iteration 从 1 起计数），故「存在 k ∈ [1, max_iterations] 使
-        k % interval == 0」等价于 ``max_iterations ≥ milestone_interval``
-        ——续训同理：起点之后的剩余区间的可达性由同一对 (max_iterations,
-        interval) 决定，起点本身不进入装配期判据（装配早于恢复，起点
-        尚不可知；用全区间判定是保守方向——判定为可达而实际没走到，
-        至多多装配一个不消费的监控相，反向漏判则会让里程碑在运行中途
-        才炸）。"""
-        return (
-            config.schedule.max_iterations >= config.schedule.milestone_interval
-        )
+        判据单一来源 = ``ScheduleConfig.milestones_reachable``（schema 层
+        里程碑样本面守卫与监控相装配共用的同一前提，PR #165 review；
+        触发条件与续训语义的完整推导见该属性 docstring）。"""
+        return config.schedule.milestones_reachable
 
     @staticmethod
     def _assemble_vocabulary(config: CynosureConfig) -> ConditionVocabulary:
