@@ -1,6 +1,6 @@
 ---
 name: experiment-release
-description: 实验完成后把 run 目录结果、实验临时脚本与运行源码打包发布为 GitHub Release（tag exp/<run-dir名>，源码 tarball 按运行 commit 用 git archive 固定）。触发：一次 train/eval run 跑完需要发布结果；用户要求发布/上传实验结果或建实验 release。
+description: 实验完成后把 run 目录结果、可视化后的代表性样本图像、实验临时脚本与运行源码打包发布为 GitHub Release（tag exp/<run-dir名>，源码 tarball 按运行 commit 用 git archive 固定）。触发：一次 train/eval run 跑完需要发布结果；用户要求发布/上传实验结果或建实验 release。
 ---
 
 # 实验发布：run 目录 → GitHub Release
@@ -48,7 +48,12 @@ run 目录须在本地（还在 SothisAI 实例上的先按 sugon 惯例拉回�
   -C <run-dir>/scripts <挑出的文件>`）；一次性探针、临时 sanity 这类过不了
   标准的留在目录里，不上；
 - 结果：run 目录下的 `config.json`、`metrics.jsonl`、`manifest.json`，以及
-  除 `checkpoints/`、`scripts/` 外的其他结果文件（图表、评测报告等）；
+  除 `checkpoints/`、`scripts/`、`samples/` 外的其他结果文件（评测报告等）；
+- 样本与图像：生成样本、监控与评测图像必须进 release——它们是 release 的
+  可读面。纪律是**先可视化**：`.nii.gz` 体数据、`.pt` 张量这类原始形态先转
+  成 PNG 切片网格（如三正交中间面拼图）再上；原始体数据挑代表性子集随附，
+  供定量复算。数量大时按代表性采样：baseline 与 RL 两侧、各里程碑、各条件
+  都要有代表，末期样本必收，打成 `samples-<short-sha>.tar.gz`；
 - checkpoint 默认不上 release：权重留集群持久分区，用户点名要的才打。
 
 每个资产过一遍 `du -h`：单资产上限 2 GiB，超限挡下（GitHub 拒收，release
@@ -59,8 +64,9 @@ run 目录须在本地（还在 SothisAI 实例上的先按 sugon 惯例拉回�
 
 从 `metrics.jsonl` 与 `config.json` 汇总，中文、短：group、seed、末次
 iteration 与 `anchor_eval_reward`、里程碑 FID 轨迹、`heldout_auc` 末值、
-是否 early-stop；标出源码 commit short sha；末尾一行列出脚本 tarball 里
-收了哪些脚本。写入临时文件供 `--notes-file`。
+是否 early-stop；标出源码 commit short sha；末尾一行列出脚本与样本 tarball
+各收了什么，样本注明采样口径（覆盖的侧 / 里程碑 / 条件）。写入临时文件供
+`--notes-file`。
 
 ### 5. 发布并验证
 
@@ -73,5 +79,6 @@ gh release create "exp/<run-dir 目录名>" <资产...> \
 （空格等）时先问用户。tag 已存在即失败，报告用户，不覆盖。
 
 完成后 `gh release view "exp/<run-dir 目录名>"` 逐项核对：资产清单与第 3 步
-一致（含 `scripts-<short-sha>.tar.gz`）、notes 要素齐全。核对通过才算发布
+一致（含 `scripts-<short-sha>.tar.gz` 与 `samples-<short-sha>.tar.gz`）、
+notes 要素齐全；解包样本 tarball 抽一张 PNG 确认可看。核对通过才算发布
 完成。
