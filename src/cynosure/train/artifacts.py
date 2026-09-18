@@ -116,6 +116,14 @@ class MilestoneEvent(BaseModel):
     early_stop: bool = False
     early_stop_reason: str | None = None
     """触发早停的签名（"plateau" / "reward_hacking"）；未停为 None。"""
+    elapsed_s: float | None = None
+    """里程碑评测总卡时（#124 监控成本读数：采样 + 解码 + FID 的全
+    区间，监控相在 RL 主循环外的独立成本行）。None = 调用方未计量
+    （替身直调场景）。"""
+    phase_seconds: dict[str, float] = Field(default_factory=dict)
+    """里程碑评测相位卡时分解（#124，#111 监控账的成本行取数面）：
+    ``decode`` = 合成侧 VAE 分块解码；``fid`` = 参照装载 + 特征提取 +
+    距离核。空 dict = 调用方未做相位计量（替身直调场景）。"""
 
 
 class OverfitAlertEvent(BaseModel):

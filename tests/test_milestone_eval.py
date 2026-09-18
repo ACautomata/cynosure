@@ -504,8 +504,11 @@ class NativeShapeRealStore:
     def __init__(self, volume_shape: tuple[int, int, int]) -> None:
         self._volume_shape = volume_shape
 
-    def case_ids(self) -> list[str]:
-        return ["case-a", "case-b"]
+    def reference_volume(
+        self, condition: str, entry_index: int, source_case: str | None,
+    ) -> torch.Tensor:
+        ids = ["case-a", "case-b"]
+        return self.volume(source_case or ids[entry_index % len(ids)], condition)
 
     def volume(self, case_id: str, modality: str) -> torch.Tensor:
         return torch.rand(self._volume_shape)
@@ -606,8 +609,10 @@ class TwoStrengthRealStore:
 
     STRENGTHS = {"t1n": 0.2, "t2w": 0.8}
 
-    def case_ids(self) -> list[str]:
-        return ["case-a"]
+    def reference_volume(
+        self, condition: str, entry_index: int, source_case: str | None,
+    ) -> torch.Tensor:
+        return self.volume("case-a", condition)
 
     def volume(self, case_id: str, modality: str) -> torch.Tensor:
         return torch.full((16, 16, 8), self.STRENGTHS[modality])

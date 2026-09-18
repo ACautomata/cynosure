@@ -24,7 +24,7 @@ from typing import Protocol, TYPE_CHECKING
 
 import torch
 
-from cynosure.conditions import ConditionVocabulary
+from cynosure.conditions import ConditionVocabulary, MrConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.decode import LatentDecoder, VolumeDecoder
@@ -35,7 +35,11 @@ from cynosure.eval.features import (
 )
 from cynosure.eval.milestone import MilestoneEvaluator, MilestoneMetrics
 from cynosure.eval.sampling import ManifestLatentSampler, ManifestVolumeSampler
-from cynosure.eval.volumes import RealVolumeStore
+from cynosure.eval.volumes import (
+    MrReferenceVolumeStore,
+    RealVolumeStore,
+    ReferenceVolumes,
+)
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
@@ -54,7 +58,10 @@ __all__ = [
     "ManifestVolumeSampler",
     "MilestoneEvaluator",
     "MilestoneMetrics",
+    "MrReferenceVolumeStore",
     "RadImageNetFeatureExtractor",
+    "RealVolumeStore",
+    "ReferenceVolumes",
     "StubSliceFeatureExtractor",
     "VolumeDecoder",
 ]
@@ -117,11 +124,10 @@ class ManifestEvaluation:
         # 两域内联分派）：rollout 条件解析与逐条目 latent 形状的共同
         # 取数面（#129 形状按条件贯通）
         vocabulary = cls._assemble_vocabulary(config)
-        # 监控相（里程碑解码评测）的两道装配守卫与同一前提绑定：本 run
-        # 是否存在里程碑触发点——不触发里程碑的 run 不消费监控相，其
-        # 样本面与参照库的装配要求随之不适用（#123：把监控相的资源/
-        # 配置前置强加给不消费它的 run，会让主循环 tracer 被下游监控票
-        # 的交付物阻塞）
+        # 监控相（里程碑解码评测）的装配前提：本 run 是否存在里程碑
+        # 触发点——不触发里程碑的 run 不消费监控相，其样本面与参照库的
+        # 装配要求随之不适用（#123：把监控相的资源/配置前置强加给不
+        # 消费它的 run，会让主循环 tracer 被下游监控票的交付物阻塞）
         monitoring_reachable = cls._monitoring_reachable(config)
         # 里程碑样本面守卫（schema 校验的 MR-RATE 承接面，#129）：
         # 条目按条件轮转，K < 词汇表条件数即永久漏尾部条件——生产 config
@@ -138,19 +144,6 @@ class ManifestEvaluation:
                 f"词汇表（{len(vocabulary.names())} 个条件；manifest 条件"
                 "轮转下 K 不足即永久漏尾部条件，早停判据对其失明——"
                 "增大评测样本面或显式声明 fixture_mode"
-            )
-        # MR-RATE 参照影像库尚未交付（RealVolumeStore = BraTS 病例布局
-        # 的参照库，dataset_root 扫描与序列键都是 BraTS 语义）：两域条件
-        # 的采样与分层度量面已按词汇表贯通（#129），参照侧像素库随 MR
-        # 数据管线后续 ticket（#124 监控链路）交付后在装配处同点分派
-        # ——显式拒绝而非让 BraTS 布局扫描在 MR dataset_root 上炸出
-        # 布局错误
-        if config.experiment.dataset == "MR-RATE" and monitoring_reachable:
-            raise ValueError(
-                "MR-RATE 线的里程碑参照影像库尚未交付（RealVolumeStore "
-                "是 BraTS 病例布局的参照库）：本 run 会走到里程碑、评测"
-                "装配在此显式拒绝，MR 参照库随 MR 数据管线后续 ticket 交付"
-                "后在同一装配点分派（不触发里程碑的 run 不装配监控相）"
             )
         resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
         latent_sampler = ManifestLatentSampler(sampler, resolver, amp, vocabulary)
@@ -236,11 +229,29 @@ class ManifestEvaluation:
     @staticmethod
     def _build_reals(
         config: CynosureConfig, pool: LatentManifest,
-    ) -> RealVolumeStore:
-        """参照影像库（BraTS 单域语义——MR-RATE 在 build 期已显式拒绝，
-        MR 参照库交付后本构造面随装配处分派扩展）：病例白名单 = pool
-        train split 的病例集；预处理链与 prepare 预编码同口径（resize
-        基数随 config——生产钉上游基数，fixture 注入小基数保持夹具尺寸）。"""
+    ) -> ReferenceVolumes:
+        """参照影像库按域分派（装配期单一点，#124：两域同一
+        ``ReferenceVolumes`` 契约）：
+
+        - **BraTS** = 病例目录布局（``RealVolumeStore``）：病例白名单 =
+          pool train split 的病例集；预处理链与 prepare 预编码同口径
+          （resize 基数随 config——生产钉上游基数，fixture 注入小基数
+          保持夹具尺寸）。
+        - **MR-RATE** = 平铺影像树（``MrReferenceVolumeStore``）：参照
+          卷集与卷 → 条件映射都来自 pool manifest 条目（病例级 train
+          split 泄漏守卫同源），逐条件统一网格预处理链随词汇表装配
+          （强度臂 clip 随 config，#130 参数化口径）。
+        """
+        if config.experiment.dataset == "MR-RATE":
+            return MrReferenceVolumeStore(
+                dataset_root=config.artifacts.dataset_root,
+                pool=pool,
+                vocabulary=MrConditionVocabulary.load(
+                    config.artifacts.condition_vocabulary_json,
+                    fixture_mode=config.fixture_mode,
+                ),
+                clip_intensity=config.preprocessing.intensity_clip,
+            )
         return RealVolumeStore(
             config.artifacts.dataset_root,
             case_ids={entry.case_id for entry in pool.entries},

@@ -11,12 +11,13 @@ MR 线的 prepare → pretrain 两段已在 ``test_mr_pretrain.py`` 贯通；本
 2. **逐 iter 卡时分解**（``iter`` 事件的 ``phase_seconds``）：rollout /
    held-out AUC / 门控回合 / policy 更新 / 判别器更新五相位。
 
-监控相（里程碑解码评测）不在本票范围（MR 参照影像库归 #124）：无里程碑
-触发点的 run 不装配监控相，本文件的场景一律
-``max_iterations < milestone_interval``——装配分界本身也有独立测试面。
+监控链路（里程碑 FID 双轨 / 监控子样本 decode / overfit_alert 订阅面，
+#124）的专项测试在 ``test_mr_monitoring.py``；本文件保留装配分界的
+在场面（里程碑可达 run 产出读数）与缺席面（无触发点 run 不装配监控相）。
 """
 
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -26,6 +27,10 @@ import torch
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.policy.field import CfgCombinedField
+from cynosure.policy.kernel import SdeKernel
+from cynosure.policy.sampler import RolloutSampler
+from cynosure.train.runtime import TrainingRuntime
 from cynosure.train.trainer import PhaseTimer
 from tests.conftest import CliSession, SyntheticMrRateDataset
 
@@ -91,8 +96,9 @@ class MrTrainScenario:
 
     def use(self, config: CynosureConfig, **schedule: object) -> None:
         """把 config 定为本场景的训练 config 并落盘（schedule 覆写随此
-        生效）；``max_iterations`` 默认压到里程碑间隔之下——本票的 run
-        无监控相（MR 参照影像库归 #124）。"""
+        生效）；``max_iterations`` 默认压到里程碑间隔之下——监控相缺席
+        是主循环场景的默认形态（监控链路场景经 ``set_schedule`` 显式
+        声明触发点）。"""
         trained = config.model_copy(deep=True)
         trained.schedule.max_iterations = min(
             trained.schedule.milestone_interval - 1, 3,
@@ -175,6 +181,23 @@ class MrTrainScenario:
 
     def iter_events(self) -> list[dict]:
         return [event for event in self.events() if event["event"] == "iter"]
+
+    def standalone_sampler(
+        self, config: CynosureConfig, device: torch.device | None = None,
+    ) -> RolloutSampler:
+        """评测相注入测试用的独立采样封装（与 ``TrainingRuntime.
+        assemble_sampler`` 同一组合方式；sigma 日程经
+        ``TrainingRuntime.assemble_schedules`` 按域分派——MR 线即逐条件
+        日程表，#129）。网络落 ``device``（缺省 CPU）。"""
+        unet = NetworkAssembler.unet(NetworkArtifact(
+            config=NetworkAssembler.load_json(config.artifacts.net_config_json),
+            checkpoint=config.artifacts.unet_ckpt,
+        )).to(device if device is not None else torch.device("cpu"))
+        return RolloutSampler(
+            CfgCombinedField(unet),
+            SdeKernel(eta=config.policy.sde_eta, s_max=config.policy.sde_s_max),
+            TrainingRuntime.assemble_schedules(config),
+        )
 
     def manifest_entries(self) -> list[dict]:
         return json.loads(
@@ -383,25 +406,34 @@ class TestConditionGateSwitch:
         assert scenario.resume_state()["gating"]["members"] == [CONDITIONS[0]]
 
 
-class TestMonitoringPhaseAbsence:
-    """监控相缺席与在场的装配分界（#123 的结构面）。"""
+class TestMonitoringPhasePresence:
+    """监控相装配分界（#123 结构面；#124 交付 MR 参照影像库后翻转）。"""
 
-    def test_milestone_reachable_run_still_requires_reference_library(
+    @pytest.mark.gpu  # 2 iteration 训练 + 里程碑解码评测（大轮次口径）
+    def test_milestone_reachable_run_produces_readings(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
-        """里程碑可达的 MR run 仍显式拒绝（MR 参照影像库属 #124）：无
-        触发点的 run 不装配监控相，有触发点的 run 保持原守卫——拒绝面
-        不因本票放宽。"""
+        """里程碑可达的 MR run 装配监控相并产出读数（#124：MR 参照影像
+        库交付，#123 的「参照库未交付」硬拒绝面移除）——run 跑通且
+        ``milestone`` 事件携带有限 FID。无触发点的 run 仍不装配监控相
+        （见 TestMrMainLoop.test_baseline_sampling_runs_without_
+        monitoring_phase 的缺席面）。"""
         scenario = MrTrainScenario(cli, tmp_path)
         prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
         pretrained = scenario.pretrain(prepared)
         scenario.use(pretrained)
         scenario.set_schedule(
             max_iterations=pretrained.schedule.milestone_interval,
+            milestone_eval_samples=len(CONDITIONS),
         )
         result = scenario.train()
-        assert result.code != 0
-        assert "里程碑参照影像库尚未交付" in result.stderr
+        assert result.code == 0, result.stderr
+        milestone = next(
+            event for event in scenario.events()
+            if event["event"] == "milestone"
+        )
+        assert milestone["iteration"] == pretrained.schedule.milestone_interval
+        assert math.isfinite(milestone["fid"]) and milestone["fid"] >= 0.0
 
 
 class TestCostReadingShape:
