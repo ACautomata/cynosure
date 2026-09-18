@@ -64,17 +64,15 @@ class ReferenceVolumes(Protocol):
     ``source_case`` 优先——同一病例 ground-truth target；组1 按条目序号
     在**该条件的参照卷池**内确定性轮转（BraTS 病例全序列 → 轮转池为全
     病例；MR-RATE 一卷一条件 → 轮转池为该条件的卷——两域条件维度的
-    语义差异封装在各实现内，消费面单一路径）。
+    语义差异封装在各实现内，消费面单一路径）。协议只承载评测编排的
+    消费面；按病例直取（``volume``）与病例清单（``case_ids``）是各
+    实现的公共方法，属测试与诊断面、不进契约。
     """
 
     def reference_volume(
         self, condition: str, entry_index: int, source_case: str | None,
     ) -> torch.Tensor:
         """条目的参照影像体 [X, Y, Z]（预处理后，与合成侧同影像空间）。"""
-        ...
-
-    def volume(self, case_id: str, condition: str) -> torch.Tensor:
-        """指定病例（卷）某条件的参照影像体 [X, Y, Z]（缓存）。"""
         ...
 
 
@@ -219,6 +217,16 @@ class MrReferenceVolumeStore:
                 )
             case_conditions[entry.case_id] = entry.modality
             condition_cases[entry.modality].append(entry.case_id)
+        if not case_conditions:
+            # 与 BraTS 侧（RealVolumeStore 构造期白名单过滤后无病例即
+            # 拒绝）对称的装配期校验：参照分布空集不让 run 白跑到首个
+            # 里程碑才在取数期失败；条件级缺失（有卷但某条件无参照）
+            # 仍在 reference_volume 取数期拒绝（prepare 的容量守卫把守
+            # pool 侧逐条件覆盖，这里只兜装配前提）
+            raise ValueError(
+                "参照库 pool manifest 无条目——参照分布为空集，里程碑"
+                "评测不可进行（检查 real_pool_manifest 与 prepare 产物）"
+            )
         self._condition_cases: dict[str, list[str]] = {
             name: sorted(cases) for name, cases in condition_cases.items()
         }

@@ -768,15 +768,13 @@ class TestMilestoneEvaluationBuildGuard:
                 write_enabled=False,
             )
 
-    def test_mr_reference_store_dispatched_with_pool_guards_at_read(
+    def test_mr_reference_store_rejects_empty_pool_at_assembly(
         self, tmp_path: Path, fixture_env,
     ) -> None:
-        """MR-RATE 评测装配分派 MR 参照影像库（#124 交付，装配期不再
-        拒绝）：RealVolumeStore 是 BraTS 病例布局的参照库（dataset_root
-        扫描与序列键都是 BraTS 语义），MR 线由 ``MrReferenceVolumeStore``
-        承接——pool manifest 条件映射装配成功；pool 无该条件卷时在**参照
-        取数期**显式拒绝（能力边界声明保留，错误面从装配期移到取数期，
-        而非静默的空参照分布）。"""
+        """MR-RATE 评测装配分派 MR 参照影像库（#124 交付，#123 的
+        「参照库未交付」硬拒绝面移除）；装配前提（pool manifest 非空）
+        在**装配期**显式拒绝——与 BraTS 侧构造期校验对称，参照分布
+        空集不让 run 白跑到首个里程碑才失败。"""
         _, _, vocab, sampler, config = fixture_env
         config.schedule.milestone_eval_samples = len(vocab.names())
         pool_path = Path(config.reward.real_pool_manifest)
@@ -792,25 +790,24 @@ class TestMilestoneEvaluationBuildGuard:
                 name: vocab.latent_shape(name) for name in vocab.names()
             },
         ).model_dump_json(), encoding="utf-8")
-        evaluation = ManifestEvaluation.build(
-            config,
-            RunArtifacts.init(config, tmp_path / "run"),
-            sampler,
-            stage=1,
-            manifest=BaselineManifest(
-                seed=0, group="modal-label",
-                conditions=list(vocab.names()),
-                entries=[
-                    ManifestEntry(
-                        index=0, condition="t1w/axial", noise_seed=0,
-                    ),
-                ],
-            ),
-            amp=AmpContext(torch.device("cpu"), torch.bfloat16),
-            write_enabled=False,
-        )
-        with pytest.raises(ValueError, match="无可用卷"):
-            evaluation.milestone_metrics()
+        with pytest.raises(ValueError, match="参照库 pool manifest 无条目"):
+            ManifestEvaluation.build(
+                config,
+                RunArtifacts.init(config, tmp_path / "run"),
+                sampler,
+                stage=1,
+                manifest=BaselineManifest(
+                    seed=0, group="modal-label",
+                    conditions=list(vocab.names()),
+                    entries=[
+                        ManifestEntry(
+                            index=0, condition="t1w/axial", noise_seed=0,
+                        ),
+                    ],
+                ),
+                amp=AmpContext(torch.device("cpu"), torch.bfloat16),
+                write_enabled=False,
+            )
 
 
 class TestMrReferenceVolumeStore:
