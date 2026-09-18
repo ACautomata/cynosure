@@ -13,11 +13,13 @@ import pytest
 
 from cynosure.fixtures import Fixture
 from cynosure.policy import TrajectoryDiagnosticRunner
+from cynosure.train import RunArtifacts
 from tests.conftest import (
     CliResult,
     CliSession,
     FixtureArtifactLibrary,
 )
+from tests.test_mr_train import PHASES
 
 RUN_DIR = "diag-run"
 
@@ -56,6 +58,17 @@ class DiagnosticScenario:
             ),
         )
 
+    def events(self) -> list[dict]:
+        """指标流取数走工件层（``RunArtifacts.read_events``，与
+        test_train_loop 同面）——不在这里手写一份 jsonl 解析。"""
+        return RunArtifacts(
+            RunArtifacts.layout(self._tmp_path / RUN_DIR),
+        ).read_events()
+
+    def iter_events(self) -> list[dict]:
+        """run 目录指标流里的 iter 事件（相位分解断言的取数面）。"""
+        return [event for event in self.events() if event["event"] == "iter"]
+
 
 @pytest.fixture
 def scenario(cli: CliSession, tmp_path: Path) -> DiagnosticScenario:
@@ -72,6 +85,21 @@ class TestDiagnosticArtifact:
         assert result.code == 0
         assert (scenario._tmp_path / RUN_DIR / "trajectory.json").is_file()
         assert "trajectory.json" in result.stdout
+
+    def test_consistency_diagnostics_have_their_own_phase(
+        self, scenario: DiagnosticScenario,
+    ) -> None:
+        """--dump-trajectory 的一致性诊断自占相位（PR #165 review）：
+        consistency_pairs 在 rollout 打点之后、held-out AUC 之前执行，
+        其 policy 前向与张量归本是诊断开销——记入 trajectory 相，不并入
+        heldout_auc（诊断运行的 AUC 卡时才不被诊断开销吹胀）；未开 dump
+        的 run 无该相位（五相位契约由 test_mr_train 的 PHASES 锚定）。"""
+        assert scenario.run().code == 0
+        iter_events = scenario.iter_events()
+        assert len(iter_events) == 1
+        assert set(iter_events[0]["phase_seconds"]) == set(PHASES) | {
+            "trajectory",
+        }
 
     def test_schedule_anchors_monai_actual_output(
         self, scenario: DiagnosticScenario,

@@ -56,7 +56,14 @@ class ReadinessGate:
         运行时白名单已在 RewardCoordinator 接线（与本判定同一实例），
         放行后循环侧 ``modality in whitelist`` 查询即时生效。拒绝报错
         含各条件 per-condition 实测值（报告 ``condition_auc`` 快照）与
-        报告路径——诊断入口。"""
+        报告路径——诊断入口。
+
+        ``reward.condition_gate_enabled=false`` 时本检查整体不适用
+        （条件闸关闭：白名单不再是上岗判据，运行时白名单为全条件放行
+        占位）——直接放行，不读名单；warm-start 权重装载（ADR-0007）
+        与本开关无关，照常发生。"""
+        if not self._config.reward.condition_gate_enabled:
+            return
         if len(self._whitelist) > 0:
             return
         readings = "、".join(

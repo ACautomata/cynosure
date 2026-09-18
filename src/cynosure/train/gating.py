@@ -160,9 +160,25 @@ class DynamicWhitelist:
         恢复评估（rank 0 更新 EMA 并滞回判定、快照广播镜像）只在动态
         恢复开启时发生；关闭（静态白名单降级路径）时名单恒为启动名单，
         跳过对账仍走集体回合（名单外条件的跳过决定依旧全 rank 一致）。
+
+        条件闸关闭（``condition_gate_enabled=false``）时本入口整体退化为
+        「无条件放行 + 集体回合」：名单恒为全条件、EMA 不更新、判定不
+        发生，返回值恒 False。AUC 观测本身不在此处消费——它经 iter 事件
+        与分叉监控照常落盘，关闸关的是「AUC 驱动更新决定」。
         """
         local_gated = modality not in self._current
+        if not self._config.condition_gate_enabled:
+            # 条件闸总开关关闭（维护者裁决，见 config RewardConfig 同名字段）：
+            # 无条件放行——白名单不参与决定（其装配形态即「不设条件闸」的
+            # 全条件放行占位），本入口不读名单、不做 EMA 递推与滞回判定。
+            # 集体回合照走（policy 更新的 allreduce 要全 rank 同一条执行序），
+            # 返回值恒 False（无 iteration 被跳过）。AUC 不在此消费——它经
+            # iter 事件与分叉监控照常落盘
+            self._dist.all_gather([False])
+            return False
         if not self._config.gating_dynamic_recovery:
+            # 静态白名单降级路径：名单恒为启动名单、无进出，跳过对账仍走
+            # 集体回合
             flags = [entry[0] for entry in self._dist.all_gather([local_gated])]
             return any(flags)
         submissions = self._dist.all_gather([Observation(modality, auc, local_gated)])
