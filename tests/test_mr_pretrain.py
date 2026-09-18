@@ -241,10 +241,16 @@ class TestMrPretrainEndToEnd:
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """AC（#133）：白名单空 → 拒跑语义在 MR-RATE 口径验证过（fixture
-        注入空场景，不赌生产）。预训练 gate 不可达（0.99）耗尽步数上限 →
-        报告白名单空、gate_passed=False，报告与 checkpoint 照常落盘供诊断
-        （driver 侧不拒跑——ADR-0008-04 语义）；拒跑由 train gate 把守
-        （ADR-0008-05）。
+        注入空场景，不赌生产）。gate 0.99 走满步数上限（真实训练态，
+        schema 上界内的最大不可达余量）；拒跑由 train gate 把守
+        （ADR-0008-05），白名单空**由构造保证**而非赌 fixture 测量的
+        偶然值：fixture 每条件仅 1 held-out 卷，AUC=1.0 离散可达且单卷
+        bootstrap CI 退化为点估计（0.99 不可达只是大概率）——故 driver
+        面只断言零偶然的结构面（报告 kind / per-condition 条件域 /
+        checkpoint 落盘），trainer 面把报告三字段受控改写为空白名单版
+        （provenance 指纹与 checkpoint 保持真实产物，装载守卫全自洽；
+        gate 契约 = 信任报告值，ADR-0008 决策 5，受控报告恰是直测该
+        契约）。
 
         seam 说明：train 走进程内构造（``GranularGrpoTrainer`` + 评测相
         注入替身）而非 CLI——MR 线的里程碑参照影像库未交付（评测装配对
@@ -260,25 +266,43 @@ class TestMrPretrainEndToEnd:
         run 目录回滚在 MR 口径的直测）。"""
         scenario = MrPretrainScenario(cli, tmp_path)
         config = scenario.run(reward_overrides={
-            "pretrain_gate_auc": 0.99,  # 不可达：白名单空
+            "pretrain_gate_auc": 0.99,
             "pretrain_max_steps": 2,
         })
         report = scenario.report()
-        assert report.gate_whitelist == []
-        assert report.gate_passed is False
-        # 诊断产物不丢：per-condition 实测快照 + checkpoint 照常落盘
+        # driver 面：零偶然的结构断言（不赌训练测量的 AUC 值——白名单
+        # 空与步数耗尽的产出归 driver/判定单元与 BraTS 端到端孪生测试）
+        assert report.kind == "pretrain_report"
         assert set(report.condition_auc) == set(CONDITIONS)
         assert (scenario.run_dir_path() / "checkpoints"
                 / "pretrain_discriminator.pt").is_file()
+        # 受控空白名单报告：白名单空由构造保证（见 docstring）；诊断
+        # 产物骨架（provenance 指纹 / checkpoint）全部保持真实产物
+        report_path = Path(config.reward.pretrain_report_json)
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        payload["gate_whitelist"] = []
+        payload["gate_passed"] = False
+        payload["condition_auc"] = {c: 0.40 for c in CONDITIONS}
+        report_path.write_text(
+            json.dumps(payload, indent=2), encoding="utf-8",
+        )
+        report = scenario.report()
+        assert report.gate_whitelist == []
+        assert report.gate_passed is False
         # train 侧装配（MR 词汇表口径）打穿至 gate：warm-start 装载守卫
         # 全过（报告与本 config 同源工件），白名单从报告接线
         run_dir = tmp_path / "train_run"
         artifacts = RunArtifacts.init(config, run_dir)
+        stub = StubEvaluation(fids=[])
         trainer = GranularGrpoTrainer(
-            config, artifacts,
-            evaluation=StubEvaluation(fids=[]),
-            device=torch.device("cpu"),
+            config, artifacts, evaluation=stub, device=torch.device("cpu"),
         )
+        # 拒绝先于昂贵启动动作的正面断言（执行序 trainer.run()：
+        # readiness.check() → seed_base_partition() → Baseline 采样）：
+        # base 分区量产 spy 化（实例级覆盖，拒绝路径不得触达）、Baseline
+        # 采样替身标志不翻转——「先拒绝后启动」不是仅由指标流零事件推断
+        partition_calls: list[str] = []
+        trainer.seed_base_partition = lambda: partition_calls.append("base")
         with pytest.raises(ValueError) as exc_info:
             trainer.run()
         message = str(exc_info.value)
@@ -287,6 +311,7 @@ class TestMrPretrainEndToEnd:
         for modality, value in report.condition_auc.items():
             assert f"held-out AUC[{modality}]: {value:.4f}" in message
         assert str(config.reward.pretrain_report_json) in message
-        # 拒绝发生在昂贵启动动作之前：指标流零事件（base 分区量产与
-        # Baseline 采样均未执行）
+        assert stub.baseline_called is False
+        assert partition_calls == []
+        # 指标流零事件（拒绝路径无任何训练侧写入）
         assert artifacts.paths.metrics.stat().st_size == 0
