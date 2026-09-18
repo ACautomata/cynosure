@@ -22,6 +22,7 @@ prepare 预处理到模型影像空间）。
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -32,7 +33,11 @@ from cynosure.eval.decode import VolumeDecoder
 from cynosure.eval.features import SliceFeatureExtractor
 from cynosure.eval.frechet import BootstrapKernelMmd, FrechetDistance
 from cynosure.eval.sampling import EntrySample, ManifestLatentSampler
-from cynosure.eval.volumes import OrthoPlane, RealVolumeStore, VolumePairFidelity
+from cynosure.eval.volumes import (
+    OrthoPlane,
+    ReferenceVolumes,
+    VolumePairFidelity,
+)
 
 if TYPE_CHECKING:
     from cynosure.train.artifacts import BaselineManifest
@@ -73,6 +78,10 @@ class MilestoneMetrics:
     """跨模态组另加：同上配对的 MAE。"""
     psnr: float | None = None
     """跨模态组另加：同上配对的 PSNR（dB，封顶 100）。"""
+    phase_seconds: dict[str, float] = field(default_factory=dict)
+    """监控成本读数的相位卡时（#124，#111 监控账的成本行取数面）：
+    ``decode`` = 合成侧 VAE 分块解码；``fid`` = 参照装载 + 特征提取 +
+    距离核 + 配对保真。空 dict = 调用方未做相位计量（替身直调场景）。"""
 
     def summary(self) -> dict[str, float]:
         """criteria_summary 的度量侧条目（逐面 FID/KID + CI 界 + 按目标
@@ -110,7 +119,7 @@ class MilestoneEvaluator:
         latent_sampler: ManifestLatentSampler,
         decoder: VolumeDecoder,
         extractor: SliceFeatureExtractor,
-        reals: RealVolumeStore,
+        reals: ReferenceVolumes,
         manifest: BaselineManifest,
         device: torch.device,
     ) -> None:
@@ -136,7 +145,12 @@ class MilestoneEvaluator:
         异形状批组织（#129）：条目按目标条件分组——组内同条件即同
         形状，合成侧分组解码（cat 仅同条件批内发生）、参照侧分组
         stack、读数逐条件产出；「里程碑评测按条件产出读数」在异形状
-        下是批组织的结构前提而非仅是统计口径。"""
+        下是批组织的结构前提而非仅是统计口径。
+
+        监控成本读数（#124）：评测分解为 decode（合成侧 VAE 分块解码）
+        与 fid（参照装载 + 特征提取 + 距离核 + 配对保真）两相打点，随
+        度量透传（``phase_seconds``）——#111 监控账的 decode/FID 卡时
+        行在里程碑事件上的取数面。"""
         entries = self._manifest.entries_for_stage(self._stage)[
             : self._config.schedule.milestone_eval_samples
         ]
@@ -144,12 +158,18 @@ class MilestoneEvaluator:
         groups: dict[str, list[EntrySample]] = {}
         for sample in samples:
             groups.setdefault(sample.target, []).append(sample)
-        per_target: dict[str, PlaneMetrics] = {}
         decoded_groups: dict[str, torch.Tensor] = {}
+        decode_started = time.monotonic()
         for target, group in sorted(groups.items()):
-            synthetic = self._decode(group)  # [k, 1, X, Y, Z]（组内同形）
+            decoded_groups[target] = self._decode(group)  # [k, 1, X, Y, Z]（组内同形）
+        fid_started = time.monotonic()
+        per_target: dict[str, PlaneMetrics] = {}
+        for target, group in sorted(groups.items()):
+            synthetic = decoded_groups[target]
             reference = torch.stack([
-                self._reals.volume(self._reference_case(sample), sample.target)
+                self._reals.reference_volume(
+                    sample.target, sample.entry.index, sample.source_case,
+                )
                 for sample in group
             ]).to(self._device).unsqueeze(1)  # 与合成侧同形、逐例对齐
             if reference.shape != synthetic.shape:
@@ -160,7 +180,6 @@ class MilestoneEvaluator:
                     "空间后入参照库；dataset_root 原生 NIfTI 直读不构成对齐"
                     "参照）"
                 )
-            decoded_groups[target] = synthetic
             per_target[target] = self._plane_metrics(
                 synthetic[:, 0], reference[:, 0],
             )
@@ -179,7 +198,9 @@ class MilestoneEvaluator:
                 synthetic_rows.append(decoded_groups[sample.target][row])
             synthetic = torch.stack(synthetic_rows)
             reference = torch.stack([
-                self._reals.volume(self._reference_case(sample), sample.target)
+                self._reals.reference_volume(
+                    sample.target, sample.entry.index, sample.source_case,
+                )
                 for sample in samples
             ]).to(self._device).unsqueeze(1)
             ssim, mae, psnr = VolumePairFidelity().score(synthetic, reference)
@@ -194,6 +215,10 @@ class MilestoneEvaluator:
                 target: metrics.kid for target, metrics in per_target.items()
             },
             ssim=ssim, mae=mae, psnr=psnr,
+            phase_seconds={
+                "decode": fid_started - decode_started,
+                "fid": time.monotonic() - fid_started,
+            },
         )
 
     @staticmethod
@@ -250,14 +275,6 @@ class MilestoneEvaluator:
     def _is_cross_modal(self) -> bool:
         """跨模态组另加 SSIM/MAE/PSNR（组3 stage-2 同语义，随阶段 config 判定）。"""
         return self._config.experiment.group == "cross-modal"
-
-    def _reference_case(self, sample: EntrySample) -> str:
-        """参照病例：组2 = entry 锁定的源病例（其目标序列 = ground-truth
-        target，配对数据集）；组1 = 按条目序号确定性轮转病例。"""
-        if sample.source_case is not None:
-            return sample.source_case
-        case_ids = self._reals.case_ids()
-        return case_ids[sample.entry.index % len(case_ids)]
 
     def _plane_metrics(
         self, synthetic: torch.Tensor, reference: torch.Tensor,

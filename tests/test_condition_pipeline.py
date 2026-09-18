@@ -30,7 +30,7 @@ from cynosure.eval.condition import EntryConditionResolver
 from cynosure.eval.milestone import MilestoneEvaluator
 from cynosure.eval.sampling import EntrySample, ManifestLatentSampler
 from cynosure.eval.features import StubSliceFeatureExtractor
-from cynosure.eval.volumes import VolumePairFidelity
+from cynosure.eval.volumes import MrReferenceVolumeStore, VolumePairFidelity
 from cynosure.config import CynosureConfig, RewardConfig
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
@@ -41,7 +41,7 @@ from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import PerConditionSchedules
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
-from cynosure.reward.artifacts import LatentManifest
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import LatentScorer, LsganTerms
 from cynosure.reward.update import OnlineUpdate
@@ -54,6 +54,7 @@ from cynosure.train.artifacts import (
 from cynosure.train.resume import ResumeStore
 from cynosure.train.rollout import MrConditionSampler, RolloutPhase
 from cynosure.train.rng import TrainingRngStreams
+from tests.conftest import SyntheticMrRateDataset
 from tests.test_condition_vocabulary import (
     PRODUCTION_CENSUS_PATH,
     PRODUCTION_VOCAB_PATH,
@@ -526,8 +527,10 @@ class PerConditionDecoder:
 class PerConditionRealStore:
     """逐条件参照替身：影像体形状随条件（统一网格 resample 后口径）。"""
 
-    def case_ids(self) -> list[str]:
-        return ["case-a"]
+    def reference_volume(
+        self, condition: str, entry_index: int, source_case: str | None,
+    ) -> torch.Tensor:
+        return self.volume("case-a", condition)
 
     def volume(self, case_id: str, modality: str) -> torch.Tensor:
         x, y, z = HeterogeneousLatentSampler.SHAPES[modality][1:]
@@ -649,15 +652,19 @@ class PlanarExtractor:
 
 class MarkedRealStore:
     """打标参照替身：参照体 = 锁定条目的标记值 + 同一微纹理——配对
-    正确时与合成侧逐位相等（配对对齐断言的原料）。"""
+    正确时与合成侧逐位相等（配对对齐断言的原料）。组2 语义：锁定
+    源病例优先于轮转（``ReferenceVolumes`` 契约）。"""
 
     _TEXTURE = torch.arange(64, dtype=torch.float32).view(4, 4, 4) / 255.0
 
     def __init__(self) -> None:
         self._marks = {"case-0": 1.0, "case-1": 2.0}
 
-    def case_ids(self) -> list[str]:
-        return list(self._marks)
+    def reference_volume(
+        self, condition: str, entry_index: int, source_case: str | None,
+    ) -> torch.Tensor:
+        assert source_case is not None  # 组2 条目恒锁定源病例
+        return self.volume(source_case, condition)
 
     def volume(self, case_id: str, target: str) -> torch.Tensor:
         return self._marks[case_id] + self._TEXTURE
@@ -761,13 +768,15 @@ class TestMilestoneEvaluationBuildGuard:
                 write_enabled=False,
             )
 
-    def test_mr_reference_store_rejected_explicitly(
+    def test_mr_reference_store_dispatched_with_pool_guards_at_read(
         self, tmp_path: Path, fixture_env,
     ) -> None:
-        """MR-RATE 评测装配在参照影像库处显式拒绝：RealVolumeStore 是
-        BraTS 病例布局的参照库（dataset_root 扫描与序列键都是 BraTS
-        语义），MR config 此前走到 BratsSeriesLayout 扫描才炸出
-        「源数据集根目录不存在」的布局错误——装配期给出能力边界声明。"""
+        """MR-RATE 评测装配分派 MR 参照影像库（#124 交付，装配期不再
+        拒绝）：RealVolumeStore 是 BraTS 病例布局的参照库（dataset_root
+        扫描与序列键都是 BraTS 语义），MR 线由 ``MrReferenceVolumeStore``
+        承接——pool manifest 条件映射装配成功；pool 无该条件卷时在**参照
+        取数期**显式拒绝（能力边界声明保留，错误面从装配期移到取数期，
+        而非静默的空参照分布）。"""
         _, _, vocab, sampler, config = fixture_env
         config.schedule.milestone_eval_samples = len(vocab.names())
         pool_path = Path(config.reward.real_pool_manifest)
@@ -783,24 +792,141 @@ class TestMilestoneEvaluationBuildGuard:
                 name: vocab.latent_shape(name) for name in vocab.names()
             },
         ).model_dump_json(), encoding="utf-8")
-        with pytest.raises(ValueError, match="参照影像库"):
-            ManifestEvaluation.build(
-                config,
-                RunArtifacts.init(config, tmp_path / "run"),
-                sampler,
-                stage=1,
-                manifest=BaselineManifest(
-                    seed=0, group="modal-label",
-                    conditions=list(vocab.names()),
-                    entries=[
-                        ManifestEntry(
-                            index=0, condition="t1w/axial", noise_seed=0,
-                        ),
-                    ],
-                ),
-                amp=AmpContext(torch.device("cpu"), torch.bfloat16),
-                write_enabled=False,
+        evaluation = ManifestEvaluation.build(
+            config,
+            RunArtifacts.init(config, tmp_path / "run"),
+            sampler,
+            stage=1,
+            manifest=BaselineManifest(
+                seed=0, group="modal-label",
+                conditions=list(vocab.names()),
+                entries=[
+                    ManifestEntry(
+                        index=0, condition="t1w/axial", noise_seed=0,
+                    ),
+                ],
+            ),
+            amp=AmpContext(torch.device("cpu"), torch.bfloat16),
+            write_enabled=False,
+        )
+        with pytest.raises(ValueError, match="无可用卷"):
+            evaluation.milestone_metrics()
+
+
+class TestMrReferenceVolumeStore:
+    """MR-RATE 参照影像库（#124）：pool train split 的条件内参照卷。
+
+    参照卷集 = pool manifest 条目（病例级 train split 的泄漏守卫与
+    BraTS 侧同源）；MR 一卷一条件，参照轮转必须在**目标条件内**进行
+    （BraTS 病例全序列的全病例池轮转在条件维度上不成立——轮转到非
+    该条件的卷即跨域比较）。"""
+
+    CONDITION_BY_SERIES = {
+        "t1w-raw-axi": "t1w/axial",
+        "flair-raw-axi": "flair/axial",
+    }
+
+    PATIENT_COUNT = 6
+
+    def _store(self, tmp_path: Path) -> MrReferenceVolumeStore:
+        root = SyntheticMrRateDataset(
+            tmp_path / "dataset", train_patients=self.PATIENT_COUNT,
+        ).write()
+        vocabulary = MrConditionVocabulary.load(
+            Fixture().write_condition_vocabulary(tmp_path / "fixtures"),
+            fixture_mode=True,
+        )
+        entries = [
+            PoolEntry(
+                case_id=f"ST{index:02d}/{series_id}",
+                modality=self.CONDITION_BY_SERIES[series_id],
+                latent=f"latents/{index}_{position}.pt",
+                spacing=(100.0, 100.0, 100.0),
             )
+            for index in range(self.PATIENT_COUNT)
+            for position, (series_id, _, _) in enumerate(
+                SyntheticMrRateDataset.MR_SERIES,
+            )
+        ]
+        pool = LatentManifest(
+            kind="real_pool",
+            encoder="fixture",
+            latent_shape=(4, 16, 16, 8),
+            split_seed=0,
+            split_sizes={"train": self.PATIENT_COUNT, "val": 0, "test": 0},
+            entries=entries,
+            condition_latent_shapes={
+                name: vocabulary.latent_shape(name)
+                for name in vocabulary.names()
+            },
+        )
+        return MrReferenceVolumeStore(
+            dataset_root=root,
+            pool=pool,
+            vocabulary=vocabulary,
+            clip_intensity=False,
+        )
+
+    def test_reference_volume_resamples_to_condition_grid(
+        self, tmp_path: Path,
+    ) -> None:
+        """参照卷经该条件的预处理链出形状 = 条件统一网格（与 prepare
+        预编码同口径——合成侧 VAE 解码的预处理空间两侧对齐）：t1w/axial
+        网格 (64,64,32) 原生同形不变；flair/axial 网格 (32,32,64) 把
+        原生 (64,64,32) 卷 resize 到位。"""
+        store = self._store(tmp_path)
+        t1w = store.reference_volume("t1w/axial", 0, None)
+        flair = store.reference_volume("flair/axial", 0, None)
+        assert tuple(t1w.shape) == (64, 64, 32)
+        assert tuple(flair.shape) == (32, 32, 64)
+
+    def test_rotation_is_deterministic_within_condition(
+        self, tmp_path: Path,
+    ) -> None:
+        """组1 参照轮转：同 (条件, 条目号) 恒同卷（缓存命中逐位相等），
+        不同条目号轮转到不同卷（seed 派生随机体逐位不同），越界条目号
+        按条件内卷数循环；轮转恒产出该条件网格的影像（不跨条件）。"""
+        store = self._store(tmp_path)
+        first = store.reference_volume("t1w/axial", 0, None)
+        assert torch.equal(first, store.reference_volume("t1w/axial", 0, None))
+        rotated = store.reference_volume("t1w/axial", 1, None)
+        assert not torch.equal(first, rotated)
+        assert torch.equal(
+            first, store.reference_volume("t1w/axial", self.PATIENT_COUNT, None),
+        )  # 6 卷循环：index 6 ≡ index 0
+        assert tuple(
+            store.reference_volume("flair/axial", 3, None).shape,
+        ) == (32, 32, 64)
+
+    def test_source_case_short_circuits_rotation(
+        self, tmp_path: Path,
+    ) -> None:
+        """source_case 非空（配对语义的继承面）时直取该卷、不轮转。"""
+        store = self._store(tmp_path)
+        direct = store.volume("ST03/t1w-raw-axi", "t1w/axial")
+        via_reference = store.reference_volume(
+            "t1w/axial", 999, "ST03/t1w-raw-axi",
+        )
+        assert torch.equal(direct, via_reference)
+
+    def test_volume_rejects_condition_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """跨条件取卷显式拒绝：一卷一条件下「卷 × 错条件」只可能是
+        轮转/装配错位——静默跨域比较被取数面挡下。"""
+        store = self._store(tmp_path)
+        with pytest.raises(ValueError, match="条件"):
+            store.volume("ST00/t1w-raw-axi", "flair/axial")
+
+    def test_reference_pool_confined_to_pool_manifest(
+        self, tmp_path: Path,
+    ) -> None:
+        """参照卷集锁进 pool manifest（病例级 train split）：held-out
+        patient（评估留出池，不落影像）不在参照分布——dataset_root
+        全树消费即参照泄漏。"""
+        store = self._store(tmp_path)
+        with pytest.raises(ValueError, match="参照库"):
+            store.volume("E00/t1w-raw-axi", "t1w/axial")
 
 
 class MrPretrainArtifactsFixture:

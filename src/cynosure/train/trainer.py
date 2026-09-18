@@ -551,8 +551,11 @@ class GranularGrpoTrainer:
         前向）全 rank 对称参与；事件写出与早停 verdict 判定只在 rank 0
         （RunArtifacts 的 rank 0 写盘契约），verdict 经广播同步——早停是
         全局决定，各 rank 必须一致 break（分歧会让 iteration 节奏的
-        barrier 互等死锁）。"""
+        barrier 互等死锁）。事件携带监控成本读数（#124：总卡时 +
+        decode/fid 相位分解——评测内部打点透传；``elapsed_s`` 是本方法
+        侧的全区间口径，覆盖采样与簿记）。"""
         dist = self.runtime.dist
+        started = time.monotonic()
         metrics: MilestoneMetrics = self.evaluation.milestone_metrics()
         if dist.rank == 0:
             stage_events = [
@@ -576,6 +579,8 @@ class GranularGrpoTrainer:
                 criteria_summary=criteria,
                 early_stop=verdict.stop,
                 early_stop_reason=verdict.reason,
+                elapsed_s=time.monotonic() - started,
+                phase_seconds=metrics.phase_seconds,
             ))
             return dist.broadcast_flag(verdict.stop)
         return dist.broadcast_flag(False)  # 返回值被 rank 0 的广播覆盖

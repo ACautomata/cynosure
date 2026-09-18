@@ -345,6 +345,18 @@ class TestMetricsStream:
         with pytest.raises(ValidationError):
             MilestoneEvent(iteration=50, fid=float("inf"))
 
+    def test_milestone_event_rejects_non_finite_phase_seconds(self) -> None:
+        """里程碑监控成本读数（decode/fid 相位分解，#124）同受非有限
+        浮点拒绝——事件契约的 NaN/Inf 守卫对新增 dict 字段同样生效。"""
+        with pytest.raises(ValidationError):
+            MilestoneEvent(
+                iteration=50, fid=1.0, phase_seconds={"decode": float("nan")},
+            )
+
+    def test_milestone_event_rejects_non_finite_elapsed_s(self) -> None:
+        with pytest.raises(ValidationError):
+            MilestoneEvent(iteration=50, fid=1.0, elapsed_s=float("inf"))
+
     def test_events_coexist_in_single_stream(
         self, valid_config_dict: dict, tmp_path: Path,
     ) -> None:
