@@ -156,6 +156,24 @@ class DistributedContext:
         dist.all_gather_object(received, items)
         return received
 
+    def all_reduce_min(self, value: int) -> int:
+        """全 rank 整数取最小、everyone-return（rollout 分块调度的 rank
+        一致性原语，#165 review P1）：各 rank 的本地值归约出全局最小。
+        FSDP 逐前向参数 all-gather 的调用序列与「前向调用次数」绑定——
+        分块上限若各 rank 本地各自取值（条件逐 rank 独立采样 → 形状/
+        预算余量不同），前向次数分叉即集合序列错配、全体互等挂死
+        （sugon train2 2026-09-17 实录：iter 0 rollout 后全 rank 阻塞）。
+        所有 rank 都须调用本方法（集合操作）；单进程恒等返回传入值。
+        张量落本 rank 计算设备（NCCL 只支持 CUDA 张量；gloo/CPU fixture
+        下即 cpu）。"""
+        if not self._distributed:
+            return value
+        tensor = torch.tensor(
+            int(value), dtype=torch.int64, device=self.local_device(),
+        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+        return int(tensor.item())
+
     def broadcast_flag(self, value: bool) -> bool:
         """rank 0 的布尔决定广播到所有 rank（早停 verdict 的全局一致性
         消费：训练循环的 break 必须各 rank 一致，分歧会让 barrier 互等

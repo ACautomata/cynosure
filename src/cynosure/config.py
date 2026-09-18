@@ -380,8 +380,22 @@ class PolicyConfig(BaseModel):
     group_size_g: int = SpecField(
         "tunable", "policy-modeling",
         "G（Group 大小）：组内共享初始噪声的方向数"
-        "（显存不够降 6–8 或逐 k 释放；fixture 亦保持 12）",
+        "（fixture 亦保持 12；显存不足经 forward_activation_budget_gib "
+        "按体积分块解决——降 G 是改变算法口径的最后手段）",
         default=12, ge=2,
+    )
+    forward_activation_budget_gib: float | None = SpecField(
+        "tunable", "本 spec 补钉",
+        "rollout 续跑的单次 policy 前向激活预算（GiB）：ODE 续跑按 "
+        "latent 体素分块，峰值显存以块为界（G 方向整批 × 大 FOV latent "
+        "的单次前向是 OOM 级分配，#123 首跑实测）。约束面仅此一处——"
+        "其余 policy 前向（扰动步的全组复用评估、log-prob 评估）本为 "
+        "batch=1 或组内共享，不吃 G 倍激活。缺省 None = 装配期按设备总"
+        "显存自动探测（常量比例，同设备可复现；共享实例按总显存探测不"
+        "反映他进程占用，须显式钉值）；显式值覆盖探测，设备总显存可探测"
+        "时（CUDA）超过即装配期拒绝（常驻权重/优化器态/缓冲与碎片余量"
+        "另占，不在本预算内）",
+        default=None, gt=0.0,
     )
     sde_eta: float = SpecField(
         "扫描接口", "policy-modeling",
@@ -704,11 +718,24 @@ class RewardConfig(BaseModel):
         "train 上岗门槛的守卫装载源，预训练 run 目录产物）。必填无默认——"
         "RL 不带 warm-start 工件在 schema 层就无法启动",
     )
+    condition_gate_enabled: bool = SpecField(
+        "运行时", "ADR-0008",
+        "条件闸总开关（维护者裁决，2026-09-17；ADR-0008 决策 5/7/8 的"
+        "统一关闭形态）：false = held-out AUC 不作为任何更新开关——"
+        "RM readiness gate 的上岗判定不再拒绝开跑、运行时白名单恒为"
+        "本域全条件放行、动态恢复停步，policy 每 iteration 对目标条件"
+        "全量更新。AUC 仍照常测量并落 iter 事件（heldout_auc 字段）与"
+        "分叉监控（ADR-0009 只报警），观测面不因关闸而退化为空白——"
+        "关的是「AUC 驱动决定」，不是「AUC 被测量」。true = 既定口径"
+        "（决策 5/7/8 全链生效，白名单空拒绝开跑）",
+        default=True,
+    )
     gating_dynamic_recovery: bool = SpecField(
         "tunable", "ADR-0008",
         "白名单动态恢复（ADR-0008 决策 8）：在线 per-condition AUC 流驱动 "
         "EMA 滞回判定，名单自动进出；false = 静态白名单降级路径（名单恒为"
-        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）",
+        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）。"
+        "condition_gate_enabled=false 时本项无消费面（名单无门控语义）",
         default=True,
     )
     gating_enter_auc: float = SpecField(
@@ -886,8 +913,12 @@ class ScheduleConfig(BaseModel):
         "里程碑解码评测样本数（取 Baseline manifest 条目的前缀，同 seed 同条件，"
         "使里程碑 FID/KID 跨里程碑可比）。小样本相对信号：K 只服务于训练期"
         "跨里程碑 plateau 比较（特征空间高维、K 小则协方差秩亏，绝对值噪声"
-        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）",
-        default=8, ge=2,
+        "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）。"
+        "默认钉 12 = 组2/组3 条件词汇表宽——三组（组1 四序列、组2/组3 12 有序"
+        "对）与 MR-RATE 11 条件的样本面下界在全数据集/全组生效，纯默认 "
+        "config 即通过生产守卫（K ≥ 词汇表、K ≤ N_baseline），缩小评测面"
+        "属 fixture 须显式声明",
+        default=12, ge=2,
     )
     decode_batch_size: int = SpecField(
         "tunable", "本 spec 补钉",
@@ -964,6 +995,24 @@ class ScheduleConfig(BaseModel):
                 "hacking 签名失去判别力）"
             )
         return value
+
+    @property
+    def milestones_reachable(self) -> bool:
+        """本日程是否存在里程碑触发点（单一判据，两处消费）。
+
+        训练循环的里程碑触发条件 = 完成数整除 ``milestone_interval``
+        （iteration 从 1 起计数），故「存在 k ∈ [1, max_iterations] 使
+        k % interval == 0」等价于 ``max_iterations ≥ milestone_interval``
+        ——续训同理：起点之后的剩余区间的可达性由同一对 (max_iterations,
+        interval) 决定，起点本身不进入判据（装配/校验早于恢复，起点尚
+        不可知；用全区间判定是保守方向——判为可达而实际没走到，至多多
+        装配一个不消费的监控相，反向漏判则会让里程碑在运行中途才炸）。
+
+        消费方：监控相装配（``eval.ManifestEvaluation.
+        _monitoring_reachable``）与 schema 层里程碑样本面守卫
+        （``CynosureConfig._milestone_samples_match_manifest_support``
+        ，PR #165 review：两层同一不变量须同一前提）。"""
+        return self.max_iterations >= self.milestone_interval
 
 
 class ShardingConfig(BaseModel):
@@ -1424,11 +1473,16 @@ class CynosureConfig(BaseModel):
           缩水到盘上条目数——配置声明的评测样本量与实际评测面失真。
 
         fixture 豁免（条目数随 fixture 缩小，覆盖以盘上条目为准）。
+        守卫以里程碑可达为前提（``ScheduleConfig.milestones_reachable``
+        ，PR #165 review）：不触发里程碑的 run 不装配监控相、评测样本面
+        无消费时机，两界随之不适用。
         MR-RATE 跳过条件集下界校验（#129：条件集在词汇表工件、schema
         不读文件）——该上界挪到评测装配期守卫（ManifestEvaluation.
         build：K < len(vocabulary.names()) 即拒绝）；上界（K ≤
         N_baseline）校验 MR-RATE 同样适用，照跑。"""
         if self.fixture_mode:
+            return self
+        if not self.schedule.milestones_reachable:
             return self
         if self.experiment.dataset != "MR-RATE":
             vocabulary = max(

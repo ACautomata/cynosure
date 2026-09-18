@@ -108,7 +108,9 @@ class PretrainDriver:
         )
         self._rollout = RolloutPhase(
             config,
-            TrainingRuntime.assemble_sampler(config, self._policy.field),
+            TrainingRuntime.assemble_sampler(
+                config, self._policy.field, device=amp.device,
+            ),
             self._rewards.update.scorer,
             generators["rollout"],
             condition_sampler=self._policy.conditions,

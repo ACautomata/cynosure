@@ -707,6 +707,8 @@ class TestSingleDeviceMilestoneEvaluation:
         )
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
+        # 监控相装配前提（#123）：里程碑有触发点才装配 MilestoneEvaluator
+        config.schedule.milestone_interval = 1
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         evaluation = ManifestEvaluation.build(
             config,
@@ -806,6 +808,11 @@ class TestProductionEvaluationContract:
     def _evaluation_phase(scenario: TrainingLoopScenario, **config_mutations):
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
+        # 监控相的装配前提：MilestoneEvaluator（连同参照影像库与特征
+        # 提取器）只在「本 run 存在里程碑触发点」时装配（#123：参照库是
+        # 里程碑路径的依赖，不是主循环的）——本类断言的正是监控相内部的
+        # 装配守卫，故显式声明触发点
+        config.schedule.milestone_interval = 1
         for key, value in config_mutations.items():
             parts = key.split(".")
             target = config

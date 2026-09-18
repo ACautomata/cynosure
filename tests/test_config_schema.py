@@ -28,6 +28,8 @@ class TestValidConfigs:
         assert config.policy.num_inference_steps == 30
         assert config.policy.input_img_size_numel == 131072
         assert config.policy.group_size_g == 12
+        # 前向激活预算缺省 = 装配期按设备总显存自动探测（显式值覆盖）
+        assert config.policy.forward_activation_budget_gib is None
         assert config.policy.sde_eta == pytest.approx(0.7)
         assert config.policy.sde_s_max == pytest.approx(0.999)
         assert config.policy.train_step_indices_m == set(range(2, 16))
@@ -69,10 +71,46 @@ class TestValidConfigs:
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
+        # 日程默认面与生产守卫自洽（纯默认即合法）：N_baseline /
+        # max_iterations 缺省 = 生产口径下界，milestone_eval_samples
+        # 缺省 12 = 组2/组3 词汇表宽（K ≥ 词汇表守卫全组生效）
+        assert config.schedule.baseline_samples == 200
+        assert config.schedule.max_iterations == 200
+        assert config.schedule.milestone_eval_samples == 12
         assert config.sharding.strategy == "fsdp"
         # 部署行（orchestration + ADR-0005）：单实例 4 卡、产物根在持久分区下
         assert config.deployment.nproc_per_node == 4
         assert config.deployment.output_root == Path("/root/private_data/cynosure")
+
+    def test_default_schedule_validates_for_every_group(self) -> None:
+        """纯默认 schedule（只填 seed）在三组全合法——默认面与生产守卫
+        自洽：milestone_eval_samples 缺省 12 覆盖组1 四序列与组2/组3
+        12 有序对（亦覆盖 MR-RATE 11 条件的装配期同款下界），N_baseline /
+        max_iterations 缺省即生产口径。默认 config 不应撞上自己的 schema
+        守卫（#123 首跑曾以缩小值踩中同类拒绝、train 集体 exit 2）。"""
+        group_artifacts = {
+            "modal-label": {},
+            "cross-modal": {
+                "controlnet_ckpt": "ckpts/controlnet.pt",
+                "controlnet_config_json": "configs/controlnet.json",
+            },
+            "sequential": {
+                "controlnet_ckpt": "ckpts/controlnet.pt",
+                "controlnet_config_json": "configs/controlnet.json",
+            },
+        }
+        for group, extra_artifacts in group_artifacts.items():
+            data = copy.deepcopy(MINIMAL_CONFIG_DICT)
+            data["experiment"]["group"] = group
+            data["artifacts"].update(extra_artifacts)
+            if group == "sequential":  # stage-2 报告绑定（#116 schema 必填）
+                data["experiment"]["stage2_pretrain_report_json"] = (
+                    "pretrain_run_stage2/pretrain_report.json"
+                )
+            config = CynosureConfig.model_validate(data)
+            assert config.schedule.milestone_eval_samples == 12
+            assert config.schedule.baseline_samples == 200
+            assert config.schedule.max_iterations == 200
 
     def test_cross_modal_pairs_default_is_ordered_12(self) -> None:
         config = CynosureConfig.model_validate(copy.deepcopy(MINIMAL_CONFIG_DICT))
@@ -358,7 +396,8 @@ class TestRejection:
         data["experiment"]["group"] = "cross-modal"
         data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
         data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8 < 12 对
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:  # 显式 K=8 < 12 对
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
         data["schedule"]["milestone_eval_samples"] = 12
@@ -390,7 +429,8 @@ class TestRejection:
         data["experiment"]["stage2_pretrain_report_json"] = (
             "pretrain_run_stage2/pretrain_report.json"
         )
-        with pytest.raises(ValidationError) as exc_info:  # 缺省 K=8
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:  # 显式 K=8 < 12 对
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
         data["schedule"]["milestone_eval_samples"] = 12
@@ -411,6 +451,29 @@ class TestRejection:
         data["fixture_mode"] = True
         data["schedule"]["milestone_eval_samples"] = 500
         CynosureConfig.model_validate(data)  # fixture 豁免
+
+    def test_milestone_samples_checks_require_milestone_reachability(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """里程碑样本面守卫与监控相装配同一前提绑定（PR #165 review）：
+        不触发里程碑的 run（max_iterations < milestone_interval）不装配
+        监控相、评测样本面无消费时机——上下界校验随之不适用（与
+        ManifestEvaluation._monitoring_reachable 同一判据）；触发面存在
+        时照常强制（对照分支防一刀切放空）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
+        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
+        data["schedule"]["max_iterations"] = 10  # < 默认 milestone_interval=50
+        data["schedule"]["milestone_eval_samples"] = 8  # < 12 有序对
+        CynosureConfig.model_validate(data)  # 不可达：守卫不适用
+        data["schedule"]["milestone_eval_samples"] = 250  # > N_baseline=200
+        CynosureConfig.model_validate(data)  # 上界同闸
+        data["schedule"]["max_iterations"] = 200  # 触发面存在（≥ 50）
+        data["schedule"]["milestone_eval_samples"] = 8
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "milestone_eval_samples" in str(exc_info.value.errors())
 
     def test_auc_chance_epsilon_below_half(self, valid_config_dict: dict) -> None:
         """AUC 近 chance 判定带半径 ≥0.5 即恒真：hacking 签名失去判别力，拒绝。"""
@@ -576,6 +639,20 @@ class TestRejection:
         data["policy"] = {"group_size_g": 1}
         with pytest.raises(ValidationError):
             CynosureConfig.model_validate(data)
+
+    def test_forward_activation_budget_positive(self, valid_config_dict: dict) -> None:
+        """前向激活预算 ≤ 0 无意义（分块塌到逐样本、等于禁用批量）：显式
+        拒绝；缺省 None = 装配期按设备总显存自动探测（#123 首跑 OOM 修复）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"forward_activation_budget_gib": 0}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("policy", "forward_activation_budget_gib") in self._locations(
+            exc_info.value,
+        )
+        data["policy"]["forward_activation_budget_gib"] = 40
+        config = CynosureConfig.model_validate(data)
+        assert config.policy.forward_activation_budget_gib == pytest.approx(40.0)
 
     def test_eta_non_negative(self, valid_config_dict: dict) -> None:
         data = copy.deepcopy(valid_config_dict)

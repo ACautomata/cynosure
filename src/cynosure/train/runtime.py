@@ -18,6 +18,8 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 - 指标归并器（EventMerger，rank 0 顺序写出）。
 """
 
+from collections.abc import Callable
+
 import torch
 
 from cynosure.conditions import ConditionVocabulary
@@ -34,7 +36,11 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
-from cynosure.policy.sampler import RolloutSampler
+from cynosure.policy.sampler import (
+    RolloutSampler,
+    auto_forward_activation_budget,
+    cuda_total_memory,
+)
 from cynosure.policy.schedules import (
     ConditionSchedules,
     PerConditionSchedules,
@@ -134,7 +140,15 @@ class TrainingRuntime:
             ),
             resume=resume,
         )
-        sampler = cls.assemble_sampler(config, policy.field)
+        # 分块上限的 rank 一致化（#165 review P1）：分布式下 rollout 续跑
+        # 的前向调用次数必须跨 rank 一致（FSDP 集合序列绑定调用次数），
+        # 注入全 rank 取最小；单进程恒等 None（本地预算直接生效）
+        sampler = cls.assemble_sampler(
+            config, policy.field, device=amp.device,
+            chunk_sync=(
+                dist.all_reduce_min if dist.distributed else None
+            ),
+        )
         updater = StepwisePolicyUpdate(
             sampler=sampler,
             optimizer=policy.optimizer,
@@ -177,16 +191,59 @@ class TrainingRuntime:
         return ConditionVocabulary.assemble(config)
 
     @classmethod
-    def assemble_sampler(cls, config: CynosureConfig, field: VelocityField) -> RolloutSampler:
+    def assemble_sampler(
+        cls,
+        config: CynosureConfig,
+        field: VelocityField,
+        device: "torch.device | None" = None,
+        chunk_sync: "Callable[[int], int] | None" = None,
+    ) -> RolloutSampler:
         """policy 采样封装装配（日程表 + 本组采样场 + SDE 核）。
 
         公开装配缝：train 运行时与预训练 driver（单进程 world-1 语境）
-        共用同一份装配代码——采样日程/核参数的调整单点生效。"""
+        共用同一份装配代码——采样日程/核参数的调整单点生效。
+
+        ``device`` 参与前向激活预算解析（``forward_activation_budget``）：
+        config 显式值优先、缺省按设备总显存自动探测；无 CUDA 设备
+        （CPU fixture 口径）回落默认常量。``chunk_sync`` 是分块上限的
+        rank 一致化回调——分布式 build 注入 ``dist.all_reduce_min``
+        （#165 review P1：FSDP 集合序列绑定前向调用次数）；单进程语境
+        缺省 None，本地预算直接生效。"""
         policy = config.policy
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
         return RolloutSampler(
             field, kernel, cls.assemble_schedules(config),
+            forward_activation_budget=cls.forward_activation_budget(
+                config, device,
+            ),
+            chunk_sync=chunk_sync,
         )
+
+    @classmethod
+    def forward_activation_budget(
+        cls,
+        config: CynosureConfig,
+        device: "torch.device | None" = None,
+    ) -> int:
+        """rollout 前向激活预算的单一解析点（字节）：
+        ``policy.forward_activation_budget_gib`` 显式值优先——**设备总显存
+        可探测时**（CUDA）超过即拒绝（永远装不下，装配期早失败优于运行中
+        OOM）；无探测面（CPU fixture / 未传设备）只保正值约束，不做该上界
+        校验。缺省按设备总显存自动探测（``AUTO_FORWARD_ACTIVATION_FRACTION``
+        ——按总显存而非空闲，共享实例上须显式钉值）。"""
+        pinned = config.policy.forward_activation_budget_gib
+        if pinned is None:
+            return auto_forward_activation_budget(device)
+        budget = int(pinned * 2**30)
+        total = cuda_total_memory(device)
+        if total is not None and budget > total:
+            raise ValueError(
+                f"policy.forward_activation_budget_gib={pinned} 超过本"
+                f"设备总显存 {total / 2**30:.1f} GiB——单次前向的激活"
+                "预算不可能装下（常驻权重/优化器态/缓冲与碎片余量"
+                "另占）：调低该值或改用缺省自动探测"
+            )
+        return budget
 
     @classmethod
     def assemble_schedules(cls, config: CynosureConfig) -> ConditionSchedules:
@@ -299,12 +356,16 @@ class TrainingRuntime:
         # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：train 新 run =
         # 报告白名单起步（gate 产物）+ 实测快照；resume/预训练冷启动 =
         # 全条件放行占位（恢复点不重查白名单，恢复应用时分片的门控状态
-        # 整体覆写；driver 自产 per-condition 判定不消费本名单）。EMA
-        # 动态恢复（决策 8）的名单变更在训练循环内经 observe 驱动
+        # 整体覆写；driver 自产 per-condition 判定不消费本名单）。条件闸
+        # 关闭（``condition_gate_enabled=false``，维护者裁决）= 白名单退化为
+        # 「不设条件闸」的全条件放行占位——报告仍装载（warm-start 权重
+        # 是 ADR-0007 的另一件事），但其白名单不作上岗判据也不作更新开关。
+        # EMA 动态恢复（决策 8）的名单变更在训练循环内经 observe 驱动
+        gate_active = config.reward.condition_gate_enabled
         gating = DynamicWhitelist(
             initial=(
                 ConditionWhitelist.from_report(report)
-                if report is not None
+                if report is not None and gate_active
                 else ConditionWhitelist.unrestricted(vocabulary.names())
             ),
             config=config.reward,

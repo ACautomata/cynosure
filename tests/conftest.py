@@ -122,16 +122,27 @@ class CliResult:
     stderr: str
 
 
+WALL_CLOCK_EVENT_FIELDS = ("elapsed_s", "phase_seconds")
+"""iter 事件里的**墙钟量**字段（跨执行语境对比的豁免面）：总耗时与
+逐相位分解都是运行环境量、不参与轨迹逐位/容差比对（#123 加入
+``phase_seconds`` 后本常量是唯一豁免清单——两处对比器共用一个来源，
+新增加时不会出现「一处豁免一处漏」）。"""
+
+
 class RunTrajectory:
-    """iter 事件流的轨迹可比面（值对象）：wall-clock ``elapsed_s`` 不参与
-    相等性——跨作业对比的语义轴是事件序下的其余字段。同**进程**重放
+    """iter 事件流的轨迹可比面（值对象）：wall-clock 字段（``elapsed_s``
+    与 ``phase_seconds``，见 ``WALL_CLOCK_EVENT_FIELDS``）不参与相等性
+    ——跨作业对比的语义轴是事件序下的其余字段。同**进程**重放
     （单进程续训 roundtrip）在此逐位断言；跨进程世界对的对比（分布式
     续训 roundtrip 等）的观测前向存在 1-2 ulp 重算噪声，走
     test_distributed.CrossPathEquivalence 的容差判定。"""
 
     def __init__(self, events: list[dict]) -> None:
         self._events = [
-            {key: value for key, value in event.items() if key != "elapsed_s"}
+            {
+                key: value for key, value in event.items()
+                if key not in WALL_CLOCK_EVENT_FIELDS
+            }
             for event in events
         ]
 

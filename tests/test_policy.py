@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from collections.abc import Callable
 from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
 from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import (
     DiffusionModelUNetMaisi,
@@ -13,6 +14,12 @@ from monai.networks.schedulers import RFlowScheduler
 
 from cynosure.fixtures import Fixture, FIXTURE_UNET_CONFIG
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.sampler import (
+    AUTO_FORWARD_ACTIVATION_FRACTION,
+    DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES,
+    auto_forward_activation_budget,
+    budget_from_total_memory,
+)
 from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.policy import (
     BareConditionField,
@@ -572,6 +579,152 @@ class TestRolloutConditionSourceSlots:
         )
         with pytest.raises(ValueError, match="batch"):
             condition.broadcast_to(12)
+
+
+class ZeroVelocityUnet:
+    """测试仪器：零速度 + 前向批量记录（不跑真前向的 CFG 配对账本桩）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs: object) -> torch.Tensor:
+        x = kwargs["x"]
+        self.calls.append({"batch": int(x.shape[0])})
+        return torch.zeros_like(x)
+
+
+class TestForwardActivationChunking:
+    """#123 首跑 OOM 修复的回归面：ODE 续跑按 latent 体素分块。
+
+    事故面：G=12 方向整批 × 生产最大条件 latent（t1w/coronal
+    [4,128,64,128]，1.05M 体素）的单次前向——CFG 配对后前向样本 24，
+    探针实测 2G=20 即在 64 GiB 卡上 OOM（解码器顶层 skip-concat 输入
+    一张即 18.00 GiB）。"""
+
+    @pytest.fixture
+    def conditions(self) -> RolloutCondition:
+        return RolloutCondition(label=torch.tensor([29]), spacing=SPACING)
+
+    @staticmethod
+    def _sampler(
+        field: object, budget: int | None,
+        chunk_sync: "Callable[[int], int] | None" = None,
+    ) -> RolloutSampler:
+        return RolloutSampler(
+            field,  # type: ignore[arg-type]  # 测试桩实现 velocity 面
+            SdeKernel(eta=0.7, s_max=0.999),
+            SingleConditionSchedules(3, 2048),
+            forward_activation_budget=budget,
+            chunk_sync=chunk_sync,
+        )
+
+    def test_oversized_production_condition_is_chunked(
+        self, conditions: RolloutCondition,
+    ) -> None:
+        """生产最大条件 × G=12：按 40 GiB 预算切成多块，单次前向样本数
+        受预算约束（40 GiB // (2 × 4 KiB × 1.05M 体素) = 5 → 前向 10）。
+        零速度桩只记分块账本——production 体素规模在 fixture UNet 上会
+        触发小通道注意力的平方级分配，本测试验的是分块调度不是前向。"""
+        torch.manual_seed(0)
+        unet = ZeroVelocityUnet()
+        sampler = self._sampler(CfgCombinedField(unet), 40 * 2**30)
+        latents = torch.randn(12, 4, 128, 64, 128)
+        out = sampler.continue_to_terminal(latents, index=1, condition=conditions)
+        assert out.shape == latents.shape
+        batches = [call["batch"] for call in unet.calls]
+        assert len(batches) > 1                      # 已分块（非单次 24 样本前向）
+        assert max(batches) <= 10                    # 预算上限（前向样本 = 2 × 分块）
+        assert sum(batches) == 2 * 12                # 逐块覆盖全部方向，无重复
+
+    def test_fixture_scale_stays_single_forward(
+        self, fixture_unet: DiffusionModelUNetMaisi,
+        conditions: RolloutCondition,
+    ) -> None:
+        """fixture 规模（[4,16,16,8]）不触发分块：真实 fixture UNet 的
+        前向组织与分解前逐位一致（既有口径不漂移）。"""
+        torch.manual_seed(0)
+        recording = RecordingUnet(fixture_unet)
+        sampler = self._sampler(CfgCombinedField(recording), 40 * 2**30)
+        latents = torch.randn(12, *LATENT_SHAPE)
+        sampler.continue_to_terminal(latents, index=1, condition=conditions)
+        assert [call["batch"] for call in recording.calls] == [24]
+
+    def test_chunking_is_scheduling_equivalent(
+        self, fixture_unet: DiffusionModelUNetMaisi,
+        conditions: RolloutCondition,
+    ) -> None:
+        """算法一致性（分块是调度不是数学）：同一批方向在「强制分块」与
+        「不分块」两条调度下数值等价——ODE 逐样本独立、CFG 配对发生在
+        样本内，切子批只改「同时算几个样本」，不改任何样本的数值路径。
+        等价是 fp32 舍入级而非逐位：子批改变 conv/attention 的批尺寸，
+        累积顺序随之微异（实测 rel ≈ 4e-7，约 3~4 倍 fp32 eps）；结构性
+        口径差异是 O(1) 级，本界（1e-5 相对）两端各留两个量级。fixture
+        规模用预算塌到 cap=1 触发分块（2048 体素 → 2^24 // (2 × 4 KiB ×
+        2048) = 1），跑真实 fixture UNet 前向而非账本桩。"""
+        torch.manual_seed(0)
+        latents = torch.randn(12, *LATENT_SHAPE)
+        whole = self._sampler(
+            CfgCombinedField(RecordingUnet(fixture_unet)), 40 * 2**30,
+        ).continue_to_terminal(latents, index=1, condition=conditions)
+        recording = RecordingUnet(fixture_unet)
+        chunked = self._sampler(
+            CfgCombinedField(recording), 2**24,
+        ).continue_to_terminal(latents, index=1, condition=conditions)
+        assert [call["batch"] for call in recording.calls] == [2] * 12
+        deviation = (whole - chunked).abs().max().item()
+        assert deviation <= 1e-5 * whole.abs().max().item()
+
+    def test_chunk_sync_pulls_cap_to_rank_minimum(self) -> None:
+        """rank 一致化注入（#165 review P1）：``chunk_sync`` 对本 rank
+        预算上限取全 rank 最小——本地 cap 5、他 rank 更小时分块跟着
+        收紧，前向调用次数跨 rank 一致（FSDP 逐前向参数 all-gather 的
+        序列与调用次数绑定，各 rank 条件形状独立采样下本地各自取值即
+        集合序列错配挂死）；子批只小不大，显存上界语义不破。"""
+        unet = ZeroVelocityUnet()
+        sampler = self._sampler(
+            CfgCombinedField(unet), 40 * 2**30,
+            chunk_sync=lambda cap: min(cap, 2),
+        )
+        latents = torch.randn(12, 4, 128, 64, 128)
+        out = sampler.continue_to_terminal(
+            latents, index=1,
+            condition=RolloutCondition(
+                label=torch.tensor([29]), spacing=SPACING,
+            ),
+        )
+        batches = [call["batch"] for call in unet.calls]
+        assert len(batches) == 6          # 本地 cap 5 → 全 rank 最小 2：块数 ceil(12/2)
+        assert max(batches) == 4          # 每块前向样本 = 2 × 2（CFG 配对）
+        assert sum(batches) == 24         # 逐块覆盖全部方向，无重复
+        assert out.shape == latents.shape
+
+    def test_chunk_floors_at_one_sample(self) -> None:
+        """超大头体积（> 预算/系数）：分块不塌到 0——逐样本续跑，不因
+        配置的体量把批量算成零。"""
+        sampler = self._sampler(ZeroVelocityUnet(), 40 * 2**30)
+        assert sampler._forward_chunk(torch.Size([4, 256, 128, 192]), 12) == 1
+
+
+class TestForwardActivationBudget:
+    """预算解析：设备总显存自动探测（可复现的按比例口径）+ 无 CUDA 回落。"""
+
+    def test_auto_budget_scales_with_total_memory(self) -> None:
+        total = 64 * 2**30
+        assert budget_from_total_memory(total) == int(
+            total * AUTO_FORWARD_ACTIVATION_FRACTION,
+        )
+        assert budget_from_total_memory(24 * 2**30) < budget_from_total_memory(
+            64 * 2**30,
+        )
+
+    def test_auto_budget_falls_back_without_cuda_device(self) -> None:
+        """CPU fixture / 未传设备：回落默认常量（分块保护恒在）。"""
+        assert auto_forward_activation_budget(None) == (
+            DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES
+        )
+        assert auto_forward_activation_budget(torch.device("cpu")) == (
+            DEFAULT_FORWARD_ACTIVATION_BUDGET_BYTES
+        )
 
 
 class TestRolloutSampler:
