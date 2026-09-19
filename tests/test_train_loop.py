@@ -1482,3 +1482,21 @@ class TestGradientGating:
         assert 0.0 < observed["value"] <= 1.0
         assert observed["count"] == 1
         assert "t1n" in state["gating"]["members"]  # 名单内条件不被门控
+
+
+class TestPairedBatchSupplyGuards:
+    """配对批配置的装配接受性（ADR-0012）：更新批换配对批后，回放半区
+    不再有消费者、配对批支持任意正 K，回放供给守卫不得误拒合法实验。
+    ReplayBuffer 组件与守卫函数的物理删除归退役票（#173）——本组只钉
+    「不误拒」这一半。"""
+
+    def test_k1_paired_batch_is_accepted_by_assembly(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """K=1（最小配对批）：装配原语支持任意正 K、real 侧容量守卫按
+        K 校验，装配期不得再以「回放半区为 0 条」为由拒绝——该需求在
+        ADR-0012 后已随更新批换配对批消失。"""
+        scenario.write_inputs(reward={"disc_batch_size_k": 1})
+        scenario.set_schedule(max_iterations=1)
+        result = scenario.train()
+        assert result.code == 0, result.stderr

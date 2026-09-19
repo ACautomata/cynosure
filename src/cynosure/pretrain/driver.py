@@ -50,7 +50,7 @@ from cynosure.pretrain.artifacts import (
     PretrainReport,
     PretrainRun,
 )
-from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
+from cynosure.reward.buffer import base_condition_quota
 from cynosure.reward.support import SupportRule
 from cynosure.train.artifacts import OverfitAlertEvent, PretrainEvent
 from cynosure.train.policy import GroupPolicy
@@ -73,15 +73,13 @@ class PretrainDriver:
         self._config = config
         self._run = run
         reward = config.reward
-        # 装配守卫（train 装配同口径，ADR-0008 决策 4：assert_replay_supply
-        # 管回放半区非零 + base 分区每条件配额 ≥ 回放半区需求；real 侧的
-        # 逐 (全池, 模态) 容量 ≥ K 守卫在共享装配缝 assemble_rewards 内，
-        # ADR-0008-03）。gate 测量批的量产口径（pretrain_fake_batch）与
-        # 更新批（配对批 = K，装配原语）已解耦——混采半区覆盖守卫随更新
-        # 批换配对批退役
-        assert_replay_supply(
-            reward, TrainingRuntime.assemble_vocabulary(config).names(),
-        )
+        # 回放供给装配守卫（ADR-0008 决策 4）的调用点已随 ADR-0012 退役：
+        # gate 测量批的量产口径（pretrain_fake_batch）与更新批（配对批 = K，
+        # 装配原语）解耦后，回放半区不再有消费者——守卫留着会误拒合法
+        # 配对批配置（如 disc_batch_size_k=1）。真实约束是 real 侧容量守卫
+        # （逐 (全池, 模态) 容量 ≥ K，位于共享装配缝 assemble_rewards 内，
+        # ADR-0008-03）。守卫函数与 ReplayBuffer 组件的物理删除归退役票
+        # （#173）。
         # 单进程执行：无 torchrun 环境下 bootstrap 为 world-1 恒等
         # （不初始化进程组），集合通信原语退化——与 train 同一条装配序
         dist = DistributedContext.bootstrap()

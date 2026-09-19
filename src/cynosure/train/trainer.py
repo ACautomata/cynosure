@@ -48,7 +48,7 @@ from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
 from cynosure.grpo import MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AmpContext
-from cynosure.reward.buffer import assert_replay_supply, base_condition_quota
+from cynosure.reward.buffer import base_condition_quota
 from cynosure.train.artifacts import (
     BaselineManifest,
     IterEvent,
@@ -237,14 +237,13 @@ class GranularGrpoTrainer:
                 "参数 EMA 锚为升级项（ADR-0001），实现未交付："
                 "ema_anchor_enabled=true 显式拒绝"
             )
-        # 回放供给装配期守卫（ADR-0008 决策 4，预训练 driver 同口径）：
-        # 回放半区非零 + base 分区每条件配额 ≥ 回放半区需求（首次判别器
-        # 更新时近期分区为空，按条件过滤的回放全量由 base 承担；无效
-        # 组合在装配期显式拒绝，而非让昂贵 rollout 先行、更新时才缺样本）。
-        # 条件集 = 本域条件名清单（#129 经词汇表装配注入；装载发生在
-        # runtime 装配之前，两次装载各自独立实例、无副作用）
-        conditions = TrainingRuntime.assemble_vocabulary(config).names()
-        assert_replay_supply(config.reward, conditions)
+        # 回放供给装配期守卫（ADR-0008 决策 4）的调用点已随 ADR-0012
+        # 退役：更新批换配对批后回放半区不再有消费者，「回放半区非零 +
+        # base 每条件配额 ≥ 半区需求」不再是有效前提——留着会误拒合法
+        # 配对批配置（如 disc_batch_size_k=1，装配原语支持任意正 K）。
+        # 真实约束是 real 侧容量守卫（逐 (全池, 模态) 容量 ≥ K，位于共享
+        # 装配缝 ``assemble_rewards`` 内，ADR-0008-03）。守卫函数与
+        # ReplayBuffer 组件的物理删除归退役票（#173）。
         self.config = config
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
