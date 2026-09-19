@@ -985,7 +985,7 @@ class TestPretrainDriverAssembly:
 
 
 class TestPretrainReconstructionFakeSupply:
-    """#171 AC：#171「预训练全程 fake 均来自装配原语（冻结基座重构），
+    """#171 AC1：「预训练全程 fake 均来自装配原语（冻结基座重构），
     量产 rollout 不再被预训练路径调用」——执行路径面与事件读数面两侧
     钉住。
 
@@ -1096,6 +1096,12 @@ class TestPretrainReconstructionFakeSupply:
             )
 
 
+SCRIPTED_SHAPE = (4, 4, 16, 16, 8)
+"""替身批形状共此一源：ScriptedAuc 测量批与 ScriptedAssembler 更新批
+同形（driver 的测量批与更新批同经装配 seam，形状分叉只会在运行断言
+炸——常量共享让两处不可能漂移）。"""
+
+
 class ScriptedClusters:
     """卷级聚类替身：携带条件名、固定点估计与卷数的哑观测（ScriptedSupport
     按 ``modality`` 查判定脚本；``pooled_auc`` 原样透传，``volume_count``
@@ -1130,7 +1136,7 @@ class ScriptedAuc:
 
     def condition_latents(self, modality: str) -> torch.Tensor:
         self._measuring = modality  # 测量流先取 real 侧：条件归因随之而来
-        return torch.zeros(4, 4, 16, 16, 8)
+        return torch.zeros(SCRIPTED_SHAPE)
 
     def compute_volume_clusters(self, latents, fake_latents):
         assert latents.shape == fake_latents.shape  # 同源配对的逐样本对齐
@@ -1154,12 +1160,10 @@ class ScriptedAssembler:
     真实前向，形状仅走 ``UpdateReport`` 的 batch_size 记账（4 卷 ×
     BraTS latent 形状，与 ScriptedAuc 替身批同约定）。"""
 
-    SCRIPTED_SHAPE = (4, 4, 16, 16, 8)
-
     def assemble(self, modality: str) -> PairBatch:
         return PairBatch(
-            reals=torch.zeros(self.SCRIPTED_SHAPE),
-            fakes=torch.zeros(self.SCRIPTED_SHAPE),
+            reals=torch.zeros(SCRIPTED_SHAPE),
+            fakes=torch.zeros(SCRIPTED_SHAPE),
             modality=modality,
         )
 

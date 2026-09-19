@@ -63,10 +63,13 @@ if TYPE_CHECKING:
 
 
 MEASUREMENT_STREAM_OFFSET = 10
-"""测量流（gate 测量批的 ε 与条件构造）相对重构流的 seed 偏移：
-``TrainingRngStreams`` 的注册表占 seed+0..+9（八条流；+5/+8 为退役中
-的流位），+10 落在注册表之外——测量不参与续训状态清单，且与
-``PretrainDriver`` 的 +7（SupportRule bootstrap）不撞位。"""
+"""测量流（gate 测量批的 ε 与条件构造）相对**重构流**的 seed 偏移。
+绝对位置按基底分轴：``TrainingRngStreams`` 注册表八条流占 rank 轴
+seed+0..+5、+8 与 shared 轴 +9（recon；+6/+7 为注册表外的派生用途
+——冷启动判别器 fork 与 ``PretrainDriver`` 的 SupportRule bootstrap），
+测量流 = 重构流 seed + 10 = **shared_seed+19**——shared 轴上越过
+recon 位，不占任何注册表流位（不进 ``named()``：测量不参与续训状态
+清单），与 rank 轴的 +6/+7 派生不同轴、无撞位可言。"""
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,8 @@ class ReconstructionAssembler:
         # 测量流 + 复位模板（measure_condition 的确定性来源）：模板只取
         # 状态、永不被推进——逐次测量复位到同一个起手点，测量输入因此
         # 与「本 run 此前测量过几次」无关。与 recon 流同为 shared seed
-        # 派生（+10 = 注册表 seed+9 之外），跨 rank 一致但互不交叉；
+        # 派生（recon = shared_seed+9，本流 = +10 → shared_seed+19，
+        # 越过 recon 位、不占注册表），跨 rank 一致但互不交叉；
         # 不进 TrainingRngStreams 注册表——测量不参与续训状态清单。
         self._measurement_template = (
             torch.Generator()

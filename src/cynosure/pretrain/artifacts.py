@@ -128,7 +128,7 @@ class PretrainReport(BaseModel):
     """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
     轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
     （拒跑由 train gate 把守，诊断产物不丢）。"""
-    gate_criterion: str = "rollout_auc"
+    gate_criterion: Literal["recon_auc", "rollout_auc"] = "rollout_auc"
     """本报告的判据口径标识（ADR-0012 决策 5 的审计面）：``"recon_auc"``
     = held-out real 原始 vs 同源重构体（当前口径，产报路径恒显式写入）；
     ``"rollout_auc"`` = 旧 ADR-0008 口径（held-out real vs 量产 rollout
