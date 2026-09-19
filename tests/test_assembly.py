@@ -437,7 +437,11 @@ class TestAssemblerContract:
             reals, condition, [sigma] * scenario.K,
             torch.randn(scenario.K, *SHAPE).to(device),
         )
-        assert fakes.device == device
+        # 与输入同设备（测点本意）：``torch.device("cuda")`` 是无索引
+        # 字面量、张量落位为 ``cuda:0``，两者不相等——断言对齐到
+        # 「输出跟随输入设备」本身，不绑设备索引写法
+        assert fakes.device == reals.device
+        assert fakes.device.type == "cuda"  # 确在加速器上（非静默回落 CPU）
 
     def test_empty_step_indices_rejected(self, scenario) -> None:
         with pytest.raises(ValueError, match="不得为空"):

@@ -1426,10 +1426,11 @@ class TestGradientGating:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """名单外条件的 iteration：policy 更新被跳过（loss 无
-        policy_step_* 项、事件带 policy_gated 标记）；rollout（fake 入
-        buffer）、判别器更新、iter 事件照常——被门控条件的判别器持续
-        受训。静态白名单（动态恢复关闭）下名单逐位恒定——恢复的数值
-        语义由 test_gating 决定面单测收口，此处不叠加测量噪声。"""
+        policy_step_* 项、事件带 policy_gated 标记）；rollout、判别器
+        更新、iter 事件照常——被门控条件的判别器持续受训（ADR-0012
+        后 fake 批由重构装配原语现场供批，不经回放缓冲）。静态白名单
+        （动态恢复关闭）下名单逐位恒定——恢复的数值语义由 test_gating
+        决定面单测收口，此处不叠加测量噪声。"""
         scenario.write_inputs()
         scenario.set_schedule(max_iterations=4)
         scenario.narrow_whitelist(["t1n"])
@@ -1450,12 +1451,13 @@ class TestGradientGating:
             assert not policy_terms  # policy 更新被跳过
             assert "discriminator" in event["loss"]  # 判别器更新照常（N_d=1）
             assert 0.0 <= event["heldout_auc"] <= 1.0  # AUC 观测照常
-            assert event["buffer_current_fraction"] > 0  # fake 批照常供给
-        # fake 入近期分区不受门控影响（gated iteration 的 buffer 照常滚动）
-        assert (
-            iter_events[-1]["buffer_recent_occupied"]
-            > iter_events[0]["buffer_recent_occupied"]
-        )
+            # 回放混采退役读数（ADR-0012）：字段按事件契约保留、恒 0；
+            # 「fake 批照常供给」的证据在判别器 loss 与 AUC 断言（上方）
+            assert event["buffer_current_fraction"] == pytest.approx(0.0)
+        # recent 分区无 push 消费者（ADR-0012）：占用量恒空、不随
+        # iteration 滚动——供批与缓冲占用已解耦，门控亦不影响
+        assert iter_events[-1]["buffer_recent_occupied"] == 0
+        assert iter_events[0]["buffer_recent_occupied"] == 0
         # 门控状态随续训分片落盘：静态名单逐位恒定、无观测记录
         # （版本常量对账——分片格式随功能演进，断言不硬编码版本号）
         state = scenario.resume_state()
