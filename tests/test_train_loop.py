@@ -1491,3 +1491,145 @@ class TestPairedBatchSupplyGuards:
         scenario.set_schedule(max_iterations=1)
         result = scenario.train()
         assert result.code == 0, result.stderr
+
+
+class TestOnPolicyReconstructionSupply:
+    """在线判别器更新的 on-policy 供批（ADR-0012，issue #172 AC）。
+
+    主循环口径：判别器更新批 = 装配原语用**当前 policy** 现做的同源
+    重构配对批——fake 随 policy 权重演化（同一 real 在 policy 更新前后
+    重构不同），rollout latent 不再进判别器更新批（此后只承担打分、
+    advantage 与在线 AUC——AUC 的 fake 侧 = rollout 终点，链路零改动由
+    既有测试回归）。重构前向是 policy 的推理前向：no_grad + autocast
+    口径、不产生评估相副作用（判别器的 spectral norm 幂迭代等推进属
+    更新步训练语义，装配前向不触）。"""
+
+    K = 2
+    """重构核直喂的批大小（``reconstruct`` 纯数学无 real 采样，任意正
+    K 合法——取小批压测试成本）。"""
+
+    def test_update_batch_comes_from_assembler(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """判别器更新批 = 装配原语的配对批：update 原样消费
+        ``assembler.assemble`` 的产出（同对象透传），条件标记与 iter
+        事件同源，fake ≠ real（σ>0 候选下重构非透传）。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        update = RecordingUpdate(trainer.rewards.discriminator)
+        trainer.rewards.update = update
+        assembler = trainer.rewards.assembler
+        assembled: list[PairBatch] = []
+        original_assemble = assembler.assemble
+
+        def recording_assemble(modality: str) -> PairBatch:
+            pair = original_assemble(modality)
+            assembled.append(pair)
+            return pair
+
+        assembler.assemble = recording_assemble  # type: ignore[method-assign]
+        assert trainer.run() == 1
+        assert len(assembled) == 1  # N_d=1：单 iteration 恰一步判别器更新
+        assert update.received[0] is assembled[0]
+        assert assembled[0].modality == scenario.events()[0]["modality"]
+        assert not torch.equal(assembled[0].fakes, assembled[0].reals)
+
+    def test_reconstruction_follows_policy_weights(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """fake 随 policy 权重演化（on-policy 的定义性观测）：同一批
+        real、同一 condition/s/ε 确定性输入（不经 recon 流抽签），一个
+        iteration 的逐 k policy 更新前后重构不同——装配原语的重构前向
+        持 policy 网络引用，权重演化即时反映进更新批的 fake 侧。"""
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        assembler = trainer.rewards.assembler
+        modality = MODALITIES[0]
+        condition = trainer.policy.conditions.sample_target(modality)
+        sigmas = [assembler.candidate_sigmas(modality)[0]] * self.K
+        stream = torch.Generator().manual_seed(41)
+        # 确定性输入随 trainer 设备落位（生产路径 real 批在加速器上，
+        # CPU 常量的 device mismatch 在本机 CPU fixture 口径测不到）
+        reals = torch.randn(
+            self.K, *Fixture.LATENT_SHAPE, generator=stream,
+        ).to(trainer.device)
+        noise = torch.randn(
+            self.K, *Fixture.LATENT_SHAPE, generator=stream,
+        ).to(trainer.device)
+        # 对比唯一变量 = policy 权重：两次重构同处 eval 相（与 rollout/
+        # 重构同 inference 口径），s 与 ε 都是固定输入、不走 recon 流
+        trainer.policy.eval_phase()
+        before = assembler.reconstruct(reals, condition, sigmas, noise)
+        assert not torch.equal(before, reals)  # σ>0 重构非透传
+        assert trainer.run() == 1  # 逐 k policy 更新 + 判别器更新照常
+        after = assembler.reconstruct(reals, condition, sigmas, noise)
+        assert not torch.equal(after, before)
+
+    def test_reconstruction_forward_is_inference_only(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """额外前向的数值口径与副作用面（AC：no_grad + bf16、评估相零
+        副作用）：装配原语的重构前向在 no_grad + autocast(bf16) 下进行
+        （前向 hook 在 assemble 窗口内采样 grad/autocast 状态）；判别器
+        不进重构链路，装配前后 state_dict（参数 + spectral norm 幂迭代
+        的 parametrization buffer）逐位不动——相位敏感推进只属于更新步
+        的 train 相（RewardCoordinator.update_step）。SN 经 ``write_inputs``
+        的 reward 覆写进库键（预训练与训练同一 reward regime）——warm-start
+        产物即谱归一化形态，形态指纹守卫可过；幂迭代的 u/v buffer 存在，
+        零触碰断言才有对象。"""
+        scenario.write_inputs(reward={"spectral_norm_enabled": True})
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        trainer = GranularGrpoTrainer(config, artifacts)
+        assembler = trainer.rewards.assembler
+        device_type = trainer.amp.device_type
+        readings: list[tuple[bool, bool, torch.dtype]] = []
+        recording = False
+
+        def probe(
+            module: torch.nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            output: torch.Tensor,
+        ) -> None:
+            if recording:
+                readings.append((
+                    torch.is_grad_enabled(),
+                    torch.is_autocast_enabled(device_type),
+                    torch.get_autocast_dtype(device_type),
+                ))
+
+        hook = trainer.unet.register_forward_hook(probe)
+        original_assemble = assembler.assemble
+
+        def recording_assemble(modality: str) -> PairBatch:
+            nonlocal recording
+            recording = True
+            try:
+                return original_assemble(modality)
+            finally:
+                recording = False
+
+        assembler.assemble = recording_assemble  # type: ignore[method-assign]
+        # state_dict 面 = 参数 + buffer（spectral norm 幂迭代的 u/v 活在
+        # parametrization buffer——只快照 parameters() 会漏掉它）
+        snapshot = {
+            name: tensor.detach().clone()
+            for name, tensor in trainer.rewards.discriminator.state_dict(
+            ).items()
+        }
+        assembler.assemble(MODALITIES[0])
+        hook.remove()
+        assert readings  # 重构前向经过了 policy 网络
+        assert all(not grad for grad, _, _ in readings)  # no_grad 推理前向
+        assert all(autocast for _, autocast, _ in readings)  # autocast 开启
+        assert all(
+            dtype == torch.bfloat16 for _, _, dtype in readings
+        )  # amp_dtype 定死 bf16 的口径
+        after = trainer.rewards.discriminator.state_dict()
+        assert set(after) == set(snapshot)
+        for name, before in snapshot.items():
+            assert torch.equal(before, after[name]), name  # 判别器零触碰
