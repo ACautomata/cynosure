@@ -1,19 +1,21 @@
-"""判别器侧协作者组（Facade）：聚合两区缓冲、Online update 与 held-out
-AUC——trainer 只面对「种植/更新/AUC」三个动作与判别器引用。
+"""判别器侧协作者组（Facade）：聚合两区缓冲、配对批装配原语、Online
+update 与 held-out AUC——trainer 只面对「装配/种植/更新/AUC」四个动作
+与判别器引用。
 
-fake 供给与判别器相位约定：更新批的当前半区从全批 fake 随机抽取
-（rollout 产出按 (k, λ) 有序堆叠，确定性取头部会使 K=4 的当前半区
-永远只见最小 step、λ=1 的头部方向）；判别器默认保持 eval 相（打分
-与监控前向不得推进 spectral norm power iteration），仅更新一步
-期间短暂 train。
+判别器相位约定：判别器默认保持 eval 相（打分与监控前向不得推进
+spectral norm power iteration），仅更新一步期间短暂 train。配对批的
+重构前向是 policy 侧 no_grad 推理（装配原语自持 no_grad + autocast
+口径），不受判别器相位影响。
 
-分布式（ADR-0003）：fake 批是本 rank rollout 产出、real 批来自 rank
-切片 pool、梯度经 DDP allreduce 平均——本类的更新语义逐字不变。
+分布式（ADR-0003）：配对批是本 rank 装配产出（real 批来自 rank 切片
+pool）、梯度经 DDP allreduce 平均——本类的更新语义逐字不变。
 """
 
-import torch
 from typing import Sequence
 
+import torch
+
+from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayStore
 from cynosure.reward.overfit import OverfitMonitor
@@ -23,17 +25,17 @@ from cynosure.train.whitelist import ConditionWhitelist
 
 
 class RewardCoordinator:
-    """判别器侧动作面（种植/更新/AUC/分叉监控）与条件白名单的单点持有。"""
+    """判别器侧动作面（装配/种植/更新/AUC/分叉监控）与条件白名单的单点持有。"""
 
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
-        generator: torch.Generator,
         gating: DynamicWhitelist,
         overfit: OverfitMonitor,
+        buffer: ReplayStore,
+        assembler: ReconstructionAssembler | None,
     ) -> None:
         self.update = update
         self.auc = auc
-        self._generator = generator
         # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：readiness
         # gate 判定与 train 循环逐 iteration 门控查询的同源消费面
         # （经 whitelist 快照视图）；名单变更（EMA 动态恢复）由它以
@@ -44,6 +46,12 @@ class RewardCoordinator:
         # 消费越线判定落 overfit_alert 事件；按 rank 独立（无集合通信），
         # 报警不动作（白名单与 σ 不被它联动）
         self.overfit = overfit
+        # 两区回放缓冲（ADR-0012 后判别器更新批不再消费它——保留种植
+        # 与落盘面，退役删除与 config schema 清理同票进行）
+        self.buffer = buffer
+        # 判别器更新批装配原语（ADR-0012 唯一新缝）：两阶段装配缝注入；
+        # None = 替身测试场景，生产装配恒注入（trainer 装配期校验）
+        self.assembler = assembler
 
     @property
     def whitelist(self) -> ConditionWhitelist:
@@ -52,11 +60,6 @@ class RewardCoordinator:
         查询读同一来源——动态恢复变更名单后，查询面即时见到新快照
         （上岗名单与更新开关永不分叉）。"""
         return self.gating.whitelist
-
-    @property
-    def buffer(self) -> "ReplayStore":
-        """两区回放缓冲（Online update 的混采源，单点持有）。"""
-        return self.update.buffer
 
     @property
     def discriminator(self) -> torch.nn.Module:
@@ -71,24 +74,16 @@ class RewardCoordinator:
         samples 为逐条目张量清单，异形状条件可表达，#129）。"""
         self.buffer.fill_base(samples, modalities)
 
-    def update_step(
-        self, current_fakes: torch.Tensor, modality: str,
-    ) -> UpdateReport:
-        """判别器 Online update 一步：全批 fake 随机置换后交更新
-        （50% 当前 / 50% 回放的混采由 update 消费置换批的头部；该条件
-        回放候选不足时该步退化纯 current 半区，退化标记随报告透出，
-        ADR-0008-03），更新期间判别器 train 相、结束后恢复 eval 相。
-        置换过的整批照常入近期分区（近期分布记录是集合语义，次序无关）。
+    def update_step(self, pair: PairBatch) -> UpdateReport:
+        """判别器 Online update 一步：消费配对批（real 与 fake 同源，
+        装配原语供批——ADR-0012），更新期间判别器 train 相、结束后
+        恢复 eval 相。
 
-        ``modality`` = 本 iteration 的目标模态：整批 fake 的条件标签
-        （入近期分区）、回放半区的过滤条件与 real 批的条件匹配采样
-        （ADR-0008 决策 1/2）同源。
-        """
-        order = torch.randperm(current_fakes.shape[0], generator=self._generator)
-        shuffled = current_fakes[order]
+        ``pair.modality`` = 本 iteration 的目标条件（条件标记随批上行，
+        ADR-0008 决策 1 的归因轴；fake 侧条件匹配由同源自动满足）。"""
         self.discriminator.train()
         try:
-            return self.update.step(shuffled, modality)
+            return self.update.step(pair)
         finally:
             self.discriminator.eval()
 
@@ -97,7 +92,9 @@ class RewardCoordinator:
     ) -> float:
         """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。
 
-        real 侧按本 iteration 采样的目标序列过滤——iter 事件按序列归因
-        reward/loss/AUC，混采会让其他序列的判别器分数偏移伪装成本序列
-        realism 变化（per-target-sequence 健康监控）。"""
+        fake 侧维持 rollout 终点（gate 的运行语义 = 判别器对打分对象
+        的分辨力，ADR-0012 决策 4）；real 侧按本 iteration 采样的目标
+        条件过滤——iter 事件按序列归因 reward/loss/AUC，混采会让其他
+        序列的判别器分数偏移伪装成本序列 realism 变化
+        （per-target-sequence 健康监控）。"""
         return self.auc.compute(current_fakes, modality=modality)

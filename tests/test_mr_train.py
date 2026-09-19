@@ -248,9 +248,9 @@ class TestMrMainLoop:
             )
             assert sum(event["phase_seconds"].values()) <= event["elapsed_s"]
             assert event["elapsed_s"] > 0.0
-            # per-condition 记账：buffer 两区占用与混采占比
-            assert 0.0 <= event["buffer_current_fraction"] <= 1.0
-            assert 0.0 <= event["buffer_replay_fraction"] <= 1.0
+            # per-condition 记账：buffer 两区占用（混采占比字段随 ADR-0012
+            # 恒退役读数 0，不在此断言量级）
+            assert event["buffer_base_occupied"] > 0
 
     @pytest.mark.gpu  # 2 + 2 iteration 训练（大轮次口径）
     def test_checkpoints_are_loadable_and_resume_advances(
@@ -397,12 +397,9 @@ class TestConditionGateSwitch:
             ]
             assert "discriminator" in event["loss"]
             assert 0.0 <= event["heldout_auc"] <= 1.0
-            assert event["buffer_current_fraction"] > 0
-        # fake 入近期分区不受门控影响（滚动照常）
-        assert (
-            events[-1]["buffer_recent_occupied"]
-            > events[0]["buffer_recent_occupied"]
-        )
+            assert event["train_pairwise_acc"] is not None  # 判别器步照常
+        # 判别器更新批不受门控影响（ADR-0008 决策 7；混采占比与近期分区
+        # 滚动读数随 ADR-0012 退役——更新批为装配原语配对批、无 push）
         assert scenario.resume_state()["gating"]["members"] == [CONDITIONS[0]]
 
 

@@ -279,10 +279,10 @@ class TestStageIndependence:
     def test_stage2_buffer_seeded_fresh_not_from_stage1_fakes(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """stage-2 的 buffer 从零起步：其首 iteration 的近期分区只含本阶段
-        新 fake（|M|×G×|Λ| + anchor = 25）——若 stage-1 的 fake 串扰进来，
-        该观测会翻倍；base 分区由 stage-2 自己的初始 policy 生成（首 iter
-        回放占比 50% 即可用）。"""
+        """stage-2 的 buffer 从零起步（stage 间不串扰）：base 分区由各阶段
+        自己的初始 policy 生成、占用读数同量独立（若 stage-1 fake 串扰进
+        stage-2 的装配，占用会翻倍）；近期分区随 ADR-0012 无 push 退役、
+        两阶段恒空。"""
         scenario.write_inputs(group="sequential")
         assert scenario.train().code == 0
         # 指标流另含 overfit_alert（同带 iteration 归因轴），按事件类型
@@ -290,10 +290,11 @@ class TestStageIndependence:
         stage1_event, stage2_event = [
             event for event in scenario.events() if event["event"] == "iter"
         ]
-        assert stage1_event["buffer_recent_occupied"] == 25
-        assert stage2_event["buffer_recent_occupied"] == 25  # 全新 buffer，非 50
+        assert stage1_event["buffer_base_occupied"] == 32
         assert stage2_event["buffer_base_occupied"] == 32  # stage-2 自行生成的 base 分区
-        assert stage2_event["buffer_replay_fraction"] == pytest.approx(0.5)
+        assert stage1_event["buffer_recent_occupied"] == 0
+        assert stage2_event["buffer_recent_occupied"] == 0  # push 退役：recent 恒空
+        assert stage2_event["buffer_replay_fraction"] == pytest.approx(0.0)
 
 
 class TestStage2ReportBinding:

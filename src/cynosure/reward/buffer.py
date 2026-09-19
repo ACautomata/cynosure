@@ -15,9 +15,11 @@
 fake 批 cat 的同形前提）。回放采样可按本 iteration 条件过滤：
 该条件候选充足则在该条件内维持两区各半、可互补语义；不足则显式拒绝
 （可区分「条件不足」与「总数不足」，绝不静默回退全池混采）。base 分区
-种子按每条件配额量产（``base_condition_quota``），装配期守卫每条件
-配额 ≥ 回放半区需求（``assert_replay_supply``，train 装配与预训练
-driver 同口径，ADR-0008 决策 4）。
+种子按每条件配额量产（``base_condition_quota``）。装配期守卫
+（``assert_replay_supply``，每条件配额 ≥ 回放半区需求，ADR-0008 决策 4）
+的调用点已随 ADR-0012 退役——更新批换配对批后回放半区不再有消费者，
+留着会误拒合法配对批配置；函数本体与 ReplayBuffer 组件的物理删除归
+退役票（#173）。
 """
 
 import math
@@ -133,8 +135,9 @@ def base_condition_quota(
     #129 经 ``ConditionVocabulary.names()`` 注入，不设代码内副本）。
 
     ADR-0008 决策 4 的量产依据：base 分区种子须每条件覆盖回放半区
-    需求（装配守卫见 ``assert_replay_supply``），否则首个判别器更新
-    在某条件上将无回放候选可用。
+    需求（装配守卫见 ``assert_replay_supply``——该守卫的调用点已随
+    ADR-0012 退役，见本模块文档串），否则首个判别器更新在某条件上将
+    无回放候选可用。
     """
     base_capacity = capacity // 2
     per, extra = divmod(base_capacity, len(conditions))
@@ -147,9 +150,17 @@ def base_condition_quota(
 def assert_replay_supply(
     config: RewardConfig, conditions: Sequence[str],
 ) -> None:
-    """装配期回放供给守卫（train 装配与预训练 driver 同口径，
-    ADR-0008 决策 4）：无效组合在装配期显式拒绝，而非让昂贵 rollout
-    先行、更新时才缺样本。
+    """装配期回放供给守卫（ADR-0008 决策 4）：无效组合在装配期显式
+    拒绝，而非让昂贵 rollout 先行、更新时才缺样本。
+
+    退役说明（ADR-0012）：本守卫的**调用点已移除**（train 装配与预训练
+    driver 两处）——更新批换配对批后回放半区不再有消费者，其两条前提
+    （回放半区非零、base 每条件配额 ≥ 半区需求）都不再成立，留着只会
+    误拒合法配对批配置（如 ``disc_batch_size_k=1``，装配原语支持任意
+    正 K）。有效约束是 real 侧容量守卫（逐 (全池, 模态) 容量 ≥ K，
+    ``assemble_rewards`` 内，ADR-0008-03）。函数本体与 ReplayBuffer
+    组件的物理删除归退役票（#173）；在那之前本函数只在测试里被直接
+    调用（语义自洽的单测面保留）。
 
     两条线：回放半区非零（K ≥ 2）；base 分区每条件配额 ≥ 回放半区
     需求——首次判别器更新时近期分区为空，回放全量由 base 承担，按

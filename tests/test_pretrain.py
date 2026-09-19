@@ -51,6 +51,7 @@ from cynosure.train import (
     RunArtifacts,
     TrainingRuntime,
 )
+from cynosure.train.policy import GroupPolicy
 from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
     CliResult,
@@ -833,32 +834,6 @@ class TestPretrainDriverAssembly:
         assert decay == pytest.approx(config.reward.disc_weight_decay)
         assert decay == pytest.approx(config.policy.policy_weight_decay)
 
-    def test_inherits_noise_injection_via_shared_assembly(
-        self, scenario: PretrainScenario,
-    ) -> None:
-        """AC（ADR-0009-α，issue #104）：预训练 driver 零改动获得噪声
-        注入——装配缝把 ``disc_noise`` 专属流接进同一更新原语（在线与
-        预训练两阶段同一注入点、同一 knobs；world-1 下 derive_seed 恒等，
-        噪声流 initial_seed 与注册表 seed+8 派生一致即接线证据）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
-        config = scenario.config()
-        run = PretrainRun.init(config, scenario.tmp_path / "noise_assembly_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        registry = TrainingRngStreams(config.schedule.seed)
-        assert (
-            driver.rewards.update._noise_generator.initial_seed()
-            == registry.disc_noise.initial_seed()
-        )
-        # 带噪入口随 config σ_max 生效（默认 0.2 > 0）；打分入口不动
-        assert config.reward.disc_noise_sigma_max > 0.0
-        latents = torch.randn(2, *config.latent_shape)
-        probe = torch.Generator().manual_seed(
-            registry.disc_noise.initial_seed(),
-        )
-        state_before = probe.get_state().clone()
-        driver.rewards.update.scorer.training_patch_logits(latents, probe)
-        assert not torch.equal(probe.get_state(), state_before)
-
     def test_consumes_same_overfit_monitor_via_shared_assembly(
         self, scenario: PretrainScenario,
     ) -> None:
@@ -885,8 +860,17 @@ class TestPretrainDriverAssembly:
         )
         generators = TrainingRngStreams(
             dist.derive_seed(config.schedule.seed),
+            shared_seed=config.schedule.seed,  # 生产装配位同款（数据侧
+            # 逐 rank 派生、recon 用 shared）——同缝重放保持镜像逐字
         ).named()
-        online = TrainingRuntime.assemble_rewards(config, amp, generators, dist)
+        policy = GroupPolicy.build(config, generators["rollout"], amp.device)
+        sampler = TrainingRuntime.assemble_sampler(
+            config, policy.field, device=amp.device,
+        )
+        online = TrainingRuntime.assemble_rewards(
+            config, amp, generators, dist,
+            sampler=sampler, conditions=policy.conditions,
+        )
         assert isinstance(online.overfit, OverfitMonitor)
         assert online.overfit._threshold == driver.rewards.overfit._threshold
         assert online.overfit._span == driver.rewards.overfit._span
@@ -895,7 +879,9 @@ class TestPretrainDriverAssembly:
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：组1/组2 走同一条路径、仅 config 不同——组2 的条件分布装配
-        为 ControlNet 交叉模态采样器（GroupPolicy 按组分派）。"""
+        为 ControlNet 交叉模态采样器（GroupPolicy 按组分派）；配对批装
+        配原语对组2 同样组装（ADR-0012 决策 7：条件构造与重构前向按组
+        自然分派——组2 判别任务的语义裁决属 stage-2 专项票）。"""
         scenario.write_config(
             group="cross-modal", reward={"pretrain_gate_auc": 0.01},
         )
@@ -903,16 +889,7 @@ class TestPretrainDriverAssembly:
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         driver = PretrainDriver(config, run, device=torch.device("cpu"))
         assert isinstance(driver.policy.conditions, CrossModalConditionSampler)
-
-    def test_rejects_fake_batch_below_current_zone(
-        self, scenario: PretrainScenario,
-    ) -> None:
-        """装配守卫：每步量产 fake 不足判别器更新批的当前半区 → 拒绝。"""
-        scenario.write_config(reward={"pretrain_fake_batch": 1})
-        config = scenario.config()  # K=4 → 当前半区需要 2 条
-        run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
-        with pytest.raises(ValueError, match="fake"):
-            PretrainDriver(config, run, device=torch.device("cpu"))
+        assert driver.rewards.assembler is not None
 
     @pytest.mark.slow  # 集群实测 ~590s：driver.run() 满步数轮转 × 每步真实 rollout
     def test_rotation_steps_round_robin(

@@ -34,7 +34,9 @@ from cynosure.eval.volumes import MrReferenceVolumeStore, VolumePairFidelity
 from cynosure.config import CynosureConfig, RewardConfig
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
+from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.condition import RolloutCondition
+from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
@@ -42,6 +44,7 @@ from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import PerConditionSchedules
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
+from cynosure.reward.assembly import ReconstructionAssembler
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import LatentScorer, LsganTerms
 from cynosure.reward.update import OnlineUpdate
@@ -305,27 +308,84 @@ class RecordingRealDraw:
         return batch
 
 
+class PerShapeSchedules:
+    """替身日程表（ConditionSchedules 协议）：按条件名给独立步数的日程
+    （异形状条件 → 独立锚的日程切换观测面；真值锚 = MONAI 库本身）。"""
+
+    def __init__(self, steps_by_name: dict[str, int]) -> None:
+        self._steps = steps_by_name
+        self._cursors: dict[str, TrajectoryCursor] = {}
+
+    def cursor(self, name: str | None) -> TrajectoryCursor:
+        if name not in self._cursors:
+            self._cursors[name] = TrajectoryCursor(
+                NetworkAssembler.rflow_scheduler(
+                    num_inference_steps=self._steps[name],
+                    input_img_size_numel=2048,
+                ),
+            )
+        return self._cursors[name]
+
+
+class ZeroVelocityUnet:
+    """零速度前向桩：确定性 ODE 每步 x' = x（重构 = 插值加噪本体的观测面）。"""
+
+    def __call__(self, **kwargs: object) -> torch.Tensor:
+        return torch.zeros_like(kwargs["x"])
+
+
+class StubConditions:
+    """条件构造替身（组1 sample_target 语义）：固定 label/spacing +
+    条件名，确定性不耗 RNG。"""
+
+    def sample(
+        self, generator: torch.Generator | None = None,
+    ) -> tuple[RolloutCondition, str]:
+        return self.sample_target("t1w/axial"), "t1w/axial"
+
+    def sample_target(
+        self, target: str, generator: torch.Generator | None = None,
+    ) -> RolloutCondition:
+        return RolloutCondition(
+            label=torch.tensor([29]),
+            spacing=torch.tensor([[100.0, 100.0, 100.0]]),
+            name=target,
+        )
+
+    def targets(self) -> tuple[str, ...]:
+        return ("t1w/axial", "flair/axial")
+
+
 class TestDiscriminatorInputBatchOrganization:
-    """判别器输入批在异形状条件下的组织（验收 4 的判别器侧）：
-    ``OnlineUpdate.step`` 的组合批（current 半区 + 同条件回放过滤）
-    与 real 批（同条件匹配）在逐条件调用下批内恒同形、形状随条件切换。"""
+    """判别器输入批在异形状条件下的组织（验收 4 的判别器侧，ADR-0012
+    面）：装配原语配对批（real 侧 + 同源重构 fake 侧）与
+    ``OnlineUpdate.step`` 的干净域前向在逐条件调用下批内恒同形、形状
+    随条件切换（绝不跨形 cat/混批）。"""
 
     def test_step_batches_are_same_shape_per_condition(self) -> None:
         t1w_shape = (4, 16, 16, 8)
         flair_shape = (4, 8, 8, 16)
-        buffer = ReplayBuffer(8)  # base 4：每条件 2（回放半区供给足额）
-        buffer.fill_base(
-            [*torch.randn(2, *t1w_shape), *torch.randn(2, *flair_shape)],
-            ["t1w/axial", "t1w/axial", "flair/axial", "flair/axial"],
-        )
         scorer = RecordingUpdateScorer()
         real_draw = RecordingRealDraw({
             "t1w/axial": t1w_shape, "flair/axial": flair_shape,
         })
+        schedules = PerShapeSchedules({"t1w/axial": 3, "flair/axial": 4})
+        assembler = ReconstructionAssembler(
+            real_sampler=real_draw,
+            sampler=RolloutSampler(
+                CfgCombinedField(ZeroVelocityUnet()),
+                SdeKernel(eta=0.7, s_max=0.999), schedules,
+            ),
+            schedules=schedules,
+            conditions=StubConditions(),
+            train_step_indices=(1, 2),
+            batch_size_k=4,
+            latent_scale_factor=1.0,
+            generator=torch.Generator().manual_seed(0),
+            amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
+        )
         update = OnlineUpdate(
             scorer=scorer,
-            buffer=buffer,
-            real_sampler=real_draw,
             config=RewardConfig(
                 disc_batch_size_k=4,
                 replay_buffer_capacity=64,
@@ -334,21 +394,21 @@ class TestDiscriminatorInputBatchOrganization:
                 channel_stats_json="stats.json",
                 pretrain_report_json="report.json",
             ),
-            generator=torch.Generator().manual_seed(0),
-            noise_generator=torch.Generator().manual_seed(1),
         )
-        update.step(torch.randn(2, *t1w_shape), "t1w/axial")
-        update.step(torch.randn(2, *flair_shape), "flair/axial")
-        # 判别器训练前向批（每步 fake 批 + real 批两次带噪前向）与干净域
-        # 复算批（每步 real + fake 两次干净前向）：各自批内同形、形状
-        # 逐条件随词汇表（绝不跨形 cat/混批）
-        doubled = [(4, *t1w_shape), (4, *t1w_shape),
-                   (4, *flair_shape), (4, *flair_shape)]
-        assert [tuple(batch.shape) for batch in scorer.training_batches] == doubled
+        pair_t1w = assembler.assemble("t1w/axial")
+        update.step(pair_t1w)
+        pair_flair = assembler.assemble("flair/axial")
+        update.step(pair_flair)
+        # 配对批两侧同形、形状逐条件随词汇表
+        assert pair_t1w.reals.shape == pair_t1w.fakes.shape == (4, *t1w_shape)
+        assert (
+            pair_flair.reals.shape == pair_flair.fakes.shape
+            == (4, *flair_shape)
+        )
+        # 判别器干净域前向批（每步复算 real/fake + 训练 real/fake 四次）：
+        # 批内同形、逐条件切换（绝不跨形 cat/混批）
+        doubled = [(4, *t1w_shape)] * 4 + [(4, *flair_shape)] * 4
         assert [tuple(batch.shape) for batch in scorer.clean_batches] == doubled
-        assert [tuple(batch.shape) for batch in real_draw.batches] == [
-            (4, *t1w_shape), (4, *flair_shape),
-        ]
         assert real_draw.calls == [(4, "t1w/axial"), (4, "flair/axial")]
 
 

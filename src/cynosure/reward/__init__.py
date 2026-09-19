@@ -6,9 +6,10 @@
   与 pool 病例级不相交、永不参与判别器更新）、per-channel 标准化统计量；
 - Reward model（reward-model 章 + ADR-0001）：MONAI PatchDiscriminator
   封装（GroupNorm、raw real-logit patch 聚合、SpectralNorm 触发式）、
-  LSGAN 在线更新一步（AdamW、50% 当前 / 50% 回放）、两区 Replay buffer
-  （固定 base + FIFO recent）、held-out AUC 监控信号、支撑度判定原语
-  （ADR-0008 决策 6：低支撑条件走 bootstrap CI 下界口径）。
+  LSGAN 在线更新一步（AdamW、消费配对批——ADR-0012）、判别器更新批
+  装配原语（同源重构 fake，ADR-0012）、两区 Replay buffer（固定 base +
+  FIFO recent，判别器链路退役中）、held-out AUC 监控信号、支撑度判定
+  原语（ADR-0008 决策 6：低支撑条件走 bootstrap CI 下界口径）。
 
 数值语义见 docs/spec/reward-model.md 与 ADR-0001。
 """
@@ -20,6 +21,7 @@ from cynosure.reward.artifacts import (
     PrepareProvenance,
     SamplingManifest,
 )
+from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
 from cynosure.reward.buffer import (
     ReplayBuffer,
@@ -76,12 +78,14 @@ __all__ = [
     "LsganTerms",
     "MaisiLatentEncoder",
     "OnlineUpdate",
+    "PairBatch",
     "PoolEntry",
     "PreparePipeline",
     "PrepareProvenance",
     "PrepareReport",
     "RealPoolSampler",
     "RealSampling",
+    "ReconstructionAssembler",
     "ReplayBuffer",
     "ReplayDraw",
     "ReplayEntry",

@@ -3,7 +3,7 @@
 
 config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 （RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、七条命名 RNG 流（TrainingRngStreams 注册表）、数值
+（RolloutPhase）、八条命名 RNG 流（TrainingRngStreams 注册表）、数值
 口径（AmpContext，定义在 policy/numerics——train 与 eval 共用的 import
 环安全位，此处 re-export 保持既有消费面）与分布式运行时
 （DistributedContext + EventMerger）。trainer 只面对本 Facade
@@ -48,6 +48,7 @@ from cynosure.policy.schedules import (
 )
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
+from cynosure.reward.assembly import ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.overfit import OverfitMonitor
@@ -58,7 +59,7 @@ from cynosure.train.artifacts import RunArtifacts
 from cynosure.train.gating import DynamicWhitelist
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
-from cynosure.train.rollout import RolloutPhase
+from cynosure.train.rollout import ConditionSampler, RolloutPhase
 from cynosure.train.rng import TrainingRngStreams
 from cynosure.train.whitelist import ConditionWhitelist
 
@@ -111,12 +112,17 @@ class TrainingRuntime:
         run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
         覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
         dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
-        # seed 的 rank 派生：七条流的演化各 rank 独立（rollout 数据多样性
-        # 来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性前提。
-        # 判别器冷启动初始化不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
+        # seed 的 rank 派生：七条数据侧流的演化各 rank 独立（rollout 数据
+        # 多样性来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性
+        # 前提。recon 流除外（shared_seed = 未派生原 seed）：s 抽样的调用
+        # 结构是 FSDP 集合序列的一部分，必须跨 rank 一致——判别器冷启动
+        # 初始化同理不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
         # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；named() 的
         # dict 视图是装配期按名取流的消费面。
-        streams = TrainingRngStreams(dist.derive_seed(config.schedule.seed))
+        streams = TrainingRngStreams(
+            dist.derive_seed(config.schedule.seed),
+            shared_seed=config.schedule.seed,
+        )
         generators = streams.named()
         # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
         # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
@@ -132,14 +138,6 @@ class TrainingRuntime:
         policy = GroupPolicy.build(
             config, generators["rollout"], amp.device, sharding=sharding,
         )
-        rewards = cls.assemble_rewards(
-            config, amp, generators, dist,
-            report=(
-                None if resume
-                else PretrainReport.load(config.reward.pretrain_report_json)
-            ),
-            resume=resume,
-        )
         # 分块上限的 rank 一致化（#165 review P1）：分布式下 rollout 续跑
         # 的前向调用次数必须跨 rank 一致（FSDP 集合序列绑定调用次数），
         # 注入全 rank 取最小；单进程恒等 None（本地预算直接生效）
@@ -148,6 +146,16 @@ class TrainingRuntime:
             chunk_sync=(
                 dist.all_reduce_min if dist.distributed else None
             ),
+        )
+        rewards = cls.assemble_rewards(
+            config, amp, generators, dist,
+            report=(
+                None if resume
+                else PretrainReport.load(config.reward.pretrain_report_json)
+            ),
+            resume=resume,
+            sampler=sampler,
+            conditions=policy.conditions,
         )
         updater = StepwisePolicyUpdate(
             sampler=sampler,
@@ -271,13 +279,22 @@ class TrainingRuntime:
         report: PretrainReport | None = None,
         *,
         resume: bool = False,
+        sampler: RolloutSampler | None = None,
+        conditions: ConditionSampler | None = None,
     ) -> RewardCoordinator:
         """判别器侧装配：网络构建 → DDP 副本升级（分布式）→ pool 切片
-        （real 侧；held-out 不切）→ Online update / AUC 协作者。
+        （real 侧；held-out 不切）→ 配对批装配原语 / Online update / AUC
+        协作者。
 
         公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
         RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
         同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
+
+        ``sampler`` + ``conditions``（policy 侧依赖，须成对提供）驱动
+        判别器更新批装配原语（ADR-0012 唯一新缝）的组装——两阶段供给
+        点（预训练 driver / 在线 trainer）经本缝获得同一原语形态；组别
+        守卫在组装缝（同源重构仅组 1 有语义，ADR-0012 非目标：跨模态
+        阶段需要（源影像, 目标标签）配对条件化）。
 
         权重来源按语境三分：``report`` 给定（train 新 run 语境）=
         warm-start 守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告
@@ -334,18 +351,7 @@ class TrainingRuntime:
         real_view = RankSlicedPool(real_pool, dist, vocabulary.names()).view()
         update = OnlineUpdate(
             scorer=scorer,
-            buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
-            real_sampler=RealPoolSampler(
-                real_view,
-                generators["real_pool"],
-                amp.device,
-            ),
             config=config.reward,
-            generator=generators["disc_update"],
-            # 训练期噪声注入的专属随机流（ADR-0009-α）：与回放抽样等
-            # 训练采样流不交叉——σ_max 取值不漂移其余流的序列；σ_max = 0
-            # 时该流零消耗（回归锚）。预训练 driver 经本装配缝自动同口径
-            noise_generator=generators["disc_noise"],
         )
         auc = HeldOutAuc(
             heldout_manifest=heldout_real,
@@ -373,10 +379,62 @@ class TrainingRuntime:
             conditions=vocabulary.names(),
         )
         return RewardCoordinator(
-            update, auc, generators["fake_shuffle"], gating,
+            update, auc, gating,
             overfit=OverfitMonitor(
                 config.reward, conditions=vocabulary.names(),
             ),
+            # 两区回放缓冲（ADR-0012 后更新批不再消费，种植与落盘面保留）
+            buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
+            assembler=cls._assemble_pair_assembler(
+                config,
+                real_sampler=RealPoolSampler(
+                    real_view, generators["real_pool"], amp.device,
+                ),
+                sampler=sampler,
+                conditions=conditions,
+                generator=generators["recon"],
+                amp=amp,
+            ),
+        )
+
+    @classmethod
+    def _assemble_pair_assembler(
+        cls,
+        config: CynosureConfig,
+        real_sampler: RealPoolSampler,
+        sampler: RolloutSampler | None,
+        conditions: ConditionSampler | None,
+        generator: torch.Generator,
+        amp: AmpContext,
+    ) -> ReconstructionAssembler | None:
+        """判别器更新批装配原语的组装缝（ADR-0012 唯一新缝）。
+
+        ``sampler``/``conditions`` 须成对提供（缺对即拒绝——半依赖的
+        装配不可运行、静默 None 会让首 iter 才炸）。条件构造与重构前向
+        按组自然分派（组1 CFG 组合场 / 组2 裸条件单前向，ADR-0012 决策
+        7——condition 经 ``ConditionSampler.sample_target`` 产出、续跑经
+        按组装配的采样场）。跨模态阶段（组2）同源重构的**语义**未裁决：
+        真正的「同源」需要（源影像, 目标标签）配对条件化、真实样本库现
+        无源影像（ADR-0012 非目标，stage-2 到来时另行设计）——机制缝本
+        票照常对组2 开放（机械链路可行），判别任务语义留待专项票。"""
+        if (sampler is None) != (conditions is None):
+            raise ValueError(
+                "配对批装配原语的 policy 侧依赖须成对提供：sampler 与 "
+                "conditions 同时给定或同时缺省（单边缺省 = 装配期拒绝，"
+                "不让缺装配原语的首个判别器更新步才暴露）"
+            )
+        if sampler is None:
+            return None
+        return ReconstructionAssembler(
+            real_sampler=real_sampler,
+            sampler=sampler,
+            schedules=cls.assemble_schedules(config),
+            conditions=conditions,
+            train_step_indices=sorted(config.policy.train_step_indices_m),
+            batch_size_k=config.reward.disc_batch_size_k,
+            latent_scale_factor=config.policy.latent_scale_factor,
+            generator=generator,
+            amp=amp,
         )
 
     @staticmethod
