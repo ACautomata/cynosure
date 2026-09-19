@@ -181,21 +181,34 @@ class PretrainEvent(BaseModel):
 
     event: Literal["pretrain"] = "pretrain"
     step: int
-    """预训练步号（0 起；每步 = 一批 fake 量产 + 一次判别器单步更新）。"""
+    """预训练步号（0 起；每步 = 一批同源重构 fake + 一次判别器单步更新，
+    确认步不更新不发事件）。"""
     modality: str
     """本步条件（目标模态，轮转条件集的 ``step % n`` 项）——预训练
-    事件按条件归因 held-out AUC（ADR-0008-04：阈值校准数据面的条件
-    轴；iter 事件同款归因字段）。"""
+    事件按条件归因 recon-AUC（ADR-0008-04：阈值校准数据面的条件轴；
+    iter 事件同款归因字段）。"""
     loss_discriminator: float
     heldout_auc: float
-    """本步更新前测得的 held-out AUC：该条件 held-out 全量卷的池化点
-    估计（与在线期 iter 事件同「更新前快照」测量时点——更新后测同一
-    fake 批会把 in-sample 拟合计入 AUC；但 real 侧采样面不同——iter
-    事件走 min(fake 批量, 池) 下采样，跨相数值不可直接比较，ADR-0008-04）。"""
+    """本步更新前测得的 **recon-AUC**（ADR-0012 决策 5）：该条件 held-out
+    全量卷原始 vs 其冻结基座同源重构体的池化点估计（与在线期 iter 事件
+    同「更新前快照」测量时点——更新后测同一测量批会把 in-sample 拟合
+    计入 AUC）。字段名沿用「可扩不可改名」契约（口径已换域，见
+    ``PretrainReport.gate_criterion``）；**与 iter 事件的 rollout-AUC
+    不可跨相直接比较**：预训练判据测的是判别器训练任务上的 out-of-sample
+    泛化力、在线口径测的是对打分对象（rollout 终点）的分辨力。"""
     buffer_base_occupied: int
-    """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
+    """Replay buffer base 分区当前占用（ADR-0012 后预训练相无种植方 →
+    恒 0；组件与字段按契约保留，物理删除归 #173）。"""
     buffer_recent_occupied: int
-    """Replay buffer 近期分区当前占用（FIFO 滚动观测面）。"""
+    """Replay buffer 近期分区当前占用（同上，恒 0）。"""
+    reconstruction_forwards: int | None = None
+    """本步测量批重构消耗的 policy 前向次数（#171 AC5 的成本口径读数：
+    批量量产的 30 步全 ODE 路径已退役，本读数让「fake 全部来自 ≤|M| 步
+    重构」在事件流上可核对）。None = 本步未测量（当前执行路径每步都测，
+    留 None 供旧事件与未来分支）。"""
+    measurement_volumes: int | None = None
+    """本步测量批的卷数（= 该条件 held-out 全量卷数；支撑度判定的卷数
+    轴在事件流上的留痕）。None 同 ``reconstruction_forwards``。"""
     lr: float
     elapsed_s: float
 

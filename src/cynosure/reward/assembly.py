@@ -34,6 +34,16 @@ CFG 组合场、组2 裸条件单前向（condition 经 ``ConditionSampler`` 产
 （真正的「同源」需要（源影像, 目标标签）配对条件化、真实样本库现无源
 影像——ADR-0012 非目标，stage-2 到来时另行设计）：机制缝本票照常对
 组2 开放（机械链路可行），判别任务语义留待专项票。
+
+两条供批入口共用同一重构核（``reconstruct``），差在 s 的导出方式与随机流：
+
+- ``assemble``（**更新批**）：s 逐样本均匀抽自被优化步日程点（ADR-0012
+  决策 2）、ε 同流 —— 训练分布；
+- ``measure_condition``（**gate 测量批**，ADR-0012 决策 5 的 recon-AUC
+  构造面）：s 按候选步点**定序轮转**、ε 走**批次起手复位**的测量流 ——
+  同输入逐位同输出。测量是上岗判据的原料（报告值与白名单都由它出），
+  不许随「此前抽了多少次」漂移：逐条件读全量 held-out 卷打分，逐次测量
+  与 run 配置无关地可比、可复算。
 """
 
 from dataclasses import dataclass
@@ -50,6 +60,13 @@ from cynosure.reward.sampler import RealSampling
 
 if TYPE_CHECKING:
     from cynosure.train.rollout import ConditionSampler
+
+
+MEASUREMENT_STREAM_OFFSET = 10
+"""测量流（gate 测量批的 ε 与条件构造）相对重构流的 seed 偏移：
+``TrainingRngStreams`` 的注册表占 seed+0..+9（八条流；+5/+8 为退役中
+的流位），+10 落在注册表之外——测量不参与续训状态清单，且与
+``PretrainDriver`` 的 +7（SupportRule bootstrap）不撞位。"""
 
 
 @dataclass(frozen=True)
@@ -107,22 +124,28 @@ class ReconstructionAssembler:
         self._batch_size_k = batch_size_k
         self._scale_factor = latent_scale_factor
         self._generator = generator
+        # 测量流 + 复位模板（measure_condition 的确定性来源）：模板只取
+        # 状态、永不被推进——逐次测量复位到同一个起手点，测量输入因此
+        # 与「本 run 此前测量过几次」无关。与 recon 流同为 shared seed
+        # 派生（+10 = 注册表 seed+9 之外），跨 rank 一致但互不交叉；
+        # 不进 TrainingRngStreams 注册表——测量不参与续训状态清单。
+        self._measurement_template = (
+            torch.Generator()
+            .manual_seed(generator.initial_seed() + MEASUREMENT_STREAM_OFFSET)
+            .get_state()
+        )
         self._amp = amp
 
     def assemble(self, modality: str) -> PairBatch:
-        """装配该条件的判别器更新批：real 无放回采样 → 先抽 s 后抽 ε →
-        同源重构 → 配对批（no_grad + autocast 口径——重构是 policy 的
-        inference 前向，与 rollout 相同数值口径）。"""
-        # 条件内的其余自由度（组2 的源对/源条目抽取）穿重构流：组1 实现
-        # 不耗 RNG、组2 缺省会用 policy 主流（train/policy.py 把条件分布
-        # 建在 rollout 流上）——不穿流则每个判别器更新步漂移 rollout 流，
-        # rollout 样本序列从此依赖判别器更新节奏（流隔离契约）
-        condition = self._conditions.sample_target(
-            modality, generator=self._generator,
-        )
+        """装配该条件的判别器更新批：real 无放回采样 → 条件构造 → 先抽 s
+        后抽 ε → 同源重构 → 配对批（no_grad + autocast 口径——重构是
+        policy 的 inference 前向，与 rollout 相同数值口径）。"""
         reals = self._real_sampler.sample(
             self._batch_size_k, modality=modality,
         )
+        # 条件构造在抽取序列的首位（组2 实现会消耗本流——次序即重放锚，
+        # ADR-0007 交付期的抽取序逐位保持）
+        condition = self._resolve_condition(modality, self._generator)
         # 采样契约（先 s 后 ε）：先抽逐样本日程位（= 噪声水平 s），再抽
         # ε 张量——同 seed 重放的次序锚；ε 全量抽（消耗量与 s 取值无关）
         position = torch.randint(
@@ -130,13 +153,102 @@ class ReconstructionAssembler:
             generator=self._generator,
         )
         steps = [self._step_indices[i] for i in position.tolist()]
-        name = condition.name_or_raise()
-        cursor = self._schedules.cursor(name)
-        self._assert_indices_within_schedule(cursor, name)
+        cursor = self._schedules.cursor(condition.name_or_raise())
+        self._assert_indices_within_schedule(cursor, condition.name_or_raise())
         sigmas = [cursor.sigma_level(step) for step in steps]
         noise = torch.randn(
             reals.shape, generator=self._generator,
         ).to(reals.device)
+        return self._build(reals, condition, modality, sigmas, noise)
+
+    def measure_condition(
+        self, reals: torch.Tensor, modality: str,
+    ) -> PairBatch:
+        """该条件 **gate 测量批**的装配（ADR-0012 决策 5 的 recon-AUC
+        构造面）：调用方给出的 real 卷 → 定序轮转 σ → 同源重构 →
+        配对批。返回的 ``reals`` 与入参**同一个张量**——AUC 的 real 侧
+        与 fake 侧因此逐样本配对，判别目标只剩重构伪影。
+
+        ``reals`` = 该条件**全量** held-out 卷（``HeldOutAuc.
+        condition_latents`` 的返回值），量由调用方持有：real 侧既作
+        AUC 的 real、又作重构的源，两次各自自抽会让同源配对在测量层
+        悄悄失效。
+
+        与 ``assemble`` 的两处差别都在「测量的可复算性」上：
+
+        - **s 定序轮转**：第 i 枚卷取候选步点的第 ``i % |M|`` 位——全员
+          覆盖候选噪声带，且同输入恒同输出（逐样本抽 s 会让报告值随
+          「本 run 此前抽了几次」漂移，上岗判据不可复算）；
+        - **ε 走批次起手复位的测量流**：不消耗 recon 流（续训分片的流
+          位置不被测量次数搅动），也不漂移 policy 主流。
+        """
+        if reals.shape[0] < 1:
+            raise ValueError("测量批需要非空 real 卷（重构的源）")
+        sigmas = self._round_robin_sigmas(modality, reals.shape[0])
+        # 批次起手复位（一次，不逐卷复位）：本批的条件构造与 ε 从这里
+        # 同一起手点顺序展开——同输入的逐次测量逐位同输出
+        measurement = torch.Generator()
+        measurement.set_state(self._measurement_template)
+        condition = self._resolve_condition(modality, measurement)
+        noise = torch.randn(reals.shape, generator=measurement).to(reals.device)
+        return self._build(reals, condition, modality, sigmas, noise)
+
+    def _round_robin_sigmas(self, modality: str, count: int) -> list[float]:
+        """定序轮转的逐卷噪声水平：第 i 枚卷取候选步点的第 ``i % |M|``
+        位（候选 = 被优化步的 sigma 日程点，按日程位升序——与
+        ``candidate_sigmas`` 同源）。``measure_condition`` 与
+        ``measurement_forward_count`` 共享本定序——成本读数与实际测量
+        批同源推算，不是平行复刻。"""
+        cursor = self._schedules.cursor(modality)
+        self._assert_indices_within_schedule(cursor, modality)
+        candidates = [cursor.sigma_level(step) for step in self._step_indices]
+        return [candidates[index % len(candidates)] for index in range(count)]
+
+    def measurement_forward_count(
+        self, reals: torch.Tensor, modality: str,
+    ) -> int:
+        """该测量批（``reals`` 同上 ``measure_condition`` 的入参）重构的
+        policy 前向次数（定序轮转下的确定值）——#171 AC5 成本口径的读数
+        面：**无全 ODE 量产**在事件流上可核对。逐卷步数 = 日程步数 − 起点
+        下标（见 ``_start_index``），恒严格小于 ``num_steps``：候选档位
+        取自被优化步（{2..15} 类中段日程点），起点下标 ≥ 0。
+
+        量纲随入参卷数（测量批的规模由调用方持有的 real 决定——装配原
+        语的 real 侧采样器≠调用方的 real 来源时，按采样器规模读会得到
+        与真实测量批无关的数）。"""
+        cursor = self._schedules.cursor(modality)
+        sigmas = self._round_robin_sigmas(modality, reals.shape[0])
+        return sum(self._remaining_steps(cursor, sigma) for sigma in sigmas)
+
+    def _remaining_steps(
+        self, cursor: TrajectoryCursor, sigma: float,
+    ) -> int:
+        """该 σ 档位的续跑步数（= 日程步数 − 1 − 起点下标，
+        ``_start_index`` 的镜像口径）。候选档位经
+        ``_assert_indices_within_schedule`` 钉在中段（1..num_steps−2），
+        零步档位在装配期即不可达，本方法只处理正步数。"""
+        return cursor.num_steps - 1 - self._start_index(cursor, sigma)
+
+    def _resolve_condition(
+        self, modality: str, generator: torch.Generator,
+    ) -> RolloutCondition:
+        """条件构造（穿注入的随机流）：组1 实现不耗 RNG；组2 的源对/
+        源条目抽取会消耗——不穿流则调用方流出（policy 主流）会被漂移
+        （train/policy.py 把条件分布建在 rollout 流上），rollout 样本
+        序列从此依赖判别器更新/测量节奏（流隔离契约）。"""
+        return self._conditions.sample_target(modality, generator=generator)
+
+    def _build(
+        self,
+        reals: torch.Tensor,
+        condition: RolloutCondition,
+        modality: str,
+        sigmas: Sequence[float],
+        noise: torch.Tensor,
+    ) -> PairBatch:
+        """两条供批入口的共用装配尾：重构 → 配对批（no_grad + autocast
+        口径——重构是 policy 的 inference 前向，与 rollout 相同数值
+        口径）。``condition`` 由调用方按其抽取序构造后注入。"""
         with torch.no_grad(), torch.autocast(
             self._amp.device_type, dtype=self._amp.dtype,
         ):
@@ -221,14 +333,22 @@ class ReconstructionAssembler:
         )
 
     def _assert_indices_within_schedule(self, cursor, name: str) -> None:
-        """被优化步集合在该条件日程内——小锚日程下 M 截尾在装配期显式
-        暴露（可读报错点名条件与越界位），而非 ``sigma_level`` 越界的
-        IndexError。"""
+        """被优化步集合在该条件日程的**中段**（末位亦是非法候选）——
+        小锚日程下 M 截尾在装配期显式暴露（可读报错点名条件与越界位），
+        而非 ``sigma_level`` 越界的 IndexError 或首步测量才炸。
+
+        末位被排除与 config 的 ``train_step_indices_m`` 校验同源
+        （``max(M) ≤ num_steps − 2``）：末位之后无续跑空间，重构会退化为
+        透传（fake ≡ real），而测量面**没有** ``reconstruct`` 的 s=0 短路
+        ——它是判别器要学的「生成伪影」的零内容批次，静默进入测量会把
+        上岗判据污染成 chance 带上的噪声。"""
         overflow = [
-            step for step in self._step_indices if step >= cursor.num_steps
+            step for step in self._step_indices
+            if step >= cursor.num_steps - 1
         ]
         if overflow:
             raise ValueError(
-                f"被优化步 {overflow} 超出条件 {name} 的日程"
-                f"（num_steps={cursor.num_steps}）：重构候选的日程位越界"
+                f"被优化步 {overflow} 越界条件 {name} 的重构候选"
+                f"（num_steps={cursor.num_steps}：合法候选为 1..num_steps−2"
+                "，首位的 s≈1 奇异端与末位的零续跑空间都排除）"
             )

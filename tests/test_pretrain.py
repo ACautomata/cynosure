@@ -36,7 +36,8 @@ from cynosure.pretrain import (
     PretrainRun,
 )
 from cynosure.pretrain.driver import PretrainDriver
-from cynosure.reward.artifacts import ChannelStats
+from cynosure.reward.artifacts import ChannelStats, LatentManifest
+from cynosure.reward.assembly import PairBatch
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train import (
@@ -669,9 +670,9 @@ class TestPretrainEndToEnd:
     def test_dense_steps_terminate_at_gate_or_cap(
         self, scenario: PretrainScenario,
     ) -> None:
-        """AC：终止语义 = 全部条件最近一次 per-condition AUC 过线或步数
-        上限——每步落盘预训练事件（判别字段 + 条件 + loss/AUC/buffer
-        占用），事件流 AUC 随密集步进按条件可归因。
+        """AC：终止语义 = 全部条件最近一次 per-condition recon-AUC 过线或
+        步数上限——每步落盘预训练事件（判别字段 + 条件 + loss/AUC/buffer
+        占用 + 重构成本读数），事件流 AUC 随密集步进按条件可归因。
 
         阈值 0.99 不可达：走满步数上限分支（白名单空仍落盘报告 +
         checkpoint 供诊断——拒跑由 train gate 把守，诊断产物不丢；
@@ -679,7 +680,6 @@ class TestPretrainEndToEnd:
         scenario.write_config(reward={
             "pretrain_gate_auc": 0.99,
             "pretrain_max_steps": 12,
-            "pretrain_fake_batch": 4,
             "disc_lr": 2e-4,
         })
         result = scenario.pretrain()
@@ -891,7 +891,7 @@ class TestPretrainDriverAssembly:
         assert isinstance(driver.policy.conditions, CrossModalConditionSampler)
         assert driver.rewards.assembler is not None
 
-    @pytest.mark.slow  # 集群实测 ~590s：driver.run() 满步数轮转 × 每步真实 rollout
+    @pytest.mark.slow  # 满步数轮转 × 每步真实装配原语重构（fixture 网络 ODE 续跑）
     def test_rotation_steps_round_robin(
         self, scenario: PretrainScenario,
     ) -> None:
@@ -983,13 +983,129 @@ class TestPretrainDriverAssembly:
         assert "held-out" in str(exc_info.value)
 
 
-class ScriptedClusters:
-    """卷级聚类替身：携带条件名与固定点估计的哑观测（ScriptedSupport
-    按 ``modality`` 查判定脚本；``pooled_auc`` 原样透传）。"""
+class TestPretrainReconstructionFakeSupply:
+    """#171 AC：#171「预训练全程 fake 均来自装配原语（冻结基座重构），
+    量产 rollout 不再被预训练路径调用」——执行路径面与事件读数面两侧
+    钉住。
 
-    def __init__(self, modality: str, point_estimate: float) -> None:
+    量产退役是**范围收窄**（RolloutPhase 从 driver 装配面消失、成本
+    读数改口径），不是「换个名字继续跑」：本类断言 driver 上不存在
+    任何量产入口，且事件流自带「重构前向次数 < 量产步数」的成本证据。
+    """
+
+    def test_driver_has_no_rollout_phase_seam(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """装配面：driver 不再持有 RolloutPhase（``rollout`` 公开面、
+        ``_rollout`` 私有位与旧量产入口 `_measurement_batch` 一律不在）
+        ——量产路径在预训练相结构性不可达，而非「约定不调用」。"""
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "supply_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        for attribute in ("rollout", "_rollout", "_measurement_batch"):
+            assert not hasattr(driver, attribute), attribute
+        # 配送面在场：测量与更新同源于装配原语（两阶段构造同构的前提）
+        assert driver.rewards.assembler is not None
+        assert callable(driver.rewards.assembler.measure_condition)
+
+    def test_measurement_batch_is_full_heldout_reconstruction(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """测量面：每步测量批 = 该条件**全量 held-out 卷**的冻结基座
+        重构（非批次量产）——卷数 = 该条件 held-out 条目数、real 与
+        fake 逐样本同形同源；``pretrain_fake_batch`` 不再是测量批的
+        量纲（配错也不改变测量批规模）。"""
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.01,
+            # 与 held-out 每条件 2 卷刻意配错：量产口径的量纲不再消费
+            "pretrain_fake_batch": 7,
+        })
+        config = scenario.config()
+        heldout = LatentManifest.load(
+            config.reward.heldout_real_manifest, kind="heldout_real",
+        )
+        assert heldout.modalities["t1n"] == 2
+        run = PretrainRun.init(config, scenario.tmp_path / "measure_run")
+        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        target = driver.policy.conditions.targets()[0]
+        reals = driver.rewards.auc.condition_latents(target)
+        batch = driver.rewards.assembler.measure_condition(reals, target)
+        assert batch.reals.shape[0] == 2  # 该条件全量卷，非 pretrain_fake_batch
+        assert batch.fakes.shape == batch.reals.shape
+        assert batch.reals is reals  # 逐样本配对的同一批张量
+        assert not torch.equal(batch.fakes, batch.reals)  # 冻结基座重构在场
+        # 成本读数与测量批的规模同源（同入参、同定序轮转）：逐卷余量
+        # 之和（MONAI 实际日程步数），严格小于量产的「每卷全 ODE」上界
+        cursor = TrainingRuntime.assemble_schedules(config).cursor(target)
+        forwards = driver.rewards.assembler.measurement_forward_count(
+            reals, target,
+        )
+        assert 0 < forwards < batch.reals.shape[0] * cursor.num_steps
+
+    def test_report_carries_recon_criterion_and_support_volumes(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """报告面（#171 AC2/AC3）：``gate_criterion="recon_auc"`` 明示判据
+        口径（两阶段读数不可横向比较的审计锚），``condition_volumes``
+        给出支撑度判定的卷数轴（逐条件 = 该条件 held-out 全量卷数）。"""
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        assert scenario.pretrain().code == 0
+        report = scenario.report()
+        assert report.gate_criterion == "recon_auc"
+        config = scenario.config()
+        heldout = LatentManifest.load(
+            config.reward.heldout_real_manifest, kind="heldout_real",
+        )
+        assert report.condition_volumes == {
+            modality: heldout.modalities[modality] for modality in MODALITIES
+        }
+        # 判据口径与支撑度卷数进 JSON 工件（旧监控的解析面无损扩展）
+        payload = json.loads(
+            (scenario.run_dir_path() / "pretrain_report.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+        assert payload["gate_criterion"] == "recon_auc"
+        assert payload["condition_volumes"] == report.condition_volumes
+
+    def test_pretrain_events_carry_reconstruction_cost_readout(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """事件面（#171 AC5）：每步 pretrain 事件带重构成本读数——
+        前向次数 = 测量批逐卷余量之和（严格小于「每卷全 ODE」的
+        ``num_steps`` 上界）、卷数 = 该条件 held-out 全量卷；量产
+        rollout 退出执行路径后再无该量级的固定开销。"""
+        scenario.write_config(reward={
+            "pretrain_gate_auc": 0.99,  # 不可达：走满步数上限
+            "pretrain_max_steps": 4,
+        })
+        assert scenario.pretrain().code == 0
+        events = [
+            event for event in scenario.events()
+            if event["event"] == "pretrain"
+        ]
+        assert len(events) == 4
+        config = scenario.config()
+        cursor = TrainingRuntime.assemble_schedules(config).cursor(MODALITIES[0])
+        for event in events:
+            assert event["measurement_volumes"] == 2  # 每条件 held-out 2 卷
+            assert 0 < event["reconstruction_forwards"] < (
+                event["measurement_volumes"] * cursor.num_steps
+            )
+
+
+class ScriptedClusters:
+    """卷级聚类替身：携带条件名、固定点估计与卷数的哑观测（ScriptedSupport
+    按 ``modality`` 查判定脚本；``pooled_auc`` 原样透传，``volume_count``
+    = real 侧行数——报告 ``condition_volumes`` 留痕的报告面）。"""
+
+    def __init__(
+        self, modality: str, point_estimate: float, volume_count: int,
+    ) -> None:
         self.modality = modality
         self._point_estimate = point_estimate
+        self.volume_count = volume_count
 
     def pooled_auc(self) -> float:
         return self._point_estimate
@@ -997,19 +1113,57 @@ class ScriptedClusters:
 
 class ScriptedAuc:
     """HeldOutAuc 替身：按条件脚本返回点估计（记录测量次序供断言）；
-    容量查询恒充足（守卫路径由真实 manifest 用例覆盖）。"""
+    容量查询恒充足（守卫路径由真实 manifest 用例覆盖）。
+
+    ``condition_latents`` 与 ``compute_volume_clusters`` 的配对语义照搬
+    真实实现（real 侧由调用方给出、与 fake 同量同形）——状态机用例只
+    换测量面的**数值来源**，不绕开配对契约。"""
 
     def __init__(self, values: dict[str, float]) -> None:
         self.values = values
         self.measurements: list[str] = []
+        self.paired: list[bool] = []
 
-    def compute_volume_clusters(self, fake_latents, modality=None):
+    def condition_latents(self, modality: str) -> torch.Tensor:
+        return torch.zeros(4, 4, 16, 16, 8)
+
+    def compute_volume_clusters(self, latents, fake_latents, modality=None):
         assert modality is not None
+        assert latents.shape == fake_latents.shape  # 同源配对的逐样本对齐
         self.measurements.append(modality)
-        return ScriptedClusters(modality, self.values[modality])
+        self.paired.append(True)
+        return ScriptedClusters(
+            modality, self.values[modality], latents.shape[0],
+        )
 
     def condition_volume_count(self, modality) -> int:
         return 4
+
+
+class ScriptedAssembler:
+    """ReconstructionAssembler 替身（旋转状态机用例的装配 seam）：测量批
+    real/fake 同量同形、值可辨识（fake = −real，同源配对的可观测面）；
+    成本读数恒 1。更新批同经本替身（ADR-0012 后 driver 的测量与更新是
+    同一装配原语的两条入口，替换必须同时覆盖）——RecordingUpdate 不做
+    真实前向，形状仅走 ``UpdateReport`` 的 batch_size 记账（4 卷 ×
+    BraTS latent 形状，与 ScriptedAuc 替身批同约定）。"""
+
+    SCRIPTED_SHAPE = (4, 4, 16, 16, 8)
+
+    def assemble(self, modality: str) -> PairBatch:
+        return PairBatch(
+            reals=torch.zeros(self.SCRIPTED_SHAPE),
+            fakes=torch.zeros(self.SCRIPTED_SHAPE),
+            modality=modality,
+        )
+
+    def measure_condition(self, reals: torch.Tensor, modality: str):
+        return PairBatch(reals=reals, fakes=-reals, modality=modality)
+
+    def measurement_forward_count(
+        self, reals: torch.Tensor, modality: str,
+    ) -> int:
+        return 1
 
 
 class ScriptedSupport:
@@ -1030,8 +1184,8 @@ class ScriptedSupport:
 class TestPretrainRotationStateMachine:
     """终止状态机替身用例（ADR-0008-04 决策 3 的判定语义）：测量
     （ScriptedAuc）/ 支撑度判定（ScriptedSupport）/ 更新（RecordingUpdate）
-    三 seam 换脚本替身，确认棘轮、部分白名单、复测掉线、耗尽补测的
-    语义逐项驱动。base 分区 seeding 与事件落盘走真实路径。"""
+    四 seam 换脚本替身（测量 / 配对批装配 / 支撑度 / 更新），确认棘轮、
+    部分白名单、复测掉线、耗尽补测的语义逐项驱动。事件落盘走真实路径。"""
 
     @pytest.fixture
     def scripted(self, scenario: PretrainScenario):
@@ -1057,11 +1211,11 @@ class TestPretrainRotationStateMachine:
             support = ScriptedSupport(plan)
             driver.rewards.update = recording
             driver.rewards.auc = auc
+            driver.rewards.assembler = ScriptedAssembler()
             driver._support = support
             return driver, auc, support, recording
         return factory
 
-    @pytest.mark.slow  # 集群实测 ~474s：满条件轮转 × 每步真实 rollout
     def test_all_conditions_confirmed_stops_early(
         self, scripted, scenario: PretrainScenario,
     ) -> None:
@@ -1085,7 +1239,6 @@ class TestPretrainRotationStateMachine:
         ]
         assert len(support.verdicts) == 8  # 每条件两次判定
 
-    @pytest.mark.slow  # 集群实测 ~694s：耗尽补测轮转 × 每步真实 rollout
     def test_partial_whitelist_on_step_exhaustion(
         self, scripted,
     ) -> None:
@@ -1121,7 +1274,6 @@ class TestPretrainRotationStateMachine:
             MODALITIES[step % len(MODALITIES)] for step in range(1, 8)
         ]
 
-    @pytest.mark.slow  # 集群实测 ~528s：复测掉线轮转 × 每步真实 rollout
     def test_confirm_failure_continues_updating(
         self, scripted,
     ) -> None:
@@ -1144,7 +1296,6 @@ class TestPretrainRotationStateMachine:
         ]
         assert events[0]["heldout_auc"] == pytest.approx(0.9)  # 首测值落事件
 
-    @pytest.mark.slow  # 集群实测 ~530s：分叉告警轮转 × 每步真实 rollout
     def test_pretrain_phase_alert_events_carry_modality_attribution(
         self, scripted,
     ) -> None:

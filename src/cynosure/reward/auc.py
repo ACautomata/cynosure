@@ -10,13 +10,16 @@ eval-reward 仍在升 = 典型 hacking 签名。held-out real 与训练 real
 fake 的配对占比（并列计 0.5，秩统计的标准 tie 口径）。实现为排序
 midrank 秩统计（O((n+m)·log(n+m))）：生产 patch 规模（数百 latent ×
 2048 patch）的配对枚举达 ~5e11 次比较/iter，监控不得支配训练。
-torch 原生算子，不引入白名单外的统计库。fake 侧全量参与；real 侧采样
-数取 min(fake 批量, held-out 条目数)（两侧数量不必相等，Mann-Whitney
-对非对称 n×m 有效）。real 侧按本 iteration 采样的目标序列过滤（iter
-事件的归因轴）：其他序列的判别器分数偏移不得伪装成本序列 realism
-变化（per-target-sequence 健康监控；modality 缺省的全池混采仅供
-诊断）。打分前向在 no_grad 下进行——AUC 非可微、永不 backward，
-判别器参数 requires_grad 时带图前向白保留全部激活图。
+torch 原生算子，不引入白名单外的统计库。``compute()``（在线期 iter 事件
+的单标量口径）：fake 侧全量参与，real 侧采样数取 min(fake 批量, held-out
+条目数)（两侧数量不必相等，Mann-Whitney 对非对称 n×m 有效），并按本
+iteration 采样的目标序列过滤（iter 事件的归因轴）——其他序列的判别器
+分数偏移不得伪装成本序列 realism 变化（per-target-sequence 健康监控；
+modality 缺省的全池混采仅供诊断）。``compute_volume_clusters()``（预训练
+gate 口径，ADR-0008-04）：real 侧由**调用方提供**（全量卷），与 fake 侧
+逐样本配对（ADR-0012 同源重构的测量面）。打分前向在 no_grad 下进行
+——AUC 非可微、永不 backward，判别器参数 requires_grad 时带图前向白
+保留全部激活图。
 """
 
 from dataclasses import dataclass
@@ -136,6 +139,26 @@ class HeldOutAuc:
         条件在装配期显式拒绝而非首步测量时才炸，ADR-0008-04）。"""
         return self._pool_size(modality)
 
+    def condition_latents(self, modality: str) -> torch.Tensor:
+        """该条件 held-out **全量卷**的 latent 批（预训练 gate 的 recon
+        构造原料，ADR-0012 决策 5）：无放回抽满该条件池——卷数是支撑度
+        规则的判定输入，采样子集会让「卷数」一栏与池不一致，故不设下
+        采样。同一调用的返回值既是判别器 real 侧、也是重构 fake 侧的
+        源（``ReconstructionAssembler.measure_condition`` 与
+        ``compute_volume_clusters`` 逐样本配对，AUC 的判别目标只剩重构
+        伪影）。
+
+        抽取消耗本对象的持有流（``heldout_auc`` 命名流）——预训练每步
+        逐条件调用，抽取次序随轮转序确定；**卷内顺序**不影响读数
+        （``auc_from_scores`` 是集合级秩统计）。"""
+        pool_size = self._pool_size(modality)
+        if pool_size < 1:
+            raise ValueError(
+                "held-out 全量卷构造需要该条件的条目"
+                f"（{modality!r}: {pool_size} 条）"
+            )
+        return self._real_sampler.sample(pool_size, modality=modality)
+
     def compute(
         self, fake_latents: torch.Tensor, modality: str | None = None,
     ) -> float:
@@ -162,33 +185,43 @@ class HeldOutAuc:
         return self.auc_from_scores(real_scores, fake_scores)
 
     def compute_volume_clusters(
-        self, fake_latents: torch.Tensor, modality: str | None = None,
+        self,
+        latents: torch.Tensor,
+        fake_latents: torch.Tensor,
+        modality: str | None = None,
     ) -> VolumeScoreClusters:
         """卷级分数聚类观测面（ADR-0008-02）：每卷一组 patch 分数 +
         fake 侧全量分数。
 
-        与 ``compute()`` 单标量口径的本质差在 real 侧采样面：该条件
-        held-out **全量卷**整卷暴露（不做 min(fake 批量, 池) 的对称
-        下采样）——卷数是支撑度规则（``cynosure.reward.support``）的
-        判定输入，下采样会篡改它。卷级分组经「同形 latent → 每卷等
-        patch 数」在展平分上 reshape 还原（load_latent 的 latent_shape
-        守卫保证同形）。打分前向同样在 no_grad 下进行、同样 SCORE_CHUNK
+        ``latents`` = real 侧（**调用方提供**，通常是
+        ``condition_latents`` 的返回值）——real 侧不再是本方法内部自抽：
+        ADR-0012 的同源重构要求 fake 逐样本由 real 重构而来，两侧必须
+        是同一批张量，内部各自抽签会让「同源配对」在测量层悄悄失效
+        （AUC 退化为混了内容差的两个分布之间的判别力，恰是本票要根治
+        的捷径口径）。逐样本配对由构造保证（``PairBatch``）。
+
+        real 侧**全量卷**整卷暴露（不做 min(fake 批量, 池) 的对称下
+        采样）——卷数是支撑度规则（``cynosure.reward.support``）的判定
+        输入，下采样会篡改它。卷级分组经「同形 latent → 每卷等 patch
+        数」在展平分上 reshape 还原（load_latent 的 latent_shape 守卫
+        保证同形）。打分前向同样在 no_grad 下进行、同样 SCORE_CHUNK
         定块；iter 事件的单标量消费路径不经本方法。
         """
+        if latents.shape[0] < 1:
+            raise ValueError("held-out AUC 卷级聚类需要非空 real 批")
         if fake_latents.shape[0] < 1:
             raise ValueError("held-out AUC 卷级聚类需要非空 fake 批")
-        pool_size = self._pool_size(modality)
-        if pool_size < 1:
+        if latents.shape != fake_latents.shape:
             raise ValueError(
-                "held-out AUC 卷级聚类需要该序列的 held-out real 条目"
-                f"（{modality!r}: {pool_size} 条）"
+                f"real 批 {tuple(latents.shape)} 与 fake 批 "
+                f"{tuple(fake_latents.shape)} 不符（同源配对的逐样本对齐"
+                "前提——两侧须同量同形）"
             )
         with torch.no_grad():
-            reals = self._real_sampler.sample(pool_size, modality=modality)
-            real_scores = self._chunked_logits(reals)
+            real_scores = self._chunked_logits(latents)
             fake_scores = self._chunked_logits(fake_latents)
-        patches = real_scores.numel() // pool_size
-        per_volume = real_scores.reshape(pool_size, patches)
+        patches = real_scores.numel() // latents.shape[0]
+        per_volume = real_scores.reshape(latents.shape[0], patches)
         return VolumeScoreClusters(
             real_volume_scores=tuple(per_volume),
             fake_scores=fake_scores,

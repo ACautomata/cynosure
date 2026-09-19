@@ -369,7 +369,7 @@ class TestDiscriminatorInputBatchOrganization:
         real_draw = RecordingRealDraw({
             "t1w/axial": t1w_shape, "flair/axial": flair_shape,
         })
-        schedules = PerShapeSchedules({"t1w/axial": 3, "flair/axial": 4})
+        schedules = PerShapeSchedules({"t1w/axial": 4, "flair/axial": 5})
         assembler = ReconstructionAssembler(
             real_sampler=real_draw,
             sampler=RolloutSampler(

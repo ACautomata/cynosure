@@ -474,24 +474,18 @@ class FixturePrepareScenario:
 class PretrainLightweightReward:
     """预训练轻量 reward 变体：warm-start 前置（ADR-0007）的消费方
     （readiness gate / train loop / trajectory diagnostic）共用的成本
-    压低取值集——fake 批 4 / 回放容量 16 / 判别器 LR 2e-4 / gate 0.60 /
-    步数上限 24。
-
-    容量取下限 16：ADR-0008 决策 4 的装配守卫要求 base 分区每条件配额
-    ≥ 回放半区（K=4 → 2 条）——capacity=16 → base 8 → 每条件配额 2
-    恰好过线；再小（如 8 → 配额 1）装配期即被拒，预训练无法启动。
+    压低取值集——判别器 LR 2e-4 / gate 0.60 / 步数上限 24。
 
     轻量参数只降低预训练本步执行成本、不进训练 config；预训练 gate
     抬到 0.60——达标即停让重算值贴着停止阈值，对 train gate（0.51）
-    留出测量噪声的安全 margin。"""
+    留出测量噪声的安全 margin。测量批的规模由 held-out 池决定
+    （ADR-0012 决策 5 / #171），不再有可压的 fake 批量 knob。"""
 
     @classmethod
     def apply(cls, config: CynosureConfig) -> CynosureConfig:
         """返回 reward 侧设为轻量取值的 config 副本（``model_copy``，
         不改入参）。"""
         pretrain = config.model_copy(deep=True)
-        pretrain.reward.pretrain_fake_batch = 4
-        pretrain.reward.replay_buffer_capacity = 16
         pretrain.reward.disc_lr = 2e-4
         pretrain.reward.pretrain_gate_auc = 0.60
         pretrain.reward.pretrain_max_steps = 24

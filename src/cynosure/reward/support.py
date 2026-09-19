@@ -22,6 +22,12 @@ MW 实现）；重复数 1000、下界取 2.5% 分位（双侧 95% CI，与 KID 
 gate 的 ADR-0008-04、train 侧 readiness gate 白名单化的 -05）装配
 时从 config 读门槛与支撑度界构造 ``SupportRule``；iter 事件的单标量
 AUC 消费路径不经本模块（ADR-0008-02：现有观测面不变）。
+
+判据的 AUC 口径归消费方：预训练相喂入的是 **recon-AUC**（held-out
+real 原始 vs 冻结基座同源重构体，ADR-0012 决策 5）——支撑度规则的
+统计形态与判据口径正交，卷数与 CI 下界的语义逐字不变，只是重采样
+簇的 fake 侧换了来源。卷数输入由调用方在构造簇时钉住（该条件
+held-out 全量卷），并在预训练报告 ``condition_volumes`` 留痕。
 """
 
 import torch

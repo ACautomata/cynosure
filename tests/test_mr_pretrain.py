@@ -12,7 +12,7 @@ BraTS fixture 端到端），但两段在 MR 线的**贯通**从未验证——p
    多条件线口径产出（per-condition AUC + 白名单 + 词表工件指纹、不记
    单域 latent_shape）且守卫重载走通；
 2. **密集步进路径**（gate 0.99 不可达）：per-condition 轮转落事件流、
-   噪声注入 knobs（ADR-0009-α）在 MR 线 pretrain 路径消费；
+   同源重构测量批的逐位重放（同 seed 双 run 判别器权重一致，ADR-0012）；
 3. **守卫重载拒绝**：词表工件内容漂移的报告守卫被指纹对照拒绝；
 4. **白名单空 → 拒跑**（#133 AC）：预训练 gate 不可达 → 报告白名单空
    （报告与 checkpoint 照常落盘供诊断）→ train 侧（进程内构造、评测相
@@ -129,11 +129,12 @@ class TestMrPretrainEndToEnd:
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """AC：prepare → pretrain 贯通，报告按多条件线口径产出——
-        per-condition AUC + 白名单（词表条件域）+ 词表工件指纹，不记
-        单域 latent_shape（#129 口径）；白名单内条件过支撑度规则确认
-        （fixture held-out 每条件 1 卷 < 支撑度界 20 → bootstrap CI
-        下界口径，gate 0.01 恒达标 → 首测 + 复测确认后零更新步终止）；
-        守卫重载（load_discriminator）在 MR 线工件上走通。"""
+        per-condition recon-AUC（#171：held-out 原始 vs 冻结基座同源
+        重构体）+ 白名单（词表条件域）+ 判据口径标识 + 白名单（词表工件
+        指纹承载形状口径、不记单域 latent_shape，#129）；白名单内条件过
+        支撑度规则确认（fixture held-out 每条件 2 卷 < 支撑度界 20 →
+        bootstrap CI 下界口径，gate 0.01 恒达标 → 首测 + 复测确认后零
+        更新步终止）；守卫重载（load_discriminator）在 MR 线工件上走通。"""
         scenario = MrPretrainScenario(cli, tmp_path)
         config = scenario.run(reward_overrides={"pretrain_gate_auc": 0.01})
         report = scenario.report()
@@ -147,6 +148,12 @@ class TestMrPretrainEndToEnd:
         assert report.gate_whitelist == CONDITIONS
         assert report.gate_passed is True
         assert report.steps_completed == 0
+        # 判据口径与支撑度卷数（#171 AC2/AC3）：recon-AUC 标识 + 逐条件
+        # held-out 全量卷数（MR 线每条件 2 卷 < 支撑度界 20 → CI 下界口径）
+        assert report.gate_criterion == "recon_auc"
+        assert report.condition_volumes == {
+            condition: 2 for condition in CONDITIONS
+        }
         # 全条件确认即停：零更新步 → 零事件
         assert scenario.events() == []
         # 词表工件指纹（#129）：MR 线 fake 形状/token/spacing/sigma 锚的
@@ -243,8 +250,8 @@ class TestMrPretrainEndToEnd:
         注入空场景，不赌生产）。gate 0.99 走满步数上限（真实训练态，
         schema 上界内的最大不可达余量）；拒跑由 train gate 把守
         （ADR-0008-05），白名单空**由构造保证**而非赌 fixture 测量的
-        偶然值：fixture 每条件仅 1 held-out 卷，AUC=1.0 离散可达且单卷
-        bootstrap CI 退化为点估计（0.99 不可达只是大概率）——故 driver
+        偶然值：fixture 每条件仅 2 卷，卷级 bootstrap 的重复分布高度离散
+        （AUC=1.0 可达、CI 下界可顶满——0.99 不可达只是大概率）——故 driver
         面只断言零偶然的结构面（报告 kind / per-condition 条件域 /
         checkpoint 落盘），trainer 面把报告三字段受控改写为空白名单版
         （provenance 指纹与 checkpoint 保持真实产物，装载守卫全自洽；

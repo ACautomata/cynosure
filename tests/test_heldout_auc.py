@@ -53,6 +53,12 @@ class TestAucScoringStaysCleanDomain:
         assert results[0] == results[1]
 
 
+def _pool_reals(auc) -> torch.Tensor:
+    """跨条件拼接 held-out 全量卷 real 批（池化口径的调用方构造面——
+    ``compute_volume_clusters`` 的 real 侧由调用方给出，#171 起）。"""
+    return torch.cat([auc.condition_latents(m) for m in MODALITIES])
+
+
 class HeldOutPoolWriter:
     """直写最小 heldout_real 工件（manifest + latent 文件）：latent 按序列
     填常数（t1n → 1.0、其余序列 → 2.0），real 侧条目的序列身份可从输入
@@ -374,8 +380,9 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
+        reals = auc.condition_latents("t2w")  # real 侧全量卷由调用方给出
         clusters = auc.compute_volume_clusters(
-            scenario.fakes(2), modality="t2w",
+            reals, scenario.fakes(5), modality="t2w",
         )
         assert clusters.volume_count == 5  # t2w 全量 5 卷，非 min(2, 5)=2
         assert len(clusters.real_volume_scores) == 5
@@ -390,14 +397,22 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
-        clusters = auc.compute_volume_clusters(scenario.fakes(4))
+        reals = auc.condition_latents("t1n")
+        pool_reals = _pool_reals(auc)
+        assert reals.shape[0] == 2  # 逐条件取值面：该条件 2 卷
+        clusters = auc.compute_volume_clusters(
+            pool_reals, scenario.fakes(pool_reals.shape[0]),
+        )
         assert clusters.volume_count == 8
         patches_per_volume = clusters.real_volume_scores[0].numel()
         assert all(
             volume.numel() == patches_per_volume
             for volume in clusters.real_volume_scores
         )
-        assert clusters.fake_scores.numel() == 4 * patches_per_volume
+        assert (
+            clusters.fake_scores.numel()
+            == pool_reals.shape[0] * patches_per_volume
+        )
 
     def test_volume_groups_align_with_per_volume_forwards(
         self, scenario: UpdateScenario, tmp_path: Path,
@@ -414,7 +429,10 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
-        clusters = auc.compute_volume_clusters(scenario.fakes(2))
+        reals = _pool_reals(auc)
+        clusters = auc.compute_volume_clusters(
+            reals, scenario.fakes(reals.shape[0]),
+        )
         scorer = scenario.scorer()
         expected_groups = {
             tuple(scorer.patch_logits(
@@ -439,7 +457,8 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
-        clusters = auc.compute_volume_clusters(scenario.fakes(14))
+        reals = _pool_reals(auc)
+        clusters = auc.compute_volume_clusters(reals, scenario.fakes(14))
         scalar = auc.compute(scenario.fakes(14))
         assert clusters.pooled_auc() == pytest.approx(scalar, rel=0.0, abs=0.0)
 
@@ -454,7 +473,8 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
-        clusters = auc.compute_volume_clusters(scenario.fakes(4))
+        reals = _pool_reals(auc)
+        clusters = auc.compute_volume_clusters(reals, scenario.fakes(8))
         rule = SupportRule(
             threshold=0.65, support_bound=20,
             generator=scenario.generator(0),
@@ -476,7 +496,8 @@ class TestVolumeScoreClusters:
             heldout_manifest=manifest, scorer=probe,  # type: ignore[arg-type]
             generator=scenario.generator(1),
         )
-        auc.compute_volume_clusters(scenario.fakes(4))
+        reals = _pool_reals(auc)
+        auc.compute_volume_clusters(reals, scenario.fakes(8))
         assert probe.grad_enabled_at_call
         assert all(enabled is False for enabled in probe.grad_enabled_at_call)
 
@@ -494,7 +515,8 @@ class TestVolumeScoreClusters:
             heldout_manifest=manifest, scorer=probe,  # type: ignore[arg-type]
             generator=scenario.generator(1),
         )
-        auc.compute_volume_clusters(scenario.fakes(20))
+        reals = _pool_reals(auc)
+        auc.compute_volume_clusters(reals, scenario.fakes(12))
         assert all(
             batch.shape[0] <= HeldOutAuc.SCORE_CHUNK
             for batch in probe.received_batches
@@ -509,7 +531,7 @@ class TestVolumeScoreClusters:
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
         with pytest.raises(ValueError, match="held-out"):
-            auc.compute_volume_clusters(scenario.fakes(2), modality="t2w")
+            auc.condition_latents("t2w")
 
     def test_empty_fake_batch_rejected(
         self, scenario: UpdateScenario, tmp_path: Path,
@@ -519,8 +541,11 @@ class TestVolumeScoreClusters:
         )
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
+        reals = auc.condition_latents("t1n")
         with pytest.raises(ValueError, match="非空"):
-            auc.compute_volume_clusters(scenario.fakes(2)[:0])
+            auc.compute_volume_clusters(reals, scenario.fakes(2)[:0])
+        with pytest.raises(ValueError, match="非空"):
+            auc.compute_volume_clusters(reals[:0], scenario.fakes(2)[:0])
 
     def test_non_finite_scores_rejected_at_cluster_gate(
         self, scenario: UpdateScenario, tmp_path: Path,
@@ -536,8 +561,9 @@ class TestVolumeScoreClusters:
             scorer=NanScorer(scenario.scorer()),  # type: ignore[arg-type]
             generator=scenario.generator(1),
         )
+        reals = _pool_reals(auc)
         with pytest.raises(ValueError, match="有限"):
-            auc.compute_volume_clusters(scenario.fakes(2))
+            auc.compute_volume_clusters(reals, scenario.fakes(8))
 
     def test_existing_scalar_consumption_paths_unchanged(
         self, scenario: UpdateScenario, tmp_path: Path,
@@ -556,7 +582,9 @@ class TestVolumeScoreClusters:
         auc = self._auc(scenario, manifest)
         before_pool = auc.compute(scenario.fakes(8))
         before_cond = auc.compute(scenario.fakes(8), modality="t1n")
-        auc.compute_volume_clusters(scenario.fakes(2), modality="t2w")
+        auc.compute_volume_clusters(
+            auc.condition_latents("t2w"), scenario.fakes(2), modality="t2w",
+        )
         assert auc.compute(scenario.fakes(8)) == pytest.approx(
             before_pool, rel=0.0, abs=0.0,
         )
