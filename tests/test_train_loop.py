@@ -569,30 +569,6 @@ class TestSingleIterationLoop:
         assert result.code == 0, result.stderr
         assert (scenario.run_dir / "checkpoints" / "discriminator_iter1.pt").is_file()
 
-    def test_replay_capacity_guard_rejects_undersized_combinations(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """回放供给装配期守卫（ADR-0008 决策 4，fail-fast）：首次判别器
-        更新时近期分区为空、回放半区全由 base 分区按条件承担——
-        ``每条件配额 < 回放半区需求`` 的组合（如 K=4/capacity=2，配额
-        0 < 2）在昂贵 rollout 完成后才会缺样本炸掉；K=1 则回放半区为
-        0 条、回放采样 API 直接拒绝。两类 schema 合法但集成无效的组合
-        在装配期显式拒绝。"""
-        scenario.write_inputs()
-        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-        data["reward"]["disc_batch_size_k"] = 4
-        data["reward"]["replay_buffer_capacity"] = 2
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        result = scenario.train()
-        assert result.code == 2, result.stderr
-        assert "回放供给" in result.stderr
-        data["reward"]["disc_batch_size_k"] = 1
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        scenario.run_dir = scenario.tmp_path / "run_k1"  # 独立 run 目录
-        result = scenario.train()
-        assert result.code == 2, result.stderr
-        assert "回放供给" in result.stderr
-
     def test_missing_artifacts_reported_cleanly(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
@@ -1497,6 +1473,21 @@ class TestPairedBatchSupplyGuards:
         K 校验，装配期不得再以「回放半区为 0 条」为由拒绝——该需求在
         ADR-0012 后已随更新批换配对批消失。"""
         scenario.write_inputs(reward={"disc_batch_size_k": 1})
+        scenario.set_schedule(max_iterations=1)
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+
+    def test_undersized_replay_capacity_no_longer_rejects(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """K=4 配 capacity=2（base 分区每条件配额 0，曾是回放供给守卫的
+        第二类拒绝组合）：ADR-0012 后回放半区无消费者，该组合不再属于
+        「schema 合法但集成无效」——装配期不得拒绝，完整训练照常跑通
+        （旧断言 code == 2 随守卫调用点退役一并撤销）。"""
+        scenario.write_inputs()
+        scenario.patch_config(
+            reward={"disc_batch_size_k": 4, "replay_buffer_capacity": 2},
+        )
         scenario.set_schedule(max_iterations=1)
         result = scenario.train()
         assert result.code == 0, result.stderr
