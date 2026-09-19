@@ -93,7 +93,7 @@ MONAI 的 PatchGAN 判别器（Pix2PixHD 式），输出 patch logit 图而非�
 训练集影像经 VAE 预编码的 latent，作为判别器的「真」，固定不更新。
 
 **Real sample pool（真实样本库）**:
-训练集影像经 VAE 预编码的 latent 集合，判别器的「真」与评测参照都取自它。分层键按域：BraTS 线 = train split（病例级 70%）全量、按序列 token 分层；MR-RATE 线 = 官方 train split 逐条件配额抽样（配额为上限、固定 seed、排序后抽样、幂等留痕）、按生成条件分层（11 格，每条件统一网格——同条件 latent 同形，异条件异形状随 `condition_latent_shapes` 契约登记）。
+训练集影像经 VAE 预编码的 latent 集合，判别器的「真」与评测参照都取自它——同源重构（ADR-0012）后也是判别器「假」的源材料。分层键按域：BraTS 线 = train split（病例级 70%）全量、按序列 token 分层；MR-RATE 线 = 官方 train split 逐条件配额抽样（配额为上限、固定 seed、排序后抽样、幂等留痕）、按生成条件分层（11 格，每条件统一网格——同条件 latent 同形，异条件异形状随 `condition_latent_shapes` 契约登记）。
 _Avoid_: 真样本集
 
 **Held-out real（留出真样本）**:
@@ -105,15 +105,19 @@ MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#
 _Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
-当前 policy rollout 的去噪输出 latent，作为判别器的「假」。
-_Avoid_: 生成样本、负样本
+Real sample pool 真实 latent 的同源重构体（构造见 同源重构），作为判别器的「假」——与 real 同内容、仅生成伪影不同。
+_Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代）
+
+**同源重构（Reconstruction fake）**:
+判别器 fake 的构造原语（ADR-0012）：真实 latent 乘回 policy 工作域后从日程步点 s 加噪（rectified flow 插值 x_s = (1−s)·x + s·noise），再用**当时的 policy**（预训练 = base 冻结权重、在线 = 当前 policy）以 η=0 确定性 ODE 去噪回 σ=0、归位 pool 存储域；s 逐样本均匀抽自该条件被优化步（`policy.train_step_indices_m`）的日程点，静态逐条件从各自 sigma 日程导出（与 rollout 同一 `ConditionSchedules`）。判别器输入恒干净域——加噪只发生在 fake 构造的输入端，不进判别器前向；real/fake 同内容配对使「记 Real sample pool 病例共性」捷径结构性失效。构造走专属命名随机流（先抽水平 s、后抽 ε，随续训分片落盘）。
+_Avoid_: 重加噪/加噪判别（判别器输入带噪的旧注入语义，已废）、partial diffusion、把重构体当数据增强（它是 fake 的定义本身）
 
 **Warm-start pre-training（判别器预训练）**:
-RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取 base policy 量产 rollout；训练至通过 RM readiness gate，产物作为在线更新的初始权重（ADR-0007）。
-_Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）
+RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构；训练至通过 RM readiness gate，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012）。
+_Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）、量产 rollout 当 fake 源（旧语义，ADR-0012）
 
 **RM readiness gate（RM 上岗门槛）**:
-RL 启动的硬前置：判别器预训练后按条件报告 held-out AUC，过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。条件闸总开关（`reward.condition_gate_enabled`，默认开）关闭时本门槛整体不适用（白名单既不作上岗判据也不作更新开关，见 条件闸）；**warm-start 权重装载不属门控链、不受开关影响**。上岗口径含组别绑定（#113）：预训练报告的 group 与消费 config 的组别严格等值——warm-start 装载守卫（assert_data_provenance）对照，跨组消费显式拒绝、无逃生门（组间 fake 分布不同，per-condition 判定只在本组分布上测量；组3 序贯 stage-2 的合法消费路径 = `experiment.stage2_pretrain_report_json` 绑定的 cross-modal 报告，stage 级绑定、不继承 stage-1 报告——#116）。
+RL 启动的硬前置：判别器预训练后按条件报告 recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012），过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值——预训练放行、在线实测重新洗牌名单是预期行为（准入体检 vs 在岗考核，ADR-0012）。条件闸总开关（`reward.condition_gate_enabled`，默认开）关闭时本门槛整体不适用（白名单既不作上岗判据也不作更新开关，见 条件闸）；**warm-start 权重装载不属门控链、不受开关影响**。上岗口径含组别绑定（#113）：预训练报告的 group 与消费 config 的组别严格等值——warm-start 装载守卫（assert_data_provenance）对照，跨组消费显式拒绝、无逃生门（组间 fake 分布不同，per-condition 判定只在本组分布上测量；组3 序贯 stage-2 的合法消费路径 = `experiment.stage2_pretrain_report_json` 绑定的 cross-modal 报告，stage 级绑定、不继承 stage-1 报告——#116）。
 _Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）、池化达标（全池单一标量口径，已被按条件取代）、跨组上岗（报告组别 ≠ 消费组别的装载——守卫期即拒绝，非 gate 白名单判定对象）
 
 **条件闸（Condition gate）**:
@@ -133,29 +137,20 @@ RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 
 _Avoid_: 把 skull-stripped 码当生成 token（生成分组恒用 whole-brain 条目）、在 BraTS config 里携带 MR 词汇工件（互斥携带即拒）、在 MR config 里声明单域锚字段（形状/锚逐条件派生，#129 互斥携带即拒）、在代码里写 token/网格常量副本（唯一来源是工件）
 
 **梯度门控（Gradient gating）**:
-白名单的按 iteration 消费（ADR-0008 决策 7）：目标条件不在名单 → 该 iteration 跳过 policy 更新——rollout、fake 入 buffer、判别器更新、iter 事件照常。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度（GRPO 无效样本不参与 advantage 的既有实践），不引入第二重 reward、KL 或参考模型。被门控条件的判别器持续受训——其建立判别力是白名单动态恢复的前提。门控决定是全 rank 集体口径：任一 rank 的条件被门控即全体跳过（policy 更新的 FSDP 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等死锁）；iter 事件以 policy_gated 标记区分门控 iteration（loss 缺 policy 项）。名单恢复由 条件白名单 词条的动态恢复机制驱动。条件闸关闭时本词条整体停用（无 iteration 被跳过，policy_gated 恒 false；见 条件闸）。
+白名单的按 iteration 消费（ADR-0008 决策 7）：目标条件不在名单 → 该 iteration 跳过 policy 更新——rollout、判别器更新（同源重构 fake 现做现用）、iter 事件照常。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度（GRPO 无效样本不参与 advantage 的既有实践），不引入第二重 reward、KL 或参考模型。被门控条件的判别器持续受训——其建立判别力是白名单动态恢复的前提。门控决定是全 rank 集体口径：任一 rank 的条件被门控即全体跳过（policy 更新的 FSDP 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等死锁）；iter 事件以 policy_gated 标记区分门控 iteration（loss 缺 policy 项）。名单恢复由 条件白名单 词条的动态恢复机制驱动。条件闸关闭时本词条整体停用（无 iteration 被跳过，policy_gated 恒 false；见 条件闸）。
 _Avoid_: 条件过滤（判别器侧条件匹配采样，另一概念）
 
 **Online update（在线更新）**:
-reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
+reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start）：fake = 当前 policy 的同源重构、现做现用（ADR-0012），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
 _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 
 **条件匹配采样（Condition-matched sampling）**:
-判别器一步更新的 real 侧与回放半区都按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采喂出的模态分类捷径。real 池逐（目标模态, 每 rank 切片）容量 ≥ K 是装配期硬守卫（不足 fail-fast 可读报错；无放回采样语义不动，不引入有放回采样补洞）。
+判别器一步更新的 real 侧按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采喂出的模态分类捷径；fake 侧经同源重构自动匹配（fake 由同批 real 重构而来，ADR-0012）。real 池逐（目标模态, 每 rank 切片）容量 ≥ K 是装配期硬守卫（不足 fail-fast 可读报错；无放回采样语义不动，不引入有放回采样补洞）。
 _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 
-**判别器训练期噪声注入（Training-time noise injection）**:
-判别器参数更新前向中 real 与 fake 两侧 latent 的对称加噪（ADR-0009-α）：逐样本 σ ~ U[0, σ_max]（上限 = config `reward.disc_noise_sigma_max`，暂定 0.2 待 MR-RATE 预训练曲线校准）在归一化域注入——通道归一化之后、σ 以相对通道 std 的比例参数化（免依赖 latent 存储域量级）。机制 = 冲掉单样本精确值指纹、逼判别器学平滑特征（ADA），补齐条件匹配采样把 real 侧骤缩到稀疏模态小池之后的过拟合防线后半道。training-only augmentation：噪声只进参数更新前向，reward 打分、held-out AUC、监控复算全部留在干净域——打分与训练共用前向主干，路径分流 = 训练专用带噪入口（scorer 的 `training_patch_logits`）、打分入口契约不动（双侧同噪会让 reward 每步 i.i.d. 抖动经 GRPO 组内标准化放大进 advantage，已否决；采样平均消抖因 rollout 打分成本 ×N，已否决）。σ_max = 0 是唯一关闭形态（回归锚：全链路与无注入逐位一致），不设独立 off 开关。噪声采样走专属命名随机流（`disc_noise`，随续训分片落盘），与训练/评测/AUC 流不交叉——σ_max 取值不漂移回放抽样序列；预训练与在线经同一更新原语（Online update）消费同一 knobs，预训练 driver 零改动获得注入。
-_Avoid_: 数据增强（像素域强度变换是上游 recipe 概念；这里是 latent 域判别器输入增强）、双向噪声（「双侧同噪」的歧义叫法）
-
 **过拟合分叉监控（Overfit divergence monitoring）**:
-判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量：带噪输入使训练批任务天然更难、系统性低估分叉），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件、按 rank 独立记账（rank 间离散 = 数据切片异质性的诊断信号，不跨 rank 平均），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：不自动移出白名单、不自动调 σ（升级项留校准后另议）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在 RM readiness gate 之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
-_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动降 σ（升级项，校准后另议）、跨 rank 平均的分叉读数（rank 离散本身是诊断信号）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
-
-**Replay buffer（回放缓冲）**:
-封顶 FIFO 的 fake latent 存库（base 时期 + 近期），条目带条件标记（目标模态标签——组2 跨模态条目按目标端归因）；更新判别器时按比例混入、回放抽取与本 iteration 条件匹配，防漂移、防灾难性遗忘。
-条件标记的落地面（ADR-0008-01）：base 分区种子按每条件配额量产（配额 ≥ 判别器更新回放半区需求是装配期硬守卫，预训练 driver 与 train 装配同口径）；回放采样按条件过滤、该条件候选不足时显式拒绝（可区分「条件不足」与「总数不足」，绝不静默回退全池混采）；在线更新在该条件候选 < 回放半区需求时该步**退化纯 current 半区**（回放 0 条、real 侧与退化后批同量匹配、iter 事件落退化标记——不静默漂移）；续训状态分片 v3 随条目标记升级，旧格式分片被版本对账显式拒绝。
-_Avoid_: 无条件回放（旧裸 latent FIFO 口径，已被带标签 FIFO 取代）
+判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量——复算保证两侧同一估计量口径），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件、按 rank 独立记账（rank 间离散 = 数据切片异质性的诊断信号，不跨 rank 平均），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：不自动移出白名单（升级项留曲线校准后另议）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在 RM readiness gate 之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
+_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动动作（只报警、人工裁决；旧「自动降 σ」升级项随噪声注入取消作废，ADR-0012）、跨 rank 平均的分叉读数（rank 离散本身是诊断信号）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
 
 **Reward hacking（奖励攻击）**:
 policy 学会骗过判别器拿高分，而非真正提升样本质量——静止判别器的必然结局（见 对抗博弈）。
