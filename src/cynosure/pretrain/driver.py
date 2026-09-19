@@ -91,6 +91,9 @@ class PretrainDriver:
         )
         generators = TrainingRngStreams(
             dist.derive_seed(config.schedule.seed),
+            # 与 train runtime 同一 seeding 规则（数据侧逐 rank 派生、
+            # recon 用 shared）——单进程下 derive_seed 恒等，两参同值
+            shared_seed=config.schedule.seed,
         ).named()
         self._policy = GroupPolicy.build(
             config, generators["rollout"], amp.device,

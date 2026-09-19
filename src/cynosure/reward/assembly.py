@@ -19,10 +19,14 @@ real/fake 同内容配对——判别器只能学生成伪影分界，「记真�
 造的输入端，配对批两侧都不携带噪声（参数更新走干净域 ``patch_logits``
 入口）。
 
-随机性：重构构造的加噪走**专属命名随机流**（``TrainingRngStreams.RECON``
+随机性：重构构造走**专属命名随机流**（``TrainingRngStreams.RECON``
 ——与训练/评测/AUC 流不交叉，一条流的抽取数变化不漂移其余流）；
-先 ``randint`` 抽日程位（= s）后 ``randn`` 抽 ε，ε 的消耗量与 s 的取
-值无关——同 seed 重放逐位一致、随续训分片落盘恢复后序列不漂移。
+条件内的自由度抽取（组2 的源对/源条目，组1 实现不耗 RNG）、
+``randint`` 抽日程位（= s）、``randn`` 抽 ε 依次全走本流——ε 的消耗
+量与 s 的取值无关，同 seed 重放逐位一致、随续训分片落盘恢复后序列
+不漂移。seeding 按 rank 无关的 shared seed 派生（runtime 装配位传原
+seed）：s 抽样的调用结构是分布式 FSDP 集合序列的一部分，跨 rank 必须
+一致（逐 rank 相异 = 首个判别器更新步集合错位死锁）。
 
 按组语义（ADR-0012 决策 7）：条件构造与重构前向按组自然分派——组1
 CFG 组合场、组2 裸条件单前向（condition 经 ``ConditionSampler`` 产出、
@@ -109,7 +113,13 @@ class ReconstructionAssembler:
         """装配该条件的判别器更新批：real 无放回采样 → 先抽 s 后抽 ε →
         同源重构 → 配对批（no_grad + autocast 口径——重构是 policy 的
         inference 前向，与 rollout 相同数值口径）。"""
-        condition = self._conditions.sample_target(modality)
+        # 条件内的其余自由度（组2 的源对/源条目抽取）穿重构流：组1 实现
+        # 不耗 RNG、组2 缺省会用 policy 主流（train/policy.py 把条件分布
+        # 建在 rollout 流上）——不穿流则每个判别器更新步漂移 rollout 流，
+        # rollout 样本序列从此依赖判别器更新节奏（流隔离契约）
+        condition = self._conditions.sample_target(
+            modality, generator=self._generator,
+        )
         reals = self._real_sampler.sample(
             self._batch_size_k, modality=modality,
         )

@@ -73,7 +73,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 8
+RESUME_STATE_FORMAT_VERSION = 9
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -101,7 +101,13 @@ v7：replay buffer 两区 latents 从单一堆叠张量改为逐条目张量清�
 v8：+ ``recon`` 流（ADR-0012 同源重构的专属随机流：先抽 s 后抽 ε
 的加噪构造，resume 后重构 fake 序列与不中断运行逐位一致）——命名
 流注册表结构一变即清单失配，旧 v7 分片缺该流状态、恢复后重构抽样
-序列无从续写，被版本对账显式拒绝。"""
+序列无从续写，被版本对账显式拒绝。
+v9：``recon`` 流改按 rank 无关的 shared seed 派生（runtime/driver 装配
+位传未派生原 seed）——s 抽样的调用结构（重构续跑
+``continue_to_terminal`` 的调用次数与逐次批量）是分布式 FSDP 集合
+序列的一部分，跨 rank 必须一致；v8 分片的 recon 流状态逐 rank 相异，
+恢复后违反该不变量、首个判别器更新步即集合错位死锁，被版本对账显
+式拒绝（seeding 规则属于 payload 契约，不是可静默换装的实现细节）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -429,11 +435,14 @@ class ResumeStore:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 "
                 f"v{RESUME_STATE_FORMAT_VERSION}"
-                "（门控与分叉监控状态随分片落盘 + 八条命名 RNG 流——含"
-                "ADR-0012 同源重构的 recon 流：先抽 s 后抽 ε 的加噪构造），"
+                "（门控与分叉监控状态随分片落盘 + 八条命名 RNG 流——"
+                "ADR-0008 逐条件标签成对分区、ADR-0012 同源重构的 recon "
+                "流：先抽 s 后抽 ε 的加噪构造、seeding 按 rank 无关 "
+                "shared 派生以对齐 FSDP 集合序列），"
                 f"得到 {version!r}——跨口径续训不可恢复（旧分片缺相应的"
-                "流状态，恢复后门控决定、重构抽样序列与分叉读数无法逐位"
-                "续写）；请从产物 checkpoint 重启新 run"
+                "流状态或违反跨 rank 流一致性不变量，恢复后门控决定、"
+                "重构抽样序列与分叉读数无法逐位续写）；请从产物 "
+                "checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
         if missing:

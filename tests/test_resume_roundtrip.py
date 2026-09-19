@@ -209,17 +209,15 @@ class TestResumeStateChecklist:
             assert "exp_avg" in next(iter(optimizer_state.values()))
 
         # buffer 两区（v7：逐条目张量清单 + 目标条件标签成对）：
-        # base 满容量（64//2）且每条件配额分布，recent = |M|×G×|Λ| + anchor = 25
+        # base 满容量（64//2）且每条件配额分布；recent 分区在 ADR-0012
+        # 后无写入方（判别器更新批换同源重构配对批，回放消费退役——
+        # buffer 组件与落盘面保留至退役票），空分区落盘 = None
         base = state["replay_buffer"]["base"]
         assert len(base["latents"]) == 32
         assert all(t.shape == (4, 16, 16, 8) for t in base["latents"])
         assert len(base["modalities"]) == 32
         assert set(base["modalities"]) == set(MODALITIES)  # 配额量产全条件覆盖
-        recent = state["replay_buffer"]["recent"]
-        assert len(recent["latents"]) == 25
-        assert all(t.shape == (4, 16, 16, 8) for t in recent["latents"])
-        assert len(recent["modalities"]) == 25
-        assert all(m in MODALITIES for m in recent["modalities"])
+        assert state["replay_buffer"]["recent"] is None
 
         # 分叉监控状态（v6，ADR-0009-β）：per-condition 分叉 EMA——单
         # iteration 单条件观测（首条观测置值、count=1）
@@ -582,12 +580,14 @@ class TestResumeGuards:
         scenario.write_inputs()
         assert scenario.train().code == 0
         state = scenario.resume_state()
-        # 回写成 v2 形态：分区 = 裸 tensor、format_version = 2
+        # 回写成 v2 形态：分区 = 裸 tensor、format_version = 2；
+        # v2 分区的 recent 本是裸堆叠 tensor——现役分片 recent 无写入方
+        # （ADR-0012，空分区 = None），以空堆叠等价重构该位
         legacy = dict(state)
         legacy["format_version"] = 2
         legacy["replay_buffer"] = {
             "base": torch.stack(state["replay_buffer"]["base"]["latents"]),
-            "recent": torch.stack(state["replay_buffer"]["recent"]["latents"]),
+            "recent": torch.zeros(0, 4, 16, 16, 8),
         }
         torch.save(legacy, scenario.run_dir / RESUME_STATE)
         result = scenario.resume()

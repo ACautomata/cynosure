@@ -14,8 +14,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
-from cynosure.policy.condition import RolloutCondition
+from cynosure.policy.condition import ModalityMapping, RolloutCondition
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AmpContext
@@ -24,6 +25,7 @@ from cynosure.policy.schedules import ConditionSchedules, SingleConditionSchedul
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
+from cynosure.train.rollout import CrossModalConditionSampler, SourceLatentPool
 from cynosure.train.rng import TrainingRngStreams
 
 SHAPE = (4, 16, 16, 8)
@@ -495,3 +497,139 @@ class TestAssemblerContract:
                 reals, condition, [sigma_zero] * scenario.K,
                 torch.randn(scenario.K, *SHAPE),
             )
+
+
+class TestRankStructuralAlignment:
+    """分布式集合序列对齐（#165 review P1 的装配原语延伸）：
+    ``continue_to_terminal`` 携带 ``chunk_sync`` 集合通信且前向过
+    FSDP——其**调用次数与逐次批量**是跨 rank 集合序列的一部分。s 抽样
+    若逐 rank 相异，分组结构（每 σ 的组存在性与组大小）相异，首个判别
+    器更新步即集合序列错位死锁。生产 seeding 规则 = 流注册表按 rank
+    派生（``DistributedContext.derive_seed``，runtime 装配位的同一规
+    则）——本测试按同一规则模拟两 rank，锁定重构续跑的调用结构逐位
+    一致。"""
+
+    @staticmethod
+    def _rank_assembler(
+        scenario: "AssemblyScenario", rank: int,
+    ) -> tuple[ReconstructionAssembler, list[tuple[int, int]]]:
+        # 生产 seeding 规则（runtime/driver 装配位同款）：数据侧流按
+        # rank 派生主 seed、recon 流按 rank 无关 shared seed 派生
+        streams = TrainingRngStreams(
+            DistributedContext(rank, 2, True).derive_seed(11),
+            shared_seed=11,
+        )
+        schedules = scenario.schedules()
+        sampler = RolloutSampler(
+            CfgCombinedField(ZeroVelocityUnet()),
+            SdeKernel(eta=0.7, s_max=0.999),
+            schedules,
+        )
+        calls: list[tuple[int, int]] = []
+        original = sampler.continue_to_terminal
+
+        def recording(noised, start, condition, _original=original):
+            calls.append((start, noised.shape[0]))
+            return _original(noised, start, condition)
+
+        sampler.continue_to_terminal = recording
+        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+        assembler = ReconstructionAssembler(
+            real_sampler=RealPoolSampler(pool, streams.real_pool),
+            sampler=sampler,
+            schedules=schedules,
+            conditions=StubConditions(),
+            train_step_indices=TRAIN_STEPS,
+            batch_size_k=scenario.K,
+            latent_scale_factor=1.0,
+            generator=streams.recon,
+            amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
+        )
+        return assembler, calls
+
+    def test_continue_call_structure_is_rank_invariant(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        structures = []
+        for rank in (0, 1):
+            assembler, calls = self._rank_assembler(scenario, rank)
+            assembler.assemble(CONDITION)
+            structures.append(calls)
+        assert structures[0] == structures[1]
+
+    def test_recon_stream_shared_and_data_streams_rank_derived(self) -> None:
+        """注册表级不变量：recon 流跨 rank 同 seed（集合序列一致性的
+        源头），数据侧流跨 rank 异 seed（多样性语义不被误伤）。"""
+        base = 11
+        registries = [
+            TrainingRngStreams(
+                DistributedContext(rank, 2, True).derive_seed(base),
+                shared_seed=base,
+            )
+            for rank in (0, 1)
+        ]
+        assert (
+            registries[0].recon.initial_seed()
+            == registries[1].recon.initial_seed()
+            == base + 9
+        )
+        assert (
+            registries[0].rollout.initial_seed()
+            != registries[1].rollout.initial_seed()
+        )
+        assert (
+            registries[0].real_pool.initial_seed()
+            != registries[1].real_pool.initial_seed()
+        )
+
+
+class TestCrossModalConditionStream:
+    """组2 条件抽取的随机流归位（流隔离契约的装配原语侧）：生产接线把
+    ``CrossModalConditionSampler`` 建在 policy 主流上（train/policy.py
+    的构造位）——``sample_target`` 的缺省语义是「缺省用主流」，装配原
+    语若不显式穿流，每个判别器更新步的源对与源条目抽取都会消耗
+    **rollout** 流，rollout 样本序列从此依赖判别器更新节奏。"""
+
+    @staticmethod
+    def _cross_modal_conditions(
+        scenario: "AssemblyScenario", rollout: torch.Generator,
+    ) -> CrossModalConditionSampler:
+        return CrossModalConditionSampler(
+            ModalityMapping({"t1n": 29, "t1c": 34, "t2w": 30, "t2f": 31}),
+            [("t1n", "t1c")],
+            SourceLatentPool(
+                LatentManifest.load(scenario.pool_path, kind="real_pool"),
+                torch.device("cpu"),
+            ),
+            rollout,
+            torch.device("cpu"),
+        )
+
+    def test_condition_draw_stays_off_rollout_stream(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        streams = TrainingRngStreams(seed=0)
+        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+        assembler = ReconstructionAssembler(
+            real_sampler=RealPoolSampler(pool, streams.real_pool),
+            sampler=RolloutSampler(
+                CfgCombinedField(ZeroVelocityUnet()),
+                SdeKernel(eta=0.7, s_max=0.999),
+                scenario.schedules(),
+            ),
+            schedules=scenario.schedules(),
+            conditions=self._cross_modal_conditions(
+                scenario, streams.rollout,
+            ),
+            train_step_indices=TRAIN_STEPS,
+            batch_size_k=scenario.K,
+            latent_scale_factor=1.0,
+            generator=streams.recon,
+            amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
+        )
+        rollout_before = streams.rollout.get_state().clone()
+        recon_before = streams.recon.get_state().clone()
+        pair = assembler.assemble("t1c")
+        assert pair.modality == "t1c"
+        assert torch.equal(streams.rollout.get_state(), rollout_before)
+        assert not torch.equal(streams.recon.get_state(), recon_before)

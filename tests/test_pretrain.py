@@ -860,6 +860,8 @@ class TestPretrainDriverAssembly:
         )
         generators = TrainingRngStreams(
             dist.derive_seed(config.schedule.seed),
+            shared_seed=config.schedule.seed,  # 生产装配位同款（数据侧
+            # 逐 rank 派生、recon 用 shared）——同缝重放保持镜像逐字
         ).named()
         policy = GroupPolicy.build(config, generators["rollout"], amp.device)
         sampler = TrainingRuntime.assemble_sampler(

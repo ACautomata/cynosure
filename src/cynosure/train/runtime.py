@@ -112,12 +112,17 @@ class TrainingRuntime:
         run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
         覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
         dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
-        # seed 的 rank 派生：八条流的演化各 rank 独立（rollout 数据多样性
-        # 来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性前提。
-        # 判别器冷启动初始化不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
+        # seed 的 rank 派生：七条数据侧流的演化各 rank 独立（rollout 数据
+        # 多样性来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性
+        # 前提。recon 流除外（shared_seed = 未派生原 seed）：s 抽样的调用
+        # 结构是 FSDP 集合序列的一部分，必须跨 rank 一致——判别器冷启动
+        # 初始化同理不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
         # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；named() 的
         # dict 视图是装配期按名取流的消费面。
-        streams = TrainingRngStreams(dist.derive_seed(config.schedule.seed))
+        streams = TrainingRngStreams(
+            dist.derive_seed(config.schedule.seed),
+            shared_seed=config.schedule.seed,
+        )
         generators = streams.named()
         # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
         # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
