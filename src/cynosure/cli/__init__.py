@@ -733,9 +733,19 @@ class CynosureCli:
             f"  - 条件白名单: {whitelist}（门槛 {report.gate_auc}，{outcome}）",
             file=self._stdout,
         )
+        # 判据口径随报告明示（ADR-0012 决策 5 的审计面）：预训练的
+        # recon-AUC 与在线 iter 事件的 rollout-AUC 不同构、不可横向比较
+        # ——准入体检 vs 在岗考核，跨阶段比读数会被误导
+        print(
+            f"  - 判据口径: {report.gate_criterion}（held-out real 原始 vs "
+            "冻结基座同源重构体；与在线 rollout-AUC 不可横向比较）",
+            file=self._stdout,
+        )
         for modality, auc in report.condition_auc.items():
+            volumes = report.condition_volumes.get(modality)
+            scope = "" if volumes is None else f"，{volumes} 卷"
             print(
-                f"  - held-out AUC[{modality}]: {auc:.4f}",
+                f"  - recon-AUC[{modality}]: {auc:.4f}{scope}",
                 file=self._stdout,
             )
         print(

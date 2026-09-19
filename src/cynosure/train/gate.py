@@ -67,7 +67,7 @@ class ReadinessGate:
         if len(self._whitelist) > 0:
             return
         readings = "、".join(
-            f"held-out AUC[{modality}]: {value:.4f}"
+            f"recon-AUC[{modality}]: {value:.4f}"
             for modality, value in self._whitelist.measured.items()
         )
         raise ValueError(

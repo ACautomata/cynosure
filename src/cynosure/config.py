@@ -620,12 +620,18 @@ class RewardConfig(BaseModel):
     )
     replay_buffer_capacity: int = SpecField(
         "tunable", "reward-model",
-        "Replay buffer 容量（固定 base 分区 + FIFO 近期分区；base 分区由初始 policy "
-        "rollout 填满；章节未定值，待 rollout 吞吐 profile 后定，执行期）",
+        "Replay buffer 容量的**退役字段**（ADR-0012 决策 6）：预训练路径"
+        "已无消费者（base 分区量产随 fake 换域退役，预训练事件流的 "
+        "buffer_* 占用读数恒 0）；train 侧消费者尚存（ReplayBuffer 构造与"
+        "启动期 base 分区种子配额，其退役归 #172 范畴），物理删除随两区"
+        "缓冲组件归退役票 #173。",
     )
     replay_current_fraction: float = SpecField(
         "定死", "reward-model",
-        "更新判别器时当前 fake 占比 = 0.5（50% 当前 / 50% 回放，防灾难性遗忘）",
+        "更新判别器时当前 fake 占比 = 0.5（50% 当前 / 50% 回放）的**退役"
+        "字段**（ADR-0012 决策 6）：配对批换域后仅存的消费者是尚未物理"
+        "删除的缓冲组件回放半区配比（reward.buffer）——随 ReplayBuffer "
+        "的物理删除归退役票 #173。",
         default=0.5,
     )
     real_pool_manifest: Path = SpecField(
@@ -708,8 +714,11 @@ class RewardConfig(BaseModel):
     )
     pretrain_fake_batch: int = SpecField(
         "tunable", "ADR-0007",
-        "预训练每步量产的 fake 批量（base policy 冻结 rollout 的产出量；"
-        "须覆盖判别器更新批的当前半区，装配期守卫）",
+        "预训练每步 fake 批量的**退役字段**（ADR-0012 决策 6）：预训练相"
+        "不再量产 rollout——测量批 = 该条件全量 held-out 卷的冻结基座"
+        "同源重构（``ReconstructionAssembler.measure_condition``），"
+        "批量由 held-out 池决定、更新批由 ``disc_batch_size_k`` 决定，"
+        "本 knob 已无消费者（字段与装载校验的物理删除归退役票 #173）。",
         default=16, ge=1,
     )
     pretrain_report_json: Path = SpecField(

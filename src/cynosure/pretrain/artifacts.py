@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
-from pydantic import BaseModel, ConfigDict, PrivateAttr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 
 from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
@@ -84,9 +84,12 @@ class PretrainReport(BaseModel):
     """判别器预训练报告（run 目录 ``pretrain_report.json`` 契约）。
 
     per-condition 口径（ADR-0008 决策 5）：``condition_auc`` = 每条件
-    最终 held-out AUC，``gate_whitelist`` = 条件白名单——池化口径的
-    ``final_heldout_auc`` 单标量已成历史格式，``load()`` 对其显式拒绝
-    （BraTS 线旧报告同此路径），报告值与工件可复现对照。
+    最终 recon-AUC（ADR-0012 决策 5 的判据换域——held-out real 原始 vs
+    冻结基座同源重构体），``gate_whitelist`` = 条件白名单，
+    ``condition_volumes`` = 支撑度判定的卷数轴，``gate_criterion`` =
+    判据口径标识；池化口径的 ``final_heldout_auc`` 单标量已成历史格式，
+    ``load()`` 对其显式拒绝（BraTS 线旧报告同此路径），报告值与工件
+    可复现对照。
     """
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -107,18 +110,39 @@ class PretrainReport(BaseModel):
     ``condition_vocabulary_sha256`` 承载（形状逐条件派生自词表工件，
     报告不落派生副本：唯一来源是工件本身）。"""
     condition_auc: dict[str, float]
-    """每条件最终 held-out AUC（该条件 held-out 全量卷的池化点估计；
+    """每条件最终 **recon-AUC**（ADR-0012 决策 5 的 gate 判据：该条件
+    held-out 全量卷**原始** vs 其冻结基座**同源重构体**的池化点估计；
     条件名域 = 本域词汇表条件集——BraTS 四序列 / MR-RATE 生成条件名）：
     白名单内条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
     确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
     它是确认时刻的测量记录，上岗判定直接信任报告值，数据口径漂移由
     装载期指纹对照把守，ADR-0008 决策 5）；未过线条件 = 步数耗尽后对
     落盘 checkpoint 权重的补测值（同快照可对照，白名单空时拒绝报错的
-    实测值来源）。"""
+    实测值来源）。
+
+    **与在线 iter 事件的 held-out AUC（rollout-AUC）不可横向比较**：
+    预训练判据测的是判别器在其训练任务上的 out-of-sample 泛化力，
+    在线口径测的是对打分对象（rollout 终点）的分辨力——准入体检 vs
+    在岗考核，判据形态不同（ADR-0012 决策 5）。"""
     gate_whitelist: list[str]
     """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
     轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
     （拒跑由 train gate 把守，诊断产物不丢）。"""
+    gate_criterion: Literal["recon_auc", "rollout_auc"] = "rollout_auc"
+    """本报告的判据口径标识（ADR-0012 决策 5 的审计面）：``"recon_auc"``
+    = held-out real 原始 vs 同源重构体（当前口径，产报路径恒显式写入）；
+    ``"rollout_auc"`` = 旧 ADR-0008 口径（held-out real vs 量产 rollout
+    fake）。字段随事件契约「可扩不可改名」新增——缺字段的历史
+    per-condition 报告按本默认装载，而字段诞生前的实测口径恰是
+    rollout，默认值即历史真值：消费方据此判定跨阶段读数可比性
+    （recon-AUC 与 rollout-AUC 不可横向比较），装载守卫的时点把控在
+    provenance 指纹与格式断代层。"""
+    condition_volumes: dict[str, int] = Field(default_factory=dict)
+    """每条件的 held-out 卷数（支撑度规则 ``SupportRule`` 的判定输入，
+    ADR-0008 决策 6）：< ``reward.gate_support_min_volumes`` 的条件走
+    bootstrap CI 下界口径、≥ 界走点估计——报告给出判定所依据的卷数，
+    白名单可审计（「这个条件为什么走 CI 口径」在报告内自证）。空 dict =
+    旧报告（装载期按缺省放行，新预训练恒产出）。"""
     steps_completed: int
     """完成的判别器更新步数（全部条件确认过线的终止路径 = 确认前的
     更新步数；步数上限路径 = 上限值减去其中的确认步——确认步不更新）。"""

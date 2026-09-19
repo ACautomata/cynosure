@@ -21,7 +21,7 @@ from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
-from cynosure.policy.schedules import ConditionSchedules, SingleConditionSchedules
+from cynosure.policy.schedules import SingleConditionSchedules
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
@@ -34,6 +34,26 @@ NUM_STEPS = 4
 """小锚日程步数（M 候选 = {1, 2}，s=1 奇异端与 σ=0 端都被排除）。"""
 TRAIN_STEPS = (1, 2)
 CONDITION = "t1n"
+MEASUREMENT_OFFSET = 10
+"""测量流 seed 偏移的字面量钉子（刻意不 import 生产常量：本测钉的是
+偏移**值**——生产常量被误改时此处显式红，而非随改随过）。"""
+
+
+def _expected_measurement_fakes(assembler, reals: torch.Tensor) -> torch.Tensor:
+    """测量批的零速度 ODE 手工复算：重构 = 插值加噪（ODE 零贡献），
+    同 seed 同 σ 定序（测量流批次起手复位 → 独立生成器取同一 noise）。"""
+    candidates = assembler.candidate_sigmas(CONDITION)
+    generator = torch.Generator().manual_seed(
+        assembler._generator.initial_seed() + MEASUREMENT_OFFSET,
+    )
+    noise = torch.randn(reals.shape, generator=generator)
+    expected = torch.empty_like(reals)
+    for index in range(reals.shape[0]):
+        # σ 经 float32 张量参与运算（生产路径的 levels 张量口径——
+        # Python float 字面量走双精度标量广播，差 1 ulp）
+        sigma = torch.tensor(candidates[index % len(candidates)])
+        expected[index] = reals[index] * (1.0 - sigma) + noise[index] * sigma
+    return expected
 
 
 class ZeroVelocityUnet:
@@ -362,7 +382,7 @@ class TestSigmaScheduleMirroring:
         """M 含超出日程的步位：候选导出显式拒绝（可读报错），不静默
         截尾。"""
         assembler = scenario.assembler(train_steps=(1, 2, NUM_STEPS + 3))
-        with pytest.raises(ValueError, match="日程"):
+        with pytest.raises(ValueError, match="越界"):
             assembler.candidate_sigmas(CONDITION)
 
 
@@ -637,3 +657,202 @@ class TestCrossModalConditionStream:
         assert pair.modality == "t1c"
         assert torch.equal(streams.rollout.get_state(), rollout_before)
         assert not torch.equal(streams.recon.get_state(), recon_before)
+
+
+class TestMeasurementConditionReconstruction:
+    """gate 测量批（#171）：ADR-0012 决策 5 的 recon-AUC 构造面——测量批
+    的 fake 由**调用方给出的 real** 同源重构而来（非量产 rollout）、σ 按
+    候选步点定序轮转、ε 走批次起手复位的测量流。
+
+    测量是上岗判据的原料（报告值与白名单都由它出），所以本类的断言面
+    是「可复算」而非「可重放」：同输入 → 逐位同输出，与调用序无关。
+    """
+
+    def _assembler(self, scenario: AssemblyScenario, **kwargs):
+        return scenario.assembler(**kwargs)
+
+    def test_measurement_reconstruction_is_paired_with_given_reals(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """配对语义：返回批的 real 与入参**同一对象**、fake 逐样本由它
+        重构——零速度 ODE 下 fake = x_s = (1−s)·x + s·ε 可手工复算。"""
+        assembler = self._assembler(scenario)
+        reals = torch.randn(6, *SHAPE)
+        pair = assembler.measure_condition(reals, CONDITION)
+        assert pair.reals is reals  # 同源配对的结构保证
+        assert pair.modality == CONDITION
+        assert pair.fakes.shape == reals.shape
+        assert not torch.equal(pair.fakes, reals)  # s > 0 → 加噪本体在场
+        # 手工复算（同 seed 同 σ 序），共享 helper 见模块头
+        assert torch.equal(
+            pair.fakes, _expected_measurement_fakes(assembler, reals),
+        )
+
+    def test_sigma_assignment_rotates_over_candidate_steps(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """σ 定序轮转：第 i 枚卷取候选步点的第 i % |M| 位——与调度无关的
+        确定性排布（``assemble`` 的逐样本抽签在此被替换为固定序）。"""
+        assembler = self._assembler(scenario, train_steps=(1, 2, 3), num_steps=5)
+        candidates = assembler.candidate_sigmas(CONDITION)
+        assert len(candidates) == 3
+        reals = torch.randn(7, *SHAPE)
+        pair = assembler.measure_condition(reals, CONDITION)
+        # 逐卷手工复算：第 i 枚卷的 σ 必须是候选轮转序的第 i % |M| 位
+        # ——σ 排布错位（如全部取首位、或按 |M| 之外的步长轮转）会让
+        # 对应行的逐位等式破掉
+        expected = _expected_measurement_fakes(assembler, reals)
+        for index in range(reals.shape[0]):
+            assert torch.equal(expected[index], pair.fakes[index]), index
+
+    def test_repeated_measurement_is_bitwise_identical(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """测量的可复算性：同输入逐次测量逐位同输出——不受「本 run 此前
+        测量过几次」影响（测量流批次起手复位）。这是报告值可复算与
+        gate 判定可比的结构前提。"""
+        assembler = self._assembler(scenario)
+        reals = torch.randn(5, *SHAPE)
+        first = assembler.measure_condition(reals, CONDITION)
+        for _ in range(3):
+            again = assembler.measure_condition(reals, CONDITION)
+            assert torch.equal(again.fakes, first.fakes)
+
+    def test_measurement_consumes_no_named_stream(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """测量不消耗 recon 流（续训分片的流位置不被测量次数搅动）、也不
+        漂移 real_pool 流之外的数据侧流；随后的更新批与「一次测量都没
+        发生」时逐位一致（流隔离契约在两条入口并存下仍成立）。"""
+        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+
+        def build(streams: TrainingRngStreams) -> ReconstructionAssembler:
+            return ReconstructionAssembler(
+                real_sampler=RealPoolSampler(pool, streams.real_pool),
+                sampler=RolloutSampler(
+                    CfgCombinedField(ZeroVelocityUnet()),
+                    SdeKernel(eta=0.7, s_max=0.999),
+                    scenario.schedules(),
+                ),
+                schedules=scenario.schedules(),
+                conditions=StubConditions(),
+                train_step_indices=TRAIN_STEPS,
+                batch_size_k=scenario.K,
+                latent_scale_factor=1.0,
+                generator=streams.recon,
+                amp=AmpContext(
+                    device=torch.device("cpu"), dtype=torch.bfloat16,
+                ),
+            )
+
+        streams = TrainingRngStreams(seed=0)
+        assembler = build(streams)
+        reals = torch.randn(4, *SHAPE)
+        measured = assembler.measure_condition(reals, CONDITION)
+        # 测量不动 recon 流的位置 → 对照装配（连测三次后的同一流位置）
+        # 产出的测量批逐位一致（测量次数不进 recon 序列）
+        twin = build(TrainingRngStreams(seed=0))
+        for _ in range(3):
+            twin.measure_condition(reals, CONDITION)
+        assert torch.equal(
+            measured.fakes, twin.measure_condition(reals, CONDITION).fakes,
+        )
+        # 命名流全员不被测量消耗（数据侧六条与 recon 都不动）
+        streams2 = TrainingRngStreams(seed=0)
+        probe = build(streams2)
+        before = {
+            name: generator.get_state().clone()
+            for name, generator in streams2.named().items()
+        }
+        probe.measure_condition(reals, CONDITION)
+        for name, state in before.items():
+            assert torch.equal(streams2.named()[name].get_state(), state), name
+        # 更新批照旧只消耗 recon / real_pool（两条入口并存不互相搅动）
+        probe.assemble(CONDITION)
+        assert not torch.equal(streams2.recon.get_state(), before["recon"])
+        assert not torch.equal(streams2.real_pool.get_state(), before["real_pool"])
+
+    def test_empty_real_batch_rejected(self, scenario: AssemblyScenario) -> None:
+        """空 real 卷显式拒绝（测量批的源不得为空——AUC 配对统计需要
+        非空两侧）。"""
+        assembler = self._assembler(scenario)
+        with pytest.raises(ValueError, match="非空"):
+            assembler.measure_condition(torch.zeros(0, *SHAPE), CONDITION)
+
+    def test_forward_count_mirrors_round_robin_schedule(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """成本读数 = 轮转排布下逐卷续跑步数之和（#171 AC5：无 30 步全
+        ODE 量产的可核对面）；σ=0 档位零步短路。"""
+        assembler = self._assembler(scenario, train_steps=(1, 3), num_steps=5)
+        cursor = scenario.schedules(5).cursor(CONDITION)
+        # 测量批的规模 = 入参卷数（装配原语不假定调用方的 real 来源：
+        # 判别器 real 池与 held-out 池是两个采样器）
+        volumes = 4
+        reals = torch.randn(volumes, *SHAPE)
+        # 轮转序 (1, 3, 1, 3, …)：逐卷余量 = num_steps − 1 − 起点下标
+        # （步数由 MONAI 实际日程定，不按 num_inference_steps 手算）
+        steps = assembler._step_indices
+        assert steps == (1, 3)
+        expected = sum(
+            cursor.num_steps - 1 - (steps[index % len(steps)] - 1)
+            for index in range(volumes)
+        )
+        forwards = assembler.measurement_forward_count(reals, CONDITION)
+        assert forwards == expected
+        # 每卷步数严格小于「量产全 ODE」（num_steps 步）——量产退役的
+        # 数值口径（重构从日程中段起步）
+        assert forwards < volumes * cursor.num_steps
+
+    def test_schedule_terminal_step_is_rejected_as_candidate(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """日程末位不是合法候选（σ 恒 > 0 的中段日程点——末位的零步档位
+        在装配期即拒，成本读数因此只处理正步数）。"""
+        # (1, 3)：3 = num_steps − 2，合法中段上界
+        assembler = self._assembler(scenario, train_steps=(1, 3), num_steps=5)
+        cursor = scenario.schedules(5).cursor(CONDITION)
+        assert assembler.candidate_sigmas(CONDITION)[-1] > 0.0
+        assert assembler.candidate_sigmas(CONDITION)[-1] == cursor.sigma_level(3)
+        # 末位（4 = num_steps − 1）与越界位都被拒：末位之后无续跑空间，
+        # 重构退化为透传（fake ≡ real）污染测量。守卫在候选导出面触发
+        # （构造期不查日程——装配与判定同一缝，见 _assert_indices_…）
+        for illegal in ((1, 4), (1, 5)):
+            with pytest.raises(ValueError, match="越界"):
+                self._assembler(
+                    scenario, train_steps=illegal, num_steps=5,
+                ).candidate_sigmas(CONDITION)
+
+    def test_cross_modal_measurement_is_deterministic(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """组2（跨模态）测量同款可复算：条件构造（源对 + 源条目抽取）走
+        复位测量流，且不漂移 rollout 流——机制缝对组2 开放、语义留待
+        专项票（ADR-0012 非目标）。"""
+        streams = TrainingRngStreams(seed=0)
+        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+        assembler = ReconstructionAssembler(
+            real_sampler=RealPoolSampler(pool, streams.real_pool),
+            sampler=RolloutSampler(
+                CfgCombinedField(ZeroVelocityUnet()),
+                SdeKernel(eta=0.7, s_max=0.999),
+                scenario.schedules(),
+            ),
+            schedules=scenario.schedules(),
+            conditions=TestCrossModalConditionStream._cross_modal_conditions(
+                scenario, streams.rollout,
+            ),
+            train_step_indices=TRAIN_STEPS,
+            batch_size_k=scenario.K,
+            latent_scale_factor=1.0,
+            generator=streams.recon,
+            amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
+        )
+        reals = torch.randn(3, *SHAPE)
+        rollout_before = streams.rollout.get_state().clone()
+        recon_before = streams.recon.get_state().clone()
+        first = assembler.measure_condition(reals, "t1c")
+        second = assembler.measure_condition(reals, "t1c")
+        assert torch.equal(first.fakes, second.fakes)
+        assert torch.equal(streams.rollout.get_state(), rollout_before)
+        assert torch.equal(streams.recon.get_state(), recon_before)

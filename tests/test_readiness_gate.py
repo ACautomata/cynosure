@@ -34,7 +34,6 @@ from cynosure.pretrain import (
 )
 from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward.artifacts import ChannelStats
-from cynosure.reward.buffer import base_condition_quota
 from cynosure.train import (
     AmpContext,
     GranularGrpoTrainer,
@@ -286,7 +285,7 @@ class TestGateVerdict:
         assert "RM readiness gate" in result.stderr
         assert "条件白名单为空" in result.stderr
         for modality, value in report.condition_auc.items():
-            assert f"held-out AUC[{modality}]: {value:.4f}" in result.stderr
+            assert f"recon-AUC[{modality}]: {value:.4f}" in result.stderr
         assert not scenario.run_dir.exists()  # 未产出工件 → 已回滚
 
     def test_conditions_below_gate_do_not_block_run(
@@ -311,16 +310,22 @@ class TestReportReproduction:
     def test_reported_auc_reproduces_replayed_measurement(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
-        """重演预训练的测量（同 seed 同 RNG 流 → 同 fake 批）：报告
-        checkpoint 装载的 scorer 与预训练时权重逐位一致（同 scorer
-        快照），其对同一批 fake 的测量与报告 ``condition_auc``
+        """重演预训练的测量（同 seed 同装配 → 同测量批 → 同读数）：
+        报告 checkpoint 装载的 scorer 与预训练时权重逐位一致（同 scorer
+        快照），其对同一批**测量批**的测量与报告 ``condition_auc``
         逐位一致。
 
-        gate=0.01 恒 0 步达标：报告值 = 轮转条件集首条件的达标测量与
-        复测（两批独立测量取小——producer 侧成功判据对单批测量噪声
-        鲁棒）中较小者；消耗序确定（ADR-0008-01：base 分区按每条件
-        配额量产 → ADR-0008-04：轮转条件集首条件 → 单条件量产测量批
-        → 复测批）。"""
+        gate=0.01 恒 0 步达标：报告值 = 轮转条件集首条件的首测与复测
+        （两次测量取小——producer 侧成功判据对单批测量噪声鲁棒）中较小
+        者。测量批口径（ADR-0012 决策 5 / #171）：该条件**全量 held-out
+        卷**经装配原语定序轮转重构（``measure_condition``——σ 定序、
+        ε 走批次起手复位的测量流）。同条件的首测与复测的独立面是
+        **held-out 抽取序**（heldout_auc 流推进 → 新排列，每卷换配
+        (σ, ε) 槽位）；ε 经复位逐位复用，单卷条件复测与首测同读数
+        （≥2 卷才是「首测 + 换批复测」的独立样本）——本测试
+        的「逐位一致」来自**跨 run 重演**：重演驱动同 seed 同 config
+        从同一 RNG 起点按同一调用序走（首测、复测两跳都重演），故重演
+        读数与报告值逐位吻合，而非同 run 内两批相同。"""
         scenario = GateScenario(cli, tmp_path)
         scenario.write_inputs()
         result = scenario.pretrain(pretrain_gate_auc=0.01)
@@ -328,8 +333,8 @@ class TestReportReproduction:
         report = scenario.report()
         assert report.steps_completed == 0
         config = ConfigLoader.load(scenario.config_path)
-        # 与 scenario.pretrain 同套轻量五元组（重演消耗序的前提：fake 批 /
-        # 缓冲容量/LR 一致；单点定义避免两处漂移）
+        # 与 scenario.pretrain 同套轻量覆写（重演的前提：测量批构造所依赖
+        # 的配置逐字一致；单点定义避免两处漂移）
         pretrain_config = PretrainLightweightReward.apply(config)
         run = PretrainRun.init(
             pretrain_config, tmp_path / "replay_run",
@@ -346,27 +351,26 @@ class TestReportReproduction:
         restored = NetworkAssembler.loadable_state_dict(scorer.discriminator)
         live = NetworkAssembler.loadable_state_dict(driver.rewards.discriminator)
         assert all(torch.equal(restored[key], live[key]) for key in restored)
-        # 消耗序重演（per-condition 口径，ADR-0008-04）：先 base 分区
-        # （每条件配额量产）、再轮转条件集首条件（确定性轮转不耗 RNG）
-        # 的单条件量产测量批、再复测批（同条件）→ 同流同批；报告值 =
-        # 该条件两次独立测量的较小者（全量卷池化点估计口径）
-        quota = base_condition_quota(pretrain_config.reward.replay_buffer_capacity, MODALITIES)
-        driver.rollout.base_partition_samples(quota)
-        batch = pretrain_config.reward.pretrain_fake_batch
+        # 测量重演（per-condition 口径，ADR-0008-04 × ADR-0012）：轮转
+        # 条件集首条件（确定性轮转不耗 RNG）的全量 held-out 卷测量批 →
+        # 两次同口径测量（driver._measurement 的等价调用序）→ 报告值 =
+        # 两次较小者（全量卷池化点估计口径）
         target = driver.policy.conditions.targets()[0]
-        # base 分区逐条目产出（#129）——单条件同形，stack 成批
-        # （同 driver._measurement_batch 范式）
-        latents, _ = driver.rollout.base_partition_samples({target: batch})
-        first = driver.rewards.auc.compute_volume_clusters(
-            torch.stack(latents), target,
-        ).pooled_auc()
-        latents, _ = driver.rollout.base_partition_samples({target: batch})
-        second = driver.rewards.auc.compute_volume_clusters(
-            torch.stack(latents), target,
-        ).pooled_auc()
+        first = self._measurement_auc(driver, target)
+        second = self._measurement_auc(driver, target)
         assert report.condition_auc[target] == pytest.approx(
             min(first, second), rel=0.0, abs=0.0,
         )
+
+    @staticmethod
+    def _measurement_auc(driver: PretrainDriver, target: str) -> float:
+        """driver 测量路径的等价调用（同 assembly 入口、同判别器快照）：
+        held-out 全量卷 → 定序轮转重构 → 卷级聚类池化点估计。"""
+        reals = driver.rewards.auc.condition_latents(target)
+        batch = driver.rewards.assembler.measure_condition(reals, target)
+        return driver.rewards.auc.compute_volume_clusters(
+            batch.reals, batch.fakes,
+        ).pooled_auc()
 
 
 class TestGateVerdictUnit:
@@ -386,8 +390,8 @@ class TestGateVerdictUnit:
         message = str(exc_info.value)
         assert "RM readiness gate" in message
         assert "条件白名单为空" in message
-        assert "held-out AUC[t1n]: 0.4321" in message
-        assert "held-out AUC[t2w]: 0.5123" in message
+        assert "recon-AUC[t1n]: 0.4321" in message
+        assert "recon-AUC[t2w]: 0.5123" in message
         assert "report.json" in message
 
     def test_nonempty_whitelist_passes_ignoring_readings(self) -> None:
@@ -581,6 +585,7 @@ def _report(
     """单测轻量报告（schema 合法即可，不触盘上工件）。"""
     return PretrainReport(
         group="modal-label",
+        gate_criterion="recon_auc",
         latent_shape=(4, 16, 16, 8),
         condition_auc=condition_auc,
         gate_whitelist=whitelist,
