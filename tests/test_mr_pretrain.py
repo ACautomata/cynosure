@@ -156,35 +156,34 @@ class TestMrPretrainEndToEnd:
         scorer = report.load_discriminator(config)
         assert scorer is not None
 
-    def test_dense_steps_rotate_conditions_and_consume_noise(
+    def test_dense_steps_rotate_conditions_and_replay_bitwise(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """AC：密集步进路径——per-condition 轮转落事件流（modality 字段
-        轮转、字段齐备），ADR-0009-α 噪声注入 knobs（σ_max > 0）在 MR
-        线 pretrain 路径真实消费（σ_max = 0 的同 seed 对照 run 与之权重
-        分叉 = 带噪更新前向生效；disc_noise 专属流 σ_max = 0 时零消耗，
-        对照 run 即无注入回归锚）。"""
+        轮转、字段齐备）；更新批 = 装配原语的配对批（重构构造走专属
+        recon 流、先抽 s 后抽 ε，ADR-0012）在 MR 线 pretrain 路径确定性
+        重放：同 seed 同 config 双 run 判别器 checkpoint 逐位一致
+        （σ_max 对照锚随注入退役——更新前向恒干净域，σ_max 不再有
+        更新链路消费面）。"""
         common = {
             "pretrain_gate_auc": 0.99,  # 不可达：走满步数上限（真训练态）
             "pretrain_max_steps": 4,
             "disc_lr": 2e-4,
         }
         # 两 run 共享同一份网络工件（判别器初始化 = 同一 checkpoint 文件、
-        # 同 seed 同数据同词表）——σ_max 是唯一差异变量
+        # 同 seed 同数据同词表）——重放逐位一致
         shared_fixtures = tmp_path / "shared_fixtures"
         torch.manual_seed(7)  # fixture 网络「固定 seed」机制（库场景先例）
         Fixture().write_artifacts(shared_fixtures)
-        noisy = MrPretrainScenario(
-            cli, tmp_path / "noisy", fixtures_dir=shared_fixtures,
+        first = MrPretrainScenario(
+            cli, tmp_path / "first", fixtures_dir=shared_fixtures,
         )
-        noisy.run(reward_overrides={
-            **common, "disc_noise_sigma_max": 0.2,
-        })
-        clean = MrPretrainScenario(
-            cli, tmp_path / "clean", fixtures_dir=shared_fixtures,
+        first.run(reward_overrides=common)
+        second = MrPretrainScenario(
+            cli, tmp_path / "second", fixtures_dir=shared_fixtures,
         )
-        clean.run(reward_overrides={**common, "disc_noise_sigma_max": 0.0})
-        events = noisy.events()
+        second.run(reward_overrides=common)
+        events = first.events()
         # 轮转条件序（目标模态均匀轮转，确定性不耗 RNG）
         assert [event["modality"] for event in events] == [
             CONDITIONS[step % len(CONDITIONS)] for step in range(4)
@@ -195,19 +194,19 @@ class TestMrPretrainEndToEnd:
              "buffer_base_occupied", "lr", "elapsed_s"} <= set(event)
             for event in events
         )
-        # 噪声注入生效的直接证据：同 seed 下 σ_max 唯一差异 → 权重分叉
-        noisy_state = torch.load(
-            noisy.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
+        # 配对批重构链路的确定性证据：同 seed 双 run → 权重逐位一致
+        first_state = torch.load(
+            first.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
             map_location="cpu", weights_only=True,
         )
-        clean_state = torch.load(
-            clean.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
+        second_state = torch.load(
+            second.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
             map_location="cpu", weights_only=True,
         )
-        assert noisy_state.keys() == clean_state.keys()
-        assert any(
-            not torch.equal(noisy_state[key], clean_state[key])
-            for key in noisy_state
+        assert first_state.keys() == second_state.keys()
+        assert all(
+            torch.equal(first_state[key], second_state[key])
+            for key in first_state
         )
 
     def test_report_guard_rejects_vocabulary_drift(

@@ -11,7 +11,7 @@ iteration 计数、LR scheduler 状态、（若启用）EMA 权重——目标�
 按周期覆写（周期 = ``schedule.checkpoint_interval``，默认每 10
 iteration + 每里程碑强制 + 收尾兜底，与产物 checkpoint 同节奏、由
 trainer 消费 config 契约驱动）。per-rank 分片的原因：Replay buffer
-（per-rank 两区内容）、七条命名 RNG 流（rank 派生 seed 下各 rank 独立
+（per-rank 两区内容）、八条命名 RNG 流（rank 派生 seed 下各 rank 独立
 演化）与 FSDP 优化器状态（分片动量）本就是 rank 本地状态；policy 与
 判别器权重在各 rank 间经梯度 allreduce 保持逐位一致，随每个分片冗余
 保存（同时是「同步生效」的外部观测面）。
@@ -30,7 +30,7 @@ stage-1 复用消费的可装载形态）；本文件是**训练机内部状态*
   恢复后显式对账；scheduler 对象落地后此处扩展为其 ``state_dict``。
 - EMA（条件项）：``ema_anchor_enabled=true`` 属升级项，trainer 装配期
   显式拒绝（静默忽略会让清单缺 EMA 权重），槽位预留、当前恒 ``None``。
-- RNG：七条命名 ``torch.Generator`` 流（TrainingRngStreams 注册表）+
+- RNG：八条命名 ``torch.Generator`` 流（TrainingRngStreams 注册表）+
   进程全局 torch/CUDA/numpy/python——全部编码为 ``weights_only`` 可安全
   反序列化的原语（张量 / int / float / None）：numpy 的 MT19937 键数组
   转 uint32 张量，python random 状态转 int 列表。
@@ -73,7 +73,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 7
+RESUME_STATE_FORMAT_VERSION = 8
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -97,7 +97,11 @@ v7：replay buffer 两区 latents 从单一堆叠张量改为逐条目张量清�
 多条件）的 buffer 条目形状随条件、无法堆叠成单张量；恢复对账逐
 条目经词汇表按条件校验形状（批内同条件即同形状）。旧 v6 分片的
 堆叠形态在异形状下无从表达、在同形状下与 v7 语义等价但形态不同，
-被版本对账显式拒绝（续训 roundtrip 的逐位一致以单一形态为锚）。"""
+被版本对账显式拒绝（续训 roundtrip 的逐位一致以单一形态为锚）。
+v8：+ ``recon`` 流（ADR-0012 同源重构的专属随机流：先抽 s 后抽 ε
+的加噪构造，resume 后重构 fake 序列与不中断运行逐位一致）——命名
+流注册表结构一变即清单失配，旧 v7 分片缺该流状态、恢复后重构抽样
+序列无从续写，被版本对账显式拒绝。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -425,11 +429,11 @@ class ResumeStore:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 "
                 f"v{RESUME_STATE_FORMAT_VERSION}"
-                "（门控与分叉监控状态随分片落盘 + 七条命名 RNG 流含判别器"
-                "噪声注入流，ADR-0008/0009），得到 "
-                f"{version!r}——跨口径续训不可恢复（旧分片的门控、噪声流"
-                "与分叉监控状态无落盘面，恢复后门控决定、噪声序列与"
-                "分叉读数无法逐位续写）；请从产物 checkpoint 重启新 run"
+                "（门控与分叉监控状态随分片落盘 + 八条命名 RNG 流——含"
+                "ADR-0012 同源重构的 recon 流：先抽 s 后抽 ε 的加噪构造），"
+                f"得到 {version!r}——跨口径续训不可恢复（旧分片缺相应的"
+                "流状态，恢复后门控决定、重构抽样序列与分叉读数无法逐位"
+                "续写）；请从产物 checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
         if missing:

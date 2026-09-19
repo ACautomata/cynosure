@@ -3,16 +3,18 @@ ADR-0008 决策 3：per-condition 步进与终止）。
 
 密集步进循环：每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态
 均匀轮转，确定性不耗 RNG）→ 以 base policy 冻结 rollout 量产**该条件**
-fake 批（复用回放缓冲 base 分区采样入口——批量分块、独立随机流、输出
-归一到 pool 存储域）→ 以更新前快照测该条件 held-out AUC（held-out 侧
-按同条件过滤、全量卷池化点估计；更新后测同一 fake 批会把 in-sample
-拟合计入 AUC）→ 支撑度规则判定过线（``SupportRule.passes``：该条件
-held-out 卷数 < 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008 决策
-6 / #85）→ 首测过线换新批复测确认：两次独立测量都过线该条件入白名单
-（单批贴线越过被非确定性拒绝），报告值取两次较小者，确认步不更新
-（无更新即无事件）→ 未确认则以在线期同款 ``OnlineUpdate.step`` 原语
-更新一步（预训练期无「当前 policy」，混采语义退化为 base fake 库内
-采样；real 侧同条件匹配）。每个更新步同时消费与在线**同一**过拟合
+测量批（gate 测量/复测/补测共用；复用回放缓冲 base 分区采样入口——
+批量分块、独立随机流、输出归一到 pool 存储域）→ 以更新前快照测该条件
+held-out AUC（held-out 侧按同条件过滤、全量卷池化点估计；更新后测同一
+测量批会把 in-sample 拟合计入 AUC）→ 支撑度规则判定过线
+（``SupportRule.passes``：该条件 held-out 卷数 < 界用 bootstrap CI 下界、
+≥ 界用点估计——ADR-0008 决策 6 / #85）→ 首测过线换新批复测确认：两次
+独立测量都过线该条件入白名单（单批贴线越过被非确定性拒绝），报告值取
+两次较小者，确认步不更新（无更新即无事件）→ 未确认则以**同一装配原语**
+产出的配对批（real + 冻结基座同源重构 fake，ADR-0012）走在线期同款
+``OnlineUpdate.step`` 更新一步（两阶段构造同构、warm-start 权重不面临
+分布跳变；gate 测量批维持 rollout 口径，判据换 recon-AUC 属落地票范围
+——ADR-0012 决策 5）。每个更新步同时消费与在线**同一**过拟合
 分叉监控组件、同一 config knobs（ADR-0009-γ：共享装配缝挂进
 ``RewardCoordinator`` 的 ``OverfitMonitor``——train 侧干净域复算准确率
 与本步更新前 held-out AUC 合成分叉观测，per-condition EMA 自下而上
@@ -29,13 +31,12 @@ gate 把守，不丢诊断产物）。
 单进程执行（World-1 退化路径）：``DistributedContext.bootstrap()`` 在
 无 torchrun 环境下不初始化进程组、集合通信恒等，产物全局唯一——多 rank
 各自预训练会分叉判别器（CLI 层另有 RANK env 显式拒绝守卫）。判别器侧
-装配经 ``TrainingRuntime.assemble_rewards``、采样封装经
-``TrainingRuntime.assemble_sampler``、policy 侧经 ``GroupPolicy.build``
-（组1/组2 的采样场与条件分布按 config 分派）——与在线期同一份装配与
-同一条执行路径，仅 config 不同。
+装配经 ``TrainingRuntime.assemble_rewards``（配对批装配原语同缝组装）、
+采样封装经 ``TrainingRuntime.assemble_sampler``、policy 侧经
+``GroupPolicy.build``（组1/组2 的采样场与条件分布按 config 分派）——
+与在线期同一份装配与同一条执行路径，仅 config 不同。
 """
 
-import math
 import time
 
 import torch
@@ -75,21 +76,12 @@ class PretrainDriver:
         # 装配守卫（train 装配同口径，ADR-0008 决策 4：assert_replay_supply
         # 管回放半区非零 + base 分区每条件配额 ≥ 回放半区需求；real 侧的
         # 逐 (全池, 模态) 容量 ≥ K 守卫在共享装配缝 assemble_rewards 内，
-        # ADR-0008-03）+ 预训练特有守卫：每步量产的 fake 须覆盖判别器
-        # 更新批的当前半区——无效组合在装配期显式拒绝，而非让昂贵 rollout
-        # 先行、更新时才缺样本
+        # ADR-0008-03）。gate 测量批的量产口径（pretrain_fake_batch）与
+        # 更新批（配对批 = K，装配原语）已解耦——混采半区覆盖守卫随更新
+        # 批换配对批退役
         assert_replay_supply(
             reward, TrainingRuntime.assemble_vocabulary(config).names(),
         )
-        current_count = math.ceil(
-            reward.disc_batch_size_k * reward.replay_current_fraction,
-        )
-        if reward.pretrain_fake_batch < current_count:
-            raise ValueError(
-                f"预训练 fake 批量 {reward.pretrain_fake_batch} 不足判别器"
-                f"更新批的当前半区 {current_count} 条"
-                f"（disc_batch_size_k={reward.disc_batch_size_k}）"
-            )
         # 单进程执行：无 torchrun 环境下 bootstrap 为 world-1 恒等
         # （不初始化进程组），集合通信原语退化——与 train 同一条装配序
         dist = DistributedContext.bootstrap()
@@ -103,14 +95,18 @@ class PretrainDriver:
         self._policy = GroupPolicy.build(
             config, generators["rollout"], amp.device,
         )
+        # 采样封装先行装配（判别器侧配对批装配原语与其共享同一实例——
+        # 确定性 ODE 续跑 kernel、日程表与分块调度单点）
+        sampler = TrainingRuntime.assemble_sampler(
+            config, self._policy.field, device=amp.device,
+        )
         self._rewards = TrainingRuntime.assemble_rewards(
             config, amp, generators, dist,
+            sampler=sampler, conditions=self._policy.conditions,
         )
         self._rollout = RolloutPhase(
             config,
-            TrainingRuntime.assemble_sampler(
-                config, self._policy.field, device=amp.device,
-            ),
+            sampler,
             self._rewards.update.scorer,
             generators["rollout"],
             condition_sampler=self._policy.conditions,
@@ -208,7 +204,15 @@ class PretrainDriver:
                         gate_passed = True  # 全部条件过线：终止
                         break
                     continue  # 本条件已确认：本步不更新（无更新即无事件）
-            update = self._rewards.update_step(fakes, modality)
+            update = self._rewards.update_step(
+                # 更新批 = 装配原语的配对批（ADR-0012）：fake = 冻结基座
+                # 对同批 real 的同源重构（专属 recon 流、先抽 s 后抽 ε、
+                # η=0 确定性 ODE 续跑）——与在线更新同一原语供批、判别器
+                # 任务两阶段同构（warm-start 权重不面临分布跳变）。gate
+                # 测量批（``_measurement_batch``）维持 rollout 量产口径，
+                # 判据换 recon-AUC 属落地票范围（ADR-0012 决策 5）。
+                self._rewards.assembler.assemble(modality),
+            )
             # 过拟合分叉观测（ADR-0009-γ）：与在线同一监控组件、同一
             # knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor，
             # 阈值/跨度同源于 config.reward.overfit_*）——train 侧干净域
@@ -260,10 +264,11 @@ class PretrainDriver:
         )
 
     def _measurement_batch(self, modality: str) -> torch.Tensor:
-        """单条件量产一批 fake（gate 测量/复测/补测共用入口）：update_step
-        的回放按本步条件过滤，测量批与更新批同条件——混采量产批没有诚实
-        标签可穿（ADR-0008-03 的最小诚实形态）。同条件批量量产（逐条清单
-        语义，#129——同条件同形状，单条件内 stack 成批）。"""
+        """单条件量产一批 rollout fake（gate 测量/复测/补测共用入口）：
+        与更新批（装配原语配对批，按同一步条件装配）同条件归因——AUC
+        测量的条件轴与本步更新的条件轴一致（ADR-0008-03 条件归因口径）。
+        同条件批量量产（逐条清单语义，#129——同条件同形状，单条件内
+        stack 成批）。"""
         latents, _ = self._rollout.base_partition_samples(
             {modality: self._config.reward.pretrain_fake_batch},
         )

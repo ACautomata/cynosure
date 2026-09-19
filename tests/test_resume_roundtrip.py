@@ -229,12 +229,13 @@ class TestResumeStateChecklist:
         assert divergence["count"] == 1
         assert isinstance(divergence["value"], float)
 
-        # RNG：七条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
+        # RNG：八条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
         # 形态：有 CUDA 的环境（集群）经装配期 fork_rng 触发 CUDA RNG
         # 初始化后捕获全设备 state；无 CUDA 恒 None）
         assert set(state["generators"]) == {
             "rollout", "real_pool", "disc_update",
             "heldout_auc", "fake_shuffle", "base_partition", "disc_noise",
+            "recon",
         }
         assert all(
             saved.dtype == torch.uint8 for saved in state["generators"].values()

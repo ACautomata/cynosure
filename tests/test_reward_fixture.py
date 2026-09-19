@@ -1,16 +1,15 @@
-"""reward 模块端到端 fixture 测试（ticket #20 验收标准聚合）。
+"""reward 模块端到端 fixture 测试（ticket #20 验收标准聚合 + ADR-0012）。
 
 fixture 驱动机制（ticket）：固定 seed + 预置固定 fake + policy 不参与更新
 （等效 policy lr=0，schema 定死 policy_lr>0，故以「不进更新循环」落实）——
 真实工件由 prepare 产出（Real sample pool / Held-out real / per-channel
-统计量），判别器经 fixture 网络工件装载，fake 源为预置 latent 批；
-online update 循环与生产同一管线（OnlineUpdate / HeldOutAuc /
-ReplayBuffer），N_d=1 即每 iter 一步。
+统计量），判别器经 fixture 网络工件装载；online update 消费配对批
+（real 从 pool 无放回采样 + 预置固定 fake 侧，ADR-0012 接口），N_d=1
+即每 iter 一步。
 
-五条 AC 对应：
+验收对应（ADR-0012 后：buffer 混采语义退役，原 AC 3 随之移除）：
 1. LSGAN 损失随 Online update 下降（固定 real/fake 源）；
 2. reward = raw real-logit 的 patch mean 聚合（数值口径断言）；
-3. buffer 两区行为：base 不变、近期 FIFO 滚动、混采 50/50、回放跨两区均匀；
 4. held-out AUC 可计算并落盘（与训练 real 病例级不相交语义成立）；
 5. SpectralNorm 默认关闭（fixture 默认 config 即触发式关闭）。
 """
@@ -25,6 +24,7 @@ from cynosure.config import ConfigLoader
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
+from cynosure.reward.assembly import PairBatch
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.sampler import RealPoolSampler
@@ -111,9 +111,8 @@ class RewardFixtureScenario:
         )
         buffer = ReplayBuffer(config.reward.replay_buffer_capacity)
         # fixture 无条件语义（固定 fake 批、事件 modality 恒 t1n）：base
-        # 标签同口径全 t1n——回放条件过滤的候选池与既有两区语义等价，
-        # 训练轨迹不因标签切分漂移（混合标签的条件过滤行为由
-        # test_replay_buffer 专门覆盖）
+        # 标签同口径全 t1n。buffer 的更新链路消费已随混采退役（ADR-0012）
+        # ——保留种植面供两区占用读数
         buffer.fill_base(
             self.fake_batches(
                 count=1, batch=buffer.base_capacity, seed=100,
@@ -122,11 +121,7 @@ class RewardFixtureScenario:
         )
         update = OnlineUpdate(
             scorer=scorer,
-            buffer=buffer,
-            real_sampler=RealPoolSampler(pool, torch.Generator().manual_seed(200)),
             config=config.reward,
-            generator=torch.Generator().manual_seed(201),
-            noise_generator=torch.Generator().manual_seed(203),
         )
         auc = HeldOutAuc(
             heldout_manifest=heldout,
@@ -150,10 +145,18 @@ class RewardFixtureScenario:
         components = self.components
         assert components is not None
         fakes = self.fake_batches(NUM_STEPS, FAKE_BATCH, seed=300)
+        real_sampler = RealPoolSampler(
+            components.pool, torch.Generator().manual_seed(200),
+        )
         for iteration, fake_batch in enumerate(fakes):
-            # fixture 固定 fake 批无生产条件——整批按事件口径标 t1n
-            # （ADR-0008-01 后 step 须穿条件：回放过滤与入区标签的来源）
-            report = components.update.step(fake_batch, "t1n")
+            # fixture 固定 fake 批无生产条件——整批按事件口径标 t1n；
+            # real 侧照旧 pool 无放回采样（配对批接口，ADR-0012）
+            pair = PairBatch(
+                reals=real_sampler.sample(FAKE_BATCH, modality="t1n"),
+                fakes=fake_batch,
+                modality="t1n",
+            )
+            report = components.update.step(pair)
             rewards = components.scorer.reward(fake_batch)
             auc = components.auc.compute(fake_batch)
             components.run_artifacts.append_event(IterEvent(
@@ -164,12 +167,9 @@ class RewardFixtureScenario:
                 intra_group_reward_std=rewards.std().item(),
                 heldout_auc=auc,
                 loss={"discriminator": report.loss_discriminator},
-                buffer_current_fraction=(
-                    report.num_current / config.reward.disc_batch_size_k
-                ),
-                buffer_replay_fraction=(
-                    report.num_replay / config.reward.disc_batch_size_k
-                ),
+                # 回放混采退役读数（ADR-0012）：字段保留、混采量恒 0
+                buffer_current_fraction=0.0,
+                buffer_replay_fraction=0.0,
                 buffer_base_occupied=components.buffer.zone_sizes().base,
                 buffer_recent_occupied=components.buffer.zone_sizes().recent,
                 lr=config.policy.policy_lr,
@@ -208,42 +208,6 @@ class TestFixtureAcceptance:
         reward = scenario.components.scorer.reward(fake)
         patch_mean = scenario.components.scorer.patch_logits(fake).mean(dim=(1, 2, 3, 4))
         assert torch.equal(reward, patch_mean)
-
-    def test_buffer_two_zone_behavior(
-        self, scenario: RewardFixtureScenario,
-    ) -> None:
-        """AC 3：base 分区内容不变、近期分区 FIFO 滚动、混采 50/50、
-        回放半区跨两区均匀（条目观测面为带标签 ReplayEntry）。"""
-        components = scenario.assemble()
-        assert components is not None
-        base_before = [
-            entry.latent.clone() for entry in components.buffer.base_samples()
-        ]
-        scenario.run_loop()
-        base_after = [
-            entry.latent.clone() for entry in components.buffer.base_samples()
-        ]
-        assert all(
-            torch.equal(a, b) for a, b in zip(base_before, base_after)
-        )  # base 固定
-        # FIFO 滚动：recent 容量 32 = 批 197 的后 8 条 + 批 198/199 各 12 条
-        batches = scenario.fake_batches(NUM_STEPS, FAKE_BATCH, seed=300)
-        recent = components.buffer.recent_samples()
-        assert len(recent) == components.buffer.recent_capacity
-        assert all(
-            torch.equal(recent[i].latent, batches[197][4 + i]) for i in range(8)
-        )
-        assert all(
-            torch.equal(recent[8 + i].latent, batches[198][i]) for i in range(12)
-        )
-        assert all(
-            torch.equal(recent[20 + i].latent, batches[199][i]) for i in range(12)
-        )
-        assert all(entry.modality == "t1n" for entry in recent)
-        # 混采占比（每步 report 断言 2/2 与 1/1，此处抽查落盘占比）
-        events = components.run_artifacts.read_events()
-        assert events[0]["buffer_current_fraction"] == pytest.approx(0.5)
-        assert events[0]["buffer_replay_fraction"] == pytest.approx(0.5)
 
     def test_heldout_auc_computed_and_persisted(
         self, scenario: RewardFixtureScenario,

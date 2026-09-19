@@ -19,7 +19,7 @@ from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.support import SupportRule
 
-from tests.test_online_update import SHAPE, UpdateScenario, WrittenPool
+from tests.test_online_update import SHAPE, UpdateScenario
 
 
 @pytest.fixture
@@ -27,30 +27,29 @@ def scenario(tmp_path) -> UpdateScenario:
     return UpdateScenario(tmp_path)
 
 
-class TestAucStaysCleanUnderNoiseInjection:
-    """ADR-0009-α 路径分流不变量在 held-out AUC 端到端面的覆盖：AUC
-    经 ``_chunked_logits`` 分块拼接消费干净域 ``patch_logits``——σ_max
-    开关前后同一输入的 AUC 逐位一致（reward 标量与 patch logit 图的
-    入口级对比见 test_reward_scorer，此处补 AUC 消费端）。"""
+class TestAucScoringStaysCleanDomain:
+    """判别器输入恒干净域在 held-out AUC 消费端的覆盖（ADR-0012：带噪
+    训练入口退役，打分路径是唯一前向形态——σ_max 开关不再存在，同
+    输入的 AUC 读数跨独立打分器实例逐位一致）。"""
 
-    def test_auc_identical_across_sigma_switch(
+    def test_auc_identical_across_scorer_instances(
         self, scenario: UpdateScenario, tmp_path: Path,
     ) -> None:
-        """σ_max = 0 与 σ_max = 0.2 两个 scorer，同 held-out 工件、同
-        fake 批、同 generator：AUC 逐位一致（打分仪器不被注入污染）。"""
+        """同 held-out 工件、同 fake 批、同 generator、同网络工件的两个
+        独立 scorer：AUC 逐位一致（打分仪器确定性、无外部污染源）。"""
         manifest_path = HeldOutPoolWriter(
             tmp_path, {modality: 2 for modality in MODALITIES},
         ).write()
         manifest = LatentManifest.load(manifest_path, kind="heldout_real")
         fakes = scenario.fakes(8)
-        results = []
-        for sigma_max in (0.0, 0.2):
-            auc = HeldOutAuc(
+        results = [
+            HeldOutAuc(
                 heldout_manifest=manifest,
-                scorer=scenario.scorer(sigma_max=sigma_max),
+                scorer=scenario.scorer(),
                 generator=scenario.generator(1),
-            )
-            results.append(auc.compute(fakes, modality="t2w"))
+            ).compute(fakes, modality="t2w")
+            for _ in range(2)
+        ]
         assert results[0] == results[1]
 
 

@@ -265,6 +265,15 @@ class GranularGrpoTrainer:
             updater=self.runtime.updater,
             amp=self.runtime.amp,
         )
+        # 判别器更新批装配原语（ADR-0012 唯一新缝）的生产缺位在装配期
+        # 显式拒绝（替身测试场景 None——生产装配恒注入，首个更新步才炸
+        # 属于失败后移）
+        if self.runtime.rewards.assembler is None:
+            raise ValueError(
+                "判别器更新批装配原语未装配（RewardCoordinator.assembler="
+                "None）：生产装配须提供 policy 侧 sampler/conditions"
+                "（ADR-0012 配对批供给）"
+            )
         # 续训状态分片存取（per-rank 落盘/恢复的单点，checkpoint 同节奏）
         self.resume_store = ResumeStore(
             run_artifacts.paths.checkpoints,
@@ -321,7 +330,7 @@ class GranularGrpoTrainer:
 
     @property
     def rng(self) -> TrainingRngStreams:
-        """七条命名 RNG 流注册表（续训状态机按名保存/恢复的枚举面）。"""
+        """八条命名 RNG 流注册表（续训状态机按名保存/恢复的枚举面）。"""
         return self.runtime.rng
 
     @property
@@ -440,12 +449,16 @@ class GranularGrpoTrainer:
             phases.mark("policy_update")
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
             # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器；
-            # 门控不影响判别器节奏）；
-            # 本 iteration 的目标模态随 fake 批穿入——回放与 real 两侧均按
-            # 条件匹配（ADR-0008 决策 1/2/3），该条件回放不足的退化步带
-            # 标记落盘（观测面扩展）
+            # 门控不影响判别器节奏——被门控条件的判别器持续受训，其建立
+            # 判别力是白名单动态恢复的前提）。
+            # 配对批现做现用（ADR-0012）：fake = 当前 policy 对同批 real 的
+            # 同源重构（专属 recon 随机流、先抽 s 后抽 ε、η=0 确定性 ODE
+            # 续跑；real 侧条件匹配 + 容量硬守卫照旧）——判别器更新批 =
+            # 装配原语的配对批，不再有回放混采与 real 内部自抽。
             report = (
-                self.rewards.update_step(record.new_fakes, record.modality)
+                self.rewards.update_step(
+                    self.rewards.assembler.assemble(record.modality),
+                )
                 if iteration % update_interval == 0 else None
             )
             # 过拟合分叉观测（ADR-0009 决策 4/5）：train 侧干净域复算准确
@@ -476,7 +489,6 @@ class GranularGrpoTrainer:
                         heldout_auc=heldout_auc,
                     )
             phases.mark("discriminator")
-            batch_size_k = self.config.reward.disc_batch_size_k
             zone_sizes = self.rewards.buffer.zone_sizes()
             events: list[IterEvent | OverfitAlertEvent] = [IterEvent(
                 iteration=iteration,
@@ -488,15 +500,13 @@ class GranularGrpoTrainer:
                 heldout_auc=heldout_auc,
                 loss=loss_terms,
                 policy_gated=policy_gated,
-                buffer_current_fraction=(
-                    report.num_current / batch_size_k if report else 0.0
-                ),
-                buffer_replay_fraction=(
-                    report.num_replay / batch_size_k if report else 0.0
-                ),
-                buffer_replay_degraded=(
-                    report.replay_degraded if report else False
-                ),
+                # 回放混采退役读数（ADR-0012）：iter 事件契约「可扩不可
+                # 改名」——字段保留（旧监控与解析脚本不被静默破坏）、
+                # 混采量恒为退役值；占用读数照常（buffer 种植与落盘面
+                # 保留，退役删除同票进行）
+                buffer_current_fraction=0.0,
+                buffer_replay_fraction=0.0,
+                buffer_replay_degraded=False,
                 buffer_base_occupied=zone_sizes.base,
                 buffer_recent_occupied=zone_sizes.recent,
                 train_pairwise_acc=(

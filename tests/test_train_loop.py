@@ -46,7 +46,8 @@ from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.buffer import ReplayEntry, base_condition_quota
+from cynosure.reward.assembly import PairBatch
+from cynosure.reward.buffer import ReplayBuffer, ReplayEntry, base_condition_quota
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
@@ -291,25 +292,26 @@ class TestSingleIterationLoop:
         assert 0.0 < event["heldout_auc"] < 1.0
         assert "policy_step_1" in event["loss"]  # M={1} → 一次 policy 梯度步
         assert "discriminator" in event["loss"]
-        assert event["buffer_current_fraction"] == pytest.approx(0.5)
-        assert event["buffer_replay_fraction"] == pytest.approx(0.5)
+        # 回放混采退役读数（ADR-0012）：字段按事件契约保留、混采量恒 0；
+        # 两区占用照常——base 种植保留、recent 无 push 退役恒空
+        assert event["buffer_current_fraction"] == pytest.approx(0.0)
+        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
         assert event["buffer_base_occupied"] == 32  # capacity 64 → base 32
-        # 首 iter 新 fake 全量入近期分区：|M|×G×|Λ| + anchor = 1×12×2 + 1 = 25
-        assert event["buffer_recent_occupied"] == 25
+        assert event["buffer_recent_occupied"] == 0
         assert event["lr"] == pytest.approx(2e-6)
         assert event["elapsed_s"] >= 0.0
 
     def test_iter_event_carries_replay_degradation_marker(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """ADR-0008-03：iter 事件观测面扩展——回放退化标记（契约可扩
-        不可改名）。正常混采步为 False：fixture 装配守卫下回放供给恒
-        充足，「占比 0」与「退化」不靠对方推断，标记独立落盘。"""
+        """iter 事件契约「可扩不可改名」（ADR-0008-03 引入、ADR-0012 退
+        役读数）：字段保留（旧监控与解析脚本不被静默破坏），回放退化标
+        记与占比恒为退役值——混采语义不再存在、标记不再有 True 形态。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         event = scenario.events()[0]
         assert event["buffer_replay_degraded"] is False
-        assert event["buffer_replay_fraction"] == pytest.approx(0.5)
+        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
 
     def test_iter_event_carries_overfit_divergence_observations(
         self, scenario: TrainingLoopScenario,
@@ -360,8 +362,8 @@ class TestSingleIterationLoop:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """判别器更新节奏 N_d 由训练循环消费：N_d=2 时每 2 个 iteration
-        更新一次（跳过的 iteration 无 discriminator loss、混合占比 0、
-        近期分区无增量）。"""
+        更新一次（跳过的 iteration 无 discriminator loss；混采占比字段
+        恒退役读数 0、近期分区无增量——push 已随混采退役）。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["schedule"]["max_iterations"] = 2
@@ -371,8 +373,8 @@ class TestSingleIterationLoop:
         assert result.code == 0, result.stderr
         first, second = scenario.events()
         assert "discriminator" in first["loss"]
-        assert first["buffer_current_fraction"] == pytest.approx(0.5)
-        assert first["buffer_recent_occupied"] == 25  # 1×12×2 + 1 条新 fake
+        assert first["buffer_current_fraction"] == pytest.approx(0.0)
+        assert first["buffer_recent_occupied"] == 0  # 无 push：recent 恒空
         assert "discriminator" not in second["loss"]  # N_d 跳过
         assert second["buffer_current_fraction"] == 0.0
         assert second["buffer_replay_fraction"] == 0.0
@@ -443,7 +445,7 @@ class TestSingleIterationLoop:
         assert set(saved.keys()) == set(live.state_dict().keys())
         assert any(".parametrizations." in key for key in saved)
         live.eval()
-        sample = trainer.rewards.buffer.recent_samples()[0].latent.unsqueeze(0)
+        sample = trainer.rewards.buffer.base_samples()[0].latent.unsqueeze(0)
         device = sample.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
         # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
         # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
@@ -1033,20 +1035,17 @@ def _reward_config_for_gating() -> RewardConfig:
 
 
 class TestDiscriminatorSideOrchestration:
-    """判别器侧编排（train 循环第 2 相的 fake 供给与判别器相位）。"""
+    """判别器侧编排（train 循环第 2 相的配对批供给与判别器相位）。"""
 
-    def test_update_step_draws_current_fakes_across_full_batch(self) -> None:
-        """当前 fake 半区跨全批均匀随机抽取：new_fakes 按训练步与粒度
-        有序堆叠（(k,λ) 升序 + Anchor 终点在末），若确定性取前 K/2 条，
-        K=4 时判别器当前半区只见最小 step、λ=1 的前两个方向——其余
-        分布从不进更新。判别器在更新期间处 train 相（spectral norm
+    def test_update_step_consumes_pair_batch_and_restores_phase(self) -> None:
+        """配对批原样透传给 update（ADR-0012：混采置换退役——批就是
+        更新批），判别器在更新期间处 train 相（spectral norm
         power iteration 属训练语义）、结束后恢复 eval 相（打分/监控
         前向不得漂移其有效权重）。"""
         discriminator = torch.nn.Linear(1, 1)
         update = RecordingUpdate(discriminator)
         coordinator = RewardCoordinator(
             update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
-            generator=torch.Generator().manual_seed(11),
             gating=DynamicWhitelist(
                 ConditionWhitelist.unrestricted(tuple(MODALITIES)),  # 本测试不触白名单
                 _reward_config_for_gating(),
@@ -1056,14 +1055,18 @@ class TestDiscriminatorSideOrchestration:
             overfit=OverfitMonitor(
                 _reward_config_for_gating(), conditions=tuple(MODALITIES),
             ),
+            buffer=ReplayBuffer(64),
+            assembler=None,  # type: ignore[arg-type]  # 替身场景不经装配原语
         )
-        fakes = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1, 1)
-        coordinator.update_step(fakes, "t2w")
-        received = update.received[0]
-        expected_perm = torch.randperm(
-            6, generator=torch.Generator().manual_seed(11),
+        pair = PairBatch(
+            reals=torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1, 1),
+            fakes=torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1, 1) + 10,
+            modality="t2w",
         )
-        assert torch.equal(received, fakes[expected_perm])  # 跨全批置换
+        coordinator.update_step(pair)
+        assert torch.equal(update.received[0].reals, pair.reals)
+        assert torch.equal(update.received[0].fakes, pair.fakes)
+        assert update.received[0].modality == "t2w"
         assert update.training_at_call[0] is True  # 更新期间 train 相
         assert discriminator.training is False  # 结束恢复 eval 相
 
@@ -1087,29 +1090,11 @@ class TestDiscriminatorSideOrchestration:
         trainer = GranularGrpoTrainer(config, artifacts)
         assert trainer.run() == 1
         assert trainer.rewards.discriminator.training is False
-        sample = trainer.rewards.buffer.recent_samples()[0].latent
+        sample = trainer.rewards.buffer.base_samples()[0].latent
         scorer = trainer.rewards.update.scorer
         first = scorer.reward(sample.unsqueeze(0))
         second = scorer.reward(sample.unsqueeze(0))
         assert torch.allclose(first, second, rtol=0.0, atol=1e-6)  # eval 相打分幂等
-
-    def test_iter_event_consumes_report_degradation_marker(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """UpdateReport 的退化标记穿入 iter 事件（观测面消费接线）：
-        退化 update 替身（replay_degraded=True）下事件落 True——退化
-        步在指标流上可观测，不静默漂移。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        trainer.rewards.update = RecordingUpdate(
-            trainer.rewards.discriminator, replay_degraded=True,
-        )
-        assert trainer.run() == 1
-        event = scenario.events()[0]
-        assert event["buffer_replay_degraded"] is True
-        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
 
     def test_update_step_receives_iteration_condition(
         self, scenario: TrainingLoopScenario,
@@ -1270,16 +1255,17 @@ class TestBufferBaseSeeding:
             modality for entry in entries for modality in [entry.modality]
         } == set(MODALITIES)
 
-    def test_base_partition_samples_differ_from_post_training_fakes(
+    def test_base_partition_seeded_before_first_iteration(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """base 分区由**冻结初始** policy 生成：其 latent 与训练后 policy
-        的 rollout 分布不同源（内容非空且非训练期 push 的样本）。"""
+        """base 分区在启动期由**冻结初始** policy 生成完毕：首 iter 事件
+        的 base 占用读数即满额（种植物化先于训练循环；近期分区无 push、
+        恒空——ADR-0012 后更新批不再入区）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         event = scenario.events()[0]
-        # 首 iter 回放半区即可用（base 已在启动期生成完毕）
-        assert event["buffer_replay_fraction"] > 0.0
+        assert event["buffer_base_occupied"] == 32  # capacity 64 → base 32
+        assert event["buffer_recent_occupied"] == 0
 
 
 class TestBaseSeedingIsolation:
