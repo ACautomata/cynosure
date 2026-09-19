@@ -2,7 +2,7 @@
 
 ADR-0008 的条件匹配采样把判别器 real 侧骤缩到单模态池：MRA train split ≈ 110 条（全池），经 `RankSlicedPool` 按序列条带切片后每 rank 仅 ≈ 110/world 条（world=8 → ≈ 14 条），装配期容量守卫要求 K ≤ 池大小。叠加 ADR-0008 裁决 3 的预训练 per-condition 均匀轮转（默认 `pretrain_max_steps=2000`，MRA 占 1/5 ≈ 400 步）与 K=8 无放回采样：**每 rank 判别器把同一条 MRA latent 反复看到 ~229 遍**。现状判别器零增强（无 augmentation / 噪声注入 / dropout / R1；仅 AdamW weight_decay=1e-4 与默认关闭的 spectral_norm），注定记住「这 14 例的共性」而非「真假 MRA 的分界」——held-out AUC（病例级不相交，MRA 仅 ≈ 16 卷）因分布共性虚高，ADR-0008 的条件白名单 gate 被假阳性骗过、无信号条件上岗。这是 MRA 上最可能的假阳性来源（`research/discriminator-saturation-risk.md` §5.6），比小样本统计问题更危险；ADA（Karras et al., arXiv:2006.06676）给出直接文献支撑：「小数据集上判别器过拟合训练样本，对生成器的反馈退化为只关注少数特征」，增强是标准对策。ADR-0008 裁决 4 已拒有放回采样（小池 bagging 是过拟合加速器），其容量守卫只防「抽不出」、不防「反复抽同一样」——本 ADR 补齐后半，即 ADR-0008 Consequences 末条所立之票的裁决。**决定：主防线 = 判别器训练期对称噪声注入（training-only augmentation），配套 per-condition 过拟合分叉监控（只报警不自动动作），预训练与在线两阶段同一套；不构成对上游 recipe 的偏离。**
 
-**Status**: accepted
+**Status**: partially superseded by ADR-0012（决策 1/2/3 训练期噪声注入被同源重构 fake 取代；决策 4/5 过拟合分叉监控仍生效）
 
 ## Decision
 
