@@ -39,6 +39,23 @@ MEASUREMENT_OFFSET = 10
 偏移**值**——生产常量被误改时此处显式红，而非随改随过）。"""
 
 
+def _expected_measurement_fakes(assembler, reals: torch.Tensor) -> torch.Tensor:
+    """测量批的零速度 ODE 手工复算：重构 = 插值加噪（ODE 零贡献），
+    同 seed 同 σ 定序（测量流批次起手复位 → 独立生成器取同一 noise）。"""
+    candidates = assembler.candidate_sigmas(CONDITION)
+    generator = torch.Generator().manual_seed(
+        assembler._generator.initial_seed() + MEASUREMENT_OFFSET,
+    )
+    noise = torch.randn(reals.shape, generator=generator)
+    expected = torch.empty_like(reals)
+    for index in range(reals.shape[0]):
+        # σ 经 float32 张量参与运算（生产路径的 levels 张量口径——
+        # Python float 字面量走双精度标量广播，差 1 ulp）
+        sigma = torch.tensor(candidates[index % len(candidates)])
+        expected[index] = reals[index] * (1.0 - sigma) + noise[index] * sigma
+    return expected
+
+
 class ZeroVelocityUnet:
     """零速度前向桩：确定性 ODE 每步 x' = x（重构 = 插值加噪本体的观测面）。"""
 
@@ -666,19 +683,10 @@ class TestMeasurementConditionReconstruction:
         assert pair.modality == CONDITION
         assert pair.fakes.shape == reals.shape
         assert not torch.equal(pair.fakes, reals)  # s > 0 → 加噪本体在场
-        # 手工复算（同 seed 同 σ 序）：重构 = 插值加噪（ODE 零贡献）
-        candidates = assembler.candidate_sigmas(CONDITION)
-        expected = torch.empty_like(reals)
-        generator = torch.Generator().manual_seed(
-            assembler._generator.initial_seed() + MEASUREMENT_OFFSET,
+        # 手工复算（同 seed 同 σ 序），共享 helper 见模块头
+        assert torch.equal(
+            pair.fakes, _expected_measurement_fakes(assembler, reals),
         )
-        noise = torch.randn(reals.shape, generator=generator)
-        for index in range(reals.shape[0]):
-            # σ 经 float32 张量参与运算（生产路径的 levels 张量口径——
-            # Python float 字面量走双精度标量广播，差 1 ulp）
-            sigma = torch.tensor(candidates[index % len(candidates)])
-            expected[index] = reals[index] * (1.0 - sigma) + noise[index] * sigma
-        assert torch.equal(pair.fakes, expected)
 
     def test_sigma_assignment_rotates_over_candidate_steps(
         self, scenario: AssemblyScenario,
@@ -690,20 +698,12 @@ class TestMeasurementConditionReconstruction:
         assert len(candidates) == 3
         reals = torch.randn(7, *SHAPE)
         pair = assembler.measure_condition(reals, CONDITION)
-        # 逐卷手工复算（同起点复位 → 同一 noise 张量，见 reconstruct 的
-        # 插值本体；零速度 ODE 零贡献）：第 i 枚卷的 σ 必须是候选轮转序
-        # 的第 i % |M| 位——σ 排布错位（如全部取首位、或按 |M| 之外的
-        # 步长轮转）会让对应行的逐位等式破掉
-        noise = torch.randn(
-            reals.shape,
-            generator=torch.Generator().manual_seed(
-                assembler._generator.initial_seed() + MEASUREMENT_OFFSET,
-            ),
-        )
+        # 逐卷手工复算：第 i 枚卷的 σ 必须是候选轮转序的第 i % |M| 位
+        # ——σ 排布错位（如全部取首位、或按 |M| 之外的步长轮转）会让
+        # 对应行的逐位等式破掉
+        expected = _expected_measurement_fakes(assembler, reals)
         for index in range(reals.shape[0]):
-            sigma = torch.tensor(candidates[index % len(candidates)])
-            row = reals[index] * (1.0 - sigma) + noise[index] * sigma
-            assert torch.equal(row, pair.fakes[index]), index
+            assert torch.equal(expected[index], pair.fakes[index]), index
 
     def test_repeated_measurement_is_bitwise_identical(
         self, scenario: AssemblyScenario,

@@ -1095,6 +1095,7 @@ class MrPretrainArtifactsFixture:
         )
         fields = {
             "group": config.experiment.group,
+            "gate_criterion": "recon_auc",
             "latent_shape": None,
             "condition_auc": {name: 0.7 for name in vocabulary.names()},
             "gate_whitelist": list(vocabulary.names()),

@@ -297,6 +297,7 @@ class PretrainReportScenario:
         )
         fields = {
             "group": "modal-label",
+            "gate_criterion": "recon_auc",
             "latent_shape": tuple(Fixture.LATENT_SHAPE),
             "condition_auc": {"t1n": 0.72, "t1c": 0.68, "t2w": 0.70, "t2f": 0.66},
             "gate_whitelist": ["t1n", "t1c", "t2w", "t2f"],
@@ -1116,20 +1117,25 @@ class ScriptedAuc:
     容量查询恒充足（守卫路径由真实 manifest 用例覆盖）。
 
     ``condition_latents`` 与 ``compute_volume_clusters`` 的配对语义照搬
-    真实实现（real 侧由调用方给出、与 fake 同量同形）——状态机用例只
-    换测量面的**数值来源**，不绕开配对契约。"""
+    真实实现（real 侧由调用方给出、与 fake 同量同形）——条件归因不在
+    聚类 seam 的入参里（生产签名无 modality 位），由测量流「先取
+    real 侧」的 ``condition_latents`` 调用带出。状态机用例只换测量面的
+    **数值来源**，不绕开配对契约。"""
 
     def __init__(self, values: dict[str, float]) -> None:
         self.values = values
         self.measurements: list[str] = []
         self.paired: list[bool] = []
+        self._measuring: str | None = None
 
     def condition_latents(self, modality: str) -> torch.Tensor:
+        self._measuring = modality  # 测量流先取 real 侧：条件归因随之而来
         return torch.zeros(4, 4, 16, 16, 8)
 
-    def compute_volume_clusters(self, latents, fake_latents, modality=None):
-        assert modality is not None
+    def compute_volume_clusters(self, latents, fake_latents):
         assert latents.shape == fake_latents.shape  # 同源配对的逐样本对齐
+        assert self._measuring is not None  # 生产 seam 无 modality 位
+        modality = self._measuring
         self.measurements.append(modality)
         self.paired.append(True)
         return ScriptedClusters(

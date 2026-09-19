@@ -128,13 +128,15 @@ class PretrainReport(BaseModel):
     """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
     轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
     （拒跑由 train gate 把守，诊断产物不丢）。"""
-    gate_criterion: str = "recon_auc"
+    gate_criterion: str = "rollout_auc"
     """本报告的判据口径标识（ADR-0012 决策 5 的审计面）：``"recon_auc"``
-    = held-out real 原始 vs 同源重构体（当前口径）。字段随事件契约
-    「可扩不可改名」新增——消费方据此判定跨阶段读数可比性（预训练
-    recon-AUC 与在线 rollout-AUC 不可横向比较），旧报告缺该字段时
-    按默认值装载（历史 ADR-0008 口径报告的判据同为本字段所指的当前
-    语义之外，装载守卫的时点把控在 provenance 指纹与格式断代层）。"""
+    = held-out real 原始 vs 同源重构体（当前口径，产报路径恒显式写入）；
+    ``"rollout_auc"`` = 旧 ADR-0008 口径（held-out real vs 量产 rollout
+    fake）。字段随事件契约「可扩不可改名」新增——缺字段的历史
+    per-condition 报告按本默认装载，而字段诞生前的实测口径恰是
+    rollout，默认值即历史真值：消费方据此判定跨阶段读数可比性
+    （recon-AUC 与 rollout-AUC 不可横向比较），装载守卫的时点把控在
+    provenance 指纹与格式断代层。"""
     condition_volumes: dict[str, int] = Field(default_factory=dict)
     """每条件的 held-out 卷数（支撑度规则 ``SupportRule`` 的判定输入，
     ADR-0008 决策 6）：< ``reward.gate_support_min_volumes`` 的条件走

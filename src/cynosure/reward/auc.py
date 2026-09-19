@@ -188,7 +188,6 @@ class HeldOutAuc:
         self,
         latents: torch.Tensor,
         fake_latents: torch.Tensor,
-        modality: str | None = None,
     ) -> VolumeScoreClusters:
         """卷级分数聚类观测面（ADR-0008-02）：每卷一组 patch 分数 +
         fake 侧全量分数。

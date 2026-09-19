@@ -381,17 +381,15 @@ class TestVolumeScoreClusters:
         manifest = LatentManifest.load(writer.write(), kind="heldout_real")
         auc = self._auc(scenario, manifest)
         reals = auc.condition_latents("t2w")  # real 侧全量卷由调用方给出
-        clusters = auc.compute_volume_clusters(
-            reals, scenario.fakes(5), modality="t2w",
-        )
+        clusters = auc.compute_volume_clusters(reals, scenario.fakes(5))
         assert clusters.volume_count == 5  # t2w 全量 5 卷，非 min(2, 5)=2
         assert len(clusters.real_volume_scores) == 5
 
     def test_pool_wide_clusters_cover_every_volume(
         self, scenario: UpdateScenario, tmp_path: Path,
     ) -> None:
-        """缺省 modality=None（全池口径，诊断/预训练 gate 侧）：聚类覆盖
-        全部 8 卷，fake 侧全量参与。"""
+        """全池口径（real 侧跨条件拼接由调用方构造）：聚类覆盖全部 8 卷，
+        fake 侧全量参与。"""
         writer = HeldOutPoolWriter(
             tmp_path / "heldout", {modality: 2 for modality in MODALITIES},
         )
@@ -583,7 +581,7 @@ class TestVolumeScoreClusters:
         before_pool = auc.compute(scenario.fakes(8))
         before_cond = auc.compute(scenario.fakes(8), modality="t1n")
         auc.compute_volume_clusters(
-            auc.condition_latents("t2w"), scenario.fakes(2), modality="t2w",
+            auc.condition_latents("t2w"), scenario.fakes(2),
         )
         assert auc.compute(scenario.fakes(8)) == pytest.approx(
             before_pool, rel=0.0, abs=0.0,

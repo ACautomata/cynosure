@@ -285,7 +285,7 @@ class TestGateVerdict:
         assert "RM readiness gate" in result.stderr
         assert "条件白名单为空" in result.stderr
         for modality, value in report.condition_auc.items():
-            assert f"held-out AUC[{modality}]: {value:.4f}" in result.stderr
+            assert f"recon-AUC[{modality}]: {value:.4f}" in result.stderr
         assert not scenario.run_dir.exists()  # 未产出工件 → 已回滚
 
     def test_conditions_below_gate_do_not_block_run(
@@ -319,9 +319,10 @@ class TestReportReproduction:
         （两次测量取小——producer 侧成功判据对单批测量噪声鲁棒）中较小
         者。测量批口径（ADR-0012 决策 5 / #171）：该条件**全量 held-out
         卷**经装配原语定序轮转重构（``measure_condition``——σ 定序、
-        ε 走批次起手复位的测量流）。同条件的首测与复测是**独立样本**
-        （held-out 抽取序走 heldout_auc 流、测量流复位再走一遍，两次
-        各拿新随机数，「首测 + 换批复测」的独立性由此而来）——本测试
+        ε 走批次起手复位的测量流）。同条件的首测与复测的独立面是
+        **held-out 抽取序**（heldout_auc 流推进 → 新排列，每卷换配
+        (σ, ε) 槽位）；ε 经复位逐位复用，单卷条件复测与首测同读数
+        （≥2 卷才是「首测 + 换批复测」的独立样本）——本测试
         的「逐位一致」来自**跨 run 重演**：重演驱动同 seed 同 config
         从同一 RNG 起点按同一调用序走（首测、复测两跳都重演），故重演
         读数与报告值逐位吻合，而非同 run 内两批相同。"""
@@ -368,7 +369,7 @@ class TestReportReproduction:
         reals = driver.rewards.auc.condition_latents(target)
         batch = driver.rewards.assembler.measure_condition(reals, target)
         return driver.rewards.auc.compute_volume_clusters(
-            batch.reals, batch.fakes, target,
+            batch.reals, batch.fakes,
         ).pooled_auc()
 
 
@@ -389,8 +390,8 @@ class TestGateVerdictUnit:
         message = str(exc_info.value)
         assert "RM readiness gate" in message
         assert "条件白名单为空" in message
-        assert "held-out AUC[t1n]: 0.4321" in message
-        assert "held-out AUC[t2w]: 0.5123" in message
+        assert "recon-AUC[t1n]: 0.4321" in message
+        assert "recon-AUC[t2w]: 0.5123" in message
         assert "report.json" in message
 
     def test_nonempty_whitelist_passes_ignoring_readings(self) -> None:
@@ -584,6 +585,7 @@ def _report(
     """单测轻量报告（schema 合法即可，不触盘上工件）。"""
     return PretrainReport(
         group="modal-label",
+        gate_criterion="recon_auc",
         latent_shape=(4, 16, 16, 8),
         condition_auc=condition_auc,
         gate_whitelist=whitelist,

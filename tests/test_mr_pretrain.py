@@ -315,7 +315,7 @@ class TestMrPretrainEndToEnd:
         assert "RM readiness gate" in message
         assert "条件白名单为空" in message
         for modality, value in report.condition_auc.items():
-            assert f"held-out AUC[{modality}]: {value:.4f}" in message
+            assert f"recon-AUC[{modality}]: {value:.4f}" in message
         assert str(config.reward.pretrain_report_json) in message
         assert stub.baseline_called is False
         assert partition_calls == []

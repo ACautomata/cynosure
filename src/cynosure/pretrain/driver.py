@@ -191,10 +191,13 @@ class PretrainDriver:
             volumes[modality] = clusters.volume_count  # 支撑度判定的卷数留痕
             auc = clusters.pooled_auc()  # 更新前快照（本步判别器权重）
             if modality not in confirmed and self._support.passes(auc, clusters):
-                # 复测（同条件独立测量）：判别器权重同刻，变化的是随机
-                # 面——held-out 卷的抽取（heldout_auc 流）与重构 ε 的
-                # 抽取（heldout_auc 流推进后、复位测量流从同一起手点再
-                # 走一遍）都拿到新一批随机数，两次读数不是同一个样本
+                # 复测（同条件换批测量）：判别器权重同刻，变化的随机面
+                # 只有一处——held-out 全量卷的抽取序（heldout_auc 流推
+                # 进 → 新排列）。重构 ε 经批次起手复位**逐位复用**（测量
+                # 批可复算的代价面）：重排列把每卷配到的 (σ, ε) 槽位换
+                # 掉，≥2 卷条件下两次读数是不同样本；单卷条件排列平凡、
+                # 复测与首测同读数（确认退化——小池由数据侧池规模与支
+                # 撑度界兜底，不以本相为抗噪防线）
                 _confirm_batch, confirm, _confirm_forwards = (
                     self._measurement(modality)
                 )
@@ -299,7 +302,7 @@ class PretrainDriver:
         reals = self._rewards.auc.condition_latents(modality)
         batch = assembler.measure_condition(reals, modality)
         clusters = self._rewards.auc.compute_volume_clusters(
-            batch.reals, batch.fakes, modality,
+            batch.reals, batch.fakes,
         )
         return batch, clusters, assembler.measurement_forward_count(
             reals, modality,

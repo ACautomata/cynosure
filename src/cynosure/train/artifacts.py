@@ -203,9 +203,11 @@ class PretrainEvent(BaseModel):
     """Replay buffer 近期分区当前占用（同上，恒 0）。"""
     reconstruction_forwards: int | None = None
     """本步测量批重构消耗的 policy 前向次数（#171 AC5 的成本口径读数：
-    批量量产的 30 步全 ODE 路径已退役，本读数让「fake 全部来自 ≤|M| 步
-    重构」在事件流上可核对）。None = 本步未测量（当前执行路径每步都测，
-    留 None 供旧事件与未来分支）。"""
+    批量量产的 num_steps 步全 ODE 路径已退役，本读数让「每卷重构前向 =
+    num_steps − 起始步位、恒严格小于全 ODE 步数」在事件流上可核对——
+    与装配原语的 ``measurement_forward_count`` 同源推算，非平行复刻）。
+    None = 本步未测量（当前执行路径每步都测，留 None 供旧事件与未来
+    分支）。"""
     measurement_volumes: int | None = None
     """本步测量批的卷数（= 该条件 held-out 全量卷数；支撑度判定的卷数
     轴在事件流上的留痕）。None 同 ``reconstruction_forwards``。"""

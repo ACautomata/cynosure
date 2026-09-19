@@ -745,7 +745,7 @@ class CynosureCli:
             volumes = report.condition_volumes.get(modality)
             scope = "" if volumes is None else f"，{volumes} 卷"
             print(
-                f"  - held-out AUC[{modality}]: {auc:.4f}{scope}",
+                f"  - recon-AUC[{modality}]: {auc:.4f}{scope}",
                 file=self._stdout,
             )
         print(
