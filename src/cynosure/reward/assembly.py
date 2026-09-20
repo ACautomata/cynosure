@@ -292,11 +292,6 @@ class ReconstructionAssembler:
                 "（逐样本噪声水平）"
             )
         cursor = self._schedules.cursor(condition.name_or_raise())
-        working = reals * self._scale_factor  # pool 存储域 → policy 工作域
-        # σ 水平张量随输入设备落位（生产路径 real 批在加速器上——CPU
-        # 常量的 device mismatch 在 fixture 全 CPU 口径下测不到）
-        levels = torch.tensor(sigmas, device=reals.device).view(-1, 1, 1, 1, 1)
-        noised = working * (1.0 - levels) + noise * levels
         groups: dict[float, list[int]] = {}
         for index, sigma in enumerate(sigmas):
             groups.setdefault(sigma, []).append(index)
@@ -307,12 +302,23 @@ class ReconstructionAssembler:
                 # （不走乘除往返，生产域换算系数下同样逐位恒等）
                 reconstructed[members] = reals[members]
                 continue
+            # 中间量组内惰性构造（#174 生产重跑 OOM 修复）：working /
+            # noised 按 σ 组切片构造、不整批实例化——测量批规模下（生产
+            # held-out 512 卷/条件）整批中间量随批线性膨胀，大尺寸条件
+            # （t1w/coronal 体素数 ≈ 8× axial）单批即数十 GiB。切片不
+            # 改变数值：插值是逐元素运算无跨样本归约，组内 σ 同值（组
+            # 内标量广播 ≡ 原 per-sample levels 的组内取值）；组遍历序
+            # （首现序）与写回位置照旧，同 seed 重放逐位一致。
+            rows = torch.tensor(members, device=reals.device)
+            level = torch.tensor(sigma, device=reals.device)
+            working = reals[rows] * self._scale_factor  # pool 存储域 → policy 工作域
+            noised = working * (1.0 - level) + noise[rows] * level
             terminal = self._sampler.continue_to_terminal(
-                noised[members],
+                noised,
                 self._start_index(cursor, sigma),
                 condition,
             )
-            reconstructed[members] = terminal / self._scale_factor
+            reconstructed[rows] = terminal / self._scale_factor
         return reconstructed
 
     def _start_index(
