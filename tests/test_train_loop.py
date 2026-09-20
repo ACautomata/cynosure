@@ -420,8 +420,8 @@ class TestSingleIterationLoop:
         assert set(saved.keys()) == set(live.state_dict().keys())
         assert any(".parametrizations." in key for key in saved)
         live.eval()
-        sample = torch.zeros(1, *config.latent_shape)
         device = trainer.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
+        sample = torch.zeros(1, *config.latent_shape, device=device)
         # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
         # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
         # normalizer 与生产装配一样迁移到 latent 所在 device，GPU 可见环境
@@ -1039,7 +1039,7 @@ class TestDiscriminatorSideOrchestration:
         trainer = GranularGrpoTrainer(config, artifacts)
         assert trainer.run() == 1
         assert trainer.rewards.discriminator.training is False
-        sample = torch.zeros(1, *config.latent_shape)
+        sample = torch.zeros(1, *config.latent_shape, device=trainer.device)
         scorer = trainer.rewards.update.scorer
         first = scorer.reward(sample)
         second = scorer.reward(sample)
