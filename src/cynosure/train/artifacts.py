@@ -57,9 +57,8 @@ class IterEvent(BaseModel):
     policy_gated: bool = False
     """policy 更新门控标记（ADR-0008 决策 7）：全 rank 集体门控决定——
     任一 rank 的目标条件不在（动态）白名单，本 iteration 全体跳过
-    policy 更新（loss 无 policy_step_* 项；rollout / fake 入 buffer /
-    判别器更新照常）。单 rank 下退化为「本 iteration 的目标条件不在
-    白名单」。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度。
+    policy 更新（loss 无 policy_step_* 项；rollout / 判别器更新照常）。
+    单 rank 下退化为「本 iteration 的目标条件不在白名单」。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度。
     False = 正常更新步。观测面扩展：事件契约可扩不可改名。"""
     train_pairwise_acc: float | None = None
     """train 侧干净域 pairwise 准确率（ADR-0009-β）：本 iteration 判别器

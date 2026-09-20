@@ -929,7 +929,8 @@ class TestCrossModalPairSampling:
 
 
 class TestModalLabelTargetSampling:
-    """组1 条件分布的 sample_target（ADR-0008-01：base 配额量产的条件源）。"""
+    """组1 条件分布的 sample_target（配对批装配原语 real 侧的条件源，
+    ADR-0012；原 base 配额量产消费面随 ReplayBuffer 退役删除）。"""
 
     def test_sample_target_binds_label_to_target(self) -> None:
         """label 条件不耗 RNG（label 由 target 决定）：给定目标序列
@@ -945,7 +946,7 @@ class TestModalLabelTargetSampling:
             assert tuple(condition.spacing[0].tolist()) == CONDITION_SPACING_X1E2
 
     def test_sample_target_ignores_stream(self) -> None:
-        """组1 的 sample_target 不消耗传入流：base 量产的 RNG 消耗
+        """组1 的 sample_target 不消耗传入流：rollout 的 RNG 消耗
         全部来自初始噪声（条件无随机自由度）。"""
         mapping = ModalityMapping(dict(FIXTURE_MODALITY_MAPPING))
         sampler = ModalLabelConditionSampler(

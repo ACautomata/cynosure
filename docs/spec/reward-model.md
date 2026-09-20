@@ -34,9 +34,9 @@
 > RL 启动前先经 **Warm-start 预训练**（ADR-0007，见下节）——本节的在线节奏适用于 RL 期间：预训练后的判别器继续随每个 iteration 在线更新（ADR-0001 核心保留，仅「在线从零」被修订）。
 
 - **节奏**：`N=1`（每个 RL iteration 都更新判别器），每批 `K` 小，**D:G 更新比 ≈ 1:1**；优化器 AdamW，LR 1e-5~1e-4（与 policy 同量级）。判别器是几层 3D conv，相对 UNet rollout（30 步 ODE × G 方向）算力可忽略，故「每 iter 更新」几乎免费；真正的约束是 rollout 吞吐（见 ticket #7 编排）。`N/K/LR` 标为 **tunable**，待 profile 后定。`weight_decay` 显式落位（`disc_weight_decay`，与 policy 侧同值口径 1e-4）——此前隐式取 PyTorch 默认 0.01 的不对称已消除（ADR-0007 卫生项）。
-- **条件匹配监督（ADR-0008）**：判别器一步更新内 real 侧与回放半区都按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采在稀疏模态上喂出的模态分类捷径（real 全池混采的旧口径废止）。Replay buffer 条目带模态标签，回放不足时该步退化为纯 current 半区并落盘；real / 回放候选容量在装配期逐（切片, 模态）校验、不足 fail-fast。
-- **fake 缓冲**：封顶 **FIFO 回放缓冲** = base 时期样本（初始冻结 policy 产出）+ 近期 policy 样本，按 **50% 当前 / 50% 回放** 混合采样。real 侧固定训练集 latent，不漂。理由：防止判别器随 policy 变好而**灾难性遗忘**「明显假」长什么样，稳定在线训练、抗漂移（GAN-RL 标准做法；代价仅是显存里存数百~数千个小 latent）。
-- **梯度门控（ADR-0008）**：条件不在 RM readiness 白名单（见下节）→ 该 iteration 跳过 policy 更新，rollout、fake 入 buffer、判别器更新照常——拒绝在 RM 无分辨率的样本上做策略梯度（不引入第二重 reward、KL 或参考模型）。白名单动态恢复：该条件在线 per-condition AUC 的 EMA 越 enter 阈值（暂定 0.55）恢复更新、跌破 exit 阈值（暂定 0.52）重新门控。盲条件的组内标准化噪声梯度（std+1e-8 尺度不变 + clamp ±5）由此道防线拦截。
+- **条件匹配监督（ADR-0008）**：判别器一步更新内 real 与 fake 都按本 iteration 的目标条件对齐（装配原语的条件匹配采样：real 按条件抽取、fake 为该条件 real 的同源重构体，ADR-0012）——判别器永远在「同一条件的 real vs fake」内比较，杜绝跨模态混采在稀疏模态上喂出的模态分类捷径（real 全池混采的旧口径废止）。real 容量在装配期逐（切片, 模态）校验、不足 fail-fast（原并列的回放半区条件过滤与退化语义随 ReplayBuffer 退役删除，ADR-0012）。
+- **fake 构造（ADR-0012）**：fake = 该条件 real 的**同源重构体**（装配原语现做：冻结基座对 real 工作域 latent 做确定性 ODE 部分重构），**不设缓冲**——原「封顶 FIFO 回放缓冲（base 时期 + 近期 policy 样本，50% 当前 / 50% 回放混采）」随 ADR-0012 决策 6（替换而非并存）整体退役。real 侧固定训练集 latent，不漂。
+- **梯度门控（ADR-0008）**：条件不在 RM readiness 白名单（见下节）→ 该 iteration 跳过 policy 更新，rollout、判别器更新照常——拒绝在 RM 无分辨率的样本上做策略梯度（不引入第二重 reward、KL 或参考模型）。白名单动态恢复：该条件在线 per-condition AUC 的 EMA 越 enter 阈值（暂定 0.55）恢复更新、跌破 exit 阈值（暂定 0.52）重新门控。盲条件的组内标准化噪声梯度（std+1e-8 尺度不变 + clamp ±5）由此道防线拦截。
 
 ## 理论定性：对抗博弈与时间尺度分离
 
@@ -63,17 +63,17 @@
 ### 开放项
 
 - **有效时间尺度对账**：D:G 名义更新比 1:|M|（`disc_update_interval_n_d=1`，policy 侧每 iteration 共 |M| 个逐 k 优化器步）。初步 lr 质量核算：`disc_lr=5e-5` vs `policy_lr=2e-6`（25×），即使 |M|=10 判别器仍快 ~2.5×——**分离方向大概率已满足**（lr 质量只是收缩率的粗糙代理，结论随 profile 复核）。`N_d`/|M|/任一 lr 变动须重算；若方向反转，two-timescale 原则指向提高 `disc_update_interval_n_d` 优先于动 policy 侧。
-- ADR-0009 噪声注入与 EMA 锚已裁决未落码，落地条件见各自 ADR。
+- ADR-0009 的噪声注入升级项随 ADR-0012 取消（fake 换域同源重构后判别器输入恒干净域，原强度 knob `disc_noise_sigma_max` 与 `disc_noise` 随机流退役删除）；EMA 锚仍未落码，落地条件见各自 ADR。
 
 ## Warm-start 预训练与 RM readiness gate（ADR-0007 / ADR-0008）
 
 T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不足——100 iter 全程徘徊 chance 带，advantage 信号近噪声。ADR-0007 修订 ADR-0001 的「在线从零」：RL 启动前新增判别器**密集预训练**，产物作为在线更新的初始权重。
 
 - **入口**：`pretrain` 子命令（与 train / eval / prepare 共享同一 config schema 与 dispatch 前校验）。单进程执行（World-1 退化路径），产物全局唯一——判别器是 DDP 完整副本口径，多 rank 各自预训练会分叉（torchrun 启动显式拒绝）。
-- **数据**：real = Real sample pool manifest（kind 守卫装载）；fake = base policy 冻结 rollout 量产，复用回放缓冲的 base 分区采样入口（批量分块、独立随机流、输出归一到 pool 存储域）。组1 / 组2 各自预训练 run（fake 分布不同）：采样场与条件分布经 `GroupPolicy` 按 config 分派——**同一条代码路径，仅 config 不同**。
-- **训练循环（ADR-0008 per-condition 步进的**最小诚实形态已落**：每步单条件量产 + real 同条件匹配；均匀轮转调度与 per-condition AUC 归因随 ADR-0008-04 落码）**：复用在线期同款判别器单步更新原语（`OnlineUpdate.step` + LSGAN + AdamW）密集步进，**无第二套判别器训练逻辑**。每步先抽一个条件（当前为条件分布的随机采样，均匀轮转归 ADR-0008-04），再量产该条件 fake 批——`update_step` 的回放按该条件过滤、real 同条件匹配（混采量产批没有诚实标签可穿，ADR-0008-03）；「预训练期混采退化为 base fake 库内采样」的旧口径废止，AUC 归因暂为全池混采（per-condition 归因随 ADR-0008-04）。终止 = 全部条件最近一次 per-condition AUC 过线即停（白名单空 → 拒跑）；当前实现的终止 = held-out AUC ≥ 门槛（`pretrain_gate_auc`，暂定 **0.65**、chance 带外，用预训练曲线校准后定版）**且换批复测仍 ≥ 门槛**（两次独立测量都达标才终止，报告值取两次较小者——train 侧 gate 按独立采样对同一阈值重算，单批贴线越过的 checkpoint 会被非确定性拒绝，producer 侧成功判据须对单批测量噪声鲁棒）或步数上限（`pretrain_max_steps`），两者皆配置化。最终 per-condition AUC（当前实现：单一 `final_heldout_auc`）与落盘 checkpoint 同快照。
+- **数据**：real = Real sample pool manifest（kind 守卫装载）；fake = 冻结基座对该条件 real 的同源重构体（装配原语产出，ADR-0012；原「base policy 冻结 rollout 量产 + 复用回放缓冲 base 分区采样入口」已退役删除）。组1 / 组2 各自预训练 run（fake 分布不同）：采样场与条件分布经 `GroupPolicy` 按 config 分派——**同一条代码路径，仅 config 不同**。
+- **训练循环（ADR-0008 per-condition 步进的**最小诚实形态已落**：每步单条件 + real 同条件匹配；均匀轮转调度与 per-condition AUC 归因随 ADR-0008-04 落码）**：复用在线期同款判别器单步更新原语（`OnlineUpdate.step` + LSGAN + AdamW）密集步进，**无第二套判别器训练逻辑**。每步先抽一个条件（当前为条件分布的随机采样，均匀轮转归 ADR-0008-04），再以装配原语构造该条件配对批（real 同条件抽取 + 其同源重构 fake，ADR-0012；混采批没有诚实标签可穿，ADR-0008-03——原「回放按该条件过滤」随 ReplayBuffer 退役删除）；「预训练期混采退化为 base fake 库内采样」的旧口径废止，AUC 归因暂为全池混采（per-condition 归因随 ADR-0008-04）。终止 = 全部条件最近一次 per-condition AUC 过线即停（白名单空 → 拒跑）；当前实现的终止 = held-out AUC ≥ 门槛（`pretrain_gate_auc`，暂定 **0.65**、chance 带外，用预训练曲线校准后定版）**且换批复测仍 ≥ 门槛**（两次独立测量都达标才终止，报告值取两次较小者——train 侧 gate 按独立采样对同一阈值重算，单批贴线越过的 checkpoint 会被非确定性拒绝，producer 侧成功判据须对单批测量噪声鲁棒）或步数上限（`pretrain_max_steps`），两者皆配置化。最终 per-condition AUC（当前实现：单一 `final_heldout_auc`）与落盘 checkpoint 同快照。
 - **产物契约**：判别器 checkpoint（可装载 state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（`kind="pretrain_report"`：组别、**per-condition 最终 AUC 与条件白名单**（ADR-0008，取代单一 `final_heldout_auc` 标量）、门槛与达标与否、数据口径指纹——ChannelStats / Real sample pool manifest / held-out manifest / 判别器网络配置的内容 sha256；MR-RATE 线另加条件词汇表工件内容 sha256（#129：该线 fake 形状/token/spacing/sigma 数值锚的派生来源））。报告落盘路径与 `pretrain_report_json` 声明的一致性是 pretrain 入口的不变式（分叉即 usage error 拒绝——train 按声明精确路径装载，分叉即 missing-report 或静默装旧报告）。装载走守卫入口（`PretrainReport.load` → `assert_data_provenance` → `load_discriminator`）：**缺报告 / kind 不符 / 组别不符 / latent 形状不符（单域线） / 条件集不符（多条件线：报告条件名集 ≠ 本域词表条件集） / 工件指纹不符（含词表工件） / 形态指纹不符即拒绝**。组3 序贯 stage-2 的合法消费路径 = stage 级报告绑定（#116）：`experiment.stage2_pretrain_report_json` 绑定 cross-modal 预训练报告（序贯必填），序贯编排把绑定路径重写进 stage-2 计划 config 的 `reward.pretrain_report_json`——trainer 装配与守卫按单阶段语义消费、无序贯分支；stage-2 指向异组报告被组别等值守卫拒绝（#113），报错指引绑定配置面、不静默继承 stage-1 报告。
-- **指标事件**：`pretrain` 事件类型（步号 + loss + held-out AUC + buffer 占用）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；事件类型清单与各型的回退记账口径见下节。
+- **指标事件**：`pretrain` 事件类型（步号 + loss + 本步条件 AUC）写入预训练 run 目录的 metrics.jsonl（event 判别字段与 iter / milestone 混存同一流）；事件类型清单与各型的回退记账口径见下节。
 - **RM readiness gate（train 入口硬前置；ADR-0007 口径已交付，ADR-0008 按条件化为定版设计）**：判别器装配从预训练报告守卫重载（latent 形状/条件集对照 → 数据口径工件指纹对照（BraTS 三件；MR-RATE 另加条件词汇表工件，见上）→ 形态指纹对照 → checkpoint 严格装载——缺报告 / kind 不符 / 工件损坏 / 口径指纹不匹配即拒绝，冷启动训练路径在 train 侧废弃，``discriminator_ckpt`` 不再是 train 装配消费点——resume 占位装配同样不消费任何 checkpoint 工件，预训练产物清理不阻断续训）；启动期按**当前 run 的数据口径**（held-out real + 本 rank base fake 批）**重算** held-out AUC——不信任预训练报告旧值，重算与预训练 gate 测量同一份 ``HeldOutAuc.compute`` 口径（全池混采），同 scorer 快照 + 同 fake 批下重算值与预训练任一次测量逐位可比；报告 ``final_heldout_auc``（= 跨界测量与换批复测的较小者）是 producer 侧留痕，重算不复现它也不必复现——门槛判定只依赖本次重算与阈值；重算值低于 ``pretrain_gate_auc`` 即给出含实测值与阈值的可读报错并回滚 run 目录（沿用 preflight 失败语义），达标放行。检查发生在 Baseline 采样等昂贵启动动作之前；分布式下各 rank 以本 rank base fake 独立重算、经集合裁决全体一致拒绝（任一 rank 眼里判别器失明都不得开跑；本地重算的任何失败——含 held-out 工件读盘异常——都收敛为该 rank 的裁决输入，不越过集合点）。**resume 跳过门槛与 warm-start 装载**——续训状态已含判别器全量状态（恢复点判别器已在岗），预训练产物被清理的 run 仍可续训；``pretrain_report_json`` 字段引入前的旧 run 快照在续训对账装载期被 schema 必填校验拒绝，旧口径 run 不再支持续训。fixture 不设豁免：fixture config 以低阈值（0.51，chance 带上沿之上）+ 自产小产物经同一条代码路径通过门槛。``pretrain_report_json`` schema 字段（生产配置**必填无默认**）已落位——RL 不带 warm-start 工件在 schema 层就无法启动。ADR-0008 按条件化落地形态：判定对象改为 per-condition AUC + **条件白名单**（过线条件清单，在线期梯度门控按此名单执行，见「在线更新机制」），0.65 为候选阈值（用 MR-RATE 预训练曲线校准后定版），条件 held-out 卷数 < 20 时用 bootstrap CI 下界判定（小样本支撑度规则）；**白名单空 = 拒绝开跑**（硬前置保留），非空即开跑、未过线条件由在线期梯度门控兜底；train 侧重算的白名单化改造随 per-condition 步进代码后续 ticket 交付。门槛是启动期机制，与「防 reward hacking」节的训练期监控（AUC 掉回 chance 带）互不替代。
 
 
@@ -83,9 +83,9 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 
 | 事件类型 | 产出方 | 字段 | 回退（rewind）记账口径 |
 |---|---|---|---|
-| `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `buffer_current_fraction` / `buffer_replay_fraction` / `buffer_replay_degraded` / `policy_gated`（ADR-0008 决策 7）/ `train_pairwise_acc`（ADR-0009-β，N_d 跳过为 null）/ `overfit_divergence_ema`（ADR-0009-β，N_d 跳过为 null）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
+| `iter` | RL 逐 iteration（train 循环） | `iteration` / `stage` / `rank` / `modality` / `anchor_eval_reward` / `intra_group_reward_std` / `heldout_auc` / `loss` / `policy_gated`（ADR-0008 决策 7）/ `train_pairwise_acc`（ADR-0009-β，N_d 跳过为 null）/ `overfit_divergence_ema`（ADR-0009-β，N_d 跳过为 null）/ `lr` / `elapsed_s` | 以 0-based iteration 号记账：保留号 < 恢复点 |
 | `milestone` | 里程碑解码评测（train 循环） | `iteration` / `stage` / `fid` / `kid` / `ssim` / `mae` / `psnr` / `criteria_summary` / `early_stop` / `early_stop_reason` | 以完成数记账：保留完成数 ≤ 恢复点（评测与恢复点 checkpoint 同批产出） |
-| `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `modality`（本步条件，ADR-0008 per-condition 步进）/ `heldout_auc`（本步条件的 AUC）/ `buffer_base_occupied` / `buffer_recent_occupied` / `lr` / `elapsed_s` | **不参与回退**：全量保留 |
+| `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `modality`（本步条件，ADR-0008 per-condition 步进）/ `heldout_auc`（本步条件的 AUC）/ `lr` / `elapsed_s` | **不参与回退**：全量保留 |
 | `overfit_alert` | 过拟合分叉报警（RL 相：train 循环，ADR-0009 决策 4/5，越线 rank 产出、随 iter 事件同归并序；预训练相：warm-start driver，ADR-0009-γ，随 pretrain 事件之后写出） | `iteration`（RL 相 = iteration 号；预训练相 = 预训练步号）/ `stage` / `rank` / `phase`（相判别：`rl` 缺省 / `pretrain`，ADR-0009-γ）/ `modality` / `divergence_ema`（分叉值）/ `train_pairwise_acc` / `heldout_auc` | **按相分轨**：RL 相以 0-based iteration 号记账（保留号 < 恢复点，回退重执行重发）；预训练相不参与回退：全量保留（与 `pretrain` 事件同口径——预训练执行史没有对应的 checkpoint 可重放） |
 
 - **预训练事件排除在回退口径外的理由**：warm-start 执行史没有对应的 checkpoint 可重放，按任何边界删都是永久丢失——预训练收敛曲线断点、RM readiness gate 的阈值校准（`pretrain_gate_auc` 定版）失去数据基础。
@@ -125,7 +125,7 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 
 ## 待定 / 移交
 
-- 精确 `N/K`、判别器 LR、replay buffer 容量 → rollout 吞吐 profile 后定（ticket #7 编排、ticket #9 终稿）。
+- 精确 `N/K`、判别器 LR → rollout 吞吐 profile 后定（ticket #7 编排、ticket #9 终稿）。
 - **门槛阈值 0.65 定版与动态门控 enter/exit/EMA 跨度定版** → MR-RATE 预训练曲线校准（ADR-0008；chance 带 ≈ 0.5±0.02 来自 T13 实测）。
 - hacking 监控阈值、早停准则 → ticket #8 + 对应 fog（依赖经验数据）。
 - **预案 A（冻结判别器 + EMA 锚）**：hacking 签名（`anchor_eval_reward` 升 + milestone FID 同步恶化）触发时切换——实现另开 ticket（ADR-0007 Considered Options A）。
