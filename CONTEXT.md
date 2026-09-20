@@ -10,6 +10,10 @@ cynosure 为 MAISI 3D latent rectified-flow 医学影像 checkpoint 设计并实
 VAE（AutoencoderKlMaisi）把影像体压缩成的 4 通道低维表征。一切 RL 采样与打分都在 latent 域进行，不回像素域。
 _Avoid_: 特征图、embedding、编码
 
+**Latent 域载体（DomainLatent）**:
+latent 张量 + 域标签的薄包装（ADR-0015，实施票未启动）：域枚举两值——存储域 / policy 工作域；「干净域 vs 带噪域」不在本枚举（第二票，见 干净域语义 = ADR-0012 判别器输入恒干净域）。域间换算只存在于载体语义级方法（`to_working` / `to_storage` 命名方向），载体方法是唯一被允许触碰 `latent_scale_factor` 的位置；**无裸函数约束**（维护者强约束）：latent 域操作一律挂载体类方法下，模块级裸函数不得触碰域换算（与域无关的统计裸函数不受约束）。错域 = 构造期拒绝，取代散布 6 处 / 13 文件的手写乘除纪律；一次性切换、不留双口径，数值零变化由既有 roundtrip / 逐位一致测试把守。
+_Avoid_: 裸张量手写 ×÷ scale factor（本词条落地后即违例）、把干净域混入本枚举、Tensor 子类（autocast 输出丢失子类类型，ADR-0015 已排除）
+
 **Policy（策略）**:
 被 RL 训练的扩散模型——模态标签阶段是 base UNet，跨模态影像阶段是 ControlNet。
 _Avoid_: 模型、网络、生成器
@@ -55,6 +59,12 @@ _Avoid_: 逐窗采样拼接当本仓语义、a/b 语义混称
 **上游锚（Upstream anchor）**:
 对齐的双重锚。recipe 级分线：BraTS 线锚 fork（ADR-0006，`clip=True` 为记录在案故意偏差），MR-RATE 线锚 NVIDIA 真上游 v1（`clip=False`）。机制级（滑窗、采样、scale factor）fork 与 NVIDIA 逐字节相同（`da438fe` 对拍 `utils.py`/`create_training_data.py`/`utils_infer.py` 零差异），两锚无分歧。说「与上游对齐」必须指明哪一锚。
 _Avoid_: 上游（不指明锚的泛指）
+
+### 配置与域
+
+**域资格（Domain qualification）**:
+config schema、装配分派与测试构造对「数据域」的单一事实源（ADR-0013，实施票未启动）：dataset → 域内字段集 / 工件集 / 错误文案 / 按域取行为的查询入口，登记在 `cynosure.domains`（待建）。schema validator 退化为查表接线（错误文案跟字段清单走同一知识单点），运行时分派（词汇表装配、schedule 装配、policy 构建、prepare 装配、eval 取数、baseline manifest 条件解析）经查询入口取本域行为——调用方不再写 `experiment.dataset == "MR-RATE"` 字面分支；新域 = 加条目不改消费面。schema 结构不动（注册表收拢、非 discriminated union）；MR-only 字段（`reward.real_pool_quota` / `heldout_fraction` / `heldout_quota_volumes` / `reward.sampling_manifest_json`）的「域内才合法」语义由查表守卫承载，取代散布 14 处 / 8 文件的字面分支与三份同步（validator / 分派 / fixtures）。
+_Avoid_: `experiment.dataset == "MR-RATE"` 字面判断（本词条落地后即违例）、域知识多处各写各的、为第三域预先设计（新域只是加条目的顺带能力）
 
 ### 策略建模
 
@@ -206,6 +216,10 @@ iter 事件由各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出
 **World-1 degeneration（world-1 恒等退化）**:
 单进程 = world size 1 的退化实现：不初始化进程组、集合通信原语恒等（barrier/gather 直接返回），训练循环对单进程/分布式走同一条执行序。
 _Avoid_: 单机模式（单机也可多进程）
+
+**分片自持（Component-owned resume state）**:
+续训分片的读写知识归各协作者自身（ADR-0014，实施票未启动）：协作者实现 `state()` / `adopt()` 小接口（gating / overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 trainer 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分片格式变更循升版拒旧先例（v10 清单退役、legacy 拒载），不写迁移读取。
+_Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）
 
 ### 实验设计与验收
 
