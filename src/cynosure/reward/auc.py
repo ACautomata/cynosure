@@ -23,10 +23,11 @@ gate 口径，ADR-0008-04）：real 侧由**调用方提供**（全量卷），�
 """
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 
-from cynosure.reward.artifacts import LatentManifest
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer
 
@@ -139,6 +140,37 @@ class HeldOutAuc:
         条件在装配期显式拒绝而非首步测量时才炸，ADR-0008-04）。"""
         return self._pool_size(modality)
 
+    def condition_order(self, modality: str) -> tuple[PoolEntry, ...]:
+        """该条件 held-out 全量卷的**索引排列**（测量批来源两步分解的
+        第一步，ADR-0016 决策 4 的实现缝）：``heldout_auc`` 命名流一次
+        randperm 抽出该条件候选域的全量排列——只定序、不加载 latent
+        本体；加载交给 ``load_order``（按排列或其切片上卡）。排列可复
+        算：同 seed 同调用序 → 同排列（抽取与加载解耦——分布式下排列
+        照旧全量同序，每 rank 只 load 本地切片）。
+
+        预训练每步逐条件调用、抽取次序随轮转序确定（与
+        ``condition_latents`` 同一消耗面）；**卷内顺序**不影响读数
+        （``auc_from_scores`` 是集合级秩统计）。"""
+        pool_size = self._pool_size(modality)
+        if pool_size < 1:
+            raise ValueError(
+                "held-out 全量卷构造需要该条件的条目"
+                f"（{modality!r}: {pool_size} 条）"
+            )
+        return tuple(self._real_sampler.permutation(modality=modality))
+
+    def load_order(self, order: Sequence[PoolEntry]) -> torch.Tensor:
+        """按索引排列加载卷批上卡（两步分解的第二步）：``condition_order``
+        的排列（或其切片）→ 逐条目懒加载 + stack + 设备迁移，零随机性。
+        切片加载与整批加载的对应切片逐位一致（顺序不重排、加载不消耗
+        流）——分布式预训练「每 rank 只 load 1/N 测量批」的数值前提。"""
+        if not order:
+            raise ValueError(
+                "按索引加载的卷切片不得为空（测量批的 real 源——"
+                "AUC 配对统计与同源重构都需要非空两侧）"
+            )
+        return self._real_sampler.load(order)
+
     def condition_latents(self, modality: str) -> torch.Tensor:
         """该条件 held-out **全量卷**的 latent 批（预训练 gate 的 recon
         构造原料，ADR-0012 决策 5）：无放回抽满该条件池——卷数是支撑度
@@ -150,14 +182,10 @@ class HeldOutAuc:
 
         抽取消耗本对象的持有流（``heldout_auc`` 命名流）——预训练每步
         逐条件调用，抽取次序随轮转序确定；**卷内顺序**不影响读数
-        （``auc_from_scores`` 是集合级秩统计）。"""
-        pool_size = self._pool_size(modality)
-        if pool_size < 1:
-            raise ValueError(
-                "held-out 全量卷构造需要该条件的条目"
-                f"（{modality!r}: {pool_size} 条）"
-            )
-        return self._real_sampler.sample(pool_size, modality=modality)
+        （``auc_from_scores`` 是集合级秩统计）。实现 = 两步分解面的全量
+        特例（``load_order(condition_order(·))``，ADR-0016 决策 4）：
+        单进程全量路径行为不变，分解面为分布式测量批分片铺路。"""
+        return self.load_order(self.condition_order(modality))
 
     def compute(
         self, fake_latents: torch.Tensor, modality: str | None = None,

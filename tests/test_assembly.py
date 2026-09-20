@@ -853,3 +853,48 @@ class TestMeasurementConditionReconstruction:
         assert torch.equal(first.fakes, second.fakes)
         assert torch.equal(streams.rollout.get_state(), rollout_before)
         assert torch.equal(streams.recon.get_state(), recon_before)
+
+    def test_epsilon_slice_generation_matches_full_batch_bitwise(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """ε 切片生成与整批生成同位逐位一致（issue #198；分布式票
+        ADR-0016 决策 4 的数值前提）：测量流批次起手复位的**同一状态**
+        下，「先消耗前 s 行 ε、再生成 (stop−s) 行」与整批 ε 的 [s:stop)
+        行逐位一致——torch CPU generator 的顺序流性质。测量批 ε 的生成
+        点在 measure_condition 的复位测量流内，多卡下每 rank 只生成本地
+        切片的 ε 依赖本性质成立；生成点若迁移设备（非 CPU 流）或改换
+        非顺序流语义，此处即红。"""
+        assembler = self._assembler(scenario)
+        reals = torch.randn(8, *SHAPE)
+        # 整批 ε：测量流复位模板直接注入（measure_condition 每批起手的
+        # 同一状态——测试不经私有方法、以模板状态为复位语义的观测面）
+        full = torch.Generator()
+        full.set_state(assembler._measurement_template)
+        batch_noise = torch.randn(reals.shape, generator=full)
+        for start, stop in ((0, 3), (2, 5), (5, 8), (0, 8)):
+            sliced = torch.Generator()
+            sliced.set_state(assembler._measurement_template)
+            if start:
+                # 前缀消耗：跳过排在前面 rank 的 ε 行（复位流的顺序位）
+                torch.randn((start, *SHAPE), generator=sliced)
+            assert torch.equal(
+                torch.randn((stop - start, *SHAPE), generator=sliced),
+                batch_noise[start:stop],
+            ), (start, stop)
+
+    def test_prefix_slice_measurement_matches_full_batch(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """前缀切片测量批 = 整批测量批的前缀行（逐位，issue #198）：
+        ε 侧走复位流前缀（同位逐位一致）+ 单候选步下 σ 轮转退化为恒位
+        （无切片错位面）+ 重构逐样本独立——分布式 rank0（首切片）的
+        端到端数值前提。任意偏移切片的 σ 轮转偏移（第 i 枚卷取第
+        i % |M| 位须按全量位次计）是分布式票的轮转偏移缝，本锚不越权。"""
+        assembler = self._assembler(scenario, train_steps=(1,))
+        assert len(assembler.candidate_sigmas(CONDITION)) == 1
+        reals = torch.randn(6, *SHAPE)
+        full = assembler.measure_condition(reals, CONDITION)
+        for cut in (1, 3, 6):
+            sliced = assembler.measure_condition(reals[:cut], CONDITION)
+            assert torch.equal(sliced.fakes, full.fakes[:cut]), cut
+            assert torch.equal(sliced.reals, full.reals[:cut]), cut
