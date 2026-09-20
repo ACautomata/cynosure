@@ -3,10 +3,10 @@
 AdamW 5e-5、干净域前向与 train 侧干净域复算。
 
 ADR-0012：real 侧不再内部自抽（装配原语负责条件匹配采样与容量硬守卫）、
-fake 侧不再回放混采（替换而非并存，判别器链路的 buffer 消费退役）；
-判别器输入恒干净域（带噪训练入口随注入退役——打分、训练、AUC、监控
-共享同一入口）；损失、优化器、梯度流零改动。real 池逐模态容量 ≥ K 的
-装配期守卫语义由 LatentManifest/RankSlicedPool 测试段把守（本文件尾部）。
+fake 侧不再回放混采（替换而非并存）；判别器输入恒干净域（决策 3）——
+打分、训练、AUC、监控共享 ``patch_logits`` 同一入口；损失、优化器、
+梯度流零改动。real 池逐模态容量 ≥ K 的装配期守卫语义由
+LatentManifest/RankSlicedPool 测试段把守（本文件尾部）。
 """
 
 from pathlib import Path
@@ -72,8 +72,7 @@ class WrittenPool:
 
 class RecordingCleanScorer:
     """测试仪器：委托真 scorer 并记录 patch_logits 的调用序列（入口、
-    调用时 grad 开关与输入批——干净域语义的观测缝）与 training_patch_logits
-    的调用（ADR-0012 后必须为零——带噪入口退役）。"""
+    调用时 grad 开关与输入批——干净域语义的观测缝）。"""
 
     def __init__(self, inner: LatentScorer) -> None:
         self._inner = inner
@@ -81,7 +80,6 @@ class RecordingCleanScorer:
         """patch_logits 的 (输入形状, 调用时 grad 是否开启) 序列。"""
         self.clean_batches: list[torch.Tensor] = []
         """patch_logits 的输入批序列（干净域复算的重放对账原料）。"""
-        self.noisy_calls: int = 0
 
     @property
     def discriminator(self):
@@ -101,12 +99,6 @@ class RecordingCleanScorer:
         self, logits_real: torch.Tensor, logits_fake: torch.Tensor,
     ):
         return self._inner.discriminator_terms(logits_real, logits_fake)
-
-    def training_patch_logits(
-        self, latents: torch.Tensor, generator: torch.Generator,
-    ) -> torch.Tensor:
-        self.noisy_calls += 1
-        return self._inner.training_patch_logits(latents, generator)
 
 
 class UpdateScenario:
@@ -247,17 +239,16 @@ class TestUpdateStep:
 
 class TestCleanDomainInput:
     """ADR-0012 决策 3：判别器输入恒干净域——参数更新前向与 train 侧
-    复算共享干净域打分入口（patch_logits），带噪训练入口退役（零调用）。"""
+    复算共享干净域打分入口（patch_logits）。"""
 
     def test_training_forward_uses_clean_entry_only(
         self, scenario: UpdateScenario,
     ) -> None:
-        """一步更新的四次前向（复算 2 + 训练 2）全走 patch_logits；
-        training_patch_logits 零调用（带噪入口退役的观测缝）。"""
+        """一步更新的四次前向（复算 2 + 训练 2）全走 patch_logits
+        （打分、训练、AUC、监控的单一入口）。"""
         recording = RecordingCleanScorer(scenario.scorer())
         update = scenario.update(scorer=recording)
         update.step(scenario.pair())
-        assert recording.noisy_calls == 0
         assert len(recording.clean_entries) == 4  # 复算 real/fake + 训练 real/fake
 
     def test_recompute_uses_no_grad_before_training_forward(

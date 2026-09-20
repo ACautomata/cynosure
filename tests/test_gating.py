@@ -38,7 +38,6 @@ class GatingFixture:
         """最小合法 RewardConfig（门控 knobs 可覆写）。"""
         fields = dict(
             disc_batch_size_k=4,
-            replay_buffer_capacity=64,
             real_pool_manifest="artifacts/real_pool.json",
             heldout_real_manifest="artifacts/heldout_real.json",
             channel_stats_json="artifacts/channel_stats.json",
@@ -376,10 +375,6 @@ class TestIterEventObservation:
             intra_group_reward_std=0.1,
             heldout_auc=0.6,
             loss={},
-            buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5,
-            buffer_base_occupied=8,
-            buffer_recent_occupied=4,
             lr=2e-6,
             elapsed_s=1.0,
         )

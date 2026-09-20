@@ -1,20 +1,22 @@
 """断点续训状态机（ticket T07，spec #15「训练循环执行序」的定期条目）。
 
-续训状态全清单（spec 钦定）：policy 与判别器各自的权重 + optimizer
-state、Replay buffer 两区内容、RNG 状态（torch/CUDA/numpy/python）、
+续训状态全清单（spec 钦定清单随 ADR-0012 退役面收窄）：policy 与判别器
+各自的权重 + optimizer state、RNG 状态（torch/CUDA/numpy/python）、
 iteration 计数、LR scheduler 状态、（若启用）EMA 权重——目标是跨作业
-边界恢复后训练轨迹与指标可复现。
+边界恢复后训练轨迹与指标可复现。（Replay buffer 两区内容曾列清单，
+ADR-0012 决策 6 判别器 fake 换域同源重构后 buffer 链路整体退役——
+v10 起不再落盘。）
 
 形态：单文件滚动 checkpoint——**per-rank 分片**（单进程/world-1 =
 ``checkpoints/<前缀>resume_state.pt``；多 rank = ``..._rank{R}.pt``，
 原子写 tmp + ``os.replace``）——崩溃恢复只消费各 rank 自己的最新状态，
 按周期覆写（周期 = ``schedule.checkpoint_interval``，默认每 10
 iteration + 每里程碑强制 + 收尾兜底，与产物 checkpoint 同节奏、由
-trainer 消费 config 契约驱动）。per-rank 分片的原因：Replay buffer
-（per-rank 两区内容）、八条命名 RNG 流（rank 派生 seed 下各 rank 独立
-演化）与 FSDP 优化器状态（分片动量）本就是 rank 本地状态；policy 与
-判别器权重在各 rank 间经梯度 allreduce 保持逐位一致，随每个分片冗余
-保存（同时是「同步生效」的外部观测面）。
+trainer 消费 config 契约驱动）。per-rank 分片的原因：四条命名 RNG 流
+（rank 派生 seed 下各 rank 独立演化；recon 流 shared 派生）与 FSDP
+优化器状态（分片动量）本就是 rank 本地状态；policy 与判别器权重在各
+rank 间经梯度 allreduce 保持逐位一致，随每个分片冗余保存（同时是
+「同步生效」的外部观测面）。
 
 与产物 checkpoint（``policy_iter*.pt`` / ``discriminator_iter*.pt``，
 rank 0 独写）的分工：后者是**契约工件**（评测 / milestone / 组3
@@ -30,13 +32,13 @@ stage-1 复用消费的可装载形态）；本文件是**训练机内部状态*
   恢复后显式对账；scheduler 对象落地后此处扩展为其 ``state_dict``。
 - EMA（条件项）：``ema_anchor_enabled=true`` 属升级项，trainer 装配期
   显式拒绝（静默忽略会让清单缺 EMA 权重），槽位预留、当前恒 ``None``。
-- RNG：八条命名 ``torch.Generator`` 流（TrainingRngStreams 注册表）+
+- RNG：四条命名 ``torch.Generator`` 流（TrainingRngStreams 注册表）+
   进程全局 torch/CUDA/numpy/python——全部编码为 ``weights_only`` 可安全
   反序列化的原语（张量 / int / float / None）：numpy 的 MT19937 键数组
   转 uint32 张量，python random 状态转 int 列表。
 
 恢复语义：trainer 装配（网络构建、冷启动判别器初始化）完成后
-``ResumeStore.restore`` 整体覆写——权重 / optimizer / buffer / 全部 RNG
+``ResumeStore.restore`` 整体覆写——权重 / optimizer / 全部 RNG
 流 / 全局 RNG 逐一回到落盘时刻，从 ``iteration`` 计数继续；恢复调用方
 还须回退指标流（RunArtifacts.``rewind_events``）删除恢复点之后的半截
 事件。
@@ -53,10 +55,8 @@ import torch
 
 from cynosure.config import ConfigLoader
 from cynosure.distributed import DistributedContext
-from cynosure.reward.buffer import ReplayEntry
 
 if TYPE_CHECKING:
-    from cynosure.conditions import ConditionVocabulary
     from cynosure.config import CynosureConfig
     from cynosure.train.trainer import GranularGrpoTrainer
 
@@ -73,7 +73,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 9
+RESUME_STATE_FORMAT_VERSION = 10
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -107,7 +107,13 @@ v9：``recon`` 流改按 rank 无关的 shared seed 派生（runtime/driver 装�
 ``continue_to_terminal`` 的调用次数与逐次批量）是分布式 FSDP 集合
 序列的一部分，跨 rank 必须一致；v8 分片的 recon 流状态逐 rank 相异，
 恢复后违反该不变量、首个判别器更新步即集合错位死锁，被版本对账显
-式拒绝（seeding 规则属于 payload 契约，不是可静默换装的实现细节）。"""
+式拒绝（seeding 规则属于 payload 契约，不是可静默换装的实现细节）。
+v10：Replay buffer 分区与四条退役 RNG 流（``disc_update`` / ``disc_noise``
+/ ``fake_shuffle`` / ``base_partition``）随 ADR-0012 退役面整体移除
+（#173：判别器 fake 换域同源重构，回放混采无消费者）——payload 删除
+``replay_buffer`` 键、generators 清单 8 流收窄为 4 流；旧 v9 分片带已
+退役键与流状态，注册表清单失配，被版本对账显式拒绝（跨口径续训不可
+恢复，退役删除属于 payload 契约变更）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -117,7 +123,6 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "policy_optimizer",
     "discriminator_network",
     "discriminator_optimizer",
-    "replay_buffer",
     "generators",
     "rng",
     "lr",
@@ -130,8 +135,8 @@ _ALLOWED_CONFIG_DRIFT: frozenset[tuple[str, ...]] = frozenset(
     {("schedule", "max_iterations")},
 )
 """续训 config 的白名单漂移字段：max_iterations 是延长/收缩训练规模的
-正当地址（跨作业边界续跑的动机本身）；其余字段漂移会让恢复的 RNG 流、
-buffer 内容与 optimizer 状态语义失配，一律拒绝。"""
+正当地址（跨作业边界续跑的动机本身）；其余字段漂移会让恢复的 RNG 流与
+optimizer 状态语义失配，一律拒绝。"""
 
 
 class ResumeStore:
@@ -141,10 +146,9 @@ class ResumeStore:
     ``os.replace``）。恢复（``restore``）的校验与应用分两段集合裁决：
     本地前置（payload 契约、拓扑、代际标记）的结果作为报告数据进对账
     collective——装载失败与代际不一致全体一致拒绝；应用段（config
-    一致性守卫 → 两模型权重与 optimizer → lr 槽位对账 → buffer 两区 →
-    命名 RNG 流 → 全局 RNG）的失败经第二段 collective 全体拒绝——
-    装配期随机性（冷启动判别器初始化）被整体覆写，恢复即落盘时刻的
-    训练机状态。
+    一致性守卫 → 两模型权重与 optimizer → lr 槽位对账 → 命名 RNG 流 →
+    全局 RNG）的失败经第二段 collective 全体拒绝——装配期随机性（冷启动
+    判别器初始化）被整体覆写，恢复即落盘时刻的训练机状态。
     """
 
     def __init__(
@@ -309,7 +313,7 @@ class ResumeStore:
 
     def _apply(self, trainer: "GranularGrpoTrainer", state: dict) -> int:
         """代际对齐通过后的恢复应用：config 守卫 → 两模型权重与
-        optimizer → lr 槽位对账 → buffer 两区 → 命名 RNG 流 → 全局 RNG
+        optimizer → lr 槽位对账 → 命名 RNG 流 → 全局 RNG
         ——装配期随机性（冷启动判别器初始化）被整体覆写；返回恢复点
         iteration。失败即抛，由调用方的第二段 collective 裁决同步给
         全体（半恢复状态不进训练循环）。"""
@@ -326,7 +330,6 @@ class ResumeStore:
             state["discriminator_optimizer"],
         )
         self._restore_lr(trainer, state["lr"])
-        self._restore_buffer(trainer, state["replay_buffer"])
         self._restore_generators(trainer, state["generators"])
         self._restore_global_rng(state["rng"])
         # 门控状态逐位复原（v4）：恢复点的（动态）白名单与 per-condition
@@ -341,11 +344,9 @@ class ResumeStore:
         self, trainer: "GranularGrpoTrainer", iteration: int,
         policy_state: dict,
     ) -> dict[str, Any]:
-        """续训状态全清单快照（T07 验收清单的落盘形态；v3：buffer 两区
-        条目带目标模态标签，latents 与 modalities 成对落盘）。"""
+        """续训状态全清单快照（T07 验收清单的落盘形态；v10 起清单不含
+        replay buffer——ADR-0012 退役面，见版本注释）。"""
         rewards = trainer.rewards
-        base = rewards.buffer.base_samples()
-        recent = rewards.buffer.recent_samples()
         return {
             "format_version": RESUME_STATE_FORMAT_VERSION,
             "iteration": int(iteration),
@@ -359,10 +360,6 @@ class ResumeStore:
             # 要求 spectral norm 的 power iteration buffer 逐位回归
             "discriminator_network": rewards.discriminator.state_dict(),
             "discriminator_optimizer": rewards.update.optimizer.state_dict(),
-            "replay_buffer": {
-                "base": self._capture_zone(base),
-                "recent": self._capture_zone(recent),
-            },
             "generators": {
                 name: generator.get_state()
                 for name, generator in trainer.rng.named().items()
@@ -379,22 +376,6 @@ class ResumeStore:
             # 分叉监控状态（v6）：per-condition 分叉 EMA（ADR-0009 决策 4；
             # 按 rank 独立、随本 rank 分片落盘）
             "overfit": trainer.rewards.overfit.state(),
-        }
-
-    @staticmethod
-    def _capture_zone(
-        entries: list[ReplayEntry],
-    ) -> dict[str, Any] | None:
-        """单分区落盘形态：latents 按区内序的**逐条目张量清单** + 逐
-        条目目标条件标签（空分区 = None；weights_only 兼容的
-        Tensor/list[str] 原语）。v7（#129）：逐条张量替代 v6 的单一
-        堆叠——异形状条件的条目形状随条件、堆叠不成立；同形状（BraTS
-        单域）下逐条清单与堆叠逐位等价。"""
-        if not entries:
-            return None
-        return {
-            "latents": [entry.latent for entry in entries],
-            "modalities": [entry.modality for entry in entries],
         }
 
     def _assert_resumable_config(
@@ -435,13 +416,11 @@ class ResumeStore:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 "
                 f"v{RESUME_STATE_FORMAT_VERSION}"
-                "（门控与分叉监控状态随分片落盘 + 八条命名 RNG 流——"
-                "ADR-0008 逐条件标签成对分区、ADR-0012 同源重构的 recon "
-                "流：先抽 s 后抽 ε 的加噪构造、seeding 按 rank 无关 "
-                "shared 派生以对齐 FSDP 集合序列），"
-                f"得到 {version!r}——跨口径续训不可恢复（旧分片缺相应的"
-                "流状态或违反跨 rank 流一致性不变量，恢复后门控决定、"
-                "重构抽样序列与分叉读数无法逐位续写）；请从产物 "
+                "（ADR-0012 退役面收窄：replay buffer 分区与 disc_update / "
+                "disc_noise / fake_shuffle / base_partition 四条退役随机流"
+                "已移除，门控与分叉监控状态、recon 流随分片落盘），"
+                f"得到 {version!r}——跨口径续训不可恢复（旧分片的退役键与"
+                "流状态在当前清单中失配，恢复后状态无从续写）；请从产物 "
                 "checkpoint 重启新 run"
             )
         missing = [key for key in _REQUIRED_KEYS if key not in state]
@@ -470,112 +449,6 @@ class ResumeStore:
                         f"续训状态 lr 槽位与 optimizer state 不一致（{name}: "
                         f"{saved_lr} vs {group['lr']}）"
                     )
-
-    def _restore_buffer(
-        self, trainer: "GranularGrpoTrainer", saved: dict,
-    ) -> None:
-        """buffer 两区内容恢复（v7：分区为逐条目 {latents, modalities}
-        成对清单——异形状条件的持久化形态，#129）：base 按固定容量严格
-        对账后整体回填，recent 按连续同标签段重放——逐段 push 与落盘时
-        的整批 push 在 FIFO 序上等价（段内插入序保持，段间序保持），
-        恢复后两区内容与落盘逐位一致；恢复后两区占用必须与落盘一致
-        （容量漂移在显式错误处暴露，不静默截断）。逐条目形状对账经
-        词汇表按条件校验（批内同条件即同形状；BraTS 单域 = 全局形状
-        特例）。"""
-        buffer = trainer.rewards.buffer
-        vocabulary = trainer.runtime.rollout.vocabulary
-        base = saved["base"]
-        if base is None:
-            raise ValueError("续训状态 base 分区缺失（v3+ 分片 base 须非空）")
-        latents, modalities = self._validate_zone(
-            "base", base, vocabulary,
-        )
-        if len(latents) != buffer.base_capacity:
-            raise ValueError(
-                f"续训状态 base 分区（{len(latents)} 条）与 buffer 容量 "
-                f"{buffer.base_capacity} 不符"
-            )
-        buffer.fill_base(
-            [latent.to(trainer.device) for latent in latents],
-            modalities,
-        )
-        recent_count = 0
-        recent = saved["recent"]
-        if recent is not None:
-            recent_latents, recent_modalities = self._validate_zone(
-                "recent", recent, vocabulary,
-            )
-            recent_count = len(recent_latents)
-            # 连续同标签段重放：生产 push 是逐 iteration 整批单条件，
-            # 同标签连续段合并 push 与逐批 extend 在 FIFO 序上等价——
-            # 恢复后的 recent 内部序与落盘逐位一致（采样消耗 randperm
-            # 的行序即内容序，行序漂移会让恢复的 loss 尾数分叉）
-            index = 0
-            while index < recent_count:
-                end = index + 1
-                while (
-                    end < recent_count
-                    and recent_modalities[end] == recent_modalities[index]
-                ):
-                    end += 1
-                buffer.push(
-                    torch.stack(
-                        [
-                            latent.to(trainer.device)
-                            for latent in recent_latents[index:end]
-                        ],
-                    ),
-                    recent_modalities[index],
-                )
-                index = end
-        sizes = buffer.zone_sizes()
-        if (sizes.base, sizes.recent) != (buffer.base_capacity, recent_count):
-            raise ValueError("续训状态 buffer 恢复后两区占用与落盘不一致")
-
-    @staticmethod
-    def _validate_zone(
-        name: str, zone: dict, vocabulary: "ConditionVocabulary",
-    ) -> tuple[list[torch.Tensor], list[str]]:
-        """v7 分区清单的输入契约：{latents, modalities} 成对（latents 为
-        逐条目张量清单——异形状条件的持久化形态）、逐行对齐、标签合法
-        （本域条件集——词汇表装载面的取值域）、逐条目形状与该条件词汇
-        表形状一致（批内同条件即同形状；返回值可直接交 fill_base /
-        push 的消费面）。"""
-        if not isinstance(zone, dict) or set(zone) != {"latents", "modalities"}:
-            raise ValueError(
-                f"续训状态 {name} 分区形态非法（v7 须为 {{latents, modalities}}）: "
-                f"{sorted(zone) if isinstance(zone, dict) else type(zone)}"
-            )
-        latents = zone["latents"]
-        modalities = zone["modalities"]
-        if not isinstance(latents, list) or any(
-            not isinstance(latent, torch.Tensor) for latent in latents
-        ):
-            raise ValueError(
-                f"续训状态 {name} 分区 latents 须为逐条目张量清单（v7 形态，"
-                f"异形状条件可持久化）: {type(latents)}"
-            )
-        if len(modalities) != len(latents):
-            raise ValueError(
-                f"续训状态 {name} 分区标签清单 {len(modalities)} 条与样本数 "
-                f"{len(latents)} 条不符"
-            )
-        allowed = set(vocabulary.names())
-        unknown = [m for m in modalities if m not in allowed]
-        if unknown:
-            raise ValueError(
-                f"续训状态 {name} 分区含非法目标条件标签: {sorted(set(unknown))}"
-                f"（本域条件集：{sorted(allowed)}）"
-            )
-        for index, (latent, modality) in enumerate(zip(latents, modalities)):
-            expected = vocabulary.latent_shape(modality)
-            if tuple(latent.shape) != expected:
-                raise ValueError(
-                    f"续训状态 {name} 分区第 {index} 条形状 "
-                    f"{tuple(latent.shape)} 与该条件（{modality!r}）词汇表"
-                    f"形状 {expected} 不符（批内同条件即同形状，#129）"
-                )
-        return latents, modalities
 
     def _restore_generators(
         self, trainer: "GranularGrpoTrainer", saved: dict,

@@ -4,10 +4,8 @@
 - fixture 下多条件异形状 config 走通 rollout 与 eval/baseline 采样，
   产出 latent 形状与各条件统一网格一致（词汇表 ``latent_shape(name)``
   为断言真值）；
-- 回放缓冲与判别器输入在异形状条件下的批组织可验证（批内同形——
-  同条件过滤使 stack/cat 恒安全）；
-- resume 状态分片 v7（逐条目张量清单）在异形状条目上的 capture /
-  对账 roundtrip。
+- 判别器输入（装配原语配对批 + OnlineUpdate 干净域前向）在异形状
+  条件下的批组织可验证（批内同形——配对批同源，cat 恒安全）。
 
 fixture 异形小词汇表（2 条件）：t1w/axial → latent (4,16,16,8)、
 flair/axial → latent (4,8,8,16)——空间 numel 2048 ≠ 1024，逐条件
@@ -45,7 +43,6 @@ from cynosure.policy.schedules import PerConditionSchedules
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.assembly import ReconstructionAssembler
-from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.scorer import LatentScorer, LsganTerms
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train import TrainingRuntime
@@ -54,7 +51,6 @@ from cynosure.train.artifacts import (
     ManifestEntry,
     RunArtifacts,
 )
-from cynosure.train.resume import ResumeStore
 from cynosure.train.rollout import MrConditionSampler, RolloutPhase
 from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import SyntheticMrRateDataset
@@ -129,50 +125,6 @@ class TestRolloutShapesFollowConditions:
             seen.add(latent_shape)
         assert seen == set(expected.values())
 
-    def test_base_partition_shapes_follow_quota(
-        self, fixture_env, tmp_path: Path,
-    ) -> None:
-        """base 分区量产：逐条件噪声形状随配额条件（验收 1 的量产路径）。"""
-        fixture, artifacts, vocab, sampler, config = fixture_env
-        generator = torch.Generator().manual_seed(0)
-        condition_sampler = MrConditionSampler(
-            vocab, generator, torch.device("cpu"),
-        )
-        rollout = RolloutPhase(
-            config,
-            sampler,
-            ZeroScorer(),  # type: ignore[arg-type]
-            generator,
-            condition_sampler,
-            vocabulary=vocab,
-            base_generator=torch.Generator().manual_seed(5),
-        )
-        quota = {"t1w/axial": 2, "flair/axial": 3}
-        fakes, names = rollout.base_partition_samples(quota)
-        assert len(fakes) == 5
-        assert names.count("t1w/axial") == 2
-        assert names.count("flair/axial") == 3
-        for latent, name in zip(fakes, names):
-            assert tuple(latent.shape) == vocab.latent_shape(name)
-
-    def test_base_batch_scales_with_condition_volume(self) -> None:
-        """量产批量按条件空间体积缩放（#122 首跑 OOM 修复）：基准 =
-        64×64×32 空间（BraTS 单域锚）× 8 批；大网格条件缩批防前向激活
-        OOM（t1w/coronal 空间 [128,64,128] = 基准体积 8 倍，单域批量
-        常数在 MR-RATE 多网格域把量产前向推向 OOM——T12 集群实录）；
-        小网格截到基准批量、不放大。
-
-        私有算术的定点测试（与「只测外部行为」的偏离及其理由）：量产
-        批量不进任何输出（条数/形状与分批无关），OOM 行为无法在小规模
-        单测里复现——缩放算术只能在此档直接钉住；批量本身的正误由
-        fixture 全循环（test_base_partition_shapes_follow_quota）以
-        输出面覆盖。"""
-        assert RolloutPhase._base_batch_for((4, 64, 64, 32)) == 8
-        assert RolloutPhase._base_batch_for((4, 128, 64, 128)) == 1
-        assert RolloutPhase._base_batch_for((4, 128, 128, 32)) == 2
-        assert RolloutPhase._base_batch_for((4, 32, 96, 96)) == 3
-        assert RolloutPhase._base_batch_for((4, 32, 32, 16)) == 8
-
 
 class TestBaselineSamplingShapes:
     """eval/baseline 采样：逐条目噪声形状从条目条件解析（验收 1 后半）。"""
@@ -211,33 +163,6 @@ class TestBaselineSamplingShapes:
         assert condition_names == set(vocab.names())
 
 
-class TestReplayBatchOrganization:
-    """回放缓冲的异形状批组织（验收 4）：同条件过滤使 stack 恒同形。"""
-
-    def test_heterogeneous_entries_sample_per_condition_shape(self) -> None:
-        buffer = ReplayBuffer(8)  # base 4：每条件 2
-        t1w_shape = (4, 16, 16, 8)
-        flair_shape = (4, 8, 8, 16)
-        buffer.fill_base(
-            [*torch.randn(2, *t1w_shape), *torch.randn(2, *flair_shape)],
-            ["t1w/axial", "t1w/axial", "flair/axial", "flair/axial"],
-        )
-        buffer.push(torch.randn(1, *t1w_shape), "t1w/axial")
-        buffer.push(torch.randn(1, *flair_shape), "flair/axial")
-        draw_t1w = buffer.sample_replay(
-            2, torch.Generator().manual_seed(0), "t1w/axial",
-        )
-        assert tuple(draw_t1w.samples.shape) == (2, *t1w_shape)
-        draw_flair = buffer.sample_replay(
-            2, torch.Generator().manual_seed(0), "flair/axial",
-        )
-        assert tuple(draw_flair.samples.shape) == (2, *flair_shape)
-        # 全池混采（None）在异形缓冲上显式失败——stack 无从同形（绝不
-        # 静默混形，批组织在形状守卫处 fail-fast）
-        with pytest.raises(RuntimeError):
-            buffer.sample_replay(4, torch.Generator().manual_seed(0))
-
-
 class TinyDiscriminator(torch.nn.Module):
     """最小可训练判别器（1×1×1 单卷积）：AdamW/反向传播面的协议最小
     替身；全卷积——异形批均可前向（批组织断言不受打分数值影响）。"""
@@ -251,24 +176,17 @@ class TinyDiscriminator(torch.nn.Module):
 
 
 class RecordingUpdateScorer:
-    """更新批观测替身：记录训练带噪入口（``training_patch_logits``）
-    与干净域入口（``patch_logits``）的输入批——判别器输入批组织
-    （验收 4 判别器侧）的观测缝。"""
+    """更新批观测替身：记录干净域入口（``patch_logits``）的输入批——
+    判别器输入批组织（验收 4 判别器侧）的观测缝（ADR-0012 后更新前向
+    恒干净域，不再有带噪入口）。"""
 
     def __init__(self) -> None:
         self._discriminator = TinyDiscriminator()
-        self.training_batches: list[torch.Tensor] = []
         self.clean_batches: list[torch.Tensor] = []
 
     @property
     def discriminator(self) -> torch.nn.Module:
         return self._discriminator
-
-    def training_patch_logits(
-        self, latents: torch.Tensor, generator: torch.Generator,
-    ) -> torch.Tensor:
-        self.training_batches.append(latents)
-        return self._discriminator(latents)
 
     def patch_logits(self, latents: torch.Tensor) -> torch.Tensor:
         self.clean_batches.append(latents)
@@ -388,7 +306,6 @@ class TestDiscriminatorInputBatchOrganization:
             scorer=scorer,
             config=RewardConfig(
                 disc_batch_size_k=4,
-                replay_buffer_capacity=64,
                 real_pool_manifest="pool.json",
                 heldout_real_manifest="heldout.json",
                 channel_stats_json="stats.json",
@@ -494,64 +411,6 @@ class TestRealPoolHeterogeneousContract:
             LatentManifest.load(path, kind="real_pool")
 
 
-class TestResumeV7HeterogeneousZones:
-    """resume v7 逐条目分片形态（验收 4 的持久化侧）：异形条目
-    capture / 对账 roundtrip、条件形状错位拒绝。"""
-
-    def test_capture_zone_is_per_entry_list(self) -> None:
-        entries = [
-            ReplayEntryStub(torch.randn(4, 16, 16, 8), "t1w/axial"),
-            ReplayEntryStub(torch.randn(4, 8, 8, 16), "flair/axial"),
-        ]
-        zone = ResumeStore._capture_zone(entries)  # type: ignore[arg-type]
-        assert zone is not None
-        assert isinstance(zone["latents"], list)
-        assert len(zone["latents"]) == 2
-        assert tuple(zone["latents"][0].shape) == (4, 16, 16, 8)
-        assert tuple(zone["latents"][1].shape) == (4, 8, 8, 16)
-        assert zone["modalities"] == ["t1w/axial", "flair/axial"]
-
-    def test_validate_zone_checks_per_condition_shapes(
-        self, fixture_env,
-    ) -> None:
-        _, _, vocab, _, _ = fixture_env
-        zone = {
-            "latents": [
-                torch.randn(*vocab.latent_shape("t1w/axial")),
-                torch.randn(*vocab.latent_shape("flair/axial")),
-            ],
-            "modalities": ["t1w/axial", "flair/axial"],
-        }
-        latents, modalities = ResumeStore._validate_zone(
-            "recent", zone, vocab,
-        )
-        assert modalities == ["t1w/axial", "flair/axial"]
-
-    def test_validate_zone_rejects_shape_mismatch(
-        self, fixture_env,
-    ) -> None:
-        _, _, vocab, _, _ = fixture_env
-        zone = {
-            "latents": [
-                torch.randn(*vocab.latent_shape("flair/axial")),
-            ],
-            "modalities": ["t1w/axial"],  # t1w 条目带 flair 形状 → 拒绝
-        }
-        with pytest.raises(ValueError, match="词汇表形状"):
-            ResumeStore._validate_zone("recent", zone, vocab)
-
-    def test_validate_zone_rejects_unknown_condition(
-        self, fixture_env,
-    ) -> None:
-        _, _, vocab, _, _ = fixture_env
-        zone = {
-            "latents": [torch.randn(4, 16, 16, 8)],
-            "modalities": ["not-in-vocabulary"],
-        }
-        with pytest.raises(ValueError, match="非法目标条件"):
-            ResumeStore._validate_zone("recent", zone, vocab)
-
-
 # ---------------------------------------------------------------------------
 # 里程碑评测的异形状读数（验收 3）——替身与 test_milestone_eval 同款机制
 
@@ -621,7 +480,6 @@ class TestMilestoneHeterogeneousReadings:
             },
             "reward": {
                 "disc_batch_size_k": 4,
-                "replay_buffer_capacity": 64,
                 "real_pool_manifest": "p.json",
                 "heldout_real_manifest": "h.json",
                 "channel_stats_json": "c.json",
@@ -665,14 +523,6 @@ class TestMilestoneHeterogeneousReadings:
             value == value and abs(value) < float("inf")
             for value in metrics.target_fid.values()
         )
-
-
-class ReplayEntryStub:
-    """ReplayEntry 的静态替身（resume._capture_zone 只消费两字段）。"""
-
-    def __init__(self, latent: torch.Tensor, modality: str) -> None:
-        self.latent = latent
-        self.modality = modality
 
 
 class MarkedLatentSampler:

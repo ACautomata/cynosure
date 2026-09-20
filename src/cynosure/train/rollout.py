@@ -18,18 +18,13 @@ rollout 初始噪声、扰动噪声的形状从批次条件经 ``ConditionVocabu
 Schedules`` 选择（锚 = 该条件空间 numel）。BraTS 单域 = 单条件词汇
 特例：任意条件恒 config ``latent_shape``、共用一份全局锚日程。
 
-ADR-0008-01：base 分区种子按每条件配额量产（``base_condition_quota``）
-——``ConditionSampler.sample_target`` 按指定目标条件构造条件（组2 的
-源影像自由度仍在合法源上均匀），量产产出逐样本目标条件标签
-（fill_base 的标签输入）。
-
 数值口径：采样（Anchor/扰动/续跑的 policy 前向）进 bf16 autocast（与
 更新相同口径，保证 π_old 可被逐位重算）；判别器打分在 autocast 外
 fp32（T05 已锚定的 reward 数值口径）。
 """
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Protocol
 
 import torch
 
@@ -43,21 +38,6 @@ from cynosure.policy.condition import (
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.scorer import LatentScorer
-
-_BASE_BATCH = 8
-"""base 分区种子生成的 rollout 批量（CFG 组合场 = 2×batch 前向）；
-基准口径 = BraTS 单域锚网格 64×64×32（config ``policy.input_img_size_
-numel`` 默认 131072 的网格形态）。大网格条件经 ``RolloutPhase.
-_base_batch_for`` 按空间体积缩批——量产前向的激活显存随 batch × 体积
-增长，多网格域（MR-RATE 逐条件统一网格，#111 裁决）直接套单域常数会
-把大网格条件推向 OOM（#122 首跑集群实录：t1w/coronal [4,128,64,128]
-batch=8 前向单次分配 12 GB）。"""
-
-_BASE_REFERENCE_SPATIAL = 64 * 64 * 32
-"""量产批量体积缩放的基准空间体积（BraTS 单域锚网格的 D×H×W，=
-131072）：与 config ``policy.input_img_size_numel`` 默认值同源，此处以
-网格形态命名（该字段在 MR 线被逐条件锚字段守卫拒绝携带，量产路径
-需要一个域无关的基准常量）。"""
 
 
 @dataclass(frozen=True)
@@ -119,18 +99,16 @@ class ConditionSampler(Protocol):
     ) -> tuple[RolloutCondition, str]:
         """均匀采一个条件的 rollout 条件（batch=1，采样场负责广播）。
 
-        ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流
-        （不漂移训练 rollout 的抽样流，各组实现同一约定）。"""
+        ``generator`` 缺省用实现自身的主流。"""
         ...
 
     def sample_target(
         self, target: str, generator: torch.Generator | None = None,
     ) -> RolloutCondition:
-        """按指定目标条件构造 rollout 条件（ADR-0008-01：base 分区
-        配额量产的条件源——配额决定目标端分布，条件内的其余自由度
-        仍按本组分布均匀抽取）。
+        """按指定目标条件构造 rollout 条件（配对批装配原语 real 侧的
+        条件源，reward.assembly）。
 
-        ``generator`` 缺省用实现自身的主流；base 分区种子生成传独立流。"""
+        ``generator`` 缺省用实现自身的主流。"""
         ...
 
     def targets(self) -> tuple[str, ...]:
@@ -164,8 +142,7 @@ class ModalLabelConditionSampler:
         """均匀采一个序列的 rollout 条件（label batch=1，组合场负责广播），
         连同采中的序列名返回——iter 事件按目标序列归因健康指标的依据。
         随机数经 CPU generator 生成（跨设备可复现的 fixture「固定 seed」
-        语义）后迁移到 rollout 设备；``generator`` 缺省用主流，base 分区
-        种子生成传独立流（不漂移训练 rollout 的抽样流）。"""
+        语义）后迁移到 rollout 设备；``generator`` 缺省用主流。"""
         stream = generator if generator is not None else self._generator
         index = int(torch.randint(len(MODALITIES), (1,), generator=stream))
         label = self._mapping.label(MODALITIES[index])
@@ -222,8 +199,7 @@ class MrConditionSampler:
         self, generator: torch.Generator | None = None,
     ) -> tuple[RolloutCondition, str]:
         """均匀采一个生成条件的 rollout 条件（轮转序 = 词汇表登记序，
-        确定性），连同条件名返回。随机流语义同 ModalLabelCondition
-        Sampler（缺省主流、base 分区独立流）。"""
+        确定性），连同条件名返回。``generator`` 缺省用主流。"""
         stream = generator if generator is not None else self._generator
         names = self._vocabulary.names()
         index = int(torch.randint(len(names), (1,), generator=stream))
@@ -233,9 +209,9 @@ class MrConditionSampler:
     def sample_target(
         self, target: str, generator: torch.Generator | None = None,
     ) -> RolloutCondition:
-        """按指定生成条件构造条件（base 分区配额量产入口）：条件的
-        token/spacing 都是条件属性、无其余自由度，不耗 RNG。未知条件
-        名即拒绝（词汇表装载面守卫的取数前置）。"""
+        """按指定生成条件构造条件（配对批装配原语 real 侧的条件源）：
+        条件的 token/spacing 都是条件属性、无其余自由度，不耗 RNG。
+        未知条件名即拒绝（词汇表装载面守卫的取数前置）。"""
         return self._condition(target)
 
     def targets(self) -> tuple[str, ...]:
@@ -327,7 +303,7 @@ class CrossModalConditionSampler:
     ) -> tuple[RolloutCondition, str]:
         """均匀采一个有序对（目标 label batch=1 + 源影像 latent batch=1），
         连同目标序列名返回——iter 事件按目标序列归因健康指标的依据；
-        ``generator`` 缺省用主流（base 分区种子生成传独立流）。"""
+        ``generator`` 缺省用主流。"""
         stream = generator if generator is not None else self._generator
         pair_index = int(torch.randint(len(self._pairs), (1,), generator=stream))
         source_modality, target_modality = self._pairs[pair_index]
@@ -339,7 +315,7 @@ class CrossModalConditionSampler:
     def sample_target(
         self, target: str, generator: torch.Generator | None = None,
     ) -> RolloutCondition:
-        """目标端固定为 ``target``（ADR-0008-01 配额量产的条件源），
+        """目标端固定为 ``target``（配对批装配原语 real 侧的条件源），
         源序列自由度按组2 分布在「目标端为 target 的有序对」上均匀
         抽取；注入清单无该目标端的有序对时显式拒绝（cross_modal_pairs
         可配置，不静默回退全目标采样）。"""
@@ -348,8 +324,7 @@ class CrossModalConditionSampler:
         if not candidates:
             raise ValueError(
                 f"组2 条件分布的有序对清单无目标端为 {target} 的对"
-                "（sample_target 是配额量产的条件源，清单来自 "
-                "cross_modal_pairs 配置）"
+                "（sample_target 的条件源清单来自 cross_modal_pairs 配置）"
             )
         pair_index = int(torch.randint(len(candidates), (1,), generator=stream))
         source_modality, _ = candidates[pair_index]
@@ -405,7 +380,6 @@ class RolloutPhase:
         device_type: str = "cpu",
         autocast_dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
-        base_generator: torch.Generator | None = None,
     ) -> None:
         self._config = config
         self._sampler = sampler
@@ -416,14 +390,10 @@ class RolloutPhase:
         self._device = device
         self._condition_sampler = condition_sampler
         self._vocabulary = vocabulary
-        # base 分区种子生成的独立流：其抽取数随 replay_buffer_capacity
-        # 变化，与训练 rollout 共流会让 buffer 容量实验漂移 policy 样本流
-        self._base_generator = base_generator
 
     @property
     def vocabulary(self) -> ConditionVocabulary:
-        """本运行时的条件词汇表（rollout 形状解析与续训 buffer 逐条目
-        对账的共同取数面，#129）。"""
+        """本运行时的条件词汇表（rollout 形状解析的取数面，#129）。"""
         return self._vocabulary
 
     def run_iteration(self) -> IterationRollout:
@@ -451,9 +421,9 @@ class RolloutPhase:
         std_count = 0
         # fake 域归一（T12 探针定谳）：rollout 终点在 checkpoint scaled
         # 采样域，real pool 按 data-preparation 契约存 encode 原始输出
-        # （seeded 后验采样）——打分与入 buffer 前归位 pool 域（见
-        # _to_pool_domain），判别器比较两侧同域。打分输入与 new_fakes
-        # 的消费面（Online update / 回放 / AUC fake 侧）因此域一致。
+        # （seeded 后验采样）——打分前归位 pool 域（见 _to_pool_domain），
+        # 判别器比较两侧同域。打分输入与 new_fakes 的消费面（held-out
+        # AUC fake 侧）因此域一致。
         with torch.no_grad():  # 打分是 inference（autocast 外、fp32、无图）
             for step_index, x_k, directions, old_log_probs, terminals in sampled:
                 rewards = {
@@ -483,73 +453,10 @@ class RolloutPhase:
             intra_group_reward_std=std_sum / std_count,
         )
 
-    def base_partition_samples(
-        self, quota: Mapping[str, int],
-    ) -> tuple[list[torch.Tensor], list[str]]:
-        """冻结初始 policy 的 rollout 产出（Anchor 全 ODE 终点）——
-        buffer base 分区的种子（train 启动时自动生成，spec 补钉）。
-
-        ADR-0008-01：按每条件配额量产（``base_condition_quota``）——
-        逐目标条件产满配额（条件键 = 序列名/生成条件名），产出逐样本
-        目标条件标签（fill_base 的标签输入；组2 条目按目标端归因）。
-        各条件的噪声形状从条件键经词汇表解析；**cat 仅同条件批内发生**
-        （跨条件异形状无从 cat，#129），返回值 = 逐条目张量清单 +
-        逐条条件标签（与 ``fill_base`` 的消费面对齐）。走独立 base 流
-        （构造注入 base_generator）：其抽取数随 buffer 容量/配额变化，
-        不占训练 rollout 的抽样流（同 seed 下容量实验的 rollout 流
-        保持不变）。"""
-        if not quota:
-            raise ValueError("base 分区量产的每条件配额不得为空")
-        generator = (
-            self._base_generator
-            if self._base_generator is not None else self._generator
-        )
-        latents: list[torch.Tensor] = []
-        condition_names: list[str] = []
-        with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
-            for condition_name, count in quota.items():
-                shape = self._vocabulary.latent_shape(condition_name)
-                produced = 0
-                while produced < count:
-                    batch = min(
-                        self._base_batch_for(shape), count - produced,
-                    )
-                    condition = self._condition_sampler.sample_target(
-                        condition_name, generator,
-                    )
-                    noise = torch.randn(
-                        (batch, *shape), generator=generator,
-                    ).to(self._device)
-                    anchor = self._sampler.anchor_trajectory(noise, condition)
-                    terminal = self._to_pool_domain(anchor[-1])
-                    latents.extend(terminal[i] for i in range(batch))
-                    condition_names.extend([condition_name] * batch)
-                    produced += batch
-        # base 分区与近期分区同一 reward 域（real pool 存储域）
-        return latents, condition_names
-
-    @staticmethod
-    def _base_batch_for(shape: tuple[int, int, int, int]) -> int:
-        """条件形状的量产批量（体积感知缩放，#122 首跑 OOM 修复）：
-        基准 = BraTS 单域锚网格 64×64×32（``_BASE_REFERENCE_SPATIAL``）×
-        ``_BASE_BATCH`` 批；实际批 = 基准批 × (基准体积 / 本条件空间体积)
-        截到 [1, 基准]——前向激活显存随 batch × 体积增长，缩批以单次
-        前向体积近似守恒；小网格只截顶、不放大（基准批量本身是 CFG
-        双前向的标定口径）。``shape`` = latent [C, D, H, W]（消费面
-        传词汇表 ``latent_shape`` 的返回）。"""
-        spatial = shape[1] * shape[2] * shape[3]
-        return max(
-            1,
-            min(
-                _BASE_BATCH,
-                _BASE_BATCH * _BASE_REFERENCE_SPATIAL // spatial,
-            ),
-        )
-
     def _to_pool_domain(self, latent: torch.Tensor) -> torch.Tensor:
         """rollout 终点（policy scaled 采样域）→ real pool 存储域：
         除 ``policy.latent_scale_factor``（``LatentDecoder`` 解码前除回
-        同构）——判别器比较与 buffer 存取的单一归一点。"""
+        同构）——判别器比较的单一归一点。"""
         return latent / self._config.policy.latent_scale_factor
 
     def _perturb(

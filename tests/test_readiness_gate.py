@@ -627,7 +627,6 @@ def _minimal_gate_config() -> CynosureConfig:
         },
         "reward": {
             "disc_batch_size_k": 4,
-            "replay_buffer_capacity": 8,
             "real_pool_manifest": "pool.json",
             "heldout_real_manifest": "heldout.json",
             "channel_stats_json": "stats.json",

@@ -317,7 +317,6 @@ class Fixture:
         reward: dict = {
             "disc_num_layers_d": 1,
             "disc_batch_size_k": 4,
-            "replay_buffer_capacity": 64,
             "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
             "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
             "channel_stats_json": str(artifacts_dir / "channel_stats.json"),

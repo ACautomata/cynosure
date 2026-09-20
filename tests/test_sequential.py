@@ -276,26 +276,6 @@ class TestStageIndependence:
             for name in stage1_disc
         )
 
-    def test_stage2_buffer_seeded_fresh_not_from_stage1_fakes(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """stage-2 的 buffer 从零起步（stage 间不串扰）：base 分区由各阶段
-        自己的初始 policy 生成、占用读数同量独立（若 stage-1 fake 串扰进
-        stage-2 的装配，占用会翻倍）；近期分区随 ADR-0012 无 push 退役、
-        两阶段恒空。"""
-        scenario.write_inputs(group="sequential")
-        assert scenario.train().code == 0
-        # 指标流另含 overfit_alert（同带 iteration 归因轴），按事件类型
-        # 取 iter 序列：两阶段各一
-        stage1_event, stage2_event = [
-            event for event in scenario.events() if event["event"] == "iter"
-        ]
-        assert stage1_event["buffer_base_occupied"] == 32
-        assert stage2_event["buffer_base_occupied"] == 32  # stage-2 自行生成的 base 分区
-        assert stage1_event["buffer_recent_occupied"] == 0
-        assert stage2_event["buffer_recent_occupied"] == 0  # push 退役：recent 恒空
-        assert stage2_event["buffer_replay_fraction"] == pytest.approx(0.0)
-
 
 class TestStage2ReportBinding:
     """stage 级报告绑定（#116）：stage-2 消费 cross-modal 预训练报告；

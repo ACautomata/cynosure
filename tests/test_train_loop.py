@@ -4,12 +4,12 @@ fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各
 续跑 → 判别器 raw logit 打分）→ MGAI advantage → 逐 k 独立梯度步 →
 判别器 Online update → iter 事件落盘 + checkpoint。
 
-五条 AC 对应：
+四条 AC 对应（原 AC 5「buffer base 分区自动生成」随 ADR-0012 量产退役
+移除，#173）：
 1. fixture 下单 iteration 全链路绿，产出可装载 checkpoint 与 iter 事件流；
 2. log-prob 一致性：Rollout 记录的 π_old 与更新时重算一致（诊断工件）；
 3. MGAI 顺序正确；G=12 下组内标准化非退化（组内 reward std 非零进事件）；
 4. 每个训练步 k 一次独立梯度步（loss 组件逐 k 记录）；
-5. buffer base 分区在 train 启动时由冻结初始 policy 自动生成。
 """
 
 import copy
@@ -47,7 +47,6 @@ from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.assembly import PairBatch
-from cynosure.reward.buffer import ReplayBuffer, ReplayEntry, base_condition_quota
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
@@ -259,7 +258,7 @@ def scenario(cli: CliSession, tmp_path: Path) -> TrainingLoopScenario:
 
 
 class TestSingleIterationLoop:
-    """AC 1/3/4/5：单 iteration 全链路绿、事件流、逐 k loss、base 分区。"""
+    """AC 1/3/4：单 iteration 全链路绿、事件流、逐 k loss。"""
 
     def test_single_iteration_runs_green_and_emits_iter_event(
         self, scenario: TrainingLoopScenario,
@@ -278,10 +277,10 @@ class TestSingleIterationLoop:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """iter 事件：Anchor eval reward、非退化组内 reward std（G=12）、
-        held-out AUC、loss 组件（逐 k policy + discriminator）、buffer
-        占比（混合占比 + 两区占用）、lr、采样的目标序列（per-sequence
-        健康监控的归因轴——条件分布每 iter 均匀采一个序列，事件不记
-        序列名时 reward/loss/AUC 无法归因，随机序列变化会伪装成趋势）。"""
+        held-out AUC、loss 组件（逐 k policy + discriminator）、lr、采样的
+        目标序列（per-sequence 健康监控的归因轴——条件分布每 iter 均匀采
+        一个序列，事件不记序列名时 reward/loss/AUC 无法归因，随机序列
+        变化会伪装成趋势）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         event = scenario.events()[0]
@@ -292,26 +291,8 @@ class TestSingleIterationLoop:
         assert 0.0 < event["heldout_auc"] < 1.0
         assert "policy_step_1" in event["loss"]  # M={1} → 一次 policy 梯度步
         assert "discriminator" in event["loss"]
-        # 回放混采退役读数（ADR-0012）：字段按事件契约保留、混采量恒 0；
-        # 两区占用照常——base 种植保留、recent 无 push 退役恒空
-        assert event["buffer_current_fraction"] == pytest.approx(0.0)
-        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
-        assert event["buffer_base_occupied"] == 32  # capacity 64 → base 32
-        assert event["buffer_recent_occupied"] == 0
         assert event["lr"] == pytest.approx(2e-6)
         assert event["elapsed_s"] >= 0.0
-
-    def test_iter_event_carries_replay_degradation_marker(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """iter 事件契约「可扩不可改名」（ADR-0008-03 引入、ADR-0012 退
-        役读数）：字段保留（旧监控与解析脚本不被静默破坏），回放退化标
-        记与占比恒为退役值——混采语义不再存在、标记不再有 True 形态。"""
-        scenario.write_inputs()
-        assert scenario.train().code == 0
-        event = scenario.events()[0]
-        assert event["buffer_replay_degraded"] is False
-        assert event["buffer_replay_fraction"] == pytest.approx(0.0)
 
     def test_iter_event_carries_overfit_divergence_observations(
         self, scenario: TrainingLoopScenario,
@@ -362,8 +343,7 @@ class TestSingleIterationLoop:
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """判别器更新节奏 N_d 由训练循环消费：N_d=2 时每 2 个 iteration
-        更新一次（跳过的 iteration 无 discriminator loss；混采占比字段
-        恒退役读数 0、近期分区无增量——push 已随混采退役）。"""
+        更新一次（跳过的 iteration 无 discriminator loss）。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["schedule"]["max_iterations"] = 2
@@ -373,12 +353,7 @@ class TestSingleIterationLoop:
         assert result.code == 0, result.stderr
         first, second = scenario.events()
         assert "discriminator" in first["loss"]
-        assert first["buffer_current_fraction"] == pytest.approx(0.0)
-        assert first["buffer_recent_occupied"] == 0  # 无 push：recent 恒空
         assert "discriminator" not in second["loss"]  # N_d 跳过
-        assert second["buffer_current_fraction"] == 0.0
-        assert second["buffer_replay_fraction"] == 0.0
-        assert second["buffer_recent_occupied"] == first["buffer_recent_occupied"]
 
     def test_checkpoint_is_loadable_and_evolved(
         self, scenario: TrainingLoopScenario,
@@ -445,8 +420,8 @@ class TestSingleIterationLoop:
         assert set(saved.keys()) == set(live.state_dict().keys())
         assert any(".parametrizations." in key for key in saved)
         live.eval()
-        sample = trainer.rewards.buffer.base_samples()[0].latent.unsqueeze(0)
-        device = sample.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
+        sample = torch.zeros(1, *config.latent_shape)
+        device = trainer.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
         # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
         # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
         # normalizer 与生产装配一样迁移到 latent 所在 device，GPU 可见环境
@@ -655,7 +630,6 @@ class TestCrossModalLoop:
         assert event["intra_group_reward_std"] > 0.0  # CFG=0 场的组内方差非退化
         assert "policy_step_1" in event["loss"]
         assert "discriminator" in event["loss"]
-        assert event["buffer_base_occupied"] == 32  # 本组判别器/buffer 独立装配
 
     def test_policy_checkpoint_is_controlnet_and_loadable(
         self, scenario: TrainingLoopScenario,
@@ -1002,7 +976,6 @@ def _reward_config_for_gating() -> RewardConfig:
     """门控对象装配的最小 RewardConfig（默认 knobs；纯单测用途）。"""
     return RewardConfig(
         disc_batch_size_k=4,
-        replay_buffer_capacity=64,
         real_pool_manifest="artifacts/real_pool.json",
         heldout_real_manifest="artifacts/heldout_real.json",
         channel_stats_json="artifacts/channel_stats.json",
@@ -1031,7 +1004,6 @@ class TestDiscriminatorSideOrchestration:
             overfit=OverfitMonitor(
                 _reward_config_for_gating(), conditions=tuple(MODALITIES),
             ),
-            buffer=ReplayBuffer(64),
             assembler=None,  # type: ignore[arg-type]  # 替身场景不经装配原语
         )
         pair = PairBatch(
@@ -1051,7 +1023,7 @@ class TestDiscriminatorSideOrchestration:
     ) -> None:
         """spectral norm 启用时打分幂等：打分/监控前向恒在 eval 相
         （power iteration 不推进）——判别器若停在 train 相打分，同批
-        两次 forward 因 buffer 漂移分数不同，reward 归因被污染。
+        两次 forward 因谱归一化漂移分数不同，reward 归因被污染。
 
         断言用绝对容差而非逐位（#95，与 checkpoint 测试同款 rationale）：
         幂等防的是 power iteration 推进，偏离量级远大于 ulp；而同权重
@@ -1066,10 +1038,10 @@ class TestDiscriminatorSideOrchestration:
         trainer = GranularGrpoTrainer(config, artifacts)
         assert trainer.run() == 1
         assert trainer.rewards.discriminator.training is False
-        sample = trainer.rewards.buffer.base_samples()[0].latent
+        sample = torch.zeros(1, *config.latent_shape)
         scorer = trainer.rewards.update.scorer
-        first = scorer.reward(sample.unsqueeze(0))
-        second = scorer.reward(sample.unsqueeze(0))
+        first = scorer.reward(sample)
+        second = scorer.reward(sample)
         assert torch.allclose(first, second, rtol=0.0, atol=1e-6)  # eval 相打分幂等
 
     def test_update_step_receives_iteration_condition(
@@ -1171,117 +1143,11 @@ class TestDevicePlacement:
         trainer = GranularGrpoTrainer(
             config, artifacts, device=torch.device("cpu"),
         )
-        trainer.seed_base_partition()
-        sample = trainer.rewards.buffer.base_samples()[0].latent
+        sample = torch.zeros(1, *config.latent_shape, device=trainer.device)
         assert sample.device.type == "cpu"
         assert trainer.rewards.update.scorer.reward(
-            sample.unsqueeze(0),
+            sample,
         ).device.type == "cpu"
-
-
-class TestBufferBaseSeeding:
-    """AC 5 + ADR-0008-01：buffer base 分区在 train 启动时由冻结初始
-    policy 按每条件配额自动生成，条目带目标模态标签。"""
-
-    def test_base_partition_filled_before_first_iteration(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """train 启动期（首 iteration 前）base 分区已满、内容为 rollout
-        产出的有限 latent；回放混采自首 iter 即可用（事件流 50/50 是其
-        外部观测）。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        trainer.seed_base_partition()
-        sizes = trainer.rewards.buffer.zone_sizes()
-        assert sizes.base == trainer.rewards.buffer.base_capacity
-        base = trainer.rewards.buffer.base_samples()
-        assert len(base) == sizes.base
-        assert all(torch.isfinite(entry.latent).all() for entry in base)
-        assert sizes.recent == 0  # base 生成不进近期分区
-
-    def test_base_partition_seeded_by_per_condition_quota(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """ADR-0008-01 AC 3：base 分区按每条件配额量产——每目标模态
-        的条目数恰为配额（回放条件过滤后每条件候选的供给根基）。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        trainer.seed_base_partition()
-        quota = base_condition_quota(config.reward.replay_buffer_capacity, MODALITIES)
-        assert trainer.rewards.buffer.zone_modalities().base == quota
-
-    def test_base_partition_entries_carry_target_labels(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """ADR-0008-01 AC 1：base 分区观测面（快照）带目标模态标签——
-        每条目为 ReplayEntry，标签 ∈ MODALITIES、按配额分布。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        trainer.seed_base_partition()
-        entries = trainer.rewards.buffer.base_samples()
-        assert all(isinstance(entry, ReplayEntry) for entry in entries)
-        assert all(entry.modality in MODALITIES for entry in entries)
-        assert {
-            modality for entry in entries for modality in [entry.modality]
-        } == set(MODALITIES)
-
-    def test_base_partition_seeded_before_first_iteration(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """base 分区在启动期由**冻结初始** policy 生成完毕：首 iter 事件
-        的 base 占用读数即满额（种植物化先于训练循环；近期分区无 push、
-        恒空——ADR-0012 后更新批不再入区）。"""
-        scenario.write_inputs()
-        assert scenario.train().code == 0
-        event = scenario.events()[0]
-        assert event["buffer_base_occupied"] == 32  # capacity 64 → base 32
-        assert event["buffer_recent_occupied"] == 0
-
-
-class TestBaseSeedingIsolation:
-    """base 分区种子生成与训练 rollout 的 RNG 流隔离。"""
-
-    @pytest.mark.gpu  # 双容量 × 完整场景训练（流隔离对比）
-    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
-    def test_capacity_change_does_not_shift_rollout_stream(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """base seeding 走独立派生 generator：base seeding 消耗的条件/
-        噪声抽取数随 replay_buffer_capacity 决定——与训练 rollout 共用
-        流时，改 buffer 容量（保持 schedule.seed）会漂移后续全部 rollout
-        抽样（modality、初始噪声、SDE 方向），buffer 容量实验与 policy
-        样本流混淆（不同 capacity 的同 seed run 不可比）。"""
-        scenario.write_inputs()
-        streams: dict[int, tuple] = {}
-        for capacity in (64, 80):
-            data = json.loads(
-                scenario.config_path.read_text(encoding="utf-8"),
-            )
-            data["reward"]["replay_buffer_capacity"] = capacity
-            scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-            config = ConfigLoader.load(scenario.config_path)
-            artifacts = RunArtifacts.init(
-                config, scenario.tmp_path / f"run_capacity{capacity}",
-            )
-            trainer = GranularGrpoTrainer(
-                config, artifacts, device=torch.device("cpu"),
-            )
-            trainer.seed_base_partition()
-            record = trainer.loop.run_iteration()
-            streams[capacity] = (
-                record.modality,
-                record.steps[0].anchor_latent,
-                record.steps[0].directions,
-            )
-        assert streams[64][0] == streams[80][0]  # modality 不随容量漂移
-        assert torch.equal(streams[64][1], streams[80][1])  # anchor 逐位同
-        assert torch.equal(streams[64][2], streams[80][2])  # 扰动方向逐位同
 
 
 class TestLogProbConsistency:
@@ -1325,8 +1191,8 @@ class TestLogProbConsistency:
 
 
 class TestRewardDomainNormalization:
-    """rollout（policy 域）→ reward/replay（real pool 存储域）的归位
-    （T12 探针定谳）：fake 在打分与入 buffer 前除 latent_scale_factor——
+    """rollout（policy 域）→ reward（real pool 存储域）的归位
+    （T12 探针定谳）：fake 在打分前除 latent_scale_factor——
     real 按 data-preparation 契约存 encode 原始输出、policy 输出在
     checkpoint scaled 域，判别器比较要求两侧同域。"""
 
@@ -1355,7 +1221,6 @@ class TestRewardDomainNormalization:
             return original_reward(latents)
 
         scorer.reward = recording_reward  # 打分输入记录（实例属性遮蔽 bound method）
-        trainer.seed_base_partition()
         record = trainer.loop.run_iteration()
         return record, scored
 
@@ -1364,9 +1229,8 @@ class TestRewardDomainNormalization:
     def test_scored_fakes_match_replay_domain(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """打分输入与 new_fakes 同值同序（同一归一域）：打分、回放入区、
-        AUC fake 侧消费同一批归一后 latent，不出现「打分用 A 域、
-        回放用 B 域」的错配。"""
+        """打分输入与 new_fakes 同值同序（同一归一域）：打分与
+        AUC fake 侧消费同一批归一后 latent，不出现跨域错配。"""
         record, scored = self._rollout_with_scale(scenario, 2.0, "replay")
         assert scored, "打分记录为空"
         assert torch.equal(torch.cat(scored), record.new_fakes)
@@ -1403,10 +1267,10 @@ class TestGradientGating:
     ) -> None:
         """名单外条件的 iteration：policy 更新被跳过（loss 无
         policy_step_* 项、事件带 policy_gated 标记）；rollout、判别器
-        更新、iter 事件照常——被门控条件的判别器持续受训（ADR-0012
-        后 fake 批由重构装配原语现场供批，不经回放缓冲）。静态白名单
-        （动态恢复关闭）下名单逐位恒定——恢复的数值语义由 test_gating
-        决定面单测收口，此处不叠加测量噪声。"""
+        更新、iter 事件照常——被门控条件的判别器持续受训（fake 批由
+        重构装配原语现场供批）。静态白名单（动态恢复关闭）下名单逐位
+        恒定——恢复的数值语义由 test_gating 决定面单测收口，此处不叠加
+        测量噪声。"""
         scenario.write_inputs()
         scenario.set_schedule(max_iterations=4)
         scenario.narrow_whitelist(["t1n"])
@@ -1427,13 +1291,6 @@ class TestGradientGating:
             assert not policy_terms  # policy 更新被跳过
             assert "discriminator" in event["loss"]  # 判别器更新照常（N_d=1）
             assert 0.0 <= event["heldout_auc"] <= 1.0  # AUC 观测照常
-            # 回放混采退役读数（ADR-0012）：字段按事件契约保留、恒 0；
-            # 「fake 批照常供给」的证据在判别器 loss 与 AUC 断言（上方）
-            assert event["buffer_current_fraction"] == pytest.approx(0.0)
-        # recent 分区无 push 消费者（ADR-0012）：占用量恒空、不随
-        # iteration 滚动——供批与缓冲占用已解耦，门控亦不影响
-        assert iter_events[-1]["buffer_recent_occupied"] == 0
-        assert iter_events[0]["buffer_recent_occupied"] == 0
         # 门控状态随续训分片落盘：静态名单逐位恒定、无观测记录
         # （版本常量对账——分片格式随功能演进，断言不硬编码版本号）
         state = scenario.resume_state()
@@ -1461,33 +1318,18 @@ class TestGradientGating:
 
 
 class TestPairedBatchSupplyGuards:
-    """配对批配置的装配接受性（ADR-0012）：更新批换配对批后，回放半区
-    不再有消费者、配对批支持任意正 K，回放供给守卫不得误拒合法实验。
-    ReplayBuffer 组件与守卫函数的物理删除归退役票（#173）——本组只钉
-    「不误拒」这一半。"""
+    """配对批配置的装配接受性（ADR-0012）：更新批换配对批后，real 侧
+    容量守卫（逐 (全池, 模态) 容量 ≥ K）按配对批 K 校验，任意正 K 的
+    合法配置不再被回放供给守卫误拒（该守卫已随 ADR-0012 退役删除，
+    #173）。"""
+
 
     def test_k1_paired_batch_is_accepted_by_assembly(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """K=1（最小配对批）：装配原语支持任意正 K、real 侧容量守卫按
-        K 校验，装配期不得再以「回放半区为 0 条」为由拒绝——该需求在
-        ADR-0012 后已随更新批换配对批消失。"""
+        K 校验，完整训练照常跑通。"""
         scenario.write_inputs(reward={"disc_batch_size_k": 1})
-        scenario.set_schedule(max_iterations=1)
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-
-    def test_undersized_replay_capacity_no_longer_rejects(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """K=4 配 capacity=2（base 分区每条件配额 0，曾是回放供给守卫的
-        第二类拒绝组合）：ADR-0012 后回放半区无消费者，该组合不再属于
-        「schema 合法但集成无效」——装配期不得拒绝，完整训练照常跑通
-        （旧断言 code == 2 随守卫调用点退役一并撤销）。"""
-        scenario.write_inputs()
-        scenario.patch_config(
-            reward={"disc_batch_size_k": 4, "replay_buffer_capacity": 2},
-        )
         scenario.set_schedule(max_iterations=1)
         result = scenario.train()
         assert result.code == 0, result.stderr

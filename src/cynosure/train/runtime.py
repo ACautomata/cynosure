@@ -3,7 +3,7 @@
 
 config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 （RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、八条命名 RNG 流（TrainingRngStreams 注册表）、数值
+（RolloutPhase）、四条命名 RNG 流（TrainingRngStreams 注册表）、数值
 口径（AmpContext，定义在 policy/numerics——train 与 eval 共用的 import
 环安全位，此处 re-export 保持既有消费面）与分布式运行时
 （DistributedContext + EventMerger）。trainer 只面对本 Facade
@@ -50,7 +50,6 @@ from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.assembly import ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
@@ -112,7 +111,7 @@ class TrainingRuntime:
         run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
         覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
         dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
-        # seed 的 rank 派生：七条数据侧流的演化各 rank 独立（rollout 数据
+        # seed 的 rank 派生：数据侧流的演化各 rank 独立（rollout 数据
         # 多样性来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性
         # 前提。recon 流除外（shared_seed = 未派生原 seed）：s 抽样的调用
         # 结构是 FSDP 集合序列的一部分，必须跨 rank 一致——判别器冷启动
@@ -174,9 +173,6 @@ class TrainingRuntime:
             device_type=amp.device_type,
             autocast_dtype=amp.dtype,
             device=amp.device,
-            # base 分区种子生成的独立派生流（seed+5）：其抽取数随 buffer
-            # 容量变化，不占训练 rollout 的抽样流（容量实验不漂移样本流）
-            base_generator=generators["base_partition"],
         )
         return cls(
             config=config,
@@ -383,8 +379,6 @@ class TrainingRuntime:
             overfit=OverfitMonitor(
                 config.reward, conditions=vocabulary.names(),
             ),
-            # 两区回放缓冲（ADR-0012 后更新批不再消费，种植与落盘面保留）
-            buffer=ReplayBuffer(config.reward.replay_buffer_capacity),
             assembler=cls._assemble_pair_assembler(
                 config,
                 real_sampler=RealPoolSampler(

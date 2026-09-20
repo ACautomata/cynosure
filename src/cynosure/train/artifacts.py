@@ -41,8 +41,8 @@ class IterEvent(BaseModel):
     iteration: int
     stage: int = 1
     """组内阶段号（序贯两阶段的归因轴）：单阶段组（组1/组2）恒 1，
-    组3 stage-2 事件 = 2——「每组判别器与 buffer 独立」在指标流上的
-    观测面（各阶段事件互不混淆）。"""
+    组3 stage-2 事件 = 2——「每组判别器独立」在指标流上的观测面（各
+    阶段事件互不混淆）。"""
     rank: int = 0
     """产出本事件的 rank（分布式归并的排序轴：同一 iteration 的 N 条
     事件按 rank 升序连续排列——无重复/无丢失的观测面；单进程恒 0，
@@ -54,16 +54,6 @@ class IterEvent(BaseModel):
     intra_group_reward_std: float
     heldout_auc: float
     loss: dict[str, float]
-    buffer_current_fraction: float
-    """更新批的当前 fake 混合占比（N_d 跳过的 iteration 为 0）。"""
-    buffer_replay_fraction: float
-    """更新批的回放混合占比（N_d 跳过的 iteration 为 0）。"""
-    buffer_replay_degraded: bool = False
-    """更新步回放退化标记（ADR-0008-03）：本步目标模态的回放候选不足
-    半区需求，该步退化纯 current 半区（回放 0 条、real 侧与退化后批
-    同量匹配，批减半而两个占比字段仍按 K 分母记账）——正常混采步与
-    N_d 跳过的 iteration 均为 False，占比 0 的两种成因靠本标记区分
-    （观测面扩展：事件契约可扩不可改名）。"""
     policy_gated: bool = False
     """policy 更新门控标记（ADR-0008 决策 7）：全 rank 集体门控决定——
     任一 rank 的目标条件不在（动态）白名单，本 iteration 全体跳过
@@ -81,10 +71,6 @@ class IterEvent(BaseModel):
     held-out AUC) 的本 rank 读数——按 rank 独立计算落盘（rank 间离散
     是数据切片异质性的诊断信号，不跨 rank 平均）。N_d 跳过的 iteration
     为 None。观测面扩展：事件契约可扩不可改名。"""
-    buffer_base_occupied: int
-    """Replay buffer base 分区当前占用（固定分区的状态观测面）。"""
-    buffer_recent_occupied: int
-    """Replay buffer 近期分区当前占用（FIFO 滚动观测面）。"""
     lr: float
     elapsed_s: float
     phase_seconds: dict[str, float] = Field(default_factory=dict)
@@ -196,11 +182,6 @@ class PretrainEvent(BaseModel):
     ``PretrainReport.gate_criterion``）；**与 iter 事件的 rollout-AUC
     不可跨相直接比较**：预训练判据测的是判别器训练任务上的 out-of-sample
     泛化力、在线口径测的是对打分对象（rollout 终点）的分辨力。"""
-    buffer_base_occupied: int
-    """Replay buffer base 分区当前占用（ADR-0012 后预训练相无种植方 →
-    恒 0；组件与字段按契约保留，物理删除归 #173）。"""
-    buffer_recent_occupied: int
-    """Replay buffer 近期分区当前占用（同上，恒 0）。"""
     reconstruction_forwards: int | None = None
     """本步测量批重构消耗的 policy 前向次数（#171 AC5 的成本口径读数：
     批量量产的 num_steps 步全 ODE 路径已退役，本读数让「每卷重构前向 =

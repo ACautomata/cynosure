@@ -248,9 +248,6 @@ class TestMrMainLoop:
             )
             assert sum(event["phase_seconds"].values()) <= event["elapsed_s"]
             assert event["elapsed_s"] > 0.0
-            # per-condition 记账：buffer 两区占用（混采占比字段随 ADR-0012
-            # 恒退役读数 0，不在此断言量级）
-            assert event["buffer_base_occupied"] > 0
 
     @pytest.mark.gpu  # 2 + 2 iteration 训练（大轮次口径）
     def test_checkpoints_are_loadable_and_resume_advances(
@@ -290,22 +287,6 @@ class TestMrMainLoop:
         ]
         # 续训后条件轮转沿同一序继续（恢复点 = iteration 2 → 条件索引 0）
         assert scenario.iter_events()[2]["modality"] == CONDITIONS[0]
-
-    @pytest.mark.gpu  # 1 iteration 训练（大轮次口径）
-    def test_resume_state_carries_condition_labelled_buffer(
-        self, cli: CliSession, tmp_path: Path,
-    ) -> None:
-        """AC：续训分片含条件标记（回放缓冲的带标签 FIFO 契约在 MR 线
-        贯通）——base 分区按每条件配额量产、条目带目标条件标签。"""
-        scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
-        scenario.use(scenario.pretrain(prepared), max_iterations=1)
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-        base = scenario.resume_state()["replay_buffer"]["base"]
-        modalities = set(base["modalities"])
-        assert modalities
-        assert modalities <= set(CONDITIONS)
 
     @pytest.mark.gpu  # 1 iteration 训练（大轮次口径）
     def test_baseline_sampling_runs_without_monitoring_phase(
@@ -377,8 +358,8 @@ class TestConditionGateSwitch:
     ) -> None:
         """既定口径的门控语义在 MR 线贯通：名单外条件的 iteration 跳过
         policy 更新（loss 无 policy_step_*、事件带 policy_gated），
-        rollout / fake 入 buffer / 判别器更新 / AUC 观测照常；静态白名单
-        （动态恢复关闭）下名单逐位恒定并随续训分片落盘。"""
+        rollout / 判别器更新（同源重构 fake 现做现用）/ AUC 观测照常；
+        静态白名单（动态恢复关闭）下名单逐位恒定并随续训分片落盘。"""
         scenario = MrTrainScenario(cli, tmp_path)
         prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
         scenario.use(scenario.pretrain(prepared), max_iterations=4)
