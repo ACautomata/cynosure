@@ -19,6 +19,7 @@ per-condition 步进（ADR-0008-04）分两层锁：**轮转与归因**在端到
 
 import copy
 import json
+import weakref
 from pathlib import Path
 
 import pytest
@@ -1325,6 +1326,49 @@ class TestPretrainRotationStateMachine:
             event["heldout_auc"] == pytest.approx(0.4)
             for event in events if event["event"] == "pretrain"
         )
+
+    def test_measurement_batch_released_before_update_step(
+        self, scripted,
+    ) -> None:
+        """更新步执行时测量批已出作用域（#174 生产重跑 OOM 修复）：测量
+        批 = 该条件全量 held-out 卷的配对批（生产口径 512 卷/条件，t1w/
+        coronal 尺寸下单批数十 GiB 级驻留）——AUC 归因完成后事件面只剩
+        卷数（volumes 留痕），配对张量不留到更新步（测量批驻留 + 更新批
+        装配叠加是 64 GiB 卡上的 OOM 峰值）。"""
+        values = {modality: 0.4 for modality in MODALITIES}
+        plan = {modality: [False] for modality in MODALITIES}
+        driver, auc, support, recording = scripted(values, plan, max_steps=2)
+        assembler = driver.rewards.assembler
+        refs: list[weakref.ReferenceType] = []
+
+        class MeasuringRefs:
+            """测量 seam 包装：对每步测量批挂弱引用（释放时机的观测面）。"""
+
+            def measure_condition(self, reals, modality):
+                batch = assembler.measure_condition(reals, modality)
+                refs.append(weakref.ref(batch))
+                return batch
+
+            def assemble(self, modality):
+                return assembler.assemble(modality)
+
+            def measurement_forward_count(self, reals, modality):
+                return assembler.measurement_forward_count(reals, modality)
+
+        driver.rewards.assembler = MeasuringRefs()
+        alive_at_update: list[list[bool]] = []
+        update_step = driver.rewards.update_step
+
+        def spying_update_step(pair_batch):
+            alive_at_update.append([ref() is not None for ref in refs])
+            return update_step(pair_batch)
+
+        driver.rewards.update_step = spying_update_step
+        report = driver.run()
+        assert report.steps_completed == 2
+        assert len(recording.received) == 2  # 每步都走更新（不可达门槛）
+        # 每个更新步执行时：此前所有测量批（含本步）都不再存活
+        assert alive_at_update == [[False], [False, False]]
 
 
 class TestOverfitAlertEventContract:

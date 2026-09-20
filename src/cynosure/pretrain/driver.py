@@ -187,10 +187,9 @@ class PretrainDriver:
                 # 批可复算的代价面）：重排列把每卷配到的 (σ, ε) 槽位换
                 # 掉，≥2 卷条件下两次读数是不同样本；单卷条件排列平凡、
                 # 复测与首测同读数（确认退化——小池由数据侧池规模与支
-                # 撑度界兜底，不以本相为抗噪防线）
-                _confirm_batch, confirm, _confirm_forwards = (
-                    self._measurement(modality)
-                )
+                # 撑度界兜底，不以本相为抗噪防线）。复测只读 AUC——配对
+                # 批不留存（与首测批同一释放口径，见下）
+                confirm = self._measurement(modality)[1]
                 confirm_auc = confirm.pooled_auc()
                 if self._support.passes(confirm_auc, confirm):
                     confirmed[modality] = min(auc, confirm_auc)  # 保守口径：两次取小
@@ -198,6 +197,12 @@ class PretrainDriver:
                         gate_passed = True  # 全部条件过线：终止
                         break
                     continue  # 本条件已确认：本步不更新（无更新即无事件）
+            # 测量批到此消费完毕（AUC 已归因、卷数已留痕 volumes）——
+            # 配对张量不进更新步（#174 生产重跑 OOM 修复：全量 held-out
+            # 测量批在大尺寸条件下数十 GiB 驻留，与更新批装配叠加是
+            # 64 GiB 卡的 OOM 峰值；事件面的 measurement_volumes 走
+            # volumes 留痕，同值）
+            del batch
             update = self._rewards.update_step(
                 # 更新批 = 装配原语的配对批（ADR-0012）：fake = 冻结基座
                 # 对同批 real 的同源重构（专属 recon 流、先抽 s 后抽 ε、
@@ -229,7 +234,7 @@ class PretrainDriver:
                 # 30 步全 ODE 量产路径已不在本执行路径，这两项让「没有
                 # 量产」在事件流上可核对（口径见模块 docstring）
                 reconstruction_forwards=forwards,
-                measurement_volumes=batch.fakes.shape[0],
+                measurement_volumes=volumes[modality],
                 lr=reward.disc_lr,
                 elapsed_s=time.monotonic() - started,
             ))
