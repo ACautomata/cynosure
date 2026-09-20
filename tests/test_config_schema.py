@@ -43,7 +43,6 @@ class TestValidConfigs:
         assert config.reward.patch_aggregation == "mean"
         assert config.reward.disc_update_interval_n_d == 1
         assert config.reward.disc_lr == pytest.approx(5e-5)
-        assert config.reward.replay_current_fraction == pytest.approx(0.5)
         # 预训练与 RM readiness gate（ADR-0007）：阈值暂定 0.65、卫生项同
         # policy 侧口径（1e-4）
         assert config.reward.disc_weight_decay == pytest.approx(1e-4)
@@ -53,19 +52,15 @@ class TestValidConfigs:
         # CI 下界口径，≥ 界点估计口径——暂定 20 待 MR-RATE 曲线校准
         assert config.reward.gate_support_min_volumes == 20
         assert config.reward.pretrain_max_steps >= 1
-        assert config.reward.pretrain_fake_batch >= 1
         # 动态门控（ADR-0008 决策 8，issue #89）：默认开启，enter/exit/
         # EMA 跨度三 knob 暂定值——MR-RATE 预训练曲线校准后定版
         assert config.reward.gating_dynamic_recovery is True
         assert config.reward.gating_enter_auc == pytest.approx(0.55)
         assert config.reward.gating_exit_auc == pytest.approx(0.52)
         assert config.reward.gating_ema_span == 8
-        # 训练期噪声注入（ADR-0009 决策 3，issue #104）：σ_max 暂定 0.2——
-        # MR-RATE 预训练曲线校准后定版；σ_max = 0 是唯一关闭形态
-        assert config.reward.disc_noise_sigma_max == pytest.approx(0.2)
         # 过拟合分叉监控（ADR-0009 决策 4/5，issue #105）：EMA 跨度与
         # ADR-0008 的 EMA(AUC) 跨度同值口径（8）、报警阈值暂定 0.2——
-        # MR-RATE 预训练曲线校准后定版
+        # MR-RATE 预训练曲线校准后定版（噪声注入 knob 随 ADR-0012 退役）
         assert config.reward.overfit_ema_span == 8
         assert config.reward.overfit_alert_divergence == pytest.approx(0.2)
         assert config.schedule.n_plateau == 3
@@ -667,15 +662,21 @@ class TestRejection:
         with pytest.raises(ValidationError):
             CynosureConfig.model_validate(data)
 
-    def test_noise_sigma_non_negative(self, valid_config_dict: dict) -> None:
-        """disc_noise_sigma_max 非负（ADR-0009）：σ_max = 0 是唯一关闭
-        形态（回归锚），负值无语义、拒绝而非静默钳零。"""
-        data = copy.deepcopy(valid_config_dict)
-        data["reward"]["disc_noise_sigma_max"] = -0.1
-        with pytest.raises(ValidationError):
-            CynosureConfig.model_validate(data)
-        data["reward"]["disc_noise_sigma_max"] = 0.0
-        CynosureConfig.model_validate(data)  # 零强度合法：唯一关闭形态
+    def test_retired_reward_knobs_are_rejected(self, valid_config_dict: dict) -> None:
+        """ADR-0012 退役面（#173）：噪声注入 σ_max、回放配比、buffer
+        容量与预训练量产批量的字段已删——旧 config 携带按仓库既有口径
+        （``extra="forbid"``）装载期字段级拒绝，不静默忽略。"""
+        for knob in (
+            "disc_noise_sigma_max",
+            "replay_current_fraction",
+            "replay_buffer_capacity",
+            "pretrain_fake_batch",
+        ):
+            data = copy.deepcopy(valid_config_dict)
+            data["reward"][knob] = 0.2
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert knob in str(exc_info.value.errors()[0]["loc"]), knob
 
     def test_sbatch_fields_are_gone_after_platform_migration(
         self, valid_config_dict: dict,
@@ -1161,7 +1162,6 @@ class TestMrRateAnchorsPerCondition:
             },
             "reward": {
                 "disc_batch_size_k": 4,
-                "replay_buffer_capacity": 64,
                 "real_pool_manifest": str(tmp_path / "real_pool.json"),
                 "heldout_real_manifest": str(tmp_path / "heldout_real.json"),
                 "channel_stats_json": str(tmp_path / "channel_stats.json"),

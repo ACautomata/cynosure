@@ -7,12 +7,12 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
       1.5 梯度门控（ADR-0008 决策 7/8）：held-out AUC 测得后喂入动态
          白名单（EMA 滞回判定，rank 0 单点判定 + 快照广播的全 rank
          集体口径）；目标条件不在名单 → 本 iteration 跳过 policy
-         更新（rollout / fake 入 buffer / 判别器更新照常）
+         更新（rollout / 判别器更新照常）
       2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次，
-         FSDP 梯度 allreduce）；判别器 Online update（本 rank fake +
-         pool 切片 + 回放混采，DDP 梯度 allreduce，门控不影响其节奏）
-         随步做 train 侧干净域复算与 per-condition 分叉观测（ADR-0009-β，
-         越线落 overfit_alert 事件、只报警不动作）
+         FSDP 梯度 allreduce）；判别器 Online update（本 rank 配对批 =
+         当前 policy 对同批 real 的同源重构，DDP 梯度 allreduce，门控
+         不影响其节奏）随步做 train 侧干净域复算与 per-condition 分叉
+         观测（ADR-0009-β，越线落 overfit_alert 事件、只报警不动作）
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
@@ -31,13 +31,11 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
 装配（含分布式包装：FSDP full-shard + 梯度检查点、判别器 DDP、pool
 切片、seed 的 rank 派生、指标归并器）收敛在 TrainingRuntime——循环
 代码对部署形态无分支。可训练对象按组装配（GroupPolicy）；每组一次
-装配 → 判别器与 Replay buffer 随训练实例天然隔离（per-rank buffer，
-跨组/跨阶段不复用）。
+装配 → 判别器随训练实例天然隔离（跨组/跨阶段不复用）。
 """
 
 import time
 from dataclasses import dataclass
-from typing import Mapping
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -48,7 +46,6 @@ from cynosure.eval import EvaluationPhase, ManifestEvaluation, MilestoneMetrics
 from cynosure.grpo import MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AmpContext
-from cynosure.reward.buffer import base_condition_quota
 from cynosure.train.artifacts import (
     BaselineManifest,
     IterEvent,
@@ -147,13 +144,6 @@ class IterationLoop:
         self.updater = updater
         self._amp = amp
 
-    def base_partition_samples(
-        self, quota: Mapping[str, int],
-    ) -> tuple[list[torch.Tensor], list[str]]:
-        """冻结初始 policy 的 base 分区供给（train 启动期一次，按每条件
-        配额量产；返回样本批 + 逐样本目标模态标签）。"""
-        return self.rollout.base_partition_samples(quota)
-
     def run_iteration(self) -> IterationRollout:
         """执行序第 1 相：eval 相 rollout（调用方负责相位于前就绪）。"""
         return self.rollout.run_iteration()
@@ -237,13 +227,6 @@ class GranularGrpoTrainer:
                 "参数 EMA 锚为升级项（ADR-0001），实现未交付："
                 "ema_anchor_enabled=true 显式拒绝"
             )
-        # 回放供给装配期守卫（ADR-0008 决策 4）的调用点已随 ADR-0012
-        # 退役：更新批换配对批后回放半区不再有消费者，「回放半区非零 +
-        # base 每条件配额 ≥ 半区需求」不再是有效前提——留着会误拒合法
-        # 配对批配置（如 disc_batch_size_k=1，装配原语支持任意正 K）。
-        # 真实约束是 real 侧容量守卫（逐 (全池, 模态) 容量 ≥ K，位于共享
-        # 装配缝 ``assemble_rewards`` 内，ADR-0008-03）。守卫函数与
-        # ReplayBuffer 组件的物理删除归退役票（#173）。
         self.config = config
         self.artifacts = run_artifacts
         self._dump = dump_trajectory
@@ -342,31 +325,18 @@ class GranularGrpoTrainer:
         """数值口径（device + autocast dtype）。"""
         return self.runtime.amp
 
-    def seed_base_partition(self) -> None:
-        """train 启动期的 buffer base 分区自动生成：用冻结初始 policy
-        （未参与任何梯度步）rollout 产出按每条件配额填满 per-rank base
-        分区（spec 补钉 + ADR-0008-01：每条件配额量产、条目带目标模态
-        标签；per-rank buffer 覆盖各自区域，rollout 走本 rank 独立流）。"""
-        quota = base_condition_quota(
-            self.config.reward.replay_buffer_capacity,
-            self.runtime.policy.conditions.targets(),
-        )
-        base_fakes, modalities = self.loop.base_partition_samples(quota)
-        self.rewards.seed_base(base_fakes, modalities)
-
     def run(self) -> int:
-        """训练主循环：base 分区自动生成 → RM readiness gate 白名单检查
-        （ADR-0008 决策 5，resume 跳过）→ Baseline 采样（rank 0，冻结
-        初始 policy）→ 逐 iteration 执行序（里程碑触发解码评测 + 早停
-        判定）→ RL 后重采（rank 0）→ checkpoint 与续训状态落盘。
+        """训练主循环：RM readiness gate 白名单检查（ADR-0008 决策 5，
+        resume 跳过）→ Baseline 采样（rank 0，冻结初始 policy）→ 逐
+        iteration 执行序（里程碑触发解码评测 + 早停判定）→ RL 后重采
+        （rank 0）→ checkpoint 与续训状态落盘。
         恢复语义由构造的 ``resume`` 单点声明（装配与执行共用同一开关，
         无双点声明可错位）：resume 构造时从 run 目录各 rank 的最新续训
         状态恢复（全清单覆写，resume 模块），rank 0 回退指标流中恢复点
-        之后的半截事件后从恢复点继续——base 分区种子生成与 Baseline
-        采样随之跳过（buffer 随状态整体回归；Baseline 冻结只采一次，
-        恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）的续训
-        是完整无操作：不重执行收官重采、不改写任何工件。返回完成的
-        iteration 数（config 口径的累计完成数；早停时小于
+        之后的半截事件后从恢复点继续——Baseline 采样随之跳过（冻结只采
+        一次，恢复点 policy 已非初始权重）。恢复点已达标（无训练迭代）
+        的续训是完整无操作：不重执行收官重采、不改写任何工件。返回完成
+        的 iteration 数（config 口径的累计完成数；早停时小于
         max_iterations；零训练迭代时 = 恢复点）。"""
         dist = self.runtime.dist
         resume = self._resume_assembled
@@ -380,18 +350,17 @@ class GranularGrpoTrainer:
                     start_iteration, self.stage_tag.stage,
                 )
             dist.barrier()
-        self.policy.eval_phase()  # base 分区生成与 rollout 同为 eval 相（执行序第 1 相口径）
+        self.policy.eval_phase()  # rollout 与 Baseline 采样同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         if not resume:
             # RM readiness gate（ADR-0008 决策 5）：预训练报告的条件白
             # 名单为空即拒绝开跑（报错含各条件实测值，沿 preflight 失败
             # 语义回滚）；非空放行、未过线条件不阻塞 run（逐 iteration
             # 门控兜底，门控消费票）。判定只读报告产物（重算废止，无需
-            # 样本输入），前置在 base 分区量产等昂贵启动动作之前。
+            # 样本输入），前置在 Baseline 采样等昂贵启动动作之前。
             # resume 跳过：续训状态已含判别器全量状态（恢复点判别器
             # 已在岗），恢复点不重查白名单
             self.readiness.check()
-            self.seed_base_partition()
             # Baseline 采样（冻结只采一次：更新开始前的当前权重即初始
             # policy）。policy 采样前向是 FSDP 集合操作，全 rank 对称
             # 参与；样本落盘与 manifest 回写是 rank 0 独写产物契约
@@ -439,8 +408,8 @@ class GranularGrpoTrainer:
             phases.mark("gating")
             # 梯度门控（ADR-0008 决策 7）：目标条件不在白名单 → 跳过本
             # iteration 的 policy 更新（不引入第二重 reward/KL/参考模型）；
-            # rollout、fake 入 buffer、判别器更新、iter 事件照常——被门控
-            # 条件的判别器持续受训，是其建立判别力、白名单得以恢复的前提
+            # rollout、判别器更新、iter 事件照常——被门控条件的判别器
+            # 持续受训，是其建立判别力、白名单得以恢复的前提
             self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
             loss_terms: dict[str, float] = {}
             if not policy_gated:
@@ -488,7 +457,6 @@ class GranularGrpoTrainer:
                         heldout_auc=heldout_auc,
                     )
             phases.mark("discriminator")
-            zone_sizes = self.rewards.buffer.zone_sizes()
             events: list[IterEvent | OverfitAlertEvent] = [IterEvent(
                 iteration=iteration,
                 stage=self.stage_tag.stage,
@@ -499,15 +467,6 @@ class GranularGrpoTrainer:
                 heldout_auc=heldout_auc,
                 loss=loss_terms,
                 policy_gated=policy_gated,
-                # 回放混采退役读数（ADR-0012）：iter 事件契约「可扩不可
-                # 改名」——字段保留（旧监控与解析脚本不被静默破坏）、
-                # 混采量恒为退役值；占用读数照常（buffer 种植与落盘面
-                # 保留，退役删除同票进行）
-                buffer_current_fraction=0.0,
-                buffer_replay_fraction=0.0,
-                buffer_replay_degraded=False,
-                buffer_base_occupied=zone_sizes.base,
-                buffer_recent_occupied=zone_sizes.recent,
                 train_pairwise_acc=(
                     report.train_pairwise_acc if report else None
                 ),

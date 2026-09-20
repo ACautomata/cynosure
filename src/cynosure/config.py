@@ -618,22 +618,6 @@ class RewardConfig(BaseModel):
         "与 policy 侧的 1e-4 不对称（ADR-0007 卫生项）",
         default=1e-4, ge=0.0,
     )
-    replay_buffer_capacity: int = SpecField(
-        "tunable", "reward-model",
-        "Replay buffer 容量的**退役字段**（ADR-0012 决策 6）：预训练路径"
-        "已无消费者（base 分区量产随 fake 换域退役，预训练事件流的 "
-        "buffer_* 占用读数恒 0）；train 侧消费者尚存（ReplayBuffer 构造与"
-        "启动期 base 分区种子配额，其退役归 #172 范畴），物理删除随两区"
-        "缓冲组件归退役票 #173。",
-    )
-    replay_current_fraction: float = SpecField(
-        "定死", "reward-model",
-        "更新判别器时当前 fake 占比 = 0.5（50% 当前 / 50% 回放）的**退役"
-        "字段**（ADR-0012 决策 6）：配对批换域后仅存的消费者是尚未物理"
-        "删除的缓冲组件回放半区配比（reward.buffer）——随 ReplayBuffer "
-        "的物理删除归退役票 #173。",
-        default=0.5,
-    )
     real_pool_manifest: Path = SpecField(
         "运行时", "reward-model",
         "Real sample pool manifest（train split 全量 VAE 预编码 latent，按序列分层；prepare 产出）",
@@ -712,15 +696,6 @@ class RewardConfig(BaseModel):
         "起步值待 DCU 预训练曲线校准）",
         default=2000, ge=1,
     )
-    pretrain_fake_batch: int = SpecField(
-        "tunable", "ADR-0007",
-        "预训练每步 fake 批量的**退役字段**（ADR-0012 决策 6）：预训练相"
-        "不再量产 rollout——测量批 = 该条件全量 held-out 卷的冻结基座"
-        "同源重构（``ReconstructionAssembler.measure_condition``），"
-        "批量由 held-out 池决定、更新批由 ``disc_batch_size_k`` 决定，"
-        "本 knob 已无消费者（字段与装载校验的物理删除归退役票 #173）。",
-        default=16, ge=1,
-    )
     pretrain_report_json: Path = SpecField(
         "运行时", "ADR-0007",
         "判别器预训练报告路径（kind 标识 + 最终 held-out AUC + 数据口径指纹；"
@@ -768,16 +743,6 @@ class RewardConfig(BaseModel):
         "观测流的平滑窗口——抑制单次测量的噪声进出",
         default=8, ge=1,
     )
-    disc_noise_sigma_max: float = SpecField(
-        "tunable", "ADR-0009",
-        "判别器训练期对称噪声注入的强度上限（暂定 0.2，MR-RATE 预训练"
-        "曲线校准后定版）：参数更新前向中 real/fake 两侧逐样本 "
-        "σ ~ U[0, σ_max] 的归一化域加噪（σ 以相对通道 std 的比例参数化）；"
-        "打分路径（reward / held-out AUC / 监控复算）恒干净域。"
-        "σ_max = 0 是唯一关闭形态（回归锚：全链路与无注入逐位一致），"
-        "不设独立 off 开关",
-        default=0.2, ge=0.0,
-    )
     overfit_ema_span: int = SpecField(
         "tunable", "ADR-0009",
         "过拟合分叉监控的 EMA 跨度（ADR-0009 决策 4，暂定 8——与 "
@@ -824,13 +789,6 @@ class RewardConfig(BaseModel):
             )
         return self
 
-    @field_validator("replay_current_fraction")
-    @classmethod
-    def _replay_mix_is_fixed(cls, value: float) -> float:
-        if value != 0.5:
-            raise ValueError("Replay buffer 混合比定死为 50% 当前 / 50% 回放（spec #15）")
-        return value
-
     @field_validator("disc_num_layers_d")
     @classmethod
     def _depth_ablation_axis(cls, value: int) -> int:
@@ -845,7 +803,7 @@ class RewardConfig(BaseModel):
             raise ValueError("num_d 消融轴为 {1,2,3}（单尺度 1 起步）")
         return value
 
-    @field_validator("disc_batch_size_k", "replay_buffer_capacity")
+    @field_validator("disc_batch_size_k")
     @classmethod
     def _positive(cls, value: int) -> int:
         if value < 1:

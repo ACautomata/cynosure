@@ -2,7 +2,7 @@
 （base′ 冻结 + 预训练 ControlNet 复用初始化，组2 配置）。
 
 验收面：两阶段顺序执行、stage-1 产物正确传入 stage-2、经 config 指定
-既有 stage-1 产物路径跳过 stage-1、每组判别器与 Replay buffer 独立
+既有 stage-1 产物路径跳过 stage-1、每组判别器独立
 （互不串扰的断言）、stage 级报告绑定（#116：stage-1 消费 modal-label
 报告、stage-2 消费 cross-modal 报告——消费异组报告被组别等值守卫拒绝）。
 """
@@ -253,8 +253,9 @@ class TestSequentialRun:
 
 
 class TestStageIndependence:
-    """AC「每组判别器与 Replay buffer 独立（互不串扰）」：组3 两阶段在
-    同一次运行内也各持独立判别器与 buffer。"""
+    """AC「每组判别器独立（互不串扰）」：组3 两阶段在同一次运行内也
+    各持独立判别器（原并列的 buffer 独立性断言随 ReplayBuffer 退役
+    删除，ADR-0012）。"""
 
     def test_stage_discriminators_train_independently(
         self, scenario: TrainingLoopScenario,
@@ -275,26 +276,6 @@ class TestStageIndependence:
             not torch.equal(stage1_disc[name], stage2_disc[name])
             for name in stage1_disc
         )
-
-    def test_stage2_buffer_seeded_fresh_not_from_stage1_fakes(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """stage-2 的 buffer 从零起步（stage 间不串扰）：base 分区由各阶段
-        自己的初始 policy 生成、占用读数同量独立（若 stage-1 fake 串扰进
-        stage-2 的装配，占用会翻倍）；近期分区随 ADR-0012 无 push 退役、
-        两阶段恒空。"""
-        scenario.write_inputs(group="sequential")
-        assert scenario.train().code == 0
-        # 指标流另含 overfit_alert（同带 iteration 归因轴），按事件类型
-        # 取 iter 序列：两阶段各一
-        stage1_event, stage2_event = [
-            event for event in scenario.events() if event["event"] == "iter"
-        ]
-        assert stage1_event["buffer_base_occupied"] == 32
-        assert stage2_event["buffer_base_occupied"] == 32  # stage-2 自行生成的 base 分区
-        assert stage1_event["buffer_recent_occupied"] == 0
-        assert stage2_event["buffer_recent_occupied"] == 0  # push 退役：recent 恒空
-        assert stage2_event["buffer_replay_fraction"] == pytest.approx(0.0)
 
 
 class TestStage2ReportBinding:

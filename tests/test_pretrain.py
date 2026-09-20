@@ -73,10 +73,6 @@ def iter_event(iteration: int, stage: int = 1) -> IterEvent:
         intra_group_reward_std=1.0,
         heldout_auc=0.5,
         loss={"discriminator": 1.0},
-        buffer_current_fraction=0.5,
-        buffer_replay_fraction=0.5,
-        buffer_base_occupied=32,
-        buffer_recent_occupied=0,
         lr=5e-5,
         elapsed_s=0.0,
     )
@@ -89,8 +85,6 @@ def pretrain_event(step: int) -> PretrainEvent:
         modality="t1n",
         loss_discriminator=1.0,
         heldout_auc=0.5,
-        buffer_base_occupied=32,
-        buffer_recent_occupied=4,
         lr=5e-5,
         elapsed_s=0.1,
     )
@@ -517,13 +511,9 @@ class PretrainScenario:
         )
         self.config_path = tmp_path / "config.json"
         self.run_dir = tmp_path / "pretrain_run"
-        # 报告路径 = run 目录内的契约名（run 目录缺省随它派生）；buffer
-        # 缩小到 16（base 分区 8、每条件配额 2 = 回放半区 2——ADR-0008
-        # 决策 4 装配守卫的下限）：量产启动成本是每用例固定开销，容量
-        # 与判定逻辑无关（生产 64）
+        # 报告路径 = run 目录内的契约名（run 目录缺省随它派生）
         self.config_dict["reward"].update({
             "pretrain_report_json": str(self.run_dir / "pretrain_report.json"),
-            "replay_buffer_capacity": 16,
         })
 
     def write_config(
@@ -672,8 +662,8 @@ class TestPretrainEndToEnd:
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：终止语义 = 全部条件最近一次 per-condition recon-AUC 过线或
-        步数上限——每步落盘预训练事件（判别字段 + 条件 + loss/AUC/buffer
-        占用 + 重构成本读数），事件流 AUC 随密集步进按条件可归因。
+        步数上限——每步落盘预训练事件（判别字段 + 条件 + loss/recon-AUC
+        + 重构成本读数），事件流 AUC 随密集步进按条件可归因。
 
         阈值 0.99 不可达：走满步数上限分支（白名单空仍落盘报告 +
         checkpoint 供诊断——拒跑由 train gate 把守，诊断产物不丢；
@@ -907,10 +897,7 @@ class TestPretrainDriverAssembly:
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        recording = RecordingUpdate(
-            driver.rewards.discriminator,
-            buffer_capacity=config.reward.replay_buffer_capacity,
-        )
+        recording = RecordingUpdate(driver.rewards.discriminator)
         driver.rewards.update = recording
         report = driver.run()
         assert report.steps_completed == 6
@@ -1015,13 +1002,9 @@ class TestPretrainReconstructionFakeSupply:
     ) -> None:
         """测量面：每步测量批 = 该条件**全量 held-out 卷**的冻结基座
         重构（非批次量产）——卷数 = 该条件 held-out 条目数、real 与
-        fake 逐样本同形同源；``pretrain_fake_batch`` 不再是测量批的
-        量纲（配错也不改变测量批规模）。"""
-        scenario.write_config(reward={
-            "pretrain_gate_auc": 0.01,
-            # 与 held-out 每条件 2 卷刻意配错：量产口径的量纲不再消费
-            "pretrain_fake_batch": 7,
-        })
+        fake 逐样本同形同源（批量量纲随 ADR-0012 量产退役消失，
+        ``pretrain_fake_batch`` 字段已删，schema 携带即拒）。"""
+        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
         config = scenario.config()
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -1213,10 +1196,7 @@ class TestPretrainRotationStateMachine:
             config = scenario.config()
             run = PretrainRun.init(config, scenario.tmp_path / "state_run")
             driver = PretrainDriver(config, run, device=torch.device("cpu"))
-            recording = RecordingUpdate(
-                driver.rewards.discriminator,
-                buffer_capacity=config.reward.replay_buffer_capacity,
-            )
+            recording = RecordingUpdate(driver.rewards.discriminator)
             auc = ScriptedAuc(values)
             support = ScriptedSupport(plan)
             driver.rewards.update = recording

@@ -204,7 +204,7 @@ class TestMrPretrainEndToEnd:
         assert all(event["event"] == "pretrain" for event in events)
         assert all(
             {"step", "loss_discriminator", "heldout_auc",
-             "buffer_base_occupied", "lr", "elapsed_s"} <= set(event)
+             "lr", "elapsed_s"} <= set(event)
             for event in events
         )
         # 配对批重构链路的确定性证据：同 seed 双 run → 权重逐位一致
@@ -304,11 +304,8 @@ class TestMrPretrainEndToEnd:
             config, artifacts, evaluation=stub, device=torch.device("cpu"),
         )
         # 拒绝先于昂贵启动动作的正面断言（执行序 trainer.run()：
-        # readiness.check() → seed_base_partition() → Baseline 采样）：
-        # base 分区量产 spy 化（实例级覆盖，拒绝路径不得触达）、Baseline
-        # 采样替身标志不翻转——「先拒绝后启动」不是仅由指标流零事件推断
-        partition_calls: list[str] = []
-        trainer.seed_base_partition = lambda: partition_calls.append("base")
+        # readiness.check() → Baseline 采样）：Baseline 采样替身标志不
+        # 翻转——「先拒绝后启动」不是仅由指标流零事件推断
         with pytest.raises(ValueError) as exc_info:
             trainer.run()
         message = str(exc_info.value)
@@ -318,6 +315,5 @@ class TestMrPretrainEndToEnd:
             assert f"recon-AUC[{modality}]: {value:.4f}" in message
         assert str(config.reward.pretrain_report_json) in message
         assert stub.baseline_called is False
-        assert partition_calls == []
         # 指标流零事件（拒绝路径无任何训练侧写入）
         assert artifacts.paths.metrics.stat().st_size == 0

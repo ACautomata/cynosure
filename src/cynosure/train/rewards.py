@@ -1,6 +1,5 @@
-"""判别器侧协作者组（Facade）：聚合两区缓冲、配对批装配原语、Online
-update 与 held-out AUC——trainer 只面对「装配/种植/更新/AUC」四个动作
-与判别器引用。
+"""判别器侧协作者组（Facade）：聚合配对批装配原语、Online update 与
+held-out AUC——trainer 只面对「装配/更新/AUC」三个动作与判别器引用。
 
 判别器相位约定：判别器默认保持 eval 相（打分与监控前向不得推进
 spectral norm power iteration），仅更新一步期间短暂 train。配对批的
@@ -11,13 +10,10 @@ spectral norm power iteration），仅更新一步期间短暂 train。配对批
 pool）、梯度经 DDP allreduce 平均——本类的更新语义逐字不变。
 """
 
-from typing import Sequence
-
 import torch
 
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.buffer import ReplayStore
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate, UpdateReport
 from cynosure.train.gating import DynamicWhitelist
@@ -25,13 +21,12 @@ from cynosure.train.whitelist import ConditionWhitelist
 
 
 class RewardCoordinator:
-    """判别器侧动作面（装配/种植/更新/AUC/分叉监控）与条件白名单的单点持有。"""
+    """判别器侧动作面（装配/更新/AUC/分叉监控）与条件白名单的单点持有。"""
 
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
         gating: DynamicWhitelist,
         overfit: OverfitMonitor,
-        buffer: ReplayStore,
         assembler: ReconstructionAssembler | None,
     ) -> None:
         self.update = update
@@ -44,11 +39,8 @@ class RewardCoordinator:
         # 过拟合分叉监控器（ADR-0009 决策 4/5）：per-condition 分叉 EMA
         # 的 rank 本地单点——train 循环逐判别器步喂入两侧干净域读数、
         # 消费越线判定落 overfit_alert 事件；按 rank 独立（无集合通信），
-        # 报警不动作（白名单与 σ 不被它联动）
+        # 报警不动作（白名单不被它联动）
         self.overfit = overfit
-        # 两区回放缓冲（ADR-0012 后判别器更新批不再消费它——保留种植
-        # 与落盘面，退役删除与 config schema 清理同票进行）
-        self.buffer = buffer
         # 判别器更新批装配原语（ADR-0012 唯一新缝）：两阶段装配缝注入；
         # None = 替身测试场景，生产装配恒注入（trainer 装配期校验）
         self.assembler = assembler
@@ -65,14 +57,6 @@ class RewardCoordinator:
     def discriminator(self) -> torch.nn.Module:
         """底层判别器（checkpoint 落盘用；DDP 装配下为解包后的裸网络）。"""
         return self.update.scorer.discriminator
-
-    def seed_base(
-        self, samples: Sequence[torch.Tensor], modalities: list[str],
-    ) -> None:
-        """冻结初始 policy 的产出填充 base 分区（train 启动期一次，
-        逐样本目标条件标签对齐——ADR-0008-01 的配额量产标签输入；
-        samples 为逐条目张量清单，异形状条件可表达，#129）。"""
-        self.buffer.fill_base(samples, modalities)
 
     def update_step(self, pair: PairBatch) -> UpdateReport:
         """判别器 Online update 一步：消费配对批（real 与 fake 同源，

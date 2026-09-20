@@ -50,7 +50,7 @@ class PoolEntry(BaseModel):
     case_id: str
     modality: str
     """条件键（BraTS = 序列名；MR-RATE = 生成条件名，如 t1w/axial）——
-    判别器条件匹配采样与回放条件过滤的归因轴；同条件 latent 同形状
+    判别器条件匹配采样的归因轴；同条件 latent 同形状
     （#129，装载期对账）。"""
     latent: str
     """latent 文件路径，相对 manifest 文件所在目录。"""

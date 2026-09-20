@@ -4,9 +4,10 @@ fixture 下 CLI train 端到端的三条验收：
 1. 训练 N iteration → 中断 → 恢复 → 与不中断续跑的轨迹/指标一致
    （iter 事件逐条相等（除 wall-clock elapsed_s，RunTrajectory）+ 收官
    policy/判别器 checkpoint 逐位一致）；
-2. 续训状态清单完整覆盖：两模型权重与 optimizer、buffer 两区、RNG
-   （torch/CUDA/numpy/python + 七条命名 generator 流）、iteration 计数、
-   LR scheduler 状态槽、EMA 条件项槽；
+2. 续训状态清单完整覆盖：两模型权重与 optimizer、RNG
+   （torch/CUDA/numpy/python + 四条命名 generator 流）、iteration 计数、
+   LR scheduler 状态槽、EMA 条件项槽（buffer 两区随 ADR-0012 退役面
+   移出清单，v10 起）；
 3. 落盘周期走 config schema（schedule.checkpoint_interval，默认 10）
    且默认值生效——周期未到不产出状态、恢复入口对缺失状态显式拒绝；
    里程碑强制落盘独立于 checkpoint 周期。
@@ -90,8 +91,6 @@ def prepend_pretrain_events(run_dir: Path, steps: int) -> list[dict]:
             modality="t1n",
             loss_discriminator=1.0,
             heldout_auc=0.5 + step * 0.01,
-            buffer_base_occupied=32,
-            buffer_recent_occupied=4,
             lr=5e-5,
             elapsed_s=0.1,
         ))
@@ -208,16 +207,9 @@ class TestResumeStateChecklist:
             assert optimizer_state, name
             assert "exp_avg" in next(iter(optimizer_state.values()))
 
-        # buffer 两区（v7：逐条目张量清单 + 目标条件标签成对）：
-        # base 满容量（64//2）且每条件配额分布；recent 分区在 ADR-0012
-        # 后无写入方（判别器更新批换同源重构配对批，回放消费退役——
-        # buffer 组件与落盘面保留至退役票），空分区落盘 = None
-        base = state["replay_buffer"]["base"]
-        assert len(base["latents"]) == 32
-        assert all(t.shape == (4, 16, 16, 8) for t in base["latents"])
-        assert len(base["modalities"]) == 32
-        assert set(base["modalities"]) == set(MODALITIES)  # 配额量产全条件覆盖
-        assert state["replay_buffer"]["recent"] is None
+        # buffer 两区随 ADR-0012 退役面移出清单（v10）：fake 换域同源
+        # 重构后回放分区无写入方与恢复语义（#173）
+        assert "replay_buffer" not in state
 
         # 分叉监控状态（v6，ADR-0009-β）：per-condition 分叉 EMA——单
         # iteration 单条件观测（首条观测置值、count=1）
@@ -227,13 +219,11 @@ class TestResumeStateChecklist:
         assert divergence["count"] == 1
         assert isinstance(divergence["value"], float)
 
-        # RNG：八条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
+        # RNG：四条命名流 + 全局 torch/numpy/python（cuda 键随执行环境
         # 形态：有 CUDA 的环境（集群）经装配期 fork_rng 触发 CUDA RNG
         # 初始化后捕获全设备 state；无 CUDA 恒 None）
         assert set(state["generators"]) == {
-            "rollout", "real_pool", "disc_update",
-            "heldout_auc", "fake_shuffle", "base_partition", "disc_noise",
-            "recon",
+            "rollout", "real_pool", "heldout_auc", "recon",
         }
         assert all(
             saved.dtype == torch.uint8 for saved in state["generators"].values()
@@ -574,23 +564,18 @@ class TestResumeGuards:
         assert "CUDA" in result.stderr
 
     def test_resume_rejects_legacy_v2_shard(self, scenario: TrainingLoopScenario) -> None:
-        """ADR-0008-01：旧格式（v2，replay buffer 为裸 latent 分区、条目
-        不带来源标签）分片被版本对账显式拒绝——跨口径续训不可恢复
-        （恢复后回放采样无法按条件过滤），报错须指向格式口径变更。"""
+        """旧格式（v2：replay buffer 为裸 latent 分区、条目不带来源标签
+        的代际）分片被版本对账显式拒绝——跨口径续训不可恢复，报错须指向
+        格式口径变更（v10 起清单已不含 replay buffer 与四条退役随机流，
+        #173；v2 形态的重构只降版本号——对账在版本数字，payload 键形
+        无所谓）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
         state = scenario.resume_state()
-        # 回写成 v2 形态：分区 = 裸 tensor、format_version = 2；
-        # v2 分区的 recent 本是裸堆叠 tensor——现役分片 recent 无写入方
-        # （ADR-0012，空分区 = None），以空堆叠等价重构该位
         legacy = dict(state)
         legacy["format_version"] = 2
-        legacy["replay_buffer"] = {
-            "base": torch.stack(state["replay_buffer"]["base"]["latents"]),
-            "recent": torch.zeros(0, 4, 16, 16, 8),
-        }
         torch.save(legacy, scenario.run_dir / RESUME_STATE)
         result = scenario.resume()
         assert result.code == 2
         assert "格式版本" in result.stderr
-        assert "ADR-0008" in result.stderr
+        assert "ADR-0012" in result.stderr

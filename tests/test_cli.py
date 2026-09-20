@@ -292,9 +292,8 @@ class TestMetricsStream:
         event = IterEvent(
             iteration=0, modality="t1n", anchor_eval_reward=-1.5,
             intra_group_reward_std=0.3,
-            heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, buffer_base_occupied=32,
-            buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
+            heldout_auc=0.62, loss={"policy": 0.01},
+            lr=2e-6, elapsed_s=12.3,
         )
         artifacts.append_event(event)
         events = artifacts.read_events()
@@ -319,9 +318,8 @@ class TestMetricsStream:
         values: dict = dict(
             iteration=0, modality="t1n", anchor_eval_reward=-1.5,
             intra_group_reward_std=0.3,
-            heldout_auc=0.62, loss={"policy": 0.01}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, buffer_base_occupied=32,
-            buffer_recent_occupied=12, lr=2e-6, elapsed_s=12.3,
+            heldout_auc=0.62, loss={"policy": 0.01},
+            lr=2e-6, elapsed_s=12.3,
         )
         values.update(overrides)
         return IterEvent(**values)
@@ -364,9 +362,8 @@ class TestMetricsStream:
         artifacts.append_event(IterEvent(
             iteration=0, modality="t1n", anchor_eval_reward=0.0,
             intra_group_reward_std=0.0,
-            heldout_auc=0.5, loss={}, buffer_current_fraction=0.5,
-            buffer_replay_fraction=0.5, buffer_base_occupied=32,
-            buffer_recent_occupied=0, lr=2e-6, elapsed_s=1.0,
+            heldout_auc=0.5, loss={},
+            lr=2e-6, elapsed_s=1.0,
         ))
         artifacts.append_event(MilestoneEvent(iteration=50, fid=1.0))
         assert [e["event"] for e in artifacts.read_events()] == ["iter", "milestone"]

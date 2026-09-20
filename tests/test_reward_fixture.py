@@ -26,7 +26,6 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.assembly import PairBatch
 from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.buffer import ReplayBuffer
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
@@ -47,7 +46,6 @@ class RewardComponents:
     scorer: RewardScorer
     pool: LatentManifest
     heldout: LatentManifest
-    buffer: ReplayBuffer
     update: OnlineUpdate
     auc: HeldOutAuc
     run_artifacts: RunArtifacts
@@ -90,7 +88,7 @@ class RewardFixtureScenario:
         return ConfigLoader.load(self.config_path)
 
     def assemble(self) -> RewardComponents:
-        """装配打分器 / 缓冲 / 更新器 / AUC 信号（与生产同一管线）。"""
+        """装配打分器 / 更新器 / AUC 信号（与生产同一管线）。"""
         self.prepare_artifacts()
         self.write_network_artifacts()
         config = self.config()
@@ -109,16 +107,6 @@ class RewardFixtureScenario:
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
         )
-        buffer = ReplayBuffer(config.reward.replay_buffer_capacity)
-        # fixture 无条件语义（固定 fake 批、事件 modality 恒 t1n）：base
-        # 标签同口径全 t1n。buffer 的更新链路消费已随混采退役（ADR-0012）
-        # ——保留种植面供两区占用读数
-        buffer.fill_base(
-            self.fake_batches(
-                count=1, batch=buffer.base_capacity, seed=100,
-            )[0],
-            ["t1n"] * buffer.base_capacity,
-        )
         update = OnlineUpdate(
             scorer=scorer,
             config=config.reward,
@@ -132,7 +120,6 @@ class RewardFixtureScenario:
             scorer=scorer,
             pool=pool,
             heldout=heldout,
-            buffer=buffer,
             update=update,
             auc=auc,
             run_artifacts=RunArtifacts.init(config, self.run_dir),
@@ -167,11 +154,6 @@ class RewardFixtureScenario:
                 intra_group_reward_std=rewards.std().item(),
                 heldout_auc=auc,
                 loss={"discriminator": report.loss_discriminator},
-                # 回放混采退役读数（ADR-0012）：字段保留、混采量恒 0
-                buffer_current_fraction=0.0,
-                buffer_replay_fraction=0.0,
-                buffer_base_occupied=components.buffer.zone_sizes().base,
-                buffer_recent_occupied=components.buffer.zone_sizes().recent,
                 lr=config.policy.policy_lr,
                 elapsed_s=0.0,
             ))

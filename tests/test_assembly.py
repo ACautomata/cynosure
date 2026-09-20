@@ -423,10 +423,7 @@ class TestReconStreamIsolation:
         assert not torch.equal(
             streams.real_pool.get_state(), before["real_pool"],
         )  # real 侧采样照旧走 real_pool 流
-        for name in (
-            "rollout", "disc_update", "disc_noise", "heldout_auc",
-            "fake_shuffle", "base_partition",
-        ):
+        for name in ("rollout", "heldout_auc"):
             assert torch.equal(
                 streams.named()[name].get_state(), before[name],
             ), name

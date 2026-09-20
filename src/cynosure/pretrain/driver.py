@@ -44,10 +44,7 @@ gate 把守，不丢诊断产物）。
 装配经 ``TrainingRuntime.assemble_rewards``（配对批装配原语同缝组装）、
 采样封装经 ``TrainingRuntime.assemble_sampler``、policy 侧经
 ``GroupPolicy.build``（组1/组2 的采样场与条件分布按 config 分派）——
-与在线期同一份装配与同一条执行路径，仅 config 不同。base 分区量产与
-``RolloutPhase`` 装配同随量产退役（回放缓冲无消费者、预训练不需
-rollout 相）；``reward.buffer`` 的组件与事件占位字段按契约保留，物理
-删除归退役票（#173）。
+与在线期同一份装配与同一条执行路径，仅 config 不同。
 """
 
 import time
@@ -90,13 +87,6 @@ class PretrainDriver:
         self._config = config
         self._run = run
         reward = config.reward
-        # 回放供给装配守卫（ADR-0008 决策 4）的调用点已随 ADR-0012 退役：
-        # gate 测量批的量产口径（pretrain_fake_batch）与更新批（配对批 = K，
-        # 装配原语）解耦后，回放半区不再有消费者——守卫留着会误拒合法
-        # 配对批配置（如 disc_batch_size_k=1）。真实约束是 real 侧容量守卫
-        # （逐 (全池, 模态) 容量 ≥ K，位于共享装配缝 assemble_rewards 内，
-        # ADR-0008-03）。守卫函数与 ReplayBuffer 组件的物理删除归退役票
-        # （#173）。
         # 单进程执行：无 torchrun 环境下 bootstrap 为 world-1 恒等
         # （不初始化进程组），集合通信原语退化——与 train 同一条装配序
         dist = DistributedContext.bootstrap()
@@ -125,7 +115,7 @@ class PretrainDriver:
         # 量产 rollout（``RolloutPhase``）不装配：ADR-0012 决策 6 后预训练
         # 相 fake 全由装配原语重构产出（测量批 / 更新批两条入口），无
         # rollout 相的消费者——装配它只会让「fake 是否走了量产」留一条
-        # 静默可用的旧路（``base_partition`` 流随之下岗，注册表结构不动）。
+        # 静默可用的旧路（base_partition 流已随 ADR-0012 退役，#173）。
         #
         # 过线判定原语（ADR-0008-04 消费 ADR-0008-02/#85 的支撑度规则）：
         # bootstrap 的随机性独立派生（seed+7——命名流注册表之外，预训练
@@ -158,7 +148,7 @@ class PretrainDriver:
 
     @property
     def rewards(self) -> RewardCoordinator:
-        """判别器侧协作者组（Online update 原语 / held-out AUC / buffer）。"""
+        """判别器侧协作者组（Online update 原语 / held-out AUC / 过拟合分叉监控）。"""
         return self._rewards
 
     def run(self) -> PretrainReport:
@@ -229,14 +219,11 @@ class PretrainDriver:
                 train_pairwise_acc=update.train_pairwise_acc,
                 heldout_auc=auc,
             )
-            zones = self._rewards.buffer.zone_sizes()
             self._run.append_event(PretrainEvent(
                 step=step,
                 modality=modality,
                 loss_discriminator=update.loss_discriminator,
                 heldout_auc=auc,
-                buffer_base_occupied=zones.base,
-                buffer_recent_occupied=zones.recent,
                 # 重构成本读数（#171 AC5 的成本口径落点）：测量批重构的
                 # 前向次数（逐卷定序 σ 的续跑步数之和）与测量批规模——
                 # 30 步全 ODE 量产路径已不在本执行路径，这两项让「没有

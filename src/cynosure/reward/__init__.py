@@ -1,5 +1,5 @@
 """reward 模块：prepare 数据工件管线（ticket #18）与 Reward model 打分 /
-在线更新 / 两区回放（ticket #20）。
+在线更新 / 配对批装配（ticket #20）。
 
 - prepare（扫描 → split → 预编码 → 统计量 → 三工件落盘，幂等）：
   Real sample pool（train split，按序列分层）、Held-out real（val split，
@@ -7,9 +7,8 @@
 - Reward model（reward-model 章 + ADR-0001）：MONAI PatchDiscriminator
   封装（GroupNorm、raw real-logit patch 聚合、SpectralNorm 触发式）、
   LSGAN 在线更新一步（AdamW、消费配对批——ADR-0012）、判别器更新批
-  装配原语（同源重构 fake，ADR-0012）、两区 Replay buffer（固定 base +
-  FIFO recent，判别器链路退役中）、held-out AUC 监控信号、支撑度判定
-  原语（ADR-0008 决策 6：低支撑条件走 bootstrap CI 下界口径）。
+  装配原语（同源重构 fake，ADR-0012）、held-out AUC 监控信号、支撑度
+  判定原语（ADR-0008 决策 6：低支撑条件走 bootstrap CI 下界口径）。
 
 数值语义见 docs/spec/reward-model.md 与 ADR-0001。
 """
@@ -23,16 +22,6 @@ from cynosure.reward.artifacts import (
 )
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
-from cynosure.reward.buffer import (
-    ReplayBuffer,
-    ReplayDraw,
-    ReplayEntry,
-    ReplayStore,
-    ZoneModalities,
-    ZoneSizes,
-    assert_replay_supply,
-    base_condition_quota,
-)
 from cynosure.reward.dataset import (
     BratsSeriesLayout,
     CaseSeries,
@@ -86,10 +75,6 @@ __all__ = [
     "RealPoolSampler",
     "RealSampling",
     "ReconstructionAssembler",
-    "ReplayBuffer",
-    "ReplayDraw",
-    "ReplayEntry",
-    "ReplayStore",
     "RewardScorer",
     "SamplingManifest",
     "SupportRule",
@@ -97,10 +82,6 @@ __all__ = [
     "UpdateReport",
     "UpstreamPreprocessChain",
     "VolumeScoreClusters",
-    "ZoneModalities",
-    "ZoneSizes",
-    "assert_replay_supply",
-    "base_condition_quota",
     "bootstrap_ci_lower_bound",
     "bootstrap_replicates",
 ]

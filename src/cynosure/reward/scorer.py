@@ -53,14 +53,6 @@ class LatentScorer(Protocol):
         """[B,4,D,H,W] → patch logit 图 [B,1,D',H',W']（raw，不过 sigmoid）。"""
         ...
 
-    def training_patch_logits(
-        self, latents: torch.Tensor, generator: torch.Generator,
-    ) -> torch.Tensor:
-        """训练专用带噪前向（ADR-0009-α）：归一化域对称噪声注入后的
-        patch logit 图——仅判别器参数更新路径消费；打分入口
-        （``patch_logits`` / ``reward``）契约不动、恒干净域。"""
-        ...
-
     def reward(self, latents: torch.Tensor) -> torch.Tensor:
         """patch logit 图聚合为标量 reward（[B]，raw real-logit）。"""
         ...
@@ -143,7 +135,6 @@ class RewardScorer(torch.nn.Module):
         self._normalizer = ChannelNormalizer(stats)
         self._aggregation = config.patch_aggregation
         self._tanh_bounding = config.reward_tanh_bounding
-        self._noise_sigma_max = config.disc_noise_sigma_max
 
     @property
     def discriminator(self) -> PatchDiscriminator:
@@ -171,46 +162,6 @@ class RewardScorer(torch.nn.Module):
         """[B,4,D,H,W] → patch logit 图 [B,1,D',H',W']（raw，不过 sigmoid）。"""
         normalized = self._normalizer.normalize(latents)
         return self._discriminator(normalized)[-1]
-
-    def training_patch_logits(
-        self, latents: torch.Tensor, generator: torch.Generator,
-    ) -> torch.Tensor:
-        """训练专用带噪前向（ADR-0009-α 决策 1-3）：标准化 → 对称噪声
-        注入 → 判别器，输出 patch logit 图（形状同 ``patch_logits``）。
-
-        仅判别器参数更新路径消费（``OnlineUpdate``，预训练与在线两阶段
-        同一原语）；打分路径（``patch_logits`` / ``reward`` / held-out
-        AUC / 监控复算）恒干净域——reward 每步 i.i.d. 抖动会经 GRPO 组内
-        标准化放大进 advantage（ADR-0009 决策 2 否决双侧同噪的理由）。
-        real 与 fake 两侧经同一入口、同一 generator（更新原语注入的专属
-        随机流）消费——对称性 = 同一采样机制、同分布。
-
-        σ_max = 0（config ``disc_noise_sigma_max``，唯一关闭形态）时与
-        ``patch_logits`` 逐位一致且零 RNG 消耗（回归锚：全链路与无注入
-        代码一致）；σ_max > 0 时逐样本 σ ~ U[0, σ_max] × ε ~ N(0,1)，
-        注入在归一化域（通道归一化之后）、σ 以相对通道 std 的比例参数化
-        ——归一化后每通道 std = 1，噪声 std = σ × 通道 std，免依赖 latent
-        存储域量级。噪声是注入常数（非参数）：梯度照常流向判别器参数。
-        """
-        normalized = self._normalizer.normalize(latents)
-        if self._noise_sigma_max > 0.0:
-            normalized = normalized + self._training_noise(
-                normalized, generator,
-            )
-        return self._discriminator(normalized)[-1]
-
-    def _training_noise(
-        self, normalized: torch.Tensor, generator: torch.Generator,
-    ) -> torch.Tensor:
-        """逐样本 σ ~ U[0, σ_max] × ε ~ N(0,1) 的噪声张量（注入流采样：
-        σ 先于 ε 的抽取次序即采样契约——同 seed 重放逐位一致；张量在
-        generator 所属设备生成后迁移，σ_max = 0 路径不进入本方法）。"""
-        sigmas = torch.rand(
-            normalized.shape[0], generator=generator,
-        )
-        eps = torch.randn(normalized.shape, generator=generator)
-        noise = sigmas.view(-1, 1, 1, 1, 1) * self._noise_sigma_max * eps
-        return noise.to(normalized.device)
 
     def reward(self, latents: torch.Tensor) -> torch.Tensor:
         """patch logit 图聚合为标量 reward（raw real-logit，保留组内分辨率）。

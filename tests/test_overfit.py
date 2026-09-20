@@ -12,8 +12,9 @@
 - 非有限浮点观测在测量层显式拒绝（「全流拒绝」口径的源头闸口）；
 - state/adopt roundtrip 逐位一致（续训复原的落盘侧），损坏形态显式
   拒绝；
-- 报警不动作：越线只报警——白名单成员与噪声 σ_max 都不被分叉监控
-  触碰（测试断言无副作用，ADR-0009 决策 5）。
+- 报警不动作：越线只报警——白名单成员不被分叉监控触碰（测试断言
+  无副作用，ADR-0009 决策 5；旧「自动调 σ」升级项随噪声注入退役
+  作废，ADR-0012）。
 
 train 侧干净域复算（更新原语 seam）的观测缝在 test_online_update；
 overfit_alert 事件契约（序列化 / 非有限拒绝 / 混存 / 回退记账）在
@@ -38,7 +39,6 @@ class OverfitFixture:
         """最小合法 RewardConfig（分叉 knobs 可覆写）。"""
         fields = dict(
             disc_batch_size_k=4,
-            replay_buffer_capacity=64,
             real_pool_manifest="artifacts/real_pool.json",
             heldout_real_manifest="artifacts/heldout_real.json",
             channel_stats_json="artifacts/channel_stats.json",
@@ -205,11 +205,10 @@ class TestOverfitState:
 
 
 class TestAlertDoesNotAct:
-    """报警不动作（ADR-0009 决策 5）：分叉越线不自动改白名单、不自动
-    调 σ——监控器只产读数，动作面（白名单/σ）不被它触碰（AC 的无
-    副作用断言）。"""
+    """报警不动作（ADR-0009 决策 5）：分叉越线不自动改白名单——监控器
+    只产读数，动作面（白名单）不被它触碰（AC 的无副作用断言）。"""
 
-    def test_crossing_alert_leaves_whitelist_and_sigma_untouched(self) -> None:
+    def test_crossing_alert_leaves_whitelist_untouched(self) -> None:
         config = OverfitFixture.reward_config()
         monitor = OverfitMonitor(
             config, conditions=("t1n", "t1c", "t2w", "t2f"),
@@ -221,7 +220,6 @@ class TestAlertDoesNotAct:
             conditions=("t1n", "t1c", "t2w", "t2f"),
         )
         members_before = whitelist.whitelist.members
-        sigma_before = config.disc_noise_sigma_max
 
         fired = [
             monitor.observe(modality, train_pairwise_acc=0.9, heldout_auc=0.5).alerted
@@ -230,4 +228,3 @@ class TestAlertDoesNotAct:
         assert fired == [True, True, True]  # 持续越线、报警面在响
 
         assert whitelist.whitelist.members == members_before  # 名单不动
-        assert config.disc_noise_sigma_max == sigma_before  # σ 不动
