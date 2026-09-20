@@ -1226,12 +1226,12 @@ class TestRewardDomainNormalization:
 
     @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
     @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
-    def test_scored_fakes_match_replay_domain(
+    def test_scored_fakes_match_new_fakes_domain(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """打分输入与 new_fakes 同值同序（同一归一域）：打分与
         AUC fake 侧消费同一批归一后 latent，不出现跨域错配。"""
-        record, scored = self._rollout_with_scale(scenario, 2.0, "replay")
+        record, scored = self._rollout_with_scale(scenario, 2.0, "domain")
         assert scored, "打分记录为空"
         assert torch.equal(torch.cat(scored), record.new_fakes)
 

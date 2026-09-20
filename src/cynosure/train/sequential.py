@@ -3,9 +3,8 @@
 
 单次运行 = stage-1（组1 配置训练并产出 base′）→ stage-2（base′ 冻结 +
 预训练 ControlNet 复用初始化，组2 配置）。两阶段各是一次完整的单阶段
-训练（GranularGrpoTrainer）：判别器与 Replay buffer 随训练实例隔离——
-跨阶段不复用（experiment-design：判别器在线跟踪本阶段 fake 分布），
-stage-2 的 buffer base 分区由 stage-2 自己的初始 policy 生成。
+训练（GranularGrpoTrainer）：判别器随训练实例隔离——跨阶段不复用
+（experiment-design：判别器在线跟踪本阶段 fake 分布）。
 
 产物布局（同一次 run 目录内）：stage-1 无前缀（与独立组1 run 逐字一致，
 故 ``stage1_run_dir`` 可指向任意其一）；stage-2 带 ``stage2_`` 前缀。

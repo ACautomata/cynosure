@@ -2,7 +2,7 @@
 （base′ 冻结 + 预训练 ControlNet 复用初始化，组2 配置）。
 
 验收面：两阶段顺序执行、stage-1 产物正确传入 stage-2、经 config 指定
-既有 stage-1 产物路径跳过 stage-1、每组判别器与 Replay buffer 独立
+既有 stage-1 产物路径跳过 stage-1、每组判别器独立
 （互不串扰的断言）、stage 级报告绑定（#116：stage-1 消费 modal-label
 报告、stage-2 消费 cross-modal 报告——消费异组报告被组别等值守卫拒绝）。
 """
@@ -253,8 +253,9 @@ class TestSequentialRun:
 
 
 class TestStageIndependence:
-    """AC「每组判别器与 Replay buffer 独立（互不串扰）」：组3 两阶段在
-    同一次运行内也各持独立判别器与 buffer。"""
+    """AC「每组判别器独立（互不串扰）」：组3 两阶段在同一次运行内也
+    各持独立判别器（原并列的 buffer 独立性断言随 ReplayBuffer 退役
+    删除，ADR-0012）。"""
 
     def test_stage_discriminators_train_independently(
         self, scenario: TrainingLoopScenario,
