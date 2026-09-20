@@ -1,0 +1,73 @@
+{
+  "checks": {
+    "pool_keys_match_download_list": true,
+    "heldout_keys_match_download_list": true,
+    "eval_series_disjoint": true,
+    "eval_patient_disjoint": true,
+    "heldout_patient_disjoint": true,
+    "all_conditions_in_pool": true,
+    "mra_full_pool_coverage": true,
+    "quota_respected": true,
+    "condition_latent_shapes_match_vocabulary": true,
+    "all_latents_match_condition_grid": true,
+    "stats_num_latents_matches_pool": true,
+    "stats_shape_anchor": true
+  },
+  "counts": {
+    "eval_series_overlap": 0,
+    "pool_patients": 16280,
+    "heldout_patients": 3400,
+    "pool_condition_counts": {
+      "flair/axial": 2000,
+      "flair/coronal": 2000,
+      "flair/sagittal": 2000,
+      "mra/all-planes": 140,
+      "swi/axial": 2000,
+      "t1w/axial": 2000,
+      "t1w/coronal": 2000,
+      "t1w/sagittal": 2000,
+      "t2w/axial": 2000,
+      "t2w/coronal": 2000,
+      "t2w/sagittal": 2000
+    },
+    "heldout_condition_counts": {
+      "flair/axial": 512,
+      "flair/coronal": 512,
+      "flair/sagittal": 512,
+      "mra/all-planes": 10,
+      "swi/axial": 512,
+      "t1w/axial": 512,
+      "t1w/coronal": 512,
+      "t1w/sagittal": 512,
+      "t2w/axial": 512,
+      "t2w/coronal": 512,
+      "t2w/sagittal": 512
+    },
+    "mra_candidates": 150,
+    "mra_pool": 140,
+    "mra_heldout": 10,
+    "pool_shape_checked": 20140,
+    "shape_mismatch": 0,
+    "stats_mean_preview": [
+      -0.052593094314006605,
+      -0.11452747219865471,
+      -0.052932859687686074,
+      0.07246145323646601
+    ],
+    "stats_std_preview": [
+      0.9803217165145778,
+      1.0228780228904986,
+      0.9843351762073167,
+      1.0105757864719067
+    ],
+    "provenance": {
+      "dataset": "MR-RATE",
+      "data_snapshot": "f6e39794",
+      "source_commit": null,
+      "intensity_clip": false,
+      "resize_semantics": "uniform-grid",
+      "upstream_anchor": "NVIDIA v1 clip=False（上游 transforms.py 原文；#71 裁决）"
+    }
+  },
+  "all_pass": true
+}
