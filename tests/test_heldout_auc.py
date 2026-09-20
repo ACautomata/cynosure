@@ -589,3 +589,98 @@ class TestVolumeScoreClusters:
         assert auc.compute(scenario.fakes(8), modality="t1n") == pytest.approx(
             before_cond, rel=0.0, abs=0.0,
         )
+
+
+class TestMeasurementSourceDecomposition:
+    """测量批来源两步分解面（ADR-0016 决策 4 的实现缝，issue #198）：
+    held-out 全量卷的来源从「抽满即加载」分解为「索引抽取（heldout 流
+    一次 randperm 定该条件全量排列）/ 按索引加载（排列切片上卡）」两个
+    可独立调用的面——分布式预训练「每 rank 只 load 1/N 测量批」的前提
+    是排列抽取与加载解耦。全部单进程 CPU 可验证；既有全量路径
+    （condition_latents）行为逐位不变（World-1 回归锚）。"""
+
+    def _auc(self, scenario: UpdateScenario, manifest: LatentManifest,
+             seed: int = 1) -> HeldOutAuc:
+        return HeldOutAuc(
+            heldout_manifest=manifest, scorer=scenario.scorer(),
+            generator=scenario.generator(seed),
+        )
+
+    def _manifest(self, tmp_path: Path) -> LatentManifest:
+        writer = HeldOutPoolWriter(
+            tmp_path / "heldout",
+            {"t1n": 2, "t1c": 3, "t2w": 5, "t2f": 4},
+        )
+        return LatentManifest.load(writer.write(), kind="heldout_real")
+
+    def test_condition_order_is_reproducible(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """排列经 heldout 流的抽取可复算：同 seed 同调用序 → 同排列
+        （分布式下 rank0 派生 seed = seed 恒等、跨 rank 同序的前提——
+        排列抽取与 latent 加载解耦后，同序重放仍复算同一排列）。排列
+        是真排列（该条件全量条目各一次）；同实例连续抽取排列改变——
+        流推进可见，排列确实消耗 heldout 流。"""
+        manifest = self._manifest(tmp_path)
+        first = self._auc(scenario, manifest)
+        second = self._auc(scenario, manifest)
+        order_a = first.condition_order("t2w")
+        order_b = second.condition_order("t2w")
+        assert order_a == order_b
+        # 同调用序推进到第二次抽取：两实例仍同序（重放可复算），且与
+        # 首次不同（heldout 流被排列抽取消耗——非幂等快照）
+        order_a2 = first.condition_order("t2w")
+        order_b2 = second.condition_order("t2w")
+        assert order_a2 == order_b2
+        assert order_a2 != order_a
+        # 真排列：该条件全量条目、各出现一次、不混入他条件条目
+        expected_ids = sorted(
+            entry.case_id for entry in manifest.entries
+            if entry.modality == "t2w"
+        )
+        assert sorted(entry.case_id for entry in order_a) == expected_ids
+
+    def test_sliced_load_matches_full_batch_bitwise(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """按索引切片加载 = 整批加载的对应切片（逐位一致）：加载逐条目
+        独立（懒加载 + stack + 设备迁移），排列切片不重排不混流。加载
+        面零随机性（heldout 流状态前后不变）——排列可复算不被加载扰动，
+        每 rank 加载自己的切片不搅动流位置。"""
+        manifest = self._manifest(tmp_path)
+        auc = self._auc(scenario, manifest)
+        order = auc.condition_order("t2w")
+        generator = auc._real_sampler._generator
+        state_before = generator.get_state().clone()
+        full = auc.load_order(order)
+        assert torch.equal(generator.get_state(), state_before)
+        for start, stop in ((0, 2), (2, 4), (4, 5), (1, 3)):
+            assert torch.equal(
+                auc.load_order(order[start:stop]), full[start:stop],
+            ), (start, stop)
+
+    def test_condition_latents_equals_order_then_load(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """既有全量路径 = 两步分解的全量特例（逐位一致）：
+        condition_latents == load_order(condition_order(·))。分解面是
+        **新增**缝——全量路径行为不变的 World-1 回归锚，逐位不等即
+        语义真回归。"""
+        manifest = self._manifest(tmp_path)
+        consumer = self._auc(scenario, manifest)
+        decomposed = self._auc(scenario, manifest)
+        assert torch.equal(
+            consumer.condition_latents("t2w"),
+            decomposed.load_order(decomposed.condition_order("t2w")),
+        )
+
+    def test_empty_slice_load_rejected(
+        self, scenario: UpdateScenario, tmp_path: Path,
+    ) -> None:
+        """空切片显式拒绝（测量批的 real 源不得为空——与 measure_condition
+        / compute_volume_clusters 的非空守卫同语义家族）。"""
+        manifest = self._manifest(tmp_path)
+        auc = self._auc(scenario, manifest)
+        order = auc.condition_order("t2w")
+        with pytest.raises(ValueError, match="不得为空"):
+            auc.load_order(order[:0])
