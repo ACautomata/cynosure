@@ -75,8 +75,12 @@ World-1 行为与分布式化前**逐位一致**（同代码路径、同 RNG 消
   checkpoint、预训练报告全部 rank0 落盘（``PretrainRun`` 单进程唯一
   写者契约由调用方 rank 门满足）；``OverfitMonitor`` 保持 rank 本地状态
   （ADR-0009 决策 4/5：per-rank 离散本身是诊断信号，不跨 rank 平均），
-  各 rank 以广播下发的全局 AUC 合成观测，越线告警的归并落 rank0 事件
-  流（最小版：rank0 写本 rank 读数）。
+  各 rank 以广播下发的全局 AUC 合成观测，越线告警经 train 侧同一
+  ``EventMerger`` 归并（``PretrainRun`` 经 ``EventSink`` 协议充当写
+  者面）：各 rank 告警清单 gather 到 rank0、仅 rank0 按源 rank 序
+  append（``rank`` 字段归因观测 rank，归并序 = (步, rank)——步内
+  pretrain 事件先于告警由 rank0 先直写 pretrain、后归并告警的写出段
+  保证）。
 
 判别器侧装配经 ``TrainingRuntime.assemble_rewards``（配对批装配原语同缝
 组装）、采样封装经 ``TrainingRuntime.assemble_sampler``、policy 侧经
@@ -91,6 +95,7 @@ import torch
 
 from cynosure.config import CynosureConfig
 from cynosure.distributed import DistributedContext
+from cynosure.distributed.merge import EventMerger
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.pretrain.artifacts import (
@@ -212,6 +217,12 @@ class PretrainDriver:
                 "切片后某 rank 测量批为空——gather 的全局 AUC 缺该 rank "
                 "分数即不完整"
             )
+        # 预训练相告警的归并器（ADR-0016 决策 8）：train 侧同一实现
+        # （EventMerger），``PretrainRun`` 经 EventSink 协议充当写者面
+        # ——归并序（gather → rank0 → 源 rank 序 append）一处实现，
+        # 两条指标流（train 的 metrics.jsonl / 预训练的 metrics.jsonl）
+        # 共用，world-1 下 gather 恒等退化为直写
+        self._merger = EventMerger(self._dist, run)
 
     @property
     def policy(self) -> GroupPolicy:
@@ -314,7 +325,8 @@ class PretrainDriver:
             # of sample 平面与 fake 来源）。OverfitMonitor 保持 rank 本地
             # 状态（ADR-0016 决策 8：per-rank 离散本身是诊断信号，不跨
             # rank 平均）——全 rank 以广播下发的全局 AUC 合成观测，越线
-            # 告警由 rank0 写本 rank 读数落事件流（最小版归并）
+            # 告警经 gather 归并落 rank0 事件流（train 侧 EventMerger
+            # 本体，归并调用见下）
             reading = self._rewards.overfit.observe(
                 modality,
                 train_pairwise_acc=update.train_pairwise_acc,
@@ -337,19 +349,32 @@ class PretrainDriver:
                     lr=reward.disc_lr,
                     elapsed_s=time.monotonic() - started,
                 ))
-                if reading.alerted:
-                    # 预训练相告警排本步 pretrain 事件之后（与在线侧「iter
-                    # 后随告警」同构的写出序）；``phase="pretrain"`` 是回退
-                    # 记账的 EXEMPT 分轨轴——预训练执行史全量保留（预训练
-                    # 相的 ``iteration`` 记本步步号）
-                    self._run.append_event(OverfitAlertEvent(
-                        iteration=step,
-                        phase="pretrain",
-                        modality=modality,
-                        divergence_ema=reading.divergence,
-                        train_pairwise_acc=update.train_pairwise_acc,
-                        heldout_auc=auc,
-                    ))
+            # 预训练相告警的 rank 归并（ADR-0016 决策 8）：train 侧
+            # EventMerger 本体（EventSink 协议下 PretrainRun 为写者面）
+            # ——OverfitMonitor 保持 rank 本地状态（per-rank 离散是诊断
+            # 信号，不跨 rank 平均），各 rank 的越线读数各自构造告警、
+            # gather 到 rank0、仅 rank0 按源 rank 序 append（归并序 =
+            # (步, rank)，清单内序保持）。rank0 已先直写本步 pretrain
+            # 事件，归并段只追加告警——写出序 = 步序 + 步内 pretrain
+            # 先于告警（与在线侧「iter 后随告警」同构）。更新步全 rank
+            # 每步恰一次 emit 内 gather（决策已广播、分支一致），确认/
+            # 终止步不进本段——集合序列逐 rank 对齐
+            alerts = []
+            if reading.alerted:
+                # ``phase="pretrain"`` 是回退记账的 EXEMPT 分轨轴——
+                # 预训练执行史全量保留（预训练相的 ``iteration`` 记本
+                # 步步号）；``rank`` 归因观测 rank（分叉按 rank 独立
+                # 计算落盘的归因轴，ADR-0009 决策 4）
+                alerts.append(OverfitAlertEvent(
+                    iteration=step,
+                    phase="pretrain",
+                    rank=self._dist.rank,
+                    modality=modality,
+                    divergence_ema=reading.divergence,
+                    train_pairwise_acc=update.train_pairwise_acc,
+                    heldout_auc=auc,
+                ))
+            self._merger.emit(alerts)
             steps_completed += 1  # 更新步计数（确认步占步号但不更新不事件）
         reported = dict(confirmed)
         if not gate_passed:
