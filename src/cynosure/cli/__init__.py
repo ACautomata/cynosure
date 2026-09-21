@@ -9,10 +9,12 @@ iter 事件流 + checkpoint），单进程与 torchrun 多进程同一条代码�
 额外产出 fixture 诊断工件（轨迹双列/log-prob 对）；``--resume`` 从既有
 run 目录的最新续训状态恢复训练（仅单阶段组、须显式 --run-dir）。
 分布式启动（检测到 RANK env）必须显式 --run-dir——默认目录按进程
-时间戳生成，无法跨 rank 对齐。pretrain 执行判别器 warm-start 预训练
-（ADR-0007）：密集步进至 held-out AUC 达 RM readiness gate 或步数上限，
-产出判别器 checkpoint + 预训练报告；单进程执行（World-1 退化路径），
-torchrun 启动显式拒绝——多 rank 各自预训练会分叉判别器。
+时间戳生成，无法跨 rank 对齐。pretrain 执行判别器 warm-start 预训练（ADR-0007）：密集步进至 held-out
+AUC 达 RM readiness gate 或步数上限，产出判别器 checkpoint + 预训练报告；
+单进程与 torchrun 多进程同一条代码路径（ADR-0016：测量批按卷切片到各
+rank、rank0 gate 单点 + 四态广播分发、产物 rank0 唯一写者），分布式
+启动必须显式 --run-dir。fid/fid-floor/base-smoke 保持单进程，torchrun
+启动显式拒绝（各自的多写者竞态后果见各子命令 docstring）。
 
 fid 是裁决性 MR FID 读数仪器（#73 双轨之一，wayfinder #79 移植）：
 独立 ``MrFidConfig`` schema（9 项冻结变量的载体），单进程执行，
@@ -655,21 +657,31 @@ class CynosureCli:
     def _pretrain(
         self, args: argparse.Namespace, config: CynosureConfig,
     ) -> int:
-        """判别器 warm-start 预训练（ADR-0007 + ADR-0008-04）：单进程
-        执行（产物全局唯一），per-condition 密集步进至全部轮转条件过线
-        或步数上限（白名单为空不拒跑——报告与 checkpoint 落盘供诊断）。
+        """判别器 warm-start 预训练（ADR-0007 + ADR-0008-04 + ADR-0016）：
+        单进程与 torchrun 同一条代码路径（per-condition 密集步进、
+        rank0 gate 单点 + 四态广播、产物 rank0 唯一写者），跑至全部
+        轮转条件过线或步数上限（白名单为空不拒跑——报告与 checkpoint
+        落盘供诊断）。
 
         run 目录默认 = config 的 ``reward.pretrain_report_json`` 所在
         目录（产物位置在 config 里声明，train 上岗按同一路径装载）；
         ``--run-dir`` 可显式覆盖（产物路径以 config 声明为准——覆盖
         目录与声明路径分叉时拒绝：train 按 config 声明装载，分叉即
-        missing-report 或静默装旧报告）。装配失败的预占目录回滚
-        （未产出任何工件）；执行中途失败保留目录（事件可取证）。"""
+        missing-report 或静默装旧报告）。分布式启动（检测到 RANK env）
+        必须显式 ``--run-dir``（跨 rank 目录对齐，train 既有规则）——
+        预训练的默认目录虽由 config 派生（理论可对齐），与 train 同款
+        显式化让启动面一致、不留「忘了给 run-dir 静默写进家目录」的缝。
+        run 目录创建/已存在检查只由 rank 0 执行 + ``broadcast_flag``
+        裁决（文件存在性无法跨 rank 自证，单方面失败退出会让其余
+        rank 停在集合操作互等）；装配失败的预占目录回滚只由 rank 0
+        执行（多 rank 各自 rmtree 同一共享目录是 stat/rmtree 竞态）。"""
         env_rank = DistributedContext.env_rank()
-        if env_rank is not None:
+        if env_rank is not None and args.run_dir is None:
             print(
-                "预训练以单进程执行（World-1 退化路径；多 rank 各自"
-                f"预训练会分叉判别器），拒绝 torchrun 启动（RANK={env_rank}）",
+                "检测到 torchrun 环境（RANK="
+                f"{env_rank}）：分布式启动必须显式指定 --run-dir"
+                "（跨 rank 对齐 run 目录；默认目录随 config 声明，"
+                "显式化与 train 同款启动面）",
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
@@ -682,6 +694,7 @@ class CynosureCli:
         # 路径装载——两者不一致时 producer/consumer 断链。比对**归一化
         # 后**的路径而非字面拼写：相对 vs 绝对、``.`` 分量、符号链接
         # 祖先都是同一位置的不同写法，字面比较会把合法调用误判成分叉。
+        # 纯本地确定性校验：各 rank 对同一 config 同判定，无通信
         declared_report = Path(config.reward.pretrain_report_json)
         produced_report = PretrainRun.layout(run_root).report
         if produced_report.resolve() != declared_report.resolve():
@@ -692,30 +705,44 @@ class CynosureCli:
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
+        # 进程组 CLI 层装配一次（train 同款）：run 目录 init 的广播裁决
+        # 与 driver 内的集合通信（gather/四态广播/DDP allreduce）共享它；
+        # 单进程 = world-1 恒等（不初始化进程组、广播原语恒等退化）
+        dist = DistributedContext.bootstrap()
         try:
-            run = PretrainRun.init(config, run_root)
-        except FileExistsError:
-            print(
-                f"预训练 run 目录已存在（不静默覆盖）: {run_root}",
-                file=self._stderr,
-            )
-            return _EXIT_USAGE_ERROR
-        # 装配期 = 输入契约（网络/工件装载、跨字段守卫）：失败回滚本次
-        # 预占的 run 目录（尚无任何产出）
-        try:
-            driver = PretrainDriver(config, run, device=self._prepare_device())
-        except (
-            ValueError, FileNotFoundError, RuntimeError,
-            pickle.UnpicklingError,
-        ) as exc:
-            print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
-            shutil.rmtree(run_root)
-            return _EXIT_USAGE_ERROR
-        try:
-            report = driver.run()
-        except (ValueError, FileNotFoundError) as exc:
-            print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
-            return _EXIT_USAGE_ERROR
+            run = self._init_pretrain_run(config, run_root, dist)
+            if run is None:
+                return _EXIT_USAGE_ERROR
+            # 装配期 = 输入契约（网络/工件装载、跨字段守卫）：失败回滚本次
+            # 预占的 run 目录（尚无任何产出）。同 config 装配失败面全 rank
+            # 一致（装配无 rank 非对称输入），各 rank 本地返回 usage 错误、
+            # rank 0 单点回滚——与 train 构造期失败同口径
+            try:
+                driver = PretrainDriver(
+                    config, run,
+                    # 分布式下设备 = 本 rank 计算卡（driver 内
+                    # dist.local_device() 解析）；单进程沿用 0 号卡惯例
+                    device=None if dist.distributed else self._prepare_device(),
+                    dist_context=dist,
+                )
+            except (
+                ValueError, FileNotFoundError, RuntimeError,
+                pickle.UnpicklingError,
+            ) as exc:
+                print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
+                if dist.rank == 0:
+                    shutil.rmtree(run_root)
+                return _EXIT_USAGE_ERROR
+            try:
+                report = driver.run()
+            except (ValueError, FileNotFoundError) as exc:
+                print(f"pretrain 输入契约违反: {exc}", file=self._stderr)
+                return _EXIT_USAGE_ERROR
+        finally:
+            dist.destroy()
+        if dist.rank != 0:
+            return 0  # 产物与读数报告 rank0 独写/独打：非 0 rank 静默成功
+        assert report is not None
         outcome = (
             "已达标（全部条件过线）" if report.gate_passed
             else "未达标（步数上限耗尽）"
@@ -763,6 +790,31 @@ class CynosureCli:
             file=self._stdout,
         )
         return 0
+
+    def _init_pretrain_run(
+        self,
+        config: CynosureConfig,
+        run_root: Path,
+        dist: DistributedContext,
+    ) -> PretrainRun | None:
+        """预训练 run 目录的装配：rank 0 创建（拒绝预存目录），成败经
+        ``broadcast_flag`` 裁决——非 0 rank 等裁决而非轮询文件系统，预存
+        目录下全体一致返回 usage error（train 侧 ``_init_new_run`` 同款
+        协议；单进程下广播恒等 = 直建/直拒）。"""
+        run: PretrainRun | None = None
+        if dist.rank == 0:
+            try:
+                run = PretrainRun.init(config, run_root)
+            except FileExistsError:
+                print(
+                    f"预训练 run 目录已存在（不静默覆盖）: {run_root}",
+                    file=self._stderr,
+                )
+        if not dist.broadcast_flag(run is not None):
+            return None
+        if run is None:
+            run = PretrainRun(PretrainRun.layout(run_root))
+        return run
 
 
 def main() -> None:

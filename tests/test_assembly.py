@@ -898,3 +898,66 @@ class TestMeasurementConditionReconstruction:
             sliced = assembler.measure_condition(reals[:cut], CONDITION)
             assert torch.equal(sliced.fakes, full.fakes[:cut]), cut
             assert torch.equal(sliced.reals, full.reals[:cut]), cut
+
+    def test_offset_slice_measurement_matches_full_batch_rows(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """任意偏移切片测量批 = 整批对应行（逐位，ADR-0016 决策 4 的
+        分布式数值前提）：σ 轮转按全量位次偏移（本地第 j 卷取候选第
+        (offset+j) % |M| 位）+ 复位测量流**前缀消耗** offset 行 ε——
+        「同排列、切加载」下 gather 拼回的全量测量批与单卡 rank0 全量
+        测量逐位一致（多卡 gate 报告值对单卡可复算）。与 #198 前缀锚
+        的分工：彼锚「前缀切片的 σ 退化为恒位」（单候选步），本锚锁
+        **任意偏移 + 多候选步** 的轮转偏移与前缀消耗组合。"""
+        assembler = self._assembler(scenario, train_steps=(1, 2, 3), num_steps=5)
+        reals = torch.randn(7, *SHAPE)
+        full = assembler.measure_condition(reals, CONDITION)
+        for start, stop in ((0, 3), (2, 5), (5, 7), (3, 4)):
+            sliced = assembler.measure_condition(
+                reals[start:stop], CONDITION, volume_offset=start,
+            )
+            assert torch.equal(sliced.fakes, full.fakes[start:stop]), (
+                start, stop
+            )
+            assert torch.equal(sliced.reals, full.reals[start:stop])
+
+    def test_measurement_forward_count_tracks_volume_offset(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """成本读数同源 σ 排布：偏移切片的逐卷步数和 = 整批对应段的
+        步数和（事件流 ``reconstruction_forwards`` 全局口径 = 各 rank
+        本地读数 gather 求和的前提——求和合法当且仅当分段推算与整批
+        推算在对应段上同值）。"""
+        assembler = self._assembler(scenario, train_steps=(1, 2, 3), num_steps=5)
+        reals = torch.randn(7, *SHAPE)
+        bounds = ((0, 3), (3, 5), (5, 7))
+        parts = [
+            assembler.measurement_forward_count(
+                reals[start:stop], CONDITION, volume_offset=start,
+            )
+            for start, stop in bounds
+        ]
+        assert sum(parts) == assembler.measurement_forward_count(
+            reals, CONDITION,
+        )
+        for (start, stop), part in zip(bounds, parts):
+            assert part == (
+                assembler.measurement_forward_count(reals[:stop], CONDITION)
+                - assembler.measurement_forward_count(
+                    reals[:start], CONDITION,
+                )
+            )
+
+    def test_negative_volume_offset_rejected(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """切片偏移是「本地批首卷在全量批中的位次」——负位次无语义，
+        显式拒绝而非静默取模（负偏移会把轮转与 ε 消耗导向错误槽位）。"""
+        assembler = self._assembler(scenario)
+        reals = torch.randn(2, *SHAPE)
+        with pytest.raises(ValueError, match="volume_offset"):
+            assembler.measure_condition(reals, CONDITION, volume_offset=-1)
+        with pytest.raises(ValueError, match="volume_offset"):
+            assembler.measurement_forward_count(
+                reals, CONDITION, volume_offset=-1,
+            )

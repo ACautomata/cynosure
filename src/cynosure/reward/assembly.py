@@ -166,7 +166,10 @@ class ReconstructionAssembler:
         return self._build(reals, condition, modality, sigmas, noise)
 
     def measure_condition(
-        self, reals: torch.Tensor, modality: str,
+        self,
+        reals: torch.Tensor,
+        modality: str,
+        volume_offset: int = 0,
     ) -> PairBatch:
         """该条件 **gate 测量批**的装配（ADR-0012 决策 5 的 recon-AUC
         构造面）：调用方给出的 real 卷 → 定序轮转 σ → 同源重构 →
@@ -185,31 +188,70 @@ class ReconstructionAssembler:
           「本 run 此前抽了几次」漂移，上岗判据不可复算）；
         - **ε 走批次起手复位的测量流**：不消耗 recon 流（续训分片的流
           位置不被测量次数搅动），也不漂移 policy 主流。
-        """
+
+        ``volume_offset``（ADR-0016 决策 4 的分布式切片语义）：本地批
+        首卷在**全量**测量批中的位次——分布式预训练把全量卷按序切片到
+        各 rank，本地第 j 卷即全量第 ``offset + j`` 卷。偏移进入两个
+        面且只进这两个面：σ 轮转按全量位次取候选第 ``(offset + j) %
+        |M|`` 位；测量流先做**前缀消耗**（生成并丢弃 offset 行的 ε，
+        torch CPU generator 的顺序流性质，#198 的前缀锚）再生的本地
+        ε 与整批 ε 的对应行**同位逐位一致**——gather 拼回的全量测量批
+        与单卡 rank0 全量测量逐位等价（多卡 gate 报告值对单卡可复算）。
+        缺省 0 = 全量批自身（World-1 路径行为逐位不变）。"""
+        if volume_offset < 0:
+            raise ValueError(
+                f"volume_offset 是本地批首卷在全量测量批中的位次，"
+                f"不得为负，得到 {volume_offset}"
+            )
         if reals.shape[0] < 1:
             raise ValueError("测量批需要非空 real 卷（重构的源）")
-        sigmas = self._round_robin_sigmas(modality, reals.shape[0])
+        sigmas = self._round_robin_sigmas(
+            modality, reals.shape[0], volume_offset,
+        )
         # 批次起手复位（一次，不逐卷复位）：本批的条件构造与 ε 从这里
         # 同一起手点顺序展开——同输入的逐次测量逐位同输出
         measurement = torch.Generator()
         measurement.set_state(self._measurement_template)
         condition = self._resolve_condition(modality, measurement)
+        if volume_offset:
+            # 前缀消耗：跳过排在本切片之前的各 rank 的 ε 行（复位流的
+            # 顺序位）——消耗序与整批同构（整批 = 条件构造 → 一次全量
+            # randn；切片 = 条件构造 → 丢弃 offset 行 → 本地 randn），
+            # 生成值因此与整批对应行逐位一致（#198 的前缀消耗锚）
+            torch.randn(
+                (volume_offset, *reals.shape[1:]), generator=measurement,
+            )
         noise = torch.randn(reals.shape, generator=measurement).to(reals.device)
         return self._build(reals, condition, modality, sigmas, noise)
 
-    def _round_robin_sigmas(self, modality: str, count: int) -> list[float]:
-        """定序轮转的逐卷噪声水平：第 i 枚卷取候选步点的第 ``i % |M|``
-        位（候选 = 被优化步的 sigma 日程点，按日程位升序——与
-        ``candidate_sigmas`` 同源）。``measure_condition`` 与
-        ``measurement_forward_count`` 共享本定序——成本读数与实际测量
-        批同源推算，不是平行复刻。"""
+    def _round_robin_sigmas(
+        self,
+        modality: str,
+        count: int,
+        volume_offset: int = 0,
+    ) -> list[float]:
+        """定序轮转的逐卷噪声水平：第 i 枚卷取候选步点的第
+        ``(volume_offset + i) % |M|`` 位（候选 = 被优化步的 sigma 日程
+        点，按日程位升序——与 ``candidate_sigmas`` 同源）。
+        ``measure_condition`` 与 ``measurement_forward_count`` 共享本定序
+        ——成本读数与实际测量批同源推算，不是平行复刻。
+
+        ``volume_offset`` = 本地批在全量测量批中的起始位次（分布式
+        rank 切片的轮转偏移）：整批的第 k 枚卷取第 ``k % |M|`` 位，
+        切片因此按全量位次而非本地序轮转（缺省 0 = 整批自身）。"""
         cursor = self._schedules.cursor(modality)
         self._assert_indices_within_schedule(cursor, modality)
         candidates = [cursor.sigma_level(step) for step in self._step_indices]
-        return [candidates[index % len(candidates)] for index in range(count)]
+        return [
+            candidates[(volume_offset + index) % len(candidates)]
+            for index in range(count)
+        ]
 
     def measurement_forward_count(
-        self, reals: torch.Tensor, modality: str,
+        self,
+        reals: torch.Tensor,
+        modality: str,
+        volume_offset: int = 0,
     ) -> int:
         """该测量批（``reals`` 同上 ``measure_condition`` 的入参）重构的
         policy 前向次数（定序轮转下的确定值）——#171 AC5 成本口径的读数
@@ -219,9 +261,19 @@ class ReconstructionAssembler:
 
         量纲随入参卷数（测量批的规模由调用方持有的 real 决定——装配原
         语的 real 侧采样器≠调用方的 real 来源时，按采样器规模读会得到
-        与真实测量批无关的数）。"""
+        与真实测量批无关的数）。``volume_offset`` 与
+        ``measure_condition`` 同语义（分布式切片的成本分段读数：各 rank
+        本地和 gather 求和 = 全量批的定序读数——求和合法的前提由
+        ``_round_robin_sigmas`` 的偏移轮转保证）。"""
+        if volume_offset < 0:
+            raise ValueError(
+                f"volume_offset 是本地批首卷在全量测量批中的位次，"
+                f"不得为负，得到 {volume_offset}"
+            )
         cursor = self._schedules.cursor(modality)
-        sigmas = self._round_robin_sigmas(modality, reals.shape[0])
+        sigmas = self._round_robin_sigmas(
+            modality, reals.shape[0], volume_offset,
+        )
         return sum(self._remaining_steps(cursor, sigma) for sigma in sigmas)
 
     def _remaining_steps(

@@ -741,17 +741,21 @@ class TestPretrainCliGuards:
         assert result.code == 2
         assert "已存在" in result.stderr
 
-    def test_rejects_torchrun_launch(
+    def test_torchrun_env_requires_explicit_run_dir(
         self, scenario: PretrainScenario, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """预训练单进程执行（World-1 退化路径）：torchrun（RANK env）
-        下启动显式拒绝——多 rank 各自预训练会分叉判别器。"""
+        """ADR-0016 决策 3：pretrain 的 RANK 拒绝守卫退役（单进程与
+        torchrun 同一条代码路径）——分布式启动面改由「显式 --run-dir」
+        把守（跨 rank 目录对齐，train 同款）；RANK env 下缺省 run 目录
+        即拒绝，不再言「单进程执行」。多 rank 真跑由 2 卡 slow 档端到端
+        覆盖（tests/test_pretrain_distributed.py）。"""
         scenario.write_config(reward={"pretrain_gate_auc": 0.01})
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "2")
         result = scenario.pretrain()
         assert result.code == 2
-        assert "单进程" in result.stderr
+        assert "--run-dir" in result.stderr
+        assert "单进程" not in result.stderr
 
     def test_explicit_run_dir_override(
         self, scenario: PretrainScenario, tmp_path: Path,
