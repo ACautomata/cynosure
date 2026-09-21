@@ -117,16 +117,17 @@ class OverfitAlertEvent(BaseModel):
 
     per-condition 分叉（EMA(train 干净域 pairwise acc − held-out AUC)）
     自下而上越线时由编排方产出——RL 相由 train 循环产出（随 iter 事件
-    同归并序写出），预训练相由预训练 driver 产出（随 pretrain 事件之后
-    直写）——按 rank 独立计算（rank 间离散是数据切片异质性的诊断信号，
-    不跨 rank 平均）。**报警不动作**：事件只承载读数，白名单与噪声 σ 不
-    被联动（人工裁决，ADR-0009 决策 5）。回退记账按相分轨（γ）：RL 相
-    按 iteration 轴随所属 iteration 删除（``REWIND_ACCOUNTING`` 的
-    ``ITERATION`` 口径——恢复点之后的告警由重执行重发）；预训练相
-    （``phase="pretrain"``）与预训练事件同口径全量保留——预训练执行史
-    没有对应的 checkpoint 可重放，删除即永久丢失。事件契约「可扩不可
-    改名」；非有限浮点构造期拒绝（判别器数值发散不产毒事件，指标流的
-    全流拒绝口径）。
+    同归并序写出），预训练相由预训练 driver 产出（随 pretrain 事件
+    之后写出；分布式预训练经 gather 归并到 rank0、``rank`` 归因观测
+    rank，ADR-0016 决策 8）——按 rank 独立计算（rank 间离散是数据切片
+    异质性的诊断信号，不跨 rank 平均）。**报警不动作**：事件只承载
+    读数，白名单与噪声 σ 不被联动（人工裁决，ADR-0009 决策 5）。回退
+    记账按相分轨（γ）：RL 相按 iteration 轴随所属 iteration 删除
+    （``REWIND_ACCOUNTING`` 的 ``ITERATION`` 口径——恢复点之后的告警
+    由重执行重发）；预训练相（``phase="pretrain"``）与预训练事件同
+    口径全量保留——预训练执行史没有对应的 checkpoint 可重放，删除即
+    永久丢失。事件契约「可扩不可改名」；非有限浮点构造期拒绝（判别器
+    数值发散不产毒事件，指标流的全流拒绝口径）。
     """
 
     model_config = ConfigDict(allow_inf_nan=False)

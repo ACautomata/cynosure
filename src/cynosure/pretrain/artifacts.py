@@ -361,8 +361,9 @@ class PretrainRun:
 
     单进程 = 唯一写者；分布式（ADR-0016）由调用方 rank 门满足同一契约
     （driver 只在 rank0 ``append_event``/finalize 落盘，run 目录 init 由
-    CLI 层 rank0 创建 + 广播裁决）——本类自身不感知 rank，写者门的
-    编排职责在调用方单点。
+    CLI 层 rank0 创建 + 广播裁决；预训练相告警先经 gather 归并到
+    rank0、仍只有 rank0 触本方法写出）——本类自身不感知 rank，写者门
+    的编排职责在调用方单点。
     """
 
     def __init__(self, paths: PretrainPaths) -> None:
@@ -400,8 +401,10 @@ class PretrainRun:
     ) -> None:
         """向预训练指标流追加一行 JSON 事件（事件类型混存同一
         metrics.jsonl，event 判别字段区分；ADR-0009-γ 起预训练相
-        ``overfit_alert`` 告警随 pretrain 事件之后写入——单进程唯一
-        写者，写出序 = 步序 + 步内 pretrain 先于告警）。"""
+        ``overfit_alert`` 告警随 pretrain 事件之后写入——rank0 唯一
+        写者，写出序 = 步序 + 步内 pretrain 先于告警；分布式下告警
+        经 gather 归并后仍只由 rank0 调本方法，序由 driver 归并段
+        保证）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(
                 event.model_dump(), ensure_ascii=False, allow_nan=False,

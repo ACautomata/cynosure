@@ -1,11 +1,18 @@
-"""预训练 torchrun 主路径测试（ADR-0016，issue #199 的 AC 聚合）。
+"""预训练 torchrun 主路径与产物观测面测试（ADR-0016；#199 AC 聚合 +
+#200 产物/观测收尾）。
 
-torchrun 2 卡（gloo/CPU，scripted fixture）端到端：测量批按卷切片
-（连续段切片 + σ 轮转偏移 + ε 前缀消耗 ⇒ gather 合并还原全量排列、
-rank0 重算全局 recon-AUC）、rank0 gate 四态广播分发（更新/复测/确认/
-终止全路径在时限内完成——挂死即集合序列错位的第一信号）、判别器经
-既有装配缝自动 DDP（各 rank 更新后权重逐位一致）、事件流/报告/checkpoint
-rank0 独写（最小 rank 门）。
+torchrun 2 卡（gloo/CPU）端到端：测量批按卷切片（连续段切片 + σ 轮转
+偏移 + ε 前缀消耗 ⇒ gather 合并还原全量排列、rank0 重算全局
+recon-AUC）、rank0 gate 四态广播分发（更新/复测/确认/终止全路径在
+时限内完成——挂死即集合序列错位的第一信号）、判别器经既有装配缝
+自动 DDP（各 rank 更新后权重逐位一致）、事件流/报告/checkpoint
+rank0 独写；#200 加锁产物字段与单卡语义同构（白名单/判据口径/步数/
+门槛/支撑度卷数的逐字段对账）、预训练相告警的 rank 归并（gather 到
+rank0、按源 rank 序、``rank`` 归因观测 rank、步内 pretrain 先于
+告警的写出序、EMA 滞留不重发的缺行面）、成本读数全量口径（forwards
+= 各 rank 本地求和、volumes = 全量卷数）。告警归并用例的数值面经
+Deterministic* 替身 scripted 化（冷启动分叉符号不可锚定），归并
+协议面（集合、落盘、广播）全部真实。
 
 测试形态 = train 侧先例（test_distributed.py）：spawn 多进程 world，
 worker 以 torchrun 同款环境变量（RANK/LOCAL_RANK/WORLD_SIZE/
@@ -32,7 +39,8 @@ from cynosure.netbuild import NetworkAssembler
 from cynosure.pretrain.artifacts import PretrainReport, PretrainRun
 from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward.artifacts import LatentManifest
-from tests.conftest import enforce_deterministic_kernels
+from cynosure.reward.assembly import PairBatch
+from tests.conftest import RecordingUpdate, enforce_deterministic_kernels
 from tests.test_distributed import (
     DistTrainResult,
     SpawnedTrainWorld,
@@ -66,6 +74,110 @@ def _heldout_volumes(config_path: Path) -> dict[str, int]:
     return {
         modality: manifest.modalities[modality] for modality in MODALITIES
     }
+
+
+_SCRIPTED_SHAPE = (4, 4, 16, 16, 8)
+"""告警归并用例的替身批形状（与 test_pretrain.SCRIPTED_SHAPE 同源约
+定：measure_condition 的配对断言只看两侧同形；4 卷/条件 ≥ world_size
+的切片守卫）。"""
+
+_SCRIPTED_POINT_AUC = 0.4
+"""聚类替身分数构造出的全局 AUC（每卷 real 3 低 2 高、fake 全中位——
+Mann-Whitney 计数口径下逐位 0.4）：rank0 重组后走真实
+``auc_from_scores`` 重算的值与 world-1 直读 scripted 值同值，两条
+路径的 gate 判定/事件读数因此同构。"""
+
+
+class DeterministicClusters:
+    """告警归并用例的确定性卷级聚类替身。
+
+    世界 1 路径 driver 直读本对象的 ``pooled_auc()``/``volume_count``；
+    分布式路径本对象只在 gather 段被提取 ``real_volume_scores``/
+    ``fake_scores``（rank0 重组为真实 ``VolumeScoreClusters`` 后
+    ``pooled_auc`` 走真实 MW 重算）——两路的 AUC 读数同为
+    ``_SCRIPTED_POINT_AUC``（分数按该值反构造），事件/判定数值因此
+    确定性。``volume_count`` 恒为全量卷数（拼接前后同构）。"""
+
+    def __init__(self, point_estimate: float, volume_count: int) -> None:
+        self._point_estimate = point_estimate
+        self.real_volume_scores = tuple(
+            torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0])
+            for _ in range(volume_count)
+        )
+        self.fake_scores = torch.full((volume_count * 5,), 0.5)
+
+    @property
+    def volume_count(self) -> int:
+        return len(self.real_volume_scores)
+
+    def pooled_auc(self) -> float:
+        return self._point_estimate
+
+
+class DeterministicAuc:
+    """HeldOutAuc 替身：AUC 读数确定性（首测/复测/补测全路径同值，
+    gate 恒不过线 → 每步更新 → 每条件恰一次越线告警）。
+
+    分布式 seam（``condition_order``/``load_order``）与世界 1 seam
+    （``condition_latents``）并集完备——同一 driver 在两种
+    DistributedContext 下走各自分支，数值同源（聚类按上同值反构造）。
+    ``condition_order`` 返回恒等序（切片拼接还原全量排列的平凡形态）。"""
+
+    def __init__(self, point_estimate: float = _SCRIPTED_POINT_AUC) -> None:
+        self._point_estimate = point_estimate
+
+    def condition_volume_count(self, modality: str) -> int:
+        return _SCRIPTED_SHAPE[0]
+
+    def condition_order(self, modality: str) -> tuple[int, ...]:
+        return tuple(range(_SCRIPTED_SHAPE[0]))
+
+    def load_order(self, order) -> torch.Tensor:
+        return torch.zeros((len(order), *_SCRIPTED_SHAPE[1:]))
+
+    def condition_latents(self, modality: str) -> torch.Tensor:
+        return torch.zeros(_SCRIPTED_SHAPE)
+
+    def compute_volume_clusters(self, latents, fake_latents):
+        assert latents.shape == fake_latents.shape  # 同源配对的逐样本对齐
+        return DeterministicClusters(
+            self._point_estimate, latents.shape[0],
+        )
+
+
+class DeterministicAssembler:
+    """配对批装配替身（数值确定性的另一半）：测量批 real/fake 同形
+    可辨识（fake = −real），更新批零值同形；重构成本读数恒 1——
+    分布式 gather 求和后 = world_size（每 rank 本地 1 份的全量口径
+    观测面），世界 1 下 = 1。``volume_offset`` 默认参兼容两路签名。"""
+
+    def assemble(self, modality: str) -> PairBatch:
+        return PairBatch(
+            reals=torch.zeros(_SCRIPTED_SHAPE),
+            fakes=torch.zeros(_SCRIPTED_SHAPE),
+            modality=modality,
+        )
+
+    def measure_condition(
+        self, reals: torch.Tensor, modality: str, volume_offset: int = 0,
+    ) -> PairBatch:
+        return PairBatch(reals=reals, fakes=-reals, modality=modality)
+
+    def measurement_forward_count(
+        self, reals: torch.Tensor, modality: str, volume_offset: int = 0,
+    ) -> int:
+        return 1
+
+
+def _install_scripted_seams(driver: PretrainDriver) -> None:
+    """注入确定性替身（告警归并用例的数值面；分布式协议面——
+    DistributedContext 集合、gather 归并、rank0 写者门、四态广播——
+    全部保持真实路径）。支撑度规则保留**真实** SupportRule：门槛
+    0.99 对读数 0.4 恒不过线（点估计/bootstrap CI 两口径同值拒绝），
+    判定语义不替身化。"""
+    driver.rewards.update = RecordingUpdate(driver.rewards.discriminator)
+    driver.rewards.auc = DeterministicAuc()
+    driver.rewards.assembler = DeterministicAssembler()
 
 
 class DistPretrainScenario:
@@ -105,8 +217,10 @@ class PretrainWorldWorker:
     协议 → 端到端 run() → 判别器可装载 state 全体 ``all_gather`` 互见
     → 回传主进程（DDP 各 rank 权重逐位一致的观测面不经落盘：pretrain
     无续训分片，落盘只有 rank0 一份；逐键 ``torch.equal`` 对账在主进程
-    完成，见 ``TestTwoRankDenseSteps``）。实例可 pickle（spawn Process
-    以它为 target）。"""
+    完成，见 ``TestTwoRankDenseSteps``）。``scripted=True`` 时注入
+    确定性替身（测量/更新/装配三 seam，数值面 scripted、分布式协议面
+    真实——告警归并用例的构造面，见 ``TestTwoRankAlertMerge``）。
+    实例可 pickle（spawn Process 以它为 target）。"""
 
     def __init__(
         self,
@@ -117,6 +231,7 @@ class PretrainWorldWorker:
         run_dir: Path,
         queue,
         num_threads: int,
+        scripted: bool = False,
     ) -> None:
         self.rank = rank
         self.world = world
@@ -125,6 +240,7 @@ class PretrainWorldWorker:
         self.run_dir = run_dir
         self.queue = queue
         self.num_threads = num_threads
+        self.scripted = scripted
 
     def __call__(self) -> None:
         torch.set_num_threads(self.num_threads)
@@ -158,6 +274,8 @@ class PretrainWorldWorker:
                 if run is None:
                     run = PretrainRun(PretrainRun.layout(self.run_dir))
                 driver = PretrainDriver(config, run, dist_context=dist)
+                if self.scripted:
+                    _install_scripted_seams(driver)
                 report = driver.run()
                 # DDP 同步的观测面：各 rank 解包判别器的可装载 state 全体
                 # 互见（all_gather），主进程逐键 torch.equal 对账——
@@ -204,11 +322,13 @@ class SpawnedPretrainWorld:
         run_dir: Path,
         world: int,
         join_timeout_s: float,
+        scripted: bool = False,
     ) -> None:
         self.config_path = config_path
         self.run_dir = run_dir
         self.world = world
         self.join_timeout_s = join_timeout_s
+        self.scripted = scripted
         type(self)._next_port += 1
         self.port = type(self)._next_port
 
@@ -219,7 +339,7 @@ class SpawnedPretrainWorld:
         workers = [
             PretrainWorldWorker(
                 rank, self.world, self.port, self.config_path,
-                self.run_dir, queue, num_threads,
+                self.run_dir, queue, num_threads, self.scripted,
             )
             for rank in range(self.world)
         ]
@@ -311,6 +431,15 @@ class TestTwoRankConfirmationPath:
             reference.condition_auc, abs=1e-9,
         )
         assert reference.gate_passed is True
+        # 产物字段与单卡语义同构（#200 AC1）：白名单（轮转序，非仅集合）、
+        # 判据口径、步数、门槛留痕、支撑度卷数、gate 判定——分布式报告
+        # 与单进程报告逐字段同构
+        assert report.gate_whitelist == reference.gate_whitelist
+        assert report.gate_criterion == reference.gate_criterion == "recon_auc"
+        assert report.steps_completed == reference.steps_completed == 0
+        assert report.gate_auc == reference.gate_auc
+        assert report.gate_passed is reference.gate_passed is True
+        assert report.condition_volumes == reference.condition_volumes
 
 
 class TestTwoRankDenseSteps:
@@ -399,11 +528,151 @@ class TestTwoRankDenseSteps:
         ] == [
             event["reconstruction_forwards"] for event in reference_events
         ]
-        # 补测循环走完：报告覆盖全部轮转条件（步数耗尽路径的补测）
+        # 补测循环走完：报告覆盖全部轮转条件（步数耗尽路径的补测）；
+        # 支撑度卷数全量口径（与事件面同口径的报告面：补测的卷数聚合
+        # 于 rank0 重组的全局聚类）
         assert set(report.condition_auc) == set(MODALITIES)
+        assert report.condition_volumes == _heldout_volumes(config_path)
         assert all(
             auc < report.gate_auc for auc in report.condition_auc.values()
         )
+
+
+def _event_order(events: list[dict]) -> list[tuple[str, int, int]]:
+    """事件流的 (类型, 轴号, rank) 序列：pretrain 取 step 轴、告警取
+    iteration 轴——#200 AC3 写出序断言的归一形态（步序单调 + 步内
+    pretrain 先于告警 + 同 rank 升序在序列里逐位可见）。"""
+    return [
+        (
+            event["event"],
+            event["step"] if event["event"] == "pretrain"
+            else event["iteration"],
+            event.get("rank", 0),
+        )
+        for event in events
+    ]
+
+
+class TestTwoRankAlertMerge:
+    """预训练相告警的 rank 归并 + 写出序 + rank 归因（#200 AC2/AC3）。
+
+    门槛 0.99 不可达 → 每步更新；分叉阈值 0.01 而观测恒 0.1（train
+    pairwise acc 0.5 − held-out AUC 0.4，scripted 数值面）→ 每条件
+    首观测即越线。数值面 scripted 化的理由：冷启动判别器的分叉符号
+    依赖初始化与 fixture 数据，不可锚定；本用例的观测面是**归并协议
+    的外部行为**（事件流内容、写出序、rank 归因、rank0 唯一写者）——
+    这些全部走真实路径（真 DistributedContext 集合、真 PretrainRun
+    落盘、真四态广播）。步数上限 6 > 4 条件：step4/5 是同条件的
+    第二次观测——EMA 越线滞留不重发在事件流上的「缺行」即上升沿
+    语义的跨 rank 锁（每 rank 各自滞留、各自静默）。
+
+    断言骨架：2 卡每更新步 = pretrain 事件 + rank0/rank1 两条告警
+    （gather 归并使非 0 rank 的越线读数落盘——``rank`` 归因字段正是
+    ADR-0009「per-rank 离散是诊断信号」的落点）；单进程对照每步至多
+    一条告警（rank 恒 0）——归并的翻倍面即「不跨 rank 平均」的观测。
+    成本读数顺带全量口径对账：forwards = 每 rank 1 的 gather 求和（2）、
+    volumes = 全量卷数（非切片 2/条件）。
+    """
+
+    def test_two_rank_alerts_merged_to_rank0_in_step_order(
+        self,
+        pretrain_inputs: Path,
+        tmp_path: Path,
+    ) -> None:
+        dist_case = DistPretrainScenario(pretrain_inputs, tmp_path / "dist")
+        config_path = dist_case.write_config(
+            pretrain_gate_auc=0.99,
+            pretrain_max_steps=6,
+            overfit_alert_divergence=0.01,
+        )
+        payloads = SpawnedPretrainWorld(
+            config_path, dist_case.run_dir, world=2,
+            join_timeout_s=_CONFIRM_JOIN_TIMEOUT_S,
+            scripted=True,
+        ).launch()
+        assert [payload["code"] for payload in payloads] == [0, 0], payloads
+
+        events = dist_case.events()
+        # 写出序：步序单调、步内 pretrain 先于告警、同 rank 升序——
+        # 每更新步两条告警（rank0 直写 + rank1 经 gather 归并）；step4/5
+        # 同条件二次观测 EMA 滞留不重发（无告警行）
+        assert _event_order(events) == [
+            ("pretrain", 0, 0),
+            ("overfit_alert", 0, 0), ("overfit_alert", 0, 1),
+            ("pretrain", 1, 0),
+            ("overfit_alert", 1, 0), ("overfit_alert", 1, 1),
+            ("pretrain", 2, 0),
+            ("overfit_alert", 2, 0), ("overfit_alert", 2, 1),
+            ("pretrain", 3, 0),
+            ("overfit_alert", 3, 0), ("overfit_alert", 3, 1),
+            ("pretrain", 4, 0),
+            ("pretrain", 5, 0),
+        ]
+        alerts = [e for e in events if e["event"] == "overfit_alert"]
+        assert all(alert["phase"] == "pretrain" for alert in alerts)
+        assert [alert["rank"] for alert in alerts] == [
+            0, 1, 0, 1, 0, 1, 0, 1,
+        ]
+        assert [alert["iteration"] for alert in alerts] == [
+            0, 0, 1, 1, 2, 2, 3, 3,
+        ]
+        assert [alert["modality"] for alert in alerts] == [
+            modality for modality in MODALITIES for _ in range(2)
+        ]
+        for alert in alerts:
+            assert alert["divergence_ema"] == pytest.approx(0.1)
+            assert alert["train_pairwise_acc"] == pytest.approx(0.5)
+            assert alert["heldout_auc"] == pytest.approx(0.4)
+        pretrains = [e for e in events if e["event"] == "pretrain"]
+        # 成本读数全量口径：forwards = 各 rank 本地 1 的 gather 求和（= 2，
+        # 非 per-rank 局部 1）；volumes = 全量 4 卷（非切片 2）
+        assert all(
+            event["reconstruction_forwards"] == 2 for event in pretrains
+        )
+        assert all(
+            event["measurement_volumes"] == 4 for event in pretrains
+        )
+
+        # 单进程对照（同 seam、world-1 退化）：每步至多一条告警、rank
+        # 恒 0、forwards 无求和（= 1）——归并翻倍面 + 数值同构的对照
+        ref_case = DistPretrainScenario(pretrain_inputs, tmp_path / "ref")
+        ref_config = ref_case.write_config(
+            pretrain_gate_auc=0.99,
+            pretrain_max_steps=6,
+            overfit_alert_divergence=0.01,
+        )
+        config = ConfigLoader.load(ref_config)
+        ref_run = PretrainRun.init(config, ref_case.run_dir)
+        driver = PretrainDriver(config, ref_run, device=torch.device("cpu"))
+        _install_scripted_seams(driver)
+        driver.run()
+        ref_events = ref_case.events()
+        assert _event_order(ref_events) == [
+            ("pretrain", 0, 0), ("overfit_alert", 0, 0),
+            ("pretrain", 1, 0), ("overfit_alert", 1, 0),
+            ("pretrain", 2, 0), ("overfit_alert", 2, 0),
+            ("pretrain", 3, 0), ("overfit_alert", 3, 0),
+            ("pretrain", 4, 0),
+            ("pretrain", 5, 0),
+        ]
+        assert all(
+            event["reconstruction_forwards"] == 1
+            for event in ref_events if event["event"] == "pretrain"
+        )
+
+        # 报告产物对账（rank0 唯一写者 + 字段语义与单卡同构）：补测
+        # 循环后全条件覆盖，值 = scripted 口径
+        report = dist_case.report()
+        reference = ref_case.report()
+        assert report.gate_passed is reference.gate_passed is False
+        assert report.steps_completed == reference.steps_completed == 6
+        assert report.gate_whitelist == reference.gate_whitelist == []
+        assert report.condition_auc == reference.condition_auc == {
+            modality: 0.4 for modality in MODALITIES
+        }
+        assert report.condition_volumes == reference.condition_volumes == {
+            modality: 4 for modality in MODALITIES
+        }
 
 
 class TestPretrainDistributedUsageContract:
