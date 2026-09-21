@@ -357,7 +357,13 @@ class PretrainPaths:
 
 
 class PretrainRun:
-    """预训练 run 目录与产物工件契约（单进程执行 = 唯一写者）。"""
+    """预训练 run 目录与产物工件契约（唯一写者 = rank 0）。
+
+    单进程 = 唯一写者；分布式（ADR-0016）由调用方 rank 门满足同一契约
+    （driver 只在 rank0 ``append_event``/finalize 落盘，run 目录 init 由
+    CLI 层 rank0 创建 + 广播裁决）——本类自身不感知 rank，写者门的
+    编排职责在调用方单点。
+    """
 
     def __init__(self, paths: PretrainPaths) -> None:
         self.paths = paths
