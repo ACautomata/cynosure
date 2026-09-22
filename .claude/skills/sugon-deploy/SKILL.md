@@ -95,15 +95,16 @@ sugon-bootstrap 的 pitfalls 排查——装任何 ML 依赖后都要回验这�
 前置链：`prepare`（构建 real sample pool / held-out / channel stats）→
 `pretrain`（判别器 warm-start，产出 `pretrain_report_json`）→ `train`。
 已有产物的环节跳过。`pretrain` 与 `train` 同走 torchrun（ADR-0016：
-pretrain 测量批按卷分片到各 rank + rank0 gate 单点判定 + 判别器 DDP，
-单进程 World-1 退化路径仅测试口径）。
+pretrain 测量批按卷分片到各 rank + rank0 gate 单点判定 + 判别器 DDP；
+单进程与 torchrun 同一代码路径，World-1 退化路径保留）。
 
 实例无作业调度器，长跑进 tmux：
 
 ```bash
 ssh sugon
 tmux new -s <run名>
-# pretrain：torchrun 启动，nproc = 实例 DCU 卡数（8 卡实例 = 8）
+# pretrain：torchrun 启动，nproc = 实例 DCU 卡数（8 卡实例 = 8，
+# 同步 config deployment.nproc_per_node——prepare 容量守卫按 K×nproc 把门）
 CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli pretrain \
   --config /root/private_data/cynosure/runs/<run>/config.json \
   --run-dir /root/private_data/cynosure/runs/<run>/pretrain_run
@@ -112,25 +113,29 @@ CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli pretrain 
 - `CYNOSURE_PG_TIMEOUT_MIN=40`：同实例其他任务会间歇饿死 RCCL 端点，
   watchdog 调到 40 分钟（`src/cynosure/distributed/process.py`）；
 - `--run-dir` 必须显式给：分布式启动（检测到 RANK）硬性要求（跨 rank
-  目录对齐，train 同款规则），且目录须与 config
-  `reward.pretrain_report_json` 声明一致——train 按声明路径装载，
+  目录对齐，train 同款规则），且须与 config `reward.pretrain_report_json`
+  声明一致——声明值精确为 `<run>/pretrain_run/pretrain_report.json`
+  （文件名由 `PretrainRun.layout` 钉死），train 按声明路径装载，
   分叉即 usage error 拒绝；
-- train 段同款（`--run-dir` 给 run 目录本身）：
+- train 段同款（`--run-dir` 给 run 目录本身，metrics 落
+  `<run>/metrics.jsonl`；nproc 沿 orchestration.md 主路径口径）：
 
 ```bash
-CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli train \
+CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=4 -m cynosure.cli train \
   --config /root/private_data/cynosure/runs/<run>/config.json \
   --run-dir /root/private_data/cynosure/runs/<run>
 ```
 
-判据：run 目录 `metrics.jsonl` 出现首条事件（pretrain 相 = 首条
-`pretrain` 事件，train 相 = 首条 `iter` 事件——进程活着 ≠ 在训练）。
+判据：对应相的 `metrics.jsonl` 出现首条事件——pretrain 相在
+`<run>/pretrain_run/metrics.jsonl`（首条 `pretrain` 事件），train 相在
+`<run>/metrics.jsonl`（首条 `iter` 事件）；进程活着 ≠ 在训练。
 
 ### 6. 监控
 
 ```bash
-ssh sugon 'hy-smi'                                                     # 卡占用
-ssh sugon 'tail -f /root/private_data/cynosure/runs/<run>/metrics.jsonl'  # iter/milestone/pretrain 事件流
+ssh sugon 'hy-smi'                                                # 卡占用
+ssh sugon 'tail -f /root/private_data/cynosure/runs/<run>/pretrain_run/metrics.jsonl'  # pretrain 相事件流
+ssh sugon 'tail -f /root/private_data/cynosure/runs/<run>/metrics.jsonl'               # train 相事件流（iter/milestone）
 ```
 
 指标契约只有 `metrics.jsonl`（JSONL 事件流，拒 NaN/Inf）；项目不接
@@ -138,9 +143,10 @@ wandb/tensorboard，监控与出图都从它出发。
 
 **读数口径（ADR-0016）**：单卡 run 与多卡 run 的预训练读数**不可横向
 比较逐位值**——测量批分块边界与判别器有效 batch（K×world_size）随
-world_size 变化；多卡重放锚是「同 config + 同 world_size 重跑逐位
-一致」，跨卡只保统计等价（卷积算法随 batch shape 的 ~1e-12 量级尾差）。
-对比实验的「同机制」判断锚在机制语义（ADR-0012）而非执行面数值。
+world_size 变化；重放锚是「同 config + 同 world_size 重跑逐位一致」，
+跨 world_size 只保统计等价（卷积算法随 batch shape 的 ~1e-12 量级
+尾差）。对比实验的「同机制」判断锚在机制语义（ADR-0012）而非执行面
+数值。
 
 ### 7. 收尾
 
