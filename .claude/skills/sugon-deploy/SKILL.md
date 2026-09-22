@@ -94,24 +94,37 @@ sugon-bootstrap 的 pitfalls 排查——装任何 ML 依赖后都要回验这�
 
 前置链：`prepare`（构建 real sample pool / held-out / channel stats）→
 `pretrain`（判别器 warm-start，产出 `pretrain_report_json`）→ `train`。
-已有产物的环节跳过。
+已有产物的环节跳过。`pretrain` 与 `train` 同走 torchrun（ADR-0016：
+pretrain 测量批按卷分片到各 rank + rank0 gate 单点判定 + 判别器 DDP，
+单进程 World-1 退化路径仅测试口径）。
 
 实例无作业调度器，长跑进 tmux：
 
 ```bash
 ssh sugon
 tmux new -s <run名>
-CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=4 -m cynosure.cli train \
+# pretrain：torchrun 启动，nproc = 实例 DCU 卡数（8 卡实例 = 8）
+CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli pretrain \
   --config /root/private_data/cynosure/runs/<run>/config.json \
-  --run-dir /root/private_data/cynosure/runs/<run>
+  --run-dir /root/private_data/cynosure/runs/<run>/pretrain_run
 ```
 
 - `CYNOSURE_PG_TIMEOUT_MIN=40`：同实例其他任务会间歇饿死 RCCL 端点，
   watchdog 调到 40 分钟（`src/cynosure/distributed/process.py`）；
-- `pretrain` 是单进程，直接 `python -m cynosure.cli pretrain …`，检测到
-  RANK 会显式拒绝——它不走 torchrun。
+- `--run-dir` 必须显式给：分布式启动（检测到 RANK）硬性要求（跨 rank
+  目录对齐，train 同款规则），且目录须与 config
+  `reward.pretrain_report_json` 声明一致——train 按声明路径装载，
+  分叉即 usage error 拒绝；
+- train 段同款（`--run-dir` 给 run 目录本身）：
 
-判据：run 目录 `metrics.jsonl` 出现首条 `iter` 事件（进程活着 ≠ 在训练）。
+```bash
+CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli train \
+  --config /root/private_data/cynosure/runs/<run>/config.json \
+  --run-dir /root/private_data/cynosure/runs/<run>
+```
+
+判据：run 目录 `metrics.jsonl` 出现首条事件（pretrain 相 = 首条
+`pretrain` 事件，train 相 = 首条 `iter` 事件——进程活着 ≠ 在训练）。
 
 ### 6. 监控
 
@@ -123,6 +136,12 @@ ssh sugon 'tail -f /root/private_data/cynosure/runs/<run>/metrics.jsonl'  # iter
 指标契约只有 `metrics.jsonl`（JSONL 事件流，拒 NaN/Inf）；项目不接
 wandb/tensorboard，监控与出图都从它出发。
 
+**读数口径（ADR-0016）**：单卡 run 与多卡 run 的预训练读数**不可横向
+比较逐位值**——测量批分块边界与判别器有效 batch（K×world_size）随
+world_size 变化；多卡重放锚是「同 config + 同 world_size 重跑逐位
+一致」，跨卡只保统计等价（卷积算法随 batch shape 的 ~1e-12 量级尾差）。
+对比实验的「同机制」判断锚在机制语义（ADR-0012）而非执行面数值。
+
 ### 7. 收尾
 
 发布走 experiment-release skill：run 三件套（`config.json`、`metrics.jsonl`、
@@ -131,7 +150,7 @@ wandb/tensorboard，监控与出图都从它出发。
 ## 参考
 
 - 启动编排、M0 门槛与 T11 实测结论：`docs/spec/orchestration.md`
-- 决策记录：`docs/adr/0003`（torchrun+FSDP）、`0005`（SothisAI 迁移）、`0007`（pretrain warm-start）
+- 决策记录：`docs/adr/0003`（torchrun+FSDP）、`0005`（SothisAI 迁移）、`0007`（pretrain warm-start）、`0016`（pretrain torchrun 化：测量批分片 + rank0 gate + 判别器 DDP）
 - config 全字段：`src/cynosure/config.py`
 - 集群级故障排查（双 source 失效、numpy 顶坏 torch、pip 超时、sourcefind wheel）：
   sugon-bootstrap 的故障排查表与 `references/dcu-pitfalls.md`
