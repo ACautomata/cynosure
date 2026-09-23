@@ -99,6 +99,14 @@ _Avoid_: 用降 G 换显存（改变算法口径的最后手段）、把预算�
 **PatchDiscriminator（PatchGAN 判别器）**:
 MONAI 的 PatchGAN 判别器（Pix2PixHD 式），输出 patch logit 图而非单一标量；本项目用它当 reward model。
 
+**判别器深度（Discriminator depth, num_layers_d）**:
+单臂 PatchDiscriminator 内部 stride-2 下采样卷积的层数——决定单尺度感受野与 patch 粒度（2 层 → latent 每维 /4，输出 16×16×8 patch logit 图）。消融轴 {1, 2}（reward-model 章臂 A）。
+_Avoid_: 判别器尺度（另一条轴）、网络总层数（另含 initial/final conv，非同一口径）
+
+**多尺度判别器（Multi-scale discriminator, num_d）**:
+并联的 PatchDiscriminator 臂数（num_d=1 即单尺度）：各臂吃同一 latent 输入、靠逐臂加深的下采样链取得由细到粗的感受野阶梯（MONAI 乘法阶梯——第 i 臂层数 = num_layers_d×(i+1)），各臂 patch logit 图先各自 mean 成标量、再跨臂相加成 reward（reward-model 章裁决）。消融轴 {1, 2, 3}（臂 B）。
+_Avoid_: 粒度（λ 时间步间隔，另一概念）、image pyramid（各臂吃原始分辨率输入，非预先下采样）、判别器深度（臂内层数，另一条轴）
+
 **Real sample（真实样本）**:
 训练集影像经 VAE 预编码的 latent，作为判别器的「真」，固定不更新。
 
@@ -186,7 +194,7 @@ GRPO 中共享同一初始噪声的 G 条 rollout 为一组；advantage 是该�
 
 **Granularity（粒度）**:
 Granular-GRPO 里续跑采样所用的时间步间隔 λ；多粒度（multi-granularity）指多个 λ 的 reward 融合。
-_Avoid_: 分辨率、尺度（尺度另有所指，见单/多尺度判别器）
+_Avoid_: 分辨率、尺度（尺度另有所指，见 多尺度判别器）
 
 ### 分布式执行
 
