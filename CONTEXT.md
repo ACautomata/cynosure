@@ -87,6 +87,14 @@ _Avoid_: 全程加噪、SDE 采样
 **MGAI（Multi-Granularity Advantage Integration）**:
 多粒度 advantage 集成：每个粒度 λ 的 advantage 各自组内标准化后直接求和的融合方式。
 
+**方向组（direction group）**:
+GRPO 更新的方向集合——G 个方向共享同一 Anchor 轨迹、共享被优化步的组内标准化与 MGAI 融合。「方向组」专指这层 G 方向集合；裸「组」保留给实验组（组1/组2/组3）。
+_Avoid_: 裸「组」指方向集合（与实验组撞名）
+
+**例子（example）**:
+一个方向组的实例化：(条件, 初始噪声) 对产出的完整方向组（Anchor → 各 k 扰动 → 各 λ 续跑 → 打分）。async 执行模型的调度单元——每个例子由一个 coroutine 承载、全组同卡；协程数可配置（默认 = 卡数），协程到卡静态绑定。一个 iteration 产出 = 协程数个例子。
+_Avoid_: 样本（sample 指样本库条目）、「每卡恰一例」当定义（那是默认协程数的特例）
+
 **前向激活预算（Forward Activation Budget）**:
 rollout 续跑里单次 policy 前向允许吃掉的激活显存上限（config `policy.forward_activation_budget_gib`）：超预算的 G 方向整批前向按 latent 体素切子批**顺序**积分，峰值以子批为界（#123 首跑 OOM 修复——探针实测激活 ≈3.2 KiB / latent 体素 / 前向样本，而 UNet 权重驻留仅 0.687 GiB）。缺省按设备**总**显存的比例自动探测（同设备可复现；共享实例不反映他进程占用，须显式钉值），显式值在设备总显存可探测时（CUDA）超过即装配期拒绝。**G 不是显存旋钮**：分块改的是「同时算几个样本」，不改任何样本的数值路径（调度等价，实测 rel ≈4e-7）。**分布式下分块上限必须 rank 一致**：FSDP 逐前向参数 all-gather 的调用序列与「前向调用次数」绑定，而条件逐 rank 独立采样（seed 的 rank 派生是设计意图）使各 rank 的体素数/本地上限不同——本地各自取值即前向次数分叉、集合序列错配、全体互等挂死（#165 review P1，sugon train2 首跑实录：iter 0 rollout 后全 rank 阻塞直至 watchdog abort）。故本地预算先经 `all_reduce_min` 取全 rank 最小再截断（子批只小不大，任何一侧的显存上界语义都不破）。
 _Avoid_: 用降 G 换显存（改变算法口径的最后手段）、把预算当空闲显存配额、按空闲显存探测（同设备不可复现）、分布式下各 rank 本地各自取分块上限（前向次数分叉 = 集合互等挂死）
@@ -228,6 +236,14 @@ _Avoid_: 单机模式（单机也可多进程）
 **分片自持（Component-owned resume state）**:
 续训分片的读写知识归各协作者自身（ADR-0014，实施票未启动）：协作者实现 `state()` / `adopt()` 小接口（gating / overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 trainer 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分片格式变更循升版拒旧先例（v10 清单退役、legacy 拒载），不写迁移读取。
 _Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）
+
+**静态分配表（static allocation table）**:
+iteration 与调度槽 → 条件的确定性映射（config + seed + iteration 的确定函数）：轮内置换——⌈C/D⌉ 个 iteration 为一轮覆盖全条件一次，每轮 seed 派生固定置换、轮间重洗；条件轴 = 条件分布的 ``targets()``（组2 按目标端、源序列自由度留槽内流，装配期断言每端有序对数相等）。槽 = 协程、协程→卡静态绑定（默认协程数 = 卡数时槽即卡）；同 seed 同分配，槽/协程数进续训对账。
+_Avoid_: 动态负载分派、条件 i.i.d. 随机采样（退役口径）、分配表状态不进续训 payload
+
+**逐 k 收集-同步（per-k collect-reduce）**:
+更新相的跨卡同步点：各卡并发 forward+backward 本卡例子的第 k 步（梯度本卡累积）→ 主线程单点串行 allreduce（SUM，loss 侧已除全 iteration 例子数）→ wait → 各卡一次 optimizer.step；k 间严格串行（Granular-GRPO 逐 k 顺序 step）。
+_Avoid_: 异步梯度累积、allreduce 与下一 k forward 重叠（缓行）、NCCL AVG op（未实证）
 
 ### 实验设计与验收
 
