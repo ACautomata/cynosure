@@ -558,9 +558,7 @@ class TestExecutorFixtureTier:
         with pytest.raises(TrainingAborted) as caught:
             executor.run()
         assert isinstance(caught.value.__cause__, RuntimeError)
-        assert all(
-            not card._thread.is_alive() for card in executor.cards
-        )
+        assert all(card.stopped_within(30.0) for card in executor.cards)
 
     def test_barrier_soft_timeout_warns_then_completes(
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -631,10 +629,8 @@ class TestExecutorFixtureTier:
         ]
         assert warnings  # 硬超时前先有软超时告警
         # 中止后的线程退绕（槽内串行睡眠 + 运行时间歇停顿）可能超出
-        # executor 的限时 join 窗口——测试侧宽限收尾后再断言线程已停
-        for card in executor.cards:
-            card._thread.join(30.0)
-        assert all(not card._thread.is_alive() for card in executor.cards)
+        # executor 的限时 join 窗口——宽限观测面收尾后再断言线程已停
+        assert all(card.stopped_within(30.0) for card in executor.cards)
 
 
 @pytest.mark.gpu

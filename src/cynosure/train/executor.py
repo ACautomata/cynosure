@@ -21,6 +21,11 @@
   Future 回传）→ 训练中止异常（``TrainingAborted``）+ 线程收尾；NCCL
   in-flight collective 无法真取消，如实以「停止派发 + loop 停转 +
   join（限时）」表达，卡死线程由进程退出兜底（daemon 线程）。
+  #231 字面「abort communicator + 进程级退出」的落位记档：torch 无
+  communicator abort API 面，abort 的等效语义 = 本卡线程收尾 + 跨卡
+  互等由 barrier 硬超时（``BarrierTimeoutPolicy``）有界化；进程级
+  退出由入口层承载（``TrainingAborted`` 抛给调用方，骨架期无 CLI
+  装配、生产入口票面明确不含，#226 决策 1）。
 - **barrier 软/硬超时**（#217 §4）：软超时 → ``barrier_soft_timeout``
   事件（主线程 = 卡 0 写出口径）后继续等待；硬超时 → fail-fast。
   ``CYNOSURE_PG_TIMEOUT_MIN`` 变量沿用、**语义换绑** per-k barrier 硬
@@ -51,7 +56,10 @@ from dataclasses import dataclass, field
 import torch
 
 from cynosure.config import CynosureConfig
-from cynosure.distributed.process import DistributedContext
+from cynosure.distributed.process import (
+    DistributedContext,
+    PG_TIMEOUT_MINUTES_ENV,
+)
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.pretrain.artifacts import PretrainReport
@@ -319,6 +327,13 @@ class CardWorker:
         if not self._thread.is_alive():
             self._loop.close()
 
+    def stopped_within(self, grace_seconds: float) -> bool:
+        """线程收尾的宽限观测面（fail-fast/超时中止路径的消费口）：宽限
+        等待后线程确已退出则 True——退绕（槽内串行任务 + 运行时间歇
+        停顿）超出宽限仍卡死则 False，由进程退出兜底。"""
+        self._thread.join(grace_seconds)
+        return not self._thread.is_alive()
+
 
 class PerKCollectReduce:
     """逐 k 收集-同步（glossary「逐 k 收集-同步」）：主线程单点串行
@@ -386,10 +401,12 @@ class BarrierTimeoutPolicy:
     """环境变量未设置时的硬超时缺省（分钟）——沿用 torch 进程组 watchdog
     的默认 10 分钟口径，换绑不改缺省。"""
 
-    ENV = "CYNOSURE_PG_TIMEOUT_MIN"
+    ENV = PG_TIMEOUT_MINUTES_ENV
     """沿用变量的语义换绑声明：旧语义 = 进程组 watchdog 超时（分钟），
     新语义 = per-k barrier 硬超时（分钟）——sugon 已设 40，零部署变更
-    （#217 §4 门面形态）。"""
+    （#217 §4 门面形态）。字面单点在 ``distributed.process``
+    （``PG_TIMEOUT_MINUTES_ENV``），两语义共享变量名、各按自己的执行序
+    解读。"""
 
     def __init__(
         self, hard_seconds: float, *, soft_fraction: float | None = None,
@@ -503,23 +520,21 @@ class AsyncTrainingExecutor:
             CardReplica.build(config, index, device, scorer_prototype)
             for index, device in enumerate(devices[1:], 1)
         ]
-        cards = [
-            CardWorker(
+        cards = []
+        for replica in replicas:
+            bound_slots = [
+                slot for slot in range(slot_count)
+                if slot % len(devices) == replica.index
+            ]
+            cards.append(CardWorker(
                 index=replica.index,
                 device=replica.device,
                 replica=replica,
-                slot_ids=[
-                    slot for slot in range(slot_count)
-                    if slot % len(devices) == replica.index
-                ],
+                slot_ids=bound_slots,
                 build_slots=cls._slot_assembly(
-                    config, replica, rng, vocabulary, heldout,
-                    [slot for slot in range(slot_count)
-                     if slot % len(devices) == replica.index],
+                    config, replica, rng, vocabulary, heldout, bound_slots,
                 ),
-            )
-            for replica in replicas
-        ]
+            ))
         return cls(
             config=config,
             artifacts=run_artifacts,
@@ -598,9 +613,9 @@ class AsyncTrainingExecutor:
     @staticmethod
     def assemble_discriminator(config: CynosureConfig) -> RewardScorer:
         """判别器 scorer 的 warm-start 装载单点（新 run 语境，ADR-0007
-        守卫链）：复用 ``TrainingRuntime._assemble_scorer`` 的权重来源
+        守卫链）：复用 ``TrainingRuntime.assemble_scorer`` 的权重来源
         分派——装配单一来源，不设第二份守卫链副本。"""
-        return TrainingRuntime._assemble_scorer(
+        return TrainingRuntime.assemble_scorer(
             config,
             PretrainReport.load(config.reward.pretrain_report_json),
         )
@@ -640,7 +655,11 @@ class AsyncTrainingExecutor:
         """单 iteration 执行序（#217 §3 相位结构）：rollout 相（全并发
         零梯度耦合）→ train 相逐 k barrier（loss×(1/N)+SUM → 各卡一次
         step）→ 事件发射（(iteration, slot) 排序写）。判别器更新步缺位
-        属骨架期口径（判别器链期落地，#226）。"""
+        属骨架期口径（判别器链期落地，#226）。phase_seconds 只发
+        rollout / policy_update 两相（#217 §3 全集含 trajectory /
+        discriminator 的记档偏差）：trajectory 相现行仅 --dump 诊断
+        打点消费、骨架期无诊断路径，discriminator 相属判别器链期——
+        两相随各自加厚期补入。"""
         started = time.monotonic()
         conditions = {
             slot: self.allocation.condition_for(iteration, slot)

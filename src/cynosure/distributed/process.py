@@ -26,8 +26,13 @@ _T = TypeVar("_T")
 _RANK_SEED_STRIDE = 1_000_000
 """rank 间 seed 派生的间隔步长（远大于流内偏移 +0..+6，防流间碰撞）。"""
 
-_PG_TIMEOUT_MINUTES_ENV = "CYNOSURE_PG_TIMEOUT_MIN"
+PG_TIMEOUT_MINUTES_ENV = "CYNOSURE_PG_TIMEOUT_MIN"
 """进程组 watchdog 超时的环境变量（分钟；未设置 = torch 默认 10 分钟）。
+
+公共命名（#231 语义换绑）：async 执行序的 per-k barrier 硬超时消费
+同一变量（train/executor.py BarrierTimeoutPolicy.ENV 引用本常量）——
+旧语义（torchrun watchdog）与新语义（barrier 硬超时）共用变量名、
+各按自己的执行序解读，字面单点在此。
 
 SothisAI DCU 平台适配（T11/#26）：同实例其他任务的间歇计算会让 RCCL
 端点被饿死数分钟，默认 10 分钟 watchdog 会让长跑训练在抖动期整组中止——
@@ -85,15 +90,15 @@ class DistributedContext:
 
     @staticmethod
     def _pg_timeout() -> datetime.timedelta | None:
-        """进程组 watchdog 超时（``_PG_TIMEOUT_MINUTES_ENV`` 分钟数；未设置
+        """进程组 watchdog 超时（``PG_TIMEOUT_MINUTES_ENV`` 分钟数；未设置
         返回 None = init_process_group 不传参、保持 torch 默认）。"""
-        raw = os.environ.get(_PG_TIMEOUT_MINUTES_ENV)
+        raw = os.environ.get(PG_TIMEOUT_MINUTES_ENV)
         if raw is None:
             return None
         minutes = int(raw)
         if minutes <= 0:
             raise ValueError(
-                f"{_PG_TIMEOUT_MINUTES_ENV} 须为正整数分钟，得到 {raw!r}"
+                f"{PG_TIMEOUT_MINUTES_ENV} 须为正整数分钟，得到 {raw!r}"
             )
         return datetime.timedelta(minutes=minutes)
 

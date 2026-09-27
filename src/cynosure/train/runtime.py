@@ -323,7 +323,7 @@ class TrainingRuntime:
                 "（ADR-0007 后 train 侧不再有冷启动装配源，"
                 "discriminator_ckpt 仅预训练 driver 冷启动消费）"
             )
-        scorer = cls._assemble_scorer(config, report, resume=resume)
+        scorer = cls.assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
         ReplicatedDiscriminator.replicate(scorer, dist)
         # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐条件容量
@@ -418,13 +418,13 @@ class TrainingRuntime:
         )
 
     @staticmethod
-    def _assemble_scorer(
+    def assemble_scorer(
         config: CynosureConfig,
         report: PretrainReport | None,
         *,
         resume: bool = False,
     ) -> RewardScorer:
-        """判别器 scorer 的权重来源分派（见 ``assemble_rewards``）。"""
+        """判别器 scorer 的权重来源分派（公开装配缝，见 ``assemble_rewards``；async 门面新 run 语境同口径消费）。"""
         if report is not None:
             # warm-start 守卫链：数据口径指纹 → 形态指纹 → 严格装载
             # （任一不符在装配期拒绝，CLI 层回滚 run 目录）
