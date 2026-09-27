@@ -657,11 +657,11 @@ class TestCrossModalConditionStream:
 
 
 class TestMeasurementConditionReconstruction:
-    """gate 测量批（#171）：ADR-0012 决策 5 的 recon-AUC 构造面——测量批
+    """过线测量批（#171）：ADR-0012 决策 5 的 recon-AUC 构造面——测量批
     的 fake 由**调用方给出的 real** 同源重构而来（非量产 rollout）、σ 按
     候选步点定序轮转、ε 走批次起手复位的测量流。
 
-    测量是上岗判据的原料（报告值与白名单都由它出），所以本类的断言面
+    测量是过线判定的原料（报告值与过线条件都由它出），所以本类的断言面
     是「可复算」而非「可重放」：同输入 → 逐位同输出，与调用序无关。
     """
 

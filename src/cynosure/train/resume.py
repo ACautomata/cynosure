@@ -73,7 +73,7 @@ N-1），静默恢复会让各 rank 从不同 iteration 继续训练（集合操
 指标流重复、权重分叉）。world-1 的历史 run 目录可无标记（单分片自身
 原子替换已保证一致性），对账跳过。"""
 
-RESUME_STATE_FORMAT_VERSION = 10
+RESUME_STATE_FORMAT_VERSION = 11
 """payload 契约版本：字段集变更时递增，恢复入口按版本拒绝旧文件。
 v2：+ world_size（多 rank 续训的拓扑对账）。
 v3：replay buffer 两区条目带目标模态标签（ADR-0008-01 决策 2 的存储
@@ -113,7 +113,11 @@ v10：Replay buffer 分区与四条退役 RNG 流（``disc_update`` / ``disc_noi
 （#173：判别器 fake 换域同源重构，回放混采无消费者）——payload 删除
 ``replay_buffer`` 键、generators 清单 8 流收窄为 4 流；旧 v9 分片带已
 退役键与流状态，注册表清单失配，被版本对账显式拒绝（跨口径续训不可
-恢复，退役删除属于 payload 契约变更）。"""
+恢复，退役删除属于 payload 契约变更）。
+v11：门控状态键随门控链退役整体移除（ADR-0017，#219：动态白名单、
+逐 iteration 梯度门控与 EMA 动态恢复全链删除）——payload 删除
+``gating`` 键；旧 v10 分片带回填不了的门控状态，静默接受会让门控决定
+凭空丢失，被版本对账显式拒绝（先例：v9→v10 的退役删除同形态）。"""
 
 _REQUIRED_KEYS: tuple[str, ...] = (
     "format_version",
@@ -127,7 +131,6 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "rng",
     "lr",
     "ema",
-    "gating",
     "overfit",
 )
 
@@ -332,9 +335,6 @@ class ResumeStore:
         self._restore_lr(trainer, state["lr"])
         self._restore_generators(trainer, state["generators"])
         self._restore_global_rng(state["rng"])
-        # 门控状态逐位复原（v4）：恢复点的（动态）白名单与 per-condition
-        # EMA 随全清单回归——后续门控决定从恢复点确定性续写
-        trainer.rewards.gating.adopt(state["gating"])
         # 分叉监控状态逐位复原（v6）：per-condition 分叉 EMA 随全清单
         # 回归——恢复后的分叉读数与告警序列从恢复点确定性续写
         trainer.rewards.overfit.adopt(state["overfit"])
@@ -370,9 +370,6 @@ class ResumeStore:
                 "discriminator": rewards.update.optimizer.param_groups[0]["lr"],
             },
             "ema": None,  # 条件项：EMA 锚升级项未交付（trainer 装配期拒绝启用）
-            # 门控状态（v4）：动态白名单当前成员 + per-condition EMA
-            # （ADR-0008 决策 7/8；恢复逐位复原的落盘侧）
-            "gating": trainer.rewards.gating.state(),
             # 分叉监控状态（v6）：per-condition 分叉 EMA（ADR-0009 决策 4；
             # 按 rank 独立、随本 rank 分片落盘）
             "overfit": trainer.rewards.overfit.state(),
@@ -416,9 +413,9 @@ class ResumeStore:
             raise ValueError(
                 f"续训状态格式版本不符：本代码口径 "
                 f"v{RESUME_STATE_FORMAT_VERSION}"
-                "（ADR-0012 退役面收窄：replay buffer 分区与 disc_update / "
-                "disc_noise / fake_shuffle / base_partition 四条退役随机流"
-                "已移除，门控与分叉监控状态、recon 流随分片落盘），"
+                "（v10 起 replay buffer 分区与四条退役随机流移除（ADR-0012），"
+                "v11 起门控状态键移除（ADR-0017 门控链退役），分叉监控状态"
+                "与 recon 流随分片落盘），"
                 f"得到 {version!r}——跨口径续训不可恢复（旧分片的退役键与"
                 "流状态在当前清单中失配，恢复后状态无从续写）；请从产物 "
                 "checkpoint 重启新 run"

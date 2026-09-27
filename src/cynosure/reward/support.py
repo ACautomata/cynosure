@@ -19,9 +19,9 @@ MW 实现）；重复数 1000、下界取 2.5% 分位（双侧 95% CI，与 KID 
 的 RNG 注入约定）。
 
 本模块只承载决策 6 的**统计形态**：消费方（预训练 per-condition
-gate 的 ADR-0008-04、train 侧 readiness gate 白名单化的 -05）装配
-时从 config 读门槛与支撑度界构造 ``SupportRule``；iter 事件的单标量
-AUC 消费路径不经本模块（ADR-0008-02：现有观测面不变）。
+过线判定，ADR-0008-04）装配时从 config 读阈值与支撑度界构造
+``SupportRule``（ADR-0017 门控链退役后唯一消费方）；iter 事件的
+单标量 AUC 消费路径不经本模块（ADR-0008-02：现有观测面不变）。
 
 判据的 AUC 口径归消费方：预训练相喂入的是 **recon-AUC**（held-out
 real 原始 vs 冻结基座同源重构体，ADR-0012 决策 5）——支撑度规则的

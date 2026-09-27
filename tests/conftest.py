@@ -381,7 +381,7 @@ MINIMAL_CONFIG_DICT: dict = {
         "real_pool_manifest": "artifacts/real_pool.json",
         "heldout_real_manifest": "artifacts/heldout_real.json",
         "channel_stats_json": "artifacts/channel_stats.json",
-        # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源（必填无默认）
+        # 预训练产物契约（ADR-0007）：warm-start 装载守卫的装载源（必填无默认）
         "pretrain_report_json": "artifacts/pretrain_report.json",
     },
     "schedule": {"seed": 0},
@@ -471,12 +471,12 @@ class FixturePrepareScenario:
 
 class PretrainLightweightReward:
     """预训练轻量 reward 变体：warm-start 前置（ADR-0007）的消费方
-    （readiness gate / train loop / trajectory diagnostic）共用的成本
-    压低取值集——判别器 LR 2e-4 / gate 0.60 / 步数上限 24。
+    （train loop / trajectory diagnostic）共用的成本压低取值集——
+    判别器 LR 2e-4 / 过线阈值 0.60 / 步数上限 24。
 
-    轻量参数只降低预训练本步执行成本、不进训练 config；预训练 gate
-    抬到 0.60——达标即停让重算值贴着停止阈值，对 train gate（0.51）
-    留出测量噪声的安全 margin。测量批的规模由 held-out 池决定
+    轻量参数只降低预训练本步执行成本、不进训练 config；过线阈值
+    抬到 0.60——棘轮尽早达标停步，对 fixture 低阈值（0.51）留出
+    测量噪声的安全 margin。测量批的规模由 held-out 池决定
     （ADR-0012 决策 5 / #171），不再有可压的 fake 批量 knob。"""
 
     @classmethod
@@ -485,7 +485,7 @@ class PretrainLightweightReward:
         不改入参）。"""
         pretrain = config.model_copy(deep=True)
         pretrain.reward.disc_lr = 2e-4
-        pretrain.reward.pretrain_gate_auc = 0.60
+        pretrain.reward.pretrain_pass_threshold = 0.60
         pretrain.reward.pretrain_max_steps = 24
         return pretrain
 
@@ -554,7 +554,6 @@ class FixtureArtifactLibrary:
         if disk_cached is not None:
             shutil.rmtree(fixture_dir, ignore_errors=True)
             shutil.copytree(disk_cached, fixture_dir)
-            cls._normalize_whitelist(fixture_dir)  # 旧盘缓存的白名单同样归一
             cls._cache[signature] = fixture_dir
             return fixture_dir
         fixture = Fixture()
@@ -602,32 +601,9 @@ class FixtureArtifactLibrary:
             )
             result = cli.run("pretrain", "--config", str(pretrain_path))
             assert result.code == 0, result.stderr
-        cls._normalize_whitelist(fixture_dir)
         SceneCache.store(disk_key, fixture_dir)
         cls._cache[signature] = fixture_dir
         return fixture_dir
-
-    @staticmethod
-    def _normalize_whitelist(fixture_dir: Path) -> None:
-        """库场景的条件白名单归一为全条件放行（幂等，构建与缓存命中的
-        恢复副本上都执行）：轻量预训练的真实白名单是概率性的部分名单
-        （如 22 步只确认 2/4 条件）——逐 iteration 梯度门控（ADR-0008
-        决策 7，issue #89）落码后，名单外条件的 policy 更新被跳过，
-        既有循环测试的 policy loss 断言会随条件采样摇。归一 = 门控不
-        触发的场景前置；门控/白名单语义的专项测试 fork 私有 report
-        （``fork_pretrained_artifacts``）后显式收窄名单。序贯变体的两份
-        报告（stage-1 modal-label + stage-2 cross-modal，#116）一并归一
-        ——两阶段的目标端词汇表同为四序列（组2 轮转集 = 有序对清单的
-        目标端去重）。盘上缓存（SceneCache）不回写——归一只发生在进程
-        私有的恢复副本上。"""
-        for report_path in sorted(
-            fixture_dir.glob("pretrain_run*/pretrain_report.json"),
-        ):
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            if report["gate_whitelist"] != list(MODALITIES):
-                report["gate_whitelist"] = list(MODALITIES)
-                report_path.write_text(json.dumps(report), encoding="utf-8")
-
 
 class RecordingScorer:
     """测试仪器：以注入判别器冒充打分器（coordinator 取相位的观测载体）。"""

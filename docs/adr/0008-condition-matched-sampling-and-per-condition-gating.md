@@ -63,3 +63,7 @@ EMA 动态恢复）合并为一个可关闭的总开关 `reward.condition_gate_e
 是它的显式降级形态而非替代（与 `gating_dynamic_recovery=false` 的静态
 白名单降级同类，只是幅度更大）。生产 warm-start 与门控口径的定版仍归
 #133/#134。
+
+## 退役（2026-09-26，#219 结票裁决）：决策 5/7/8 的门控链删除
+
+决策 5（RM readiness gate 上岗判定）、决策 7（逐 iteration 梯度门控）、决策 8（EMA 动态恢复）构成的门控链随 **ADR-0017** 整体退役删除——从 2026-09-17 的「可关闭」（条件闸总开关）到「无此链」：文件、trainer 相与装配位、config 五 knob 与滞回 validator、`policy_gated` 事件字段（收缩特例）、resume `gating` 键（v11 bump 拒旧）一次性清除，gate 术语一次清干净（报告字段族改名，见 ADR-0017 删除面清单）。理由「有效性有限 + 架构复杂度」（#122 空白名单实测 + 关闸后全链零消费）。**决策 1–4、6 不在退役面**：条件匹配采样、容量守卫、支撑度规则（`SupportRule` + `gate_support_min_volumes`，棘轮判据统计形态）原样保留；监控面（held-out AUC 逐 iteration 测量、ADR-0009 分叉监控）升格为唯一安全网，只报警不动作；warm-start 装载守卫（ADR-0007）零改动。

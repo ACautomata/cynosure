@@ -484,7 +484,7 @@ class TestMilestoneHeterogeneousReadings:
                 "heldout_real_manifest": "h.json",
                 "channel_stats_json": "c.json",
                 "pretrain_report_json": "r.json",
-                "pretrain_gate_auc": 0.51,
+                "pretrain_pass_threshold": 0.51,
                 "sampling_manifest_json": "sampling_manifest.json",
             },
             "schedule": {
@@ -945,13 +945,13 @@ class MrPretrainArtifactsFixture:
         )
         fields = {
             "group": config.experiment.group,
-            "gate_criterion": "recon_auc",
+            "auc_criterion": "recon_auc",
             "latent_shape": None,
             "condition_auc": {name: 0.7 for name in vocabulary.names()},
-            "gate_whitelist": list(vocabulary.names()),
+            "conditions_passed": list(vocabulary.names()),
             "steps_completed": 12,
-            "gate_auc": 0.51,
-            "gate_passed": True,
+            "pass_threshold": 0.51,
+            "all_conditions_passed": True,
             "discriminator_ckpt": "checkpoints/pretrain_discriminator.pt",
             "provenance": provenance,
         }
@@ -1035,7 +1035,7 @@ class TestRealPoolVocabularyShapeGuard:
     ) -> None:
         """多条件域 manifest 缺逐条件形状契约：装配期拒绝——缺表则
         ``load_latent`` 静默回退全局 ``latent_shape`` 对账，异形条件在
-        判别器 real 采样 / gate 重算期才炸、同形条件带着错误的全局口径
+        判别器 real 采样 / 过线判定期才炸、同形条件带着错误的全局口径
         静默入训（判别器全卷积，形状差异自身不报错）。"""
         vocab, config = mr_pretrain_artifacts
         MrPretrainArtifactsFixture.write_manifest(
@@ -1073,12 +1073,12 @@ class TestPretrainReportVocabularyGuard:
         self, mr_pretrain_artifacts,
     ) -> None:
         """报告条件集 ≠ 本域词汇表条件集（四序列名拿到 MR config 上岗）：
-        装载期显式拒绝——白名单不落到另一条件域的判别力上。"""
+        装载期显式拒绝——过线判定不落到另一条件域的判别力上。"""
         vocab, config = mr_pretrain_artifacts
         mislabelled = MrPretrainArtifactsFixture.report(
             config, vocab,
             condition_auc={"t1n": 0.7, "t1c": 0.7},
-            gate_whitelist=["t1n"],
+            conditions_passed=["t1n"],
         )
         with pytest.raises(ValueError, match="条件集不符"):
             mislabelled.assert_data_provenance(config)
@@ -1100,7 +1100,7 @@ class TestPretrainReportVocabularyGuard:
     ) -> None:
         """词表工件内容改动（flair/axial 网格口径变更）而 real 侧工件与
         权重未变：报告条件集与名称都对得上，唯有内容指纹不符——拒绝
-        （否则白名单与 AUC 是对另一份 fake 分布的测量）。"""
+        （否则过线判定与 AUC 是对另一份 fake 分布的测量）。"""
         vocab, config = mr_pretrain_artifacts
         report = MrPretrainArtifactsFixture.report(config, vocab)
         report.assert_data_provenance(config)  # 对齐基线先放行

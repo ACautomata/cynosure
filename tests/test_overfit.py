@@ -2,19 +2,18 @@
 
 验收面（issue #105 AC）：
 
-- 分叉 EMA：首观测置值、α = 2/(span+1) 递推（跨度与 ADR-0008 EMA(AUC)
-  同换算口径）、观测计数、落盘状态回填（restore 与 observe 的一对写
-  入口）；
+- 分叉 EMA：首观测置值、α = 2/(span+1) 递推、观测计数、落盘状态回填
+  （restore 与 observe 的一对写入口）；
 - 报警触发边界（越线发、不越线静默）：分叉 EMA 自下而上越过报警阈值
   即发（首次观测即越线 = 出生即分叉，同样发）、线上滞留不重发、回落后
-  再越线重发；阈值点本身算越线（与门控 enter 判定的 ``>=`` 同语义）；
+  再越线重发；阈值点本身算越线（``>=`` 闭区间语义）；
 - per-condition 独立记账：条件间 EMA 与越线判定互不可见；
 - 非有限浮点观测在测量层显式拒绝（「全流拒绝」口径的源头闸口）；
 - state/adopt roundtrip 逐位一致（续训复原的落盘侧），损坏形态显式
   拒绝；
-- 报警不动作：越线只报警——白名单成员不被分叉监控触碰（测试断言
-  无副作用，ADR-0009 决策 5；旧「自动调 σ」升级项随噪声注入退役
-  作废，ADR-0012）。
+- 报警不动作：越线只报警——分叉监控无任何动作面（ADR-0009 决策 5；
+  旧「自动调 σ」升级项随噪声注入退役作废，ADR-0012；门控链已随
+  ADR-0017 退役）。
 
 train 侧干净域复算（更新原语 seam）的观测缝在 test_online_update；
 overfit_alert 事件契约（序列化 / 非有限拒绝 / 混存 / 回退记账）在
@@ -24,15 +23,12 @@ test_pretrain 的事件契约族；多 rank 归并序由 test_distributed 覆盖
 import pytest
 
 from cynosure.config import RewardConfig
-from cynosure.distributed import DistributedContext
 from cynosure.reward.overfit import DivergenceEma, OverfitMonitor
-from cynosure.train.gating import DynamicWhitelist
-from cynosure.train.whitelist import ConditionWhitelist
 
 
 class OverfitFixture:
     """分叉监控单测的装配面：最小 RewardConfig 与监控对象的构造
-    （工厂收拢为类，不留在模块级；与 test_gating.GatingFixture 同款）。"""
+    （工厂收拢为类，不留在模块级）。"""
 
     @staticmethod
     def reward_config(**overrides) -> RewardConfig:
@@ -57,7 +53,7 @@ class OverfitFixture:
 
 
 class TestDivergenceEma:
-    """分叉 EMA 的递推语义（与 gating 的 ConditionAucEma 同换算口径）。"""
+    """分叉 EMA 的递推语义（span=8 → α = 2/9 的换算口径）。"""
 
     def test_first_observation_seeds_value(self) -> None:
         ema = DivergenceEma(span=8)
@@ -122,7 +118,7 @@ class TestAlertBoundary:
         assert reading.alerted is True
 
     def test_threshold_point_itself_counts_as_crossed(self) -> None:
-        # 阈值点算越线（与门控 enter 判定的 >= 同语义）
+        # 阈值点算越线（>= 闭区间语义）
         monitor = OverfitFixture.monitor(
             overfit_ema_span=3, overfit_alert_divergence=0.25,
         )
@@ -204,27 +200,3 @@ class TestOverfitState:
         assert monitor.state() == {"ema": {}}
 
 
-class TestAlertDoesNotAct:
-    """报警不动作（ADR-0009 决策 5）：分叉越线不自动改白名单——监控器
-    只产读数，动作面（白名单）不被它触碰（AC 的无副作用断言）。"""
-
-    def test_crossing_alert_leaves_whitelist_untouched(self) -> None:
-        config = OverfitFixture.reward_config()
-        monitor = OverfitMonitor(
-            config, conditions=("t1n", "t1c", "t2w", "t2f"),
-        )
-        whitelist = DynamicWhitelist(
-            ConditionWhitelist.unrestricted(("t1n", "t1c", "t2w", "t2f")),
-            config,
-            DistributedContext(0, 1, False),
-            conditions=("t1n", "t1c", "t2w", "t2f"),
-        )
-        members_before = whitelist.whitelist.members
-
-        fired = [
-            monitor.observe(modality, train_pairwise_acc=0.9, heldout_auc=0.5).alerted
-            for modality in ("t1n", "t2w", "t2f")
-        ]
-        assert fired == [True, True, True]  # 持续越线、报警面在响
-
-        assert whitelist.whitelist.members == members_before  # 名单不动

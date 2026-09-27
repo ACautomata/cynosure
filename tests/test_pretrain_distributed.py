@@ -3,10 +3,10 @@
 
 torchrun 2 卡（gloo/CPU）端到端：测量批按卷切片（连续段切片 + σ 轮转
 偏移 + ε 前缀消耗 ⇒ gather 合并还原全量排列、rank0 重算全局
-recon-AUC）、rank0 gate 四态广播分发（更新/复测/确认/终止全路径在
+recon-AUC）、rank0 过线判定四态广播分发（更新/复测/确认/终止全路径在
 时限内完成——挂死即集合序列错位的第一信号）、判别器经既有装配缝
 自动 DDP（各 rank 更新后权重逐位一致）、事件流/报告/checkpoint
-rank0 独写；#200 加锁产物字段与单卡语义同构（白名单/判据口径/步数/
+rank0 独写；#200 加锁产物字段与单卡语义同构（过线条件/判据口径/步数/
 门槛/支撑度卷数的逐字段对账）、预训练相告警的 rank 归并（gather 到
 rank0、按源 rank 序、``rank`` 归因观测 rank、步内 pretrain 先于
 告警的写出序、EMA 滞留不重发的缺行面）、成本读数全量口径（forwards
@@ -85,7 +85,7 @@ _SCRIPTED_POINT_AUC = 0.4
 """聚类替身分数构造出的全局 AUC（每卷 real 3 低 2 高、fake 全中位——
 Mann-Whitney 计数口径下逐位 0.4）：rank0 重组后走真实
 ``auc_from_scores`` 重算的值与 world-1 直读 scripted 值同值，两条
-路径的 gate 判定/事件读数因此同构。"""
+路径的过线判定/事件读数因此同构。"""
 
 
 class DeterministicClusters:
@@ -116,7 +116,7 @@ class DeterministicClusters:
 
 class DeterministicAuc:
     """HeldOutAuc 替身：AUC 读数确定性（首测/复测/补测全路径同值，
-    gate 恒不过线 → 每步更新 → 每条件恰一次越线告警）。
+    阈值恒不过线 → 每步更新 → 每条件恰一次越线告警）。
 
     分布式 seam（``condition_order``/``load_order``）与世界 1 seam
     （``condition_latents``）并集完备——同一 driver 在两种
@@ -393,7 +393,7 @@ class TestTwoRankConfirmationPath:
         tmp_path: Path,
     ) -> None:
         dist_case = DistPretrainScenario(pretrain_inputs, tmp_path / "dist")
-        config_path = dist_case.write_config(pretrain_gate_auc=0.01)
+        config_path = dist_case.write_config(pretrain_pass_threshold=0.01)
         result = SpawnedTrainWorld(
             config_path, dist_case.run_dir, world=2,
             argv=[
@@ -405,9 +405,9 @@ class TestTwoRankConfirmationPath:
         result.assert_green()
 
         report = dist_case.report()
-        assert report.gate_passed is True
+        assert report.all_conditions_passed is True
         assert report.steps_completed == 0  # 确认步不更新
-        assert sorted(report.gate_whitelist) == sorted(MODALITIES)
+        assert sorted(report.conditions_passed) == sorted(MODALITIES)
         assert set(report.condition_auc) == set(MODALITIES)
         # 事件流仅 rank0 落盘（最小 rank 门）：确认路径零更新 → 零事件；
         # 若两个 rank 都写，同一共享 metrics.jsonl 即双份行
@@ -421,7 +421,7 @@ class TestTwoRankConfirmationPath:
         # 打分前向的卷积 batch-shape 尾差在秩统计上只表现为 ~1e-12 级
         # 读数差——容差外的差即分片错位/漏卷的分布级信号）
         ref_case = DistPretrainScenario(pretrain_inputs, tmp_path / "ref")
-        ref_config = ref_case.write_config(pretrain_gate_auc=0.01)
+        ref_config = ref_case.write_config(pretrain_pass_threshold=0.01)
         assert cli.run(
             "pretrain", "--config", str(ref_config),
             "--run-dir", str(ref_case.run_dir),
@@ -430,15 +430,15 @@ class TestTwoRankConfirmationPath:
         assert report.condition_auc == pytest.approx(
             reference.condition_auc, abs=1e-9,
         )
-        assert reference.gate_passed is True
-        # 产物字段与单卡语义同构（#200 AC1）：白名单（轮转序，非仅集合）、
-        # 判据口径、步数、门槛留痕、支撑度卷数、gate 判定——分布式报告
+        assert reference.all_conditions_passed is True
+        # 产物字段与单卡语义同构（#200 AC1）：过线条件（轮转序，非仅集合）、
+        # 判据口径、步数、阈值留痕、支撑度卷数、过线判定——分布式报告
         # 与单进程报告逐字段同构
-        assert report.gate_whitelist == reference.gate_whitelist
-        assert report.gate_criterion == reference.gate_criterion == "recon_auc"
+        assert report.conditions_passed == reference.conditions_passed
+        assert report.auc_criterion == reference.auc_criterion == "recon_auc"
         assert report.steps_completed == reference.steps_completed == 0
-        assert report.gate_auc == reference.gate_auc
-        assert report.gate_passed is reference.gate_passed is True
+        assert report.pass_threshold == reference.pass_threshold
+        assert report.all_conditions_passed is reference.all_conditions_passed is True
         assert report.condition_volumes == reference.condition_volumes
 
 
@@ -466,7 +466,7 @@ class TestTwoRankDenseSteps:
     ) -> None:
         dist_case = DistPretrainScenario(pretrain_inputs, tmp_path / "dist")
         config_path = dist_case.write_config(
-            pretrain_gate_auc=0.99,
+            pretrain_pass_threshold=0.99,
             pretrain_max_steps=4,
             disc_lr=2e-4,
         )
@@ -489,7 +489,7 @@ class TestTwoRankDenseSteps:
         assert payloads[1]["report"] is None
         report = dist_case.report()
         assert payloads[0]["report"] is not None
-        assert report.gate_passed is False
+        assert report.all_conditions_passed is False
         assert report.steps_completed == 4
         # rank0 独写 checkpoint：可装载且与报告指纹对得上（守卫重载链
         # 在分布式产物上照常成立）
@@ -514,7 +514,7 @@ class TestTwoRankDenseSteps:
         )
         ref_case = DistPretrainScenario(pretrain_inputs, tmp_path / "ref")
         ref_config = ref_case.write_config(
-            pretrain_gate_auc=0.99,
+            pretrain_pass_threshold=0.99,
             pretrain_max_steps=4,
             disc_lr=2e-4,
         )
@@ -534,7 +534,7 @@ class TestTwoRankDenseSteps:
         assert set(report.condition_auc) == set(MODALITIES)
         assert report.condition_volumes == _heldout_volumes(config_path)
         assert all(
-            auc < report.gate_auc for auc in report.condition_auc.values()
+            auc < report.pass_threshold for auc in report.condition_auc.values()
         )
 
 
@@ -581,7 +581,7 @@ class TestTwoRankAlertMerge:
     ) -> None:
         dist_case = DistPretrainScenario(pretrain_inputs, tmp_path / "dist")
         config_path = dist_case.write_config(
-            pretrain_gate_auc=0.99,
+            pretrain_pass_threshold=0.99,
             pretrain_max_steps=6,
             overfit_alert_divergence=0.01,
         )
@@ -637,7 +637,7 @@ class TestTwoRankAlertMerge:
         # 恒 0、forwards 无求和（= 1）——归并翻倍面 + 数值同构的对照
         ref_case = DistPretrainScenario(pretrain_inputs, tmp_path / "ref")
         ref_config = ref_case.write_config(
-            pretrain_gate_auc=0.99,
+            pretrain_pass_threshold=0.99,
             pretrain_max_steps=6,
             overfit_alert_divergence=0.01,
         )
@@ -664,9 +664,9 @@ class TestTwoRankAlertMerge:
         # 循环后全条件覆盖，值 = scripted 口径
         report = dist_case.report()
         reference = ref_case.report()
-        assert report.gate_passed is reference.gate_passed is False
+        assert report.all_conditions_passed is reference.all_conditions_passed is False
         assert report.steps_completed == reference.steps_completed == 6
-        assert report.gate_whitelist == reference.gate_whitelist == []
+        assert report.conditions_passed == reference.conditions_passed == []
         assert report.condition_auc == reference.condition_auc == {
             modality: 0.4 for modality in MODALITIES
         }
@@ -687,7 +687,7 @@ class TestPretrainDistributedUsageContract:
         tmp_path: Path,
     ) -> None:
         dist_case = DistPretrainScenario(pretrain_inputs, tmp_path / "dist")
-        config_path = dist_case.write_config(pretrain_gate_auc=0.01)
+        config_path = dist_case.write_config(pretrain_pass_threshold=0.01)
         dist_case.run_dir.mkdir(parents=True)
         (dist_case.run_dir / "config.json").write_text("{}", encoding="utf-8")
         result: DistTrainResult = SpawnedTrainWorld(

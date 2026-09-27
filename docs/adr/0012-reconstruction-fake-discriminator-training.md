@@ -33,4 +33,4 @@ ADR-0008/0009 链路下判别器以 rollout 终点 latent 为 fake、以训练�
 - **成本曲线**：预训练 fake 由 30 步全 ODE → 平均 ~21 步重构（更便宜）；在线判别器更新新增 ~K×21 次 UNet 前向/更新步（no_grad、bf16，按 `update_interval` 节奏摊薄）。
 - **范围边界（stage-2 非目标）**：跨模态阶段（ControlNet）的同源重构需要（源影像, 目标标签）配对条件化，real pool 现无源影像配对——组1/stage-1（模态标签）不受影响；stage-2 到来时 fake 构造另行设计。
 - **BraTS 线旧 run 数字与新 run 不横向可比**：fake 构造换域即判别器任务变更，在 ADR-0008/0009 已声明的校准断层之上再叠一层来源。
-- 条件闸（`condition_gate_enabled`）语义不受影响：新机制首跑可选择关闭条件闸全条件更新、纯观测攒曲线（run 级 config 决定，非本 ADR 锁定）。
+- 条件闸（`condition_gate_enabled`）语义不受影响：新机制首跑可选择关闭条件闸全条件更新、纯观测攒曲线（run 级 config 决定，非本 ADR 锁定）。（历史注记，2026-09-26：该开关与整条门控链已随 ADR-0017 退役——policy 每 iteration 无条件更新，纯观测攒曲线成为恒定口径。）

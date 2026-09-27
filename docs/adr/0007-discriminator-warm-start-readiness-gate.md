@@ -2,7 +2,7 @@
 
 T12/T13（#56）取证：判别器 held-out AUC 100 iter 全程徘徊 chance 带，RL 信号近噪声。根因判定为**判别器训练量结构性不足**——在线 D:G≈1:1（N_d=1）下每个 RL iteration 判别器只攒 1 个 AdamW step，100 iter ≈ 100 步梯度，从零初始化的 3D PatchGAN 出不了冷启动。决定：**RL 启动前新增判别器离线密集预训练（warm-start），预训练通过 RM 上岗门槛（held-out AUC ≥ 0.65 暂定，chance 带外）才允许进入 RL；RL 期间保留 ADR-0001 的逐 iter 在线更新**。本 ADR 修订 ADR-0001 的「在线从零」部分，其余决策（LSGAN、raw logit、GroupNorm、replay buffer、无 KL/参考模型）不变。
 
-**Status**: accepted
+**Status**: accepted（「预训练通过 RM 上岗门槛才允许进入 RL」的启动期硬检查由 ADR-0017 退役——预训练本体、warm-start 装载守卫与指纹对照全保留，过线判定由预训练棘轮的终止判据承载；报告字段族随 ADR-0017 改名）
 
 ## Considered Options
 

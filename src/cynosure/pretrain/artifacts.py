@@ -5,7 +5,7 @@
   唯一写者；单进程执行下 rank 0 独写退化为直写），但工件集最小：无
   Baseline manifest、无采样体（预训练不产出像素体，评测相不参与）；
 - **PretrainReport**：预训练报告契约（kind 标识 + per-condition held-out
-  AUC + 条件白名单 + 数据口径指纹）与守卫重载入口——组别不符 / kind 不符
+  AUC + 过线条件清单 + 数据口径指纹）与守卫重载入口——组别不符 / kind 不符
   / 缺报告 / 旧格式（池化口径单标量，ADR-0008 之前）即拒绝装载（守卫哲学），
   判别器形态指纹对照后经 netbuild 严格装载路径还原。
 
@@ -60,17 +60,17 @@ class PretrainProvenance(BaseModel):
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对预训练 run 目录，与报告同款相对形）。"""
     discriminator_ckpt_sha256: str
-    """checkpoint 内容指纹：报告的白名单与 per-condition 实测值只对预
-    训练落盘的这份权重负责——启动期重算废止（ADR-0008 决策 5）后，
-    「测量对象 = 装载对象」由装载期指纹对照把守（同形态换权重显式
-    拒绝，见 ``PretrainReport.load_discriminator``）。"""
+    """checkpoint 内容指纹：报告的过线判定与 per-condition 实测值只对
+    预训练落盘的这份权重负责——「测量对象 = 装载对象」由装载期指纹
+    对照把守（同形态换权重显式拒绝，见
+    ``PretrainReport.load_discriminator``）。"""
     condition_vocabulary: str | None = None
     """条件词汇表工件路径（多条件线在册；单域（BraTS）线的条件语义 =
     代码内四序列常量、无工件可指纹，为 None）。"""
     condition_vocabulary_sha256: str | None = None
     """词汇表内容指纹（多条件线）：该线的 fake 形状/token/spacing/sigma
     数值锚全部派生自本工件——工件内容漂移（token 或 FOV/网格改动）而
-    real 侧工件与权重未变时，报告的白名单与 AUC 就是对另一份 fake 分布
+    real 侧工件与权重未变时，报告的过线判定与 AUC 就是对另一份 fake 分布
     的测量，指纹对照在装载期显式拒绝（与 manifest/channel stats 同款
     口径守卫）。"""
 
@@ -85,8 +85,8 @@ class PretrainReport(BaseModel):
 
     per-condition 口径（ADR-0008 决策 5）：``condition_auc`` = 每条件
     最终 recon-AUC（ADR-0012 决策 5 的判据换域——held-out real 原始 vs
-    冻结基座同源重构体），``gate_whitelist`` = 条件白名单，
-    ``condition_volumes`` = 支撑度判定的卷数轴，``gate_criterion`` =
+    冻结基座同源重构体），``conditions_passed`` = 过线条件清单，
+    ``condition_volumes`` = 支撑度判定的卷数轴，``auc_criterion`` =
     判据口径标识；池化口径的 ``final_heldout_auc`` 单标量已成历史格式，
     ``load()`` 对其显式拒绝（BraTS 线旧报告同此路径），报告值与工件
     可复现对照。
@@ -101,7 +101,7 @@ class PretrainReport(BaseModel):
     group: str
     """预训练组别（组1 modal-label / 组2 cross-modal；fake 分布不同的
     归因轴）。装载守卫与消费 config 的组别严格等值对照（
-    ``assert_data_provenance``，#113）：per-condition AUC 与条件白名单
+    ``assert_data_provenance``，#113）：per-condition AUC 与过线判定
     在本组 fake 分布上测量，跨组消费是显式拒绝的错误、无配置开关可
     绕过。"""
     latent_shape: tuple[int, int, int, int] | None = None
@@ -110,50 +110,51 @@ class PretrainReport(BaseModel):
     ``condition_vocabulary_sha256`` 承载（形状逐条件派生自词表工件，
     报告不落派生副本：唯一来源是工件本身）。"""
     condition_auc: dict[str, float]
-    """每条件最终 **recon-AUC**（ADR-0012 决策 5 的 gate 判据：该条件
+    """每条件最终 **recon-AUC**（ADR-0012 决策 5 的过线判据：该条件
     held-out 全量卷**原始** vs 其冻结基座**同源重构体**的池化点估计；
     条件名域 = 本域词汇表条件集——BraTS 四序列 / MR-RATE 生成条件名）：
-    白名单内条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
+    过线条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
     确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
-    它是确认时刻的测量记录，上岗判定直接信任报告值，数据口径漂移由
-    装载期指纹对照把守，ADR-0008 决策 5）；未过线条件 = 步数耗尽后对
-    落盘 checkpoint 权重的补测值（同快照可对照，白名单空时拒绝报错的
-    实测值来源）。
+    它是确认时刻的测量记录，数据口径漂移由装载期指纹对照把守）；
+    未过线条件 = 步数耗尽后对落盘 checkpoint 权重的补测值（同快照
+    可对照，人工诊断的实测值来源）。
 
     **与在线 iter 事件的 held-out AUC（rollout-AUC）不可横向比较**：
     预训练判据测的是判别器在其训练任务上的 out-of-sample 泛化力，
     在线口径测的是对打分对象（rollout 终点）的分辨力——准入体检 vs
     在岗考核，判据形态不同（ADR-0012 决策 5）。"""
-    gate_whitelist: list[str]
-    """条件白名单（ADR-0008 决策 5 的 gate 产物）：复测确认过线的条件，
-    轮转序。空名单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
-    （拒跑由 train gate 把守，诊断产物不丢）。"""
-    gate_criterion: Literal["recon_auc", "rollout_auc"] = "rollout_auc"
+    conditions_passed: list[str]
+    """过线条件清单（预训练棘轮的确认产物）：复测确认过线的条件，
+    轮转序。空清单 = 无条件达线——报告与 checkpoint 照常落盘供诊断
+    （warm-start 装载守卫只对账数据口径与指纹，不做门槛判定）。"""
+    auc_criterion: Literal["recon_auc", "rollout_auc"] = "recon_auc"
     """本报告的判据口径标识（ADR-0012 决策 5 的审计面）：``"recon_auc"``
     = held-out real 原始 vs 同源重构体（当前口径，产报路径恒显式写入）；
     ``"rollout_auc"`` = 旧 ADR-0008 口径（held-out real vs 量产 rollout
-    fake）。字段随事件契约「可扩不可改名」新增——缺字段的历史
-    per-condition 报告按本默认装载，而字段诞生前的实测口径恰是
-    rollout，默认值即历史真值：消费方据此判定跨阶段读数可比性
+    fake）。字段名随 ADR-0017 改名（旧名 ``gate_criterion``，「gate」
+    术语一次清干净；事件契约「可扩不可改名」的改名特例由 ADR-0017
+    记录），缺省值随之对齐当前口径——改名后旧键名报告在
+    ``extra=forbid`` 下整体拒绝装载，历史断代由 schema 拒绝承载，
+    不再依赖缺省值的断代语义。消费方据此判定跨阶段读数可比性
     （recon-AUC 与 rollout-AUC 不可横向比较），装载守卫的时点把控在
     provenance 指纹与格式断代层。"""
     condition_volumes: dict[str, int] = Field(default_factory=dict)
     """每条件的 held-out 卷数（支撑度规则 ``SupportRule`` 的判定输入，
     ADR-0008 决策 6）：< ``reward.gate_support_min_volumes`` 的条件走
     bootstrap CI 下界口径、≥ 界走点估计——报告给出判定所依据的卷数，
-    白名单可审计（「这个条件为什么走 CI 口径」在报告内自证）。空 dict =
+    过线判定可审计（「这个条件为什么走 CI 口径」在报告内自证）。空 dict =
     旧报告（装载期按缺省放行，新预训练恒产出）。"""
     steps_completed: int
     """完成的判别器更新步数（全部条件确认过线的终止路径 = 确认前的
     更新步数；步数上限路径 = 上限值减去其中的确认步——确认步不更新）。"""
-    gate_auc: float
-    """本次预训练采用的门槛阈值（报告留痕：阈值可配置，跨 run 可比性
+    pass_threshold: float
+    """本次预训练采用的过线阈值（报告留痕：阈值可配置，跨 run 可比性
     以报告值为准）。"""
-    gate_passed: bool
+    all_conditions_passed: bool
     """终止成功判据是否通过：全部轮转条件都经「首测 + 换批复测」两次
-    独立测量确认过线（False = 步数上限耗尽——白名单可能非空，已确认
-    者仍在名单内；checkpoint 仍落盘供诊断，上岗与否由 train 侧读报告
-    白名单判定，ADR-0008 决策 5）。"""
+    独立测量确认过线（False = 步数上限耗尽——过线条件可能非空，已确认
+    者仍在清单内；checkpoint 仍落盘供诊断。ADR-0017 门控链退役后
+    train 侧不设上岗门槛，本判据只承载预训练棘轮的终止形态）。"""
     discriminator_ckpt: str
     """判别器 checkpoint 路径（相对本报告文件所在目录；可装载
     state_dict，与训练期产物 checkpoint 同构）。"""
@@ -180,7 +181,7 @@ class PretrainReport(BaseModel):
                 raise ValueError(
                     "预训练报告为 ADR-0008 之前的池化口径格式"
                     "（final_heldout_auc 单标量）：per-condition 报告契约"
-                    "（condition_auc dict + gate_whitelist 白名单）自 "
+                    "（condition_auc dict + conditions_passed 过线清单）自 "
                     "ADR-0008 起生效，旧报告显式拒绝装载（BraTS 线旧报告"
                     "同此路径）——请以当前版本重新预训练产出"
                 ) from exc
@@ -192,7 +193,7 @@ class PretrainReport(BaseModel):
         """当前 config 的数据口径与报告对照：不匹配即拒绝。
 
         组别对照先行（纯内存比较）：group 是 fake 分布的归因轴，
-        per-condition AUC 与条件白名单都在预训练组别自己的 fake 分布上
+        per-condition AUC 与过线判定都在预训练组别自己的 fake 分布上
         测量——跨组消费是口径错位而非可配置语义，显式拒绝、无逃生门
         （#113）。组3 序贯 stage-2 的合法消费路径 = stage 级报告绑定
         （#116）：序贯编排把 ``experiment.stage2_pretrain_report_json``
@@ -200,7 +201,7 @@ class PretrainReport(BaseModel):
         本守卫只见一份普通的同组（cross-modal）消费，无序贯分支。随后
         latent 形状对照（纯内存比较）：口径指纹与判别器形态指纹都不覆盖
         分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的 fake
-        静默通过 gate 并把错位数据带进在线更新。real pool / held-out
+        静默通过过线判定并把错位数据带进在线更新。real pool / held-out
         manifest / channel stats 任一文件内容与预训练时的指纹不符
         （manifest 重建、统计量换源）都让上岗判别力与预训练报告脱钩——
         warm-start 装载前显式拒绝，不给静默错位留缝（判别器形态指纹的
@@ -214,8 +215,8 @@ class PretrainReport(BaseModel):
         if config.experiment.group != self.group:
             raise ValueError(
                 f"预训练报告组别不符：报告 {self.group}，当前 config "
-                f"{config.experiment.group}（预训练与上岗须同组别口径——"
-                "per-condition AUC 与条件白名单是在预训练组别自己的 fake "
+                f"{config.experiment.group}（预训练与 warm-start 消费须同组别口径——"
+                "per-condition AUC 与过线判定是在预训练组别自己的 fake "
                 "分布上测量的，跨组消费是显式拒绝的错误，无配置开关可"
                 f"绕过；单阶段组请核对 reward.pretrain_report_json 指向的"
                 f"预训练 run 组别；组3 序贯 stage-2 的对应配置面是 "
@@ -242,7 +243,7 @@ class PretrainReport(BaseModel):
                 "condition_vocabulary_sha256 承载（单域全局形状在换域线"
                 "没有语义）"
             )
-        # 条件集对照：per-condition AUC 与白名单是对预训练时的条件集
+        # 条件集对照：per-condition AUC 与过线判定是对预训练时的条件集
         # 测量的，取值域 = 本域词汇表条件集（换域/换词表消费即拒绝）
         vocabulary = ConditionVocabulary.assemble(config)
         names = set(vocabulary.names())
@@ -250,7 +251,7 @@ class PretrainReport(BaseModel):
             raise ValueError(
                 "预训练报告条件集不符：报告 "
                 f"{sorted(self.condition_auc)}，当前词汇表 {sorted(names)}"
-                "（per-condition AUC 与条件白名单只对预训练时的条件集"
+                "（per-condition AUC 与过线判定只对预训练时的条件集"
                 "成立——报告与上岗的条件域须同一口径）"
             )
         checks = (
@@ -275,7 +276,7 @@ class PretrainReport(BaseModel):
             )
         # 词表工件指纹（多条件线的 fake 分布口径来源）：形状/token/
         # spacing/sigma 锚全部派生自该工件——内容漂移而其余工件与权重
-        # 未变时，报告的白名单与 AUC 对的是另一份 fake 分布
+        # 未变时，报告的过线判定与 AUC 对的是另一份 fake 分布
         current_vocabulary = (
             None if vocabulary_path is None
             else PretrainProvenance.digest(vocabulary_path)
@@ -298,9 +299,9 @@ class PretrainReport(BaseModel):
 
         形态指纹不符（预训练与当前 config 的判别器网络配置不同）显式
         拒绝——strict 装载对同 shape 异配置会静默通过，指纹是那层守卫；
-        checkpoint 指纹不符（盘上权重 ≠ 报告实测的那份）同此——白名单
-        与实测值的绑定对象是预训练落盘的 checkpoint，不是「该路径下
-        此刻的任何权重」。
+        checkpoint 指纹不符（盘上权重 ≠ 报告实测的那份）同此——过线
+        判定与实测值的绑定对象是预训练落盘的 checkpoint，不是「该
+        路径下此刻的任何权重」。
         """
         if self._path is None:
             raise ValueError(
@@ -327,7 +328,7 @@ class PretrainReport(BaseModel):
             raise ValueError(
                 "判别器 checkpoint 指纹不符：报告 "
                 f"{self.provenance.discriminator_ckpt_sha256[:12]}…，盘上 "
-                f"{observed[:12]}…（报告的白名单与 per-condition 实测值只"
+                f"{observed[:12]}…（报告的过线判定与 per-condition 实测值只"
                 "对预训练落盘的这份权重负责——启动期重算废止后，同形态换"
                 "权重无其他检查可拦，装载期显式拒绝）"
             )

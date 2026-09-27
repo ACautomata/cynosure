@@ -3,14 +3,14 @@ ADR-0008 决策 3：per-condition 步进与终止；ADR-0016：torchrun 测量�
 分片 + rank0 gate）。
 
 密集步进循环：每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态
-均匀轮转，确定性不耗 RNG）→ 该条件的 gate 测量批 = 装配原语对
+均匀轮转，确定性不耗 RNG）→ 该条件的过线测量批 = 装配原语对
 **全量 held-out 卷**的冻结基座同源重构（``ReconstructionAssembler.
 measure_condition``：定序轮转 σ + 复位测量流 ⇒ 同输入同输出、可复算）
 → 以更新前快照测该条件 recon-AUC（real = held-out real 原始、fake = 其
 重构体，逐样本配对；更新后测同一测量批会把 in-sample 拟合计入 AUC）
 → 支撑度规则判定过线（``SupportRule.passes``：该条件 held-out 卷数
 < 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008 决策 6 / #85）→
-首测过线换新批复测确认：两次独立测量都过线该条件入白名单（单批贴线
+首测过线换新批复测确认：两次独立测量都过线该条件确认过线（单批贴线
 越过被非确定性拒绝），报告值取两次较小者，确认步不更新（无更新即无
 事件）→ 未确认则以**同一装配原语**产出的配对批（real + 冻结基座同源
 重构 fake，ADR-0012）走在线期同款 ``OnlineUpdate.step`` 更新一步
@@ -22,13 +22,13 @@ docstring）。每个更新步同时消费与在线**同一**过拟合
 与本步更新前 recon-AUC 合成分叉观测，per-condition EMA 自下而上
 越线落预训练相 ``overfit_alert`` 事件（``phase="pretrain"``，EXEMPT
 记账——预训练执行史全量保留）；只报警不动作，确认步不更新不观测）——
-per-condition 分叉监控在 RM readiness gate 之前的预训练相即暴露稀疏
-模态（MRA）记忆化。已入白名单的条件不再复测（棘轮：复测确认
-已拦住单批噪声，后续掉线由在线期白名单动态恢复机制兜底）。终止 =
-全部条件最近一次确认过线即停；``pretrain_max_steps`` 耗尽 → 白名单 =
+per-condition 分叉监控在预训练棘轮终止之前即暴露稀疏
+模态（MRA）记忆化。已确认过线的条件不再复测（棘轮：复测确认
+已拦住单批噪声）。终止 =
+全部条件最近一次确认过线即停；``pretrain_max_steps`` 耗尽 → 过线条件 =
 已确认者，未确认条件逐个对落盘权重补测（报告值与 checkpoint 同快照）。
-白名单为空不拒跑——报告与 checkpoint 照常落盘供诊断（拒跑由 train
-gate 把守，不丢诊断产物）。
+过线条件为空同样落盘全部产物——报告与 checkpoint 是诊断产物，不丢
+（warm-start 装载无门槛判定，ADR-0017）。
 
 **预训练相不产 rollout**（ADR-0012 决策 6）：量产 rollout（num_steps 步
 全 ODE）整体退出本执行路径——fake 侧只剩「全量 held-out 卷的重构」
@@ -58,7 +58,7 @@ World-1 行为与分布式化前**逐位一致**（同代码路径、同 RNG 消
   跨 rank 设备语义，且 AUC 秩统计是 CPU 工作负载）→ rank0 重组全量
   ``VolumeScoreClusters``（卷级归属保留、连续段按 rank 序拼接还原全量
   排列序）重算全局 recon-AUC（Mann-Whitney estimand 不变）→
-  ``SupportRule`` 判定、复测确认、白名单棘轮、``steps_completed`` 计数
+  ``SupportRule`` 判定、复测确认、过线棘轮、``steps_completed`` 计数
   rank0 单点 → ``broadcast_object`` 分发步进四态（更新/复测/确认/终止，
   world-1 下广播恒等 = 本地判定）。控制流单点 = 集合序列单点：gather
   与广播的调用次数由 rank0 判定驱动，全 rank 同一条执行序，复测确认步
@@ -122,7 +122,7 @@ _DECISION_CONFIRM = "confirm"
 _DECISION_HALT = "halt"
 """gate 步进四态（ADR-0016 决策 5 的广播协议值）：rank0 判定的分发面，
 world-1 下 ``broadcast_object`` 恒等 = 本地判定。``update`` = 本步更新；
-``remeasure`` = 首测过线、换批复测；``confirm`` = 复测确认入白名单、
+``remeasure`` = 首测过线、换批复测；``confirm`` = 复测确认过线、
 跳过更新；``halt`` = 末个条件确认、全体终止。消息体 = (态, AUC)：更新/
 复测态携带首测值（更新步事件与分叉观测的全局 recon-AUC 记账面），
 确认/终止态携带 ``min(首测, 复测)`` 的保守报告值。"""
@@ -186,7 +186,7 @@ class PretrainDriver:
         # 状态清单失配）。判定只在 rank0 发生（分布式下非 0 rank 的流
         # 不消费——广播镜像 rank0 的决定，ADR-0016 决策 5）
         self._support = SupportRule(
-            threshold=reward.pretrain_gate_auc,
+            threshold=reward.pretrain_pass_threshold,
             support_bound=reward.gate_support_min_volumes,
             generator=torch.Generator().manual_seed(
                 self._dist.derive_seed(config.schedule.seed + 7),
@@ -245,14 +245,14 @@ class PretrainDriver:
         下按卷切片到各 rank、rank0 重组全局分数，见 ``_measurement``；
         recon-AUC 的 fake 侧）、real 同条件同批配对、AUC 归因该条件；首测
         过线（``SupportRule.passes``，rank0 单点判定 + 四态广播）换新批复
-        测确认——两次独立测量都过线才入白名单（producer 侧成功判据对单批
+        测确认——两次独立测量都过线才确认（producer 侧成功判据对单批
         测量噪声鲁棒，train 侧按独立采样的重算不再与非确定性拒绝耦合），
-        报告值取两次较小者。已入白名单的条件不再复测（棘轮：复测确认
-        已拦住单批噪声，在线期的掉线由白名单动态恢复机制兜底）；
-        ``pretrain_max_steps`` 耗尽 → 白名单 = 已确认者、未确认条件对
+        报告值取两次较小者。已确认过线的条件不再复测（棘轮：复测确认
+        已拦住单批噪声）；
+        ``pretrain_max_steps`` 耗尽 → 过线条件 = 已确认者、未确认条件对
         落盘权重补测（补测循环全 rank 走同一目标序列——gather 的集合
-        对齐由「reported 全 rank 一致」保证）。白名单为空仍落盘全部产物
-        （拒跑由 train gate 把守）。"""
+        对齐由「reported 全 rank 一致」保证）。过线条件为空仍落盘全部产物
+        （诊断产物不丢；warm-start 装载无门槛判定，ADR-0017）。"""
         reward = self._config.reward
         targets = self._policy.conditions.targets()
         self._policy.eval_phase()  # 冻结 base 的推理相（重构是 policy 前向）
@@ -260,7 +260,7 @@ class PretrainDriver:
         confirmed: dict[str, float] = {}
         volumes: dict[str, int] = {}
         steps_completed = 0
-        gate_passed = False
+        all_conditions_passed = False
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
             modality = targets[step % len(targets)]
@@ -270,7 +270,7 @@ class PretrainDriver:
                 # 全量卷数，聚合于 ``_measurement`` 的 gather 重组）
                 assert clusters is not None  # rank0 恒拿到全局聚类
                 volumes[modality] = clusters.volume_count
-            # gate 首测判定：rank0 单点（分布式）/ 本地（world-1 恒等），
+            # 过线首测判定（rank0 单点分布式 / 本地 world-1 恒等），
             # broadcast_object 在 world-1 下原样返回传入值——控制流全
             # rank 同一条，集合序列（gather/广播的调用次数）随之对齐
             decision = self._first_decision(modality, confirmed, clusters)
@@ -295,7 +295,7 @@ class PretrainDriver:
                     confirmed[modality] = decision[1]  # 保守口径：两次取小
                     del batch  # 确认/终止步不更新：测量批到此释放
                     if decision[0] == _DECISION_HALT:
-                        gate_passed = True  # 全部条件过线：终止
+                        all_conditions_passed = True  # 全部条件过线：终止
                         break
                     continue  # 本条件已确认：本步不更新（无更新即无事件）
             # 测量批到此消费完毕（AUC 已归因、卷数已留痕 volumes）——
@@ -377,7 +377,7 @@ class PretrainDriver:
             self._merger.emit(alerts)
             steps_completed += 1  # 更新步计数（确认步占步号但不更新不事件）
         reported = dict(confirmed)
-        if not gate_passed:
+        if not all_conditions_passed:
             # 步数上限耗尽：未确认条件逐个对落盘权重补测（循环内最后一次
             # 测得值属于更新前的上一份权重，与 checkpoint 不同快照；
             # 已确认条件的报告值 = 确认时的两次较小者，保留不覆盖）。补测
@@ -394,7 +394,8 @@ class PretrainDriver:
         if self._dist.rank != 0:
             return None  # 产物 rank0 唯一写者：非 0 rank 无报告消费者
         return self._finalize(
-            steps_completed, reported, list(confirmed), gate_passed, volumes,
+            steps_completed, reported, list(confirmed),
+            all_conditions_passed, volumes,
         )
 
     def _first_decision(
@@ -441,7 +442,7 @@ class PretrainDriver:
     def _measurement(
         self, modality: str,
     ) -> tuple[PairBatch, VolumeScoreClusters | None, int]:
-        """单条件测量批 → 卷级分数聚类（gate 测量/复测/补测共用入口）。
+        """单条件测量批 → 卷级分数聚类（过线测量/复测/补测共用入口）。
 
         测量批 = 该条件**全量 held-out 卷**的冻结基座同源重构（装配原语
         ``measure_condition``：定序轮转 σ + 复位测量流 ⇒ 逐次测量逐位同
@@ -549,16 +550,16 @@ class PretrainDriver:
         self,
         steps_completed: int,
         condition_auc: dict[str, float],
-        whitelist: list[str],
-        gate_passed: bool,
+        conditions_passed: list[str],
+        all_conditions_passed: bool,
         condition_volumes: dict[str, int],
     ) -> PretrainReport:
         """产物落盘（rank0 唯一写者）：判别器 checkpoint（可装载
         state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（kind
-        标识 + per-condition recon-AUC + 条件白名单 + 支撑度卷数 + 数据
-        口径指纹，含 checkpoint 内容指纹——报告的白名单与实测值只对
+        标识 + per-condition recon-AUC + 过线条件清单 + 支撑度卷数 + 数据
+        口径指纹，含 checkpoint 内容指纹——报告的过线判定与实测值只对
         落盘这份权重负责，装载面按指纹对照，
-        ``load_discriminator``）。白名单为空同样落盘——报告与
+        ``load_discriminator``）。过线条件为空同样落盘——报告与
         checkpoint 是失败预训练的诊断产物，不丢。"""
         torch.save(
             NetworkAssembler.loadable_state_dict(self._rewards.discriminator),
@@ -588,15 +589,15 @@ class PretrainDriver:
                 else self._config.latent_shape
             ),
             condition_auc=condition_auc,
-            gate_whitelist=whitelist,
+            conditions_passed=conditions_passed,
             # 判据口径标识（ADR-0012 决策 5 的审计面）：本报告的 AUC 是
             # held-out real 原始 vs 冻结基座同源重构体的 recon-AUC——
             # 与在线 iter 事件的 rollout-AUC 不可横向比较
-            gate_criterion="recon_auc",
+            auc_criterion="recon_auc",
             condition_volumes=condition_volumes,
             steps_completed=steps_completed,
-            gate_auc=reward.pretrain_gate_auc,
-            gate_passed=gate_passed,
+            pass_threshold=reward.pretrain_pass_threshold,
+            all_conditions_passed=all_conditions_passed,
             discriminator_ckpt=discriminator_relative,
             provenance=PretrainProvenance(
                 real_pool_manifest=str(reward.real_pool_manifest),

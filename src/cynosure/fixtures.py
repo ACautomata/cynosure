@@ -320,16 +320,15 @@ class Fixture:
             "real_pool_manifest": str(artifacts_dir / "real_pool.json"),
             "heldout_real_manifest": str(artifacts_dir / "heldout_real.json"),
             "channel_stats_json": str(artifacts_dir / "channel_stats.json"),
-            # 预训练产物契约（ADR-0007）：RM readiness gate 的守卫装载源
+            # 预训练产物契约（ADR-0007）：warm-start 装载守卫的装载源
             # （必填无默认）；fixture 产物路径 = 预训练 run 目录内的报告名
             "pretrain_report_json": str(
                 artifacts_dir / "pretrain_run" / "pretrain_report.json"
             ),
-            # RM readiness gate 的 fixture 低阈值（ADR-0007）：chance 带
-            # 上沿之上、自产小产物可达——门槛判定逻辑的 fixture 专属取值
-            # （fixture 不设豁免：train 门槛硬检查以同一条代码路径放行；
-            # 生产默认 0.65 不受影响）
-            "pretrain_gate_auc": 0.51,
+            # 预训练棘轮过线阈值的 fixture 低阈值（ADR-0007）：chance 带
+            # 上沿之上、自产小产物可达——棘轮尽早达标停步的 fixture 专属
+            # 取值（生产默认 0.65 不受影响；train 侧无上岗门槛，ADR-0017）
+            "pretrain_pass_threshold": 0.51,
         }
         if dataset == "MR-RATE":
             # 条件词汇表工件绑定（#127 schema 守卫：MR-RATE 必填、
