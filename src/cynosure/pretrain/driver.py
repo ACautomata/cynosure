@@ -156,15 +156,15 @@ class PretrainDriver:
             device=device if device is not None else self._dist.local_device(),
             dtype=AMP_DTYPES[config.policy.amp_dtype],
         )
-        generators = TrainingRngStreams(
+        streams = TrainingRngStreams(
             self._dist.derive_seed(config.schedule.seed),
             # 与 train runtime 同一 seeding 规则（数据侧逐 rank 派生、
             # recon 用 shared）——rank 0 恒等偏移 = 分布式下 rank0 的全部
             # 数据流与单进程逐位同序（重放锚）
             shared_seed=config.schedule.seed,
-        ).named()
+        )
         self._policy = GroupPolicy.build(
-            config, generators["rollout"], amp.device,
+            config, streams.rollout, amp.device,
         )
         # 采样封装先行装配（判别器侧配对批装配原语与其共享同一实例——
         # 确定性 ODE 续跑 kernel、日程表与分块调度单点）
@@ -172,7 +172,7 @@ class PretrainDriver:
             config, self._policy.field, device=amp.device,
         )
         self._rewards = TrainingRuntime.assemble_rewards(
-            config, amp, generators, self._dist,
+            config, amp, streams, self._dist,
             sampler=sampler, conditions=self._policy.conditions,
         )
         # 量产 rollout（``RolloutPhase``）不装配：ADR-0012 决策 6 后预训练

@@ -1026,7 +1026,7 @@ class TestRealPoolVocabularyShapeGuard:
                 ),
                 TrainingRngStreams(
                     dist.derive_seed(config.schedule.seed),
-                ).named(),
+                ),
                 dist,
             )
 
@@ -1052,7 +1052,7 @@ class TestRealPoolVocabularyShapeGuard:
                 ),
                 TrainingRngStreams(
                     dist.derive_seed(config.schedule.seed),
-                ).named(),
+                ),
                 dist,
             )
 

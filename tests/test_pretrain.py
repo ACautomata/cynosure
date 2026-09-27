@@ -854,17 +854,17 @@ class TestPretrainDriverAssembly:
             device=torch.device("cpu"),
             dtype=AMP_DTYPES[config.policy.amp_dtype],
         )
-        generators = TrainingRngStreams(
+        streams = TrainingRngStreams(
             dist.derive_seed(config.schedule.seed),
             shared_seed=config.schedule.seed,  # 生产装配位同款（数据侧
             # 逐 rank 派生、recon 用 shared）——同缝重放保持镜像逐字
-        ).named()
-        policy = GroupPolicy.build(config, generators["rollout"], amp.device)
+        )
+        policy = GroupPolicy.build(config, streams.rollout, amp.device)
         sampler = TrainingRuntime.assemble_sampler(
             config, policy.field, device=amp.device,
         )
         online = TrainingRuntime.assemble_rewards(
-            config, amp, generators, dist,
+            config, amp, streams, dist,
             sampler=sampler, conditions=policy.conditions,
         )
         assert isinstance(online.overfit, OverfitMonitor)

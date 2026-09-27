@@ -8,7 +8,10 @@ ADR-0012 的新流）由 rank 无关的 shared seed 派生——其 s 抽样的�
 结构是分布式集合序列的一部分，必须跨 rank 一致。
 
 续训状态按**流名**保存/恢复（resume 模块经 ``named()`` 枚举），注册
-表结构一变即续训状态清单失配、显式拒绝。
+表结构一变即续训状态清单失配、显式拒绝。本类是 RNG 侧**唯一注册
+对象**，归 TrainingRuntime 聚合层持有（#218：禁 helper/dict 裸容器；
+#230 聚合先行已并入原 generators 裸 dict 载体）——装配缝与消费面
+一律经本对象取流。
 
 历史（ADR-0012 退役，#173）：``disc_noise``（训练期噪声注入）、
 ``disc_update``（回放抽样）、``fake_shuffle``（fake 全批置换）、
@@ -49,7 +52,8 @@ class TrainingRngStreams:
         )
 
     def named(self) -> dict[str, torch.Generator]:
-        """流名 → Generator 的映射视图（续训状态的保存/恢复枚举面）。"""
+        """流名 → Generator 的映射视图（续训状态的保存/恢复枚举面；
+        装配期消费不经此视图——直接经属性取流）。"""
         return {
             self.ROLLOUT: self.rollout,
             self.REAL_POOL: self.real_pool,
