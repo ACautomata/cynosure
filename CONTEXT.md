@@ -230,8 +230,8 @@ iter 事件由各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出
 _Avoid_: 单机模式（单机也可多进程）
 
 **分片自持（Component-owned resume state）**:
-续训分片的读写知识归各协作者自身（ADR-0014，实施票未启动）：协作者实现 `state()` / `adopt()` 小接口（overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 trainer 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分片格式变更循升版拒旧先例（v10 清单退役、v11 门控状态退役、legacy 拒载），不写迁移读取。
-_Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）
+续训分片的读写知识归各协作者自身（ADR-0014；聚合面先行件随 #230 落 TrainingRuntime——RNG 注册对象归聚合层、无 generators 裸容器，ResumeStore 挂 runtime 与分片键自持随续训与事件契约期）：协作者实现 `state()` / `adopt()` 小接口（overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 TrainingRuntime 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分档：长寿命协作者自持；「任务化组件自持」档为空——任务是协程跑的短寿命对象，无状态长于其上（RNG 状态在注册表、分叉 EMA 在 OverfitMonitor、spectral norm buffer 在权重侧、分配表位置纯函数重导出），`state()` / `adopt()` 只落长寿命协作者。分片格式变更循升版拒旧先例（v10 清单退役、v11 门控状态退役、legacy 拒载），不写迁移读取。
+_Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）、为短寿命任务建注册面（任务无自持状态档如实为空）
 
 **静态分配表（static allocation table）**:
 iteration 与调度槽 → 条件的确定性映射（config + seed + iteration 的确定函数）：轮内置换——⌈C/D⌉ 个 iteration 为一轮覆盖全条件一次，每轮 seed 派生固定置换、轮间重洗；条件轴 = 条件分布的 ``targets()``（组2 按目标端、源序列自由度留槽内流，装配期断言每端有序对数相等）。槽 = 协程、协程→卡静态绑定（默认协程数 = 卡数时槽即卡）；同 seed 同分配，槽/协程数进续训对账。

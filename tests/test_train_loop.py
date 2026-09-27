@@ -54,6 +54,7 @@ from cynosure.train import (
     RewardCoordinator,
     RunArtifacts,
 )
+from cynosure.train.rng import TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
 from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.rollout import (
@@ -593,6 +594,29 @@ class TestPolicyOptimizerConfig:
             config.policy.policy_weight_decay,
         )
         assert group["weight_decay"] == pytest.approx(1e-4)
+
+
+class TestRngRegistryAggregation:
+    """RNG 注册对象归 TrainingRuntime 聚合层（#230 聚合先行，#218/#222
+    口径）：单一命名注册对象（TrainingRngStreams），无 ``generators`` 裸
+    容器第二载体——骨架期 per-槽实例化的载体前提。「任务无自持状态」档
+    为空：聚合层不为短寿命任务建注册面，注册清单即四条命名流。"""
+
+    def test_runtime_holds_registry_object_not_bare_dict(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        scenario.write_inputs()
+        config = ConfigLoader.load(scenario.config_path)
+        artifacts = RunArtifacts.init(config, scenario.run_dir)
+        runtime = GranularGrpoTrainer(config, artifacts).runtime
+        assert isinstance(runtime.rng, TrainingRngStreams)
+        assert not hasattr(runtime, "generators")
+        assert set(runtime.rng.named()) == {
+            TrainingRngStreams.ROLLOUT,
+            TrainingRngStreams.REAL_POOL,
+            TrainingRngStreams.HELDOUT_AUC,
+            TrainingRngStreams.RECON,
+        }
 
 
 class TestCrossModalLoop:

@@ -3,11 +3,19 @@
 
 config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 （RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、四条命名 RNG 流（TrainingRngStreams 注册表）、数值
-口径（AmpContext，定义在 policy/numerics——train 与 eval 共用的 import
-环安全位，此处 re-export 保持既有消费面）与分布式运行时
-（DistributedContext + EventMerger）。trainer 只面对本 Facade
-编排 iteration 循环，装配细节（含分布式包装）不进循环代码路径。
+（RolloutPhase）、四条命名 RNG 流（TrainingRngStreams——RNG 侧唯一
+注册对象，归本聚合层持有；装配缝与续训状态枚举一律经它取流，无裸
+dict 第二载体，#218/#230）、数值口径（AmpContext，定义在
+policy/numerics——train 与 eval 共用的 import 环安全位，此处
+re-export 保持既有消费面）与分布式运行时（DistributedContext +
+EventMerger）。trainer 只面对本 Facade 编排 iteration 循环，装配细节
+（含分布式包装）不进循环代码路径。
+
+聚合面口径（ADR-0014 平移先行，#230）：本 Facade 是续训聚合层——
+长寿命协作者由本层持有注册；「任务无自持状态」档为空（任务是协程跑
+的短寿命对象，无状态长于其上，#222 spec 明文），不为骨架期任务建
+注册面。骨架期 RNG 注册表 per-槽实例化（#218）即在本层持有的注册
+对象载体上进行。
 
 分布式装配点（ADR-0003，仅 torchrun 多进程下生效、单进程恒等）：
 - seed 的 rank 派生（各 rank 数据流独立；rank 0 恒等 = 单进程等价前提）；
@@ -74,7 +82,6 @@ class TrainingRuntime:
         updater: StepwisePolicyUpdate,
         rollout: RolloutPhase,
         rng: TrainingRngStreams,
-        generators: dict[str, torch.Generator],
         amp: AmpContext,
         dist: DistributedContext,
         merger: EventMerger,
@@ -85,7 +92,6 @@ class TrainingRuntime:
         self.updater = updater
         self.rollout = rollout
         self.rng = rng
-        self.generators = generators
         self.amp = amp
         self.dist = dist
         self.merger = merger
@@ -114,13 +120,13 @@ class TrainingRuntime:
         # 前提。recon 流除外（shared_seed = 未派生原 seed）：s 抽样的调用
         # 结构是 FSDP 集合序列的一部分，必须跨 rank 一致——判别器冷启动
         # 初始化同理不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
-        # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；named() 的
-        # dict 视图是装配期按名取流的消费面。
+        # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；装配期
+        # 各消费面直接经注册对象取流（无裸 dict 中转，#218「领域命名
+        # 注册对象」归本聚合层）。
         streams = TrainingRngStreams(
             dist.derive_seed(config.schedule.seed),
             shared_seed=config.schedule.seed,
         )
-        generators = streams.named()
         # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
         # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
         # （cuda:LOCAL_RANK）错位；CPU fixture 下即 cpu
@@ -133,7 +139,7 @@ class TrainingRuntime:
         sharding = PolicySharding.from_config(dist, config)
         # FSDP 包装在 optimizer 构建之前（优化器状态活在分片后参数上）
         policy = GroupPolicy.build(
-            config, generators["rollout"], amp.device, sharding=sharding,
+            config, streams.rollout, amp.device, sharding=sharding,
         )
         # 分块上限的 rank 一致化（#165 review P1）：分布式下 rollout 续跑
         # 的前向调用次数必须跨 rank 一致（FSDP 集合序列绑定调用次数），
@@ -145,7 +151,7 @@ class TrainingRuntime:
             ),
         )
         rewards = cls.assemble_rewards(
-            config, amp, generators, dist,
+            config, amp, streams, dist,
             report=(
                 None if resume
                 else PretrainReport.load(config.reward.pretrain_report_json)
@@ -165,7 +171,7 @@ class TrainingRuntime:
             config,
             sampler,
             rewards.update.scorer,
-            generators["rollout"],
+            streams.rollout,
             condition_sampler=policy.conditions,
             vocabulary=cls.assemble_vocabulary(config),
             device_type=amp.device_type,
@@ -179,7 +185,6 @@ class TrainingRuntime:
             updater=updater,
             rollout=rollout,
             rng=streams,
-            generators=generators,
             amp=amp,
             dist=dist,
             merger=EventMerger(dist, run_artifacts),
@@ -268,7 +273,7 @@ class TrainingRuntime:
         cls,
         config: CynosureConfig,
         amp: AmpContext,
-        generators: dict[str, torch.Generator],
+        rng: TrainingRngStreams,
         dist: DistributedContext,
         report: PretrainReport | None = None,
         *,
@@ -283,6 +288,8 @@ class TrainingRuntime:
         公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
         RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
         同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
+        ``rng`` 收命名注册对象本体（TrainingRngStreams，#218 禁裸容器
+        ——各协作者经它取各自的专属流）。
 
         ``sampler`` + ``conditions``（policy 侧依赖，须成对提供）驱动
         判别器更新批装配原语（ADR-0012 唯一新缝）的组装——两阶段供给
@@ -350,7 +357,7 @@ class TrainingRuntime:
         auc = HeldOutAuc(
             heldout_manifest=heldout_real,
             scorer=scorer,
-            generator=generators["heldout_auc"],
+            generator=rng.heldout_auc,
             device=amp.device,
         )
         return RewardCoordinator(
@@ -361,11 +368,11 @@ class TrainingRuntime:
             assembler=cls._assemble_pair_assembler(
                 config,
                 real_sampler=RealPoolSampler(
-                    real_view, generators["real_pool"], amp.device,
+                    real_view, rng.real_pool, amp.device,
                 ),
                 sampler=sampler,
                 conditions=conditions,
-                generator=generators["recon"],
+                generator=rng.recon,
                 amp=amp,
             ),
         )
