@@ -672,13 +672,14 @@ class RewardConfig(BaseModel):
         "dataset=MR-RATE 有语义且必填；BraTS config 携带即拒绝",
         default=None,
     )
-    pretrain_gate_auc: float = SpecField(
+    pretrain_pass_threshold: float = SpecField(
         "tunable", "ADR-0007",
-        "RM readiness gate 门槛阈值：预训练 per-condition held-out AUC 的"
+        "预训练棘轮的过线阈值：预训练 per-condition held-out recon-AUC 的"
         "过线判定（暂定 0.65，T13 实测 chance 带 ≈ 0.5±0.02；MR-RATE "
-        "预训练曲线校准后定版——ADR-0008 决策 6）。门槛数值只在预训练侧"
-        "消费：train 上岗判定读报告条件白名单，不重算不复核（ADR-0008 "
-        "决策 5，启动期池化重算废止）",
+        "预训练曲线校准后定版——ADR-0008 决策 6）。阈值数值只在预训练侧"
+        "消费：全部条件过线即提前终止密集步进（终止成功判据随报告落盘"
+        "留痕；train 侧不设上岗门槛——ADR-0017 门控链退役，warm-start "
+        "装载只做指纹对照不做门槛判定）",
         default=0.65, gt=0.0, lt=1.0,
     )
     gate_support_min_volumes: int = SpecField(
@@ -699,55 +700,14 @@ class RewardConfig(BaseModel):
     pretrain_report_json: Path = SpecField(
         "运行时", "ADR-0007",
         "判别器预训练报告路径（kind 标识 + 最终 held-out AUC + 数据口径指纹；"
-        "train 上岗门槛的守卫装载源，预训练 run 目录产物）。必填无默认——"
-        "RL 不带 warm-start 工件在 schema 层就无法启动",
-    )
-    condition_gate_enabled: bool = SpecField(
-        "运行时", "ADR-0008",
-        "条件闸总开关（维护者裁决，2026-09-17；ADR-0008 决策 5/7/8 的"
-        "统一关闭形态）：false = held-out AUC 不作为任何更新开关——"
-        "RM readiness gate 的上岗判定不再拒绝开跑、运行时白名单恒为"
-        "本域全条件放行、动态恢复停步，policy 每 iteration 对目标条件"
-        "全量更新。AUC 仍照常测量并落 iter 事件（heldout_auc 字段）与"
-        "分叉监控（ADR-0009 只报警），观测面不因关闸而退化为空白——"
-        "关的是「AUC 驱动决定」，不是「AUC 被测量」。true = 既定口径"
-        "（决策 5/7/8 全链生效，白名单空拒绝开跑）",
-        default=True,
-    )
-    gating_dynamic_recovery: bool = SpecField(
-        "tunable", "ADR-0008",
-        "白名单动态恢复（ADR-0008 决策 8）：在线 per-condition AUC 流驱动 "
-        "EMA 滞回判定，名单自动进出；false = 静态白名单降级路径（名单恒为"
-        "预训练报告产物，gated 条件不自动恢复，判别器仍照常受训）。"
-        "condition_gate_enabled=false 时本项无消费面（名单无门控语义）",
-        default=True,
-    )
-    gating_enter_auc: float = SpecField(
-        "tunable", "ADR-0008",
-        "动态恢复 enter 阈值（暂定 0.55，MR-RATE 预训练曲线校准后定版）："
-        "gated 条件的 EMA(held-out AUC) 越过此线即恢复该条件的 policy 更新"
-        "（判别力出带的自动上岗）",
-        default=0.55, gt=0.0, lt=1.0,
-    )
-    gating_exit_auc: float = SpecField(
-        "tunable", "ADR-0008",
-        "动态恢复 exit 阈值（暂定 0.52，MR-RATE 预训练曲线校准后定版）："
-        "名单内条件的 EMA(held-out AUC) 跌破此线即重新门控（拒绝在 RM "
-        "无分辨率的样本上做策略梯度）",
-        default=0.52, gt=0.0, lt=1.0,
-    )
-    gating_ema_span: int = SpecField(
-        "tunable", "ADR-0008",
-        "动态恢复的 EMA 跨度（暂定 8 iter，MR-RATE 预训练曲线校准后定版）："
-        "per-condition AUC 的指数移动平均时间尺度（α = 2/(span+1)），"
-        "观测流的平滑窗口——抑制单次测量的噪声进出",
-        default=8, ge=1,
+        "warm-start 装载守卫的守卫装载源，预训练 run 目录产物）。必填无默认"
+        "——RL 不带 warm-start 工件在 schema 层就无法启动",
     )
     overfit_ema_span: int = SpecField(
         "tunable", "ADR-0009",
-        "过拟合分叉监控的 EMA 跨度（ADR-0009 决策 4，暂定 8——与 "
-        "gating_ema_span 的 EMA(AUC) 跨度同值口径，MR-RATE 预训练曲线"
-        "校准后定版）：per-condition 分叉 = EMA(train 干净域 pairwise "
+        "过拟合分叉监控的 EMA 跨度（ADR-0009 决策 4，暂定 8——per-condition "
+        "AUC 流的平滑窗口同量级取值，MR-RATE 预训练曲线校准后定版）："
+        "per-condition 分叉 = EMA(train 干净域 pairwise "
         "acc − held-out AUC) 的平滑窗口（α = 2/(span+1)），观测流是"
         "该条件判别器步的稀疏序列（跨度语义 = 观测条数尺度）",
         default=8, ge=1,
@@ -775,19 +735,6 @@ class RewardConfig(BaseModel):
                 f"配置错误；关闭条件用不登记键表达）: {starved}"
             )
         return value
-
-    @model_validator(mode="after")
-    def _gating_hysteresis_band(self) -> "RewardConfig":
-        """动态门控的滞回带形状：exit < enter（滞回带非空，防名单在
-        阈值线上的进出抖动）且两者都在 chance（0.5）之上——AUC ≤ 0.5
-        即判别器无分辨率，不存在「过线恢复」语义。"""
-        enter, exit_ = self.gating_enter_auc, self.gating_exit_auc
-        if not 0.5 < exit_ < enter < 1.0:
-            raise ValueError(
-                f"动态门控阈值须 0.5 < exit < enter < 1.0（滞回带非空、"
-                f"均在 chance 之上），得到 enter={enter} exit={exit_}"
-            )
-        return self
 
     @field_validator("disc_num_layers_d")
     @classmethod

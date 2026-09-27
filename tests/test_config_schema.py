@@ -43,24 +43,18 @@ class TestValidConfigs:
         assert config.reward.patch_aggregation == "mean"
         assert config.reward.disc_update_interval_n_d == 1
         assert config.reward.disc_lr == pytest.approx(5e-5)
-        # 预训练与 RM readiness gate（ADR-0007）：阈值暂定 0.65、卫生项同
-        # policy 侧口径（1e-4）
+        # 预训练棘轮（ADR-0007）：过线阈值暂定 0.65、卫生项同 policy 侧
+        # 口径（1e-4）
         assert config.reward.disc_weight_decay == pytest.approx(1e-4)
         assert config.reward.disc_weight_decay == config.policy.policy_weight_decay
-        assert config.reward.pretrain_gate_auc == pytest.approx(0.65)
+        assert config.reward.pretrain_pass_threshold == pytest.approx(0.65)
         # 支撑度界（ADR-0008 决策 6）：条件 held-out 卷数 < 此界走 bootstrap
         # CI 下界口径，≥ 界点估计口径——暂定 20 待 MR-RATE 曲线校准
         assert config.reward.gate_support_min_volumes == 20
         assert config.reward.pretrain_max_steps >= 1
-        # 动态门控（ADR-0008 决策 8，issue #89）：默认开启，enter/exit/
-        # EMA 跨度三 knob 暂定值——MR-RATE 预训练曲线校准后定版
-        assert config.reward.gating_dynamic_recovery is True
-        assert config.reward.gating_enter_auc == pytest.approx(0.55)
-        assert config.reward.gating_exit_auc == pytest.approx(0.52)
-        assert config.reward.gating_ema_span == 8
-        # 过拟合分叉监控（ADR-0009 决策 4/5，issue #105）：EMA 跨度与
-        # ADR-0008 的 EMA(AUC) 跨度同值口径（8）、报警阈值暂定 0.2——
-        # MR-RATE 预训练曲线校准后定版（噪声注入 knob 随 ADR-0012 退役）
+        # 过拟合分叉监控（ADR-0009 决策 4/5，issue #105）：EMA 跨度暂定 8、
+        # 报警阈值暂定 0.2——MR-RATE 预训练曲线校准后定版（噪声注入 knob
+        # 随 ADR-0012 退役；gating_* 三 knob 与条件闸开关随 ADR-0017 退役）
         assert config.reward.overfit_ema_span == 8
         assert config.reward.overfit_alert_divergence == pytest.approx(0.2)
         assert config.schedule.n_plateau == 3
@@ -1166,7 +1160,7 @@ class TestMrRateAnchorsPerCondition:
                 "heldout_real_manifest": str(tmp_path / "heldout_real.json"),
                 "channel_stats_json": str(tmp_path / "channel_stats.json"),
                 "pretrain_report_json": str(tmp_path / "report.json"),
-                "pretrain_gate_auc": 0.51,
+                "pretrain_pass_threshold": 0.51,
                 "sampling_manifest_json": str(
                     tmp_path / "sampling_manifest.json"
                 ),

@@ -50,13 +50,11 @@ from cynosure.reward.assembly import PairBatch
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
-    DynamicWhitelist,
     GranularGrpoTrainer,
     RewardCoordinator,
     RunArtifacts,
 )
 from cynosure.train.runtime import TrainingRuntime
-from cynosure.train.whitelist import ConditionWhitelist
 from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.rollout import (
     CrossModalConditionSampler,
@@ -123,8 +121,8 @@ class TrainingLoopScenario:
         ``FixtureArtifactLibrary`` 按 (group, 日程, seed, reward 覆写)
         变体构建一次、进程内只读共享——本方法只剩 config 落盘（场景
         搭建成本从每测试一次降为每变体一次）。warm-start 前置（ADR-0007）
-        由库承担：RM readiness gate 是 train 入口的硬检查、消费预训练
-        产物；``reward`` 覆写进库键（在预训练之前生效）——预训练与训练
+        由库承担：train 装载消费预训练报告（warm-start 装载守卫）；
+        ``reward`` 覆写进库键（在预训练之前生效）——预训练与训练
         同一 reward regime（如 SN 启用时预训练产物即谱归一化形态，
         warm-start 装载走形态分派的逐位还原路径）。工件对本场景只读；
         要篡改预训练产物的测试先 ``fork_pretrained_artifacts``。"""
@@ -160,18 +158,6 @@ class TrainingLoopScenario:
         self.config_path.write_text(
             json.dumps(data, indent=2), encoding="utf-8",
         )
-
-    def narrow_whitelist(self, members: list) -> None:
-        """fork 私有预训练产物并把白名单收窄为 ``members``（门控场景
-        的条件构造，test_train_loop.TestGradientGating 与
-        test_distributed.TestTwoRankGating 共用；报告的实测值与
-        checkpoint 不动——warm-start 装载与守卫链不受影响）。"""
-        self.fork_pretrained_artifacts()
-        data = json.loads(self.config_path.read_text(encoding="utf-8"))
-        report_path = Path(data["reward"]["pretrain_report_json"])
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        report["gate_whitelist"] = members
-        report_path.write_text(json.dumps(report), encoding="utf-8")
 
     def train(self, *, dump: bool = False):
         argv = ["train", "--config", str(self.config_path), "--run-dir", str(self.run_dir)]
@@ -973,8 +959,8 @@ class SequencedAuc:
         return 0.5
 
 
-def _reward_config_for_gating() -> RewardConfig:
-    """门控对象装配的最小 RewardConfig（默认 knobs；纯单测用途）。"""
+def _reward_config() -> RewardConfig:
+    """判别器侧协作者装配的最小 RewardConfig（默认 knobs；纯单测用途）。"""
     return RewardConfig(
         disc_batch_size_k=4,
         real_pool_manifest="artifacts/real_pool.json",
@@ -996,14 +982,8 @@ class TestDiscriminatorSideOrchestration:
         update = RecordingUpdate(discriminator)
         coordinator = RewardCoordinator(
             update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
-            gating=DynamicWhitelist(
-                ConditionWhitelist.unrestricted(tuple(MODALITIES)),  # 本测试不触白名单
-                _reward_config_for_gating(),
-                DistributedContext(0, 1, False),
-                conditions=tuple(MODALITIES),
-            ),
             overfit=OverfitMonitor(
-                _reward_config_for_gating(), conditions=tuple(MODALITIES),
+                _reward_config(), conditions=tuple(MODALITIES),
             ),
             assembler=None,  # type: ignore[arg-type]  # 替身场景不经装配原语
         )
@@ -1250,72 +1230,6 @@ class TestRewardDomainNormalization:
         assert torch.equal(
             neutral_record.new_fakes, scaled_record.new_fakes * 2.0,
         )
-
-
-class TestGradientGating:
-    """逐 iteration 梯度门控与动态恢复（ADR-0008 决策 7/8，issue #89）。
-
-    端到端口径：``TrainingLoopScenario.narrow_whitelist`` 收窄白名单
-    （库场景默认全条件放行），名单外条件的 policy 更新被跳过、判别器
-    侧照常——门控状态随续训分片落盘。滞回判定的数值语义（enter/exit/
-    EMA 递推）由 test_gating 的决定面单测收口；多 rank 集体一致性由
-    test_distributed 的 spawn world 覆盖。
-    """
-
-    @pytest.mark.gpu  # 4 iteration 训练（大轮次）
-    def test_gated_iteration_skips_policy_update_only(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """名单外条件的 iteration：policy 更新被跳过（loss 无
-        policy_step_* 项、事件带 policy_gated 标记）；rollout、判别器
-        更新、iter 事件照常——被门控条件的判别器持续受训（fake 批由
-        重构装配原语现场供批）。静态白名单（动态恢复关闭）下名单逐位
-        恒定——恢复的数值语义由 test_gating 决定面单测收口，此处不叠加
-        测量噪声。"""
-        scenario.write_inputs()
-        scenario.set_schedule(max_iterations=4)
-        scenario.narrow_whitelist(["t1n"])
-        scenario.patch_config(reward={"gating_dynamic_recovery": False})
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-        iter_events = [
-            event for event in scenario.events() if event["event"] == "iter"
-        ]
-        assert len(iter_events) == 4
-        gated = [event for event in iter_events if event["policy_gated"]]
-        assert gated  # 名单外条件 3/4：4 iteration 至少一个 gated
-        for event in gated:
-            assert event["modality"] != "t1n"
-            policy_terms = [
-                key for key in event["loss"] if key.startswith("policy_step")
-            ]
-            assert not policy_terms  # policy 更新被跳过
-            assert "discriminator" in event["loss"]  # 判别器更新照常（N_d=1）
-            assert 0.0 <= event["heldout_auc"] <= 1.0  # AUC 观测照常
-        # 门控状态随续训分片落盘：静态名单逐位恒定、无观测记录
-        # （版本常量对账——分片格式随功能演进，断言不硬编码版本号）
-        state = scenario.resume_state()
-        assert state["format_version"] == RESUME_STATE_FORMAT_VERSION
-        assert state["gating"]["members"] == ["t1n"]
-        assert state["gating"]["ema"] == {}
-
-    @pytest.mark.gpu  # 单 iteration 训练（大轮次口径与既有全链一致）
-    def test_dynamic_recovery_streams_observations(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """动态恢复开启（默认）：AUC 观测流落进续训分片的门控状态
-        （per-condition EMA 有记录）——恢复评估的数据面贯通；名单是否
-        因实测值进出由测量决定（该语义的决定论覆盖在 test_gating）。"""
-        scenario.write_inputs()
-        scenario.narrow_whitelist(["t1n"])
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-        state = scenario.resume_state()
-        assert len(state["gating"]["ema"]) == 1  # 单 iteration 单条件观测
-        observed = next(iter(state["gating"]["ema"].values()))
-        assert 0.0 < observed["value"] <= 1.0
-        assert observed["count"] == 1
-        assert "t1n" in state["gating"]["members"]  # 名单内条件不被门控
 
 
 class TestPairedBatchSupplyGuards:

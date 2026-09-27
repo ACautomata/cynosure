@@ -80,7 +80,7 @@ class TestMilestoneDualTrack:
         落盘（条件坍缩观测面在 MR 生成条件名上贯通）；监控子样本
         decode 前缀 K 条（= 词汇表条件数），跨条件异形状分组解码。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared))
         scenario.set_schedule(
             max_iterations=2,
@@ -120,7 +120,7 @@ class TestDecodeOnlyInMonitoringSamples:
         flair/axial (4,8,8,16)，#129 条件分组）是 MR 线的独立观测面。
         iter 事件的 ``phase_seconds`` 恒五相位（主循环账无 decode 行项）。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared))
         scenario.set_schedule(
             max_iterations=3,
@@ -214,7 +214,7 @@ class TestOverfitAlertSubscribable:
         归因轴）、phase="rl"（RL 相按 iteration 轴记账）、rank、分叉值与
         两侧原始量均有限。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared), max_iterations=2)
         config = ConfigLoader.load(scenario.config_path())
         artifacts = RunArtifacts.init(config, scenario.run_dir())
@@ -244,12 +244,8 @@ class TestOverfitAlertSubscribable:
                 assert math.isfinite(alert[key])
             assert 0.0 <= alert["heldout_auc"] <= 1.0
             assert 0.0 <= alert["train_pairwise_acc"] <= 1.0
-        # 报警不动作（ADR-0009 决策 5）：iter 事件的白名单状态不受告警
-        # 联动——全条件在名单内（fixture 预训练过线），无 gated 迭代
-        assert all(
-            event["policy_gated"] is False
-            for event in scenario.iter_events()
-        )
+        # 报警不动作（ADR-0009 决策 5）：无任何自动动作——门控链已随
+        # ADR-0017 退役，「无机制可实现自动动作」的结构性保证
 
 
 class TestDualTrackIsolation:

@@ -150,8 +150,8 @@ class TestSequentialRun:
         assert scenario.train().code == 0, scenario.stderr
         events = scenario.events()
         # stage-1 与 stage-2 各一 iteration，顺序排列、stage 字段区分
-        # （stage-2 能开跑 = cross-modal 报告通过 readiness gate 与
-        # warm-start 组别守卫——两阶段各自消费同组报告）；指标流另含
+        # （stage-2 能开跑 = cross-modal 报告通过 warm-start 装载守卫
+        # ——两阶段各自消费同组报告）；指标流另含
         # overfit_alert（同带 stage/iteration 归因轴），按事件类型取
         # iter 序列后再对账阶段顺序
         iter_events = [event for event in events if event["event"] == "iter"]

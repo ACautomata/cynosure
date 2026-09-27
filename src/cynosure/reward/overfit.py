@@ -13,7 +13,7 @@ pairwise 准确率（随单步更新报告上行，更新原语 ``OnlineUpdate.s
 
 - per-condition 独立记账：条件间 EMA 与越线判定互不可见（观测流是
   per-condition 稀疏序列——该条件的判别器步才有一条观测，EMA 跨度
-  语义 = 该条件观测条数的平滑尺度，与 gating 的 EMA(AUC) 同口径）；
+  语义 = 该条件观测条数的平滑尺度）；
 - **按 rank 独立**：监控器是 rank 本地状态、无任何集合通信——判别器
   是 DDP 完整副本、权重各 rank 同步，分叉的 rank 间离散反映数据切片
   异质性，本身是诊断信号（不跨 rank 平均，随 iter 事件同归并序落盘）；
@@ -50,10 +50,8 @@ class DivergenceEma:
     """单条件分叉的指数移动平均（ADR-0009 决策 4 的平滑观测器）。
 
     首个观测直接置值（递推无初值偏置）；此后
-    ``ema ← (1−α)·ema + α·sample``，α 由 EMA 跨度换算（span=8 → 2/9）
-    ——与 gating 的 EMA(AUC)（``ConditionAucEma``）同一换算口径（本类
-    与其互为镜像的独立实现：分叉监控不依赖门控模块，两处 docstring
-    各自锚定自己的观测流语义）。
+    ``ema ← (1−α)·ema + α·sample``，α 由 EMA 跨度换算（span=8 → 2/9，
+    pandas ewm span 语义）。
 
     观测流是 per-condition 稀疏序列（条件被采样到且判别器步发生才有一条
     观测）——指数 EMA 的跨度语义 = **该条件观测条数**的平滑尺度（非
@@ -91,8 +89,7 @@ class DivergenceEma:
     def restore(self, value: float, count: int) -> None:
         """落盘状态的逐位回填（续训恢复的入口）：EMA 的递推链不可从
         终值重放（初值与中间观测未落盘），状态机的回填语义即
-        「value/count 直接置位」——与 observe 构成状态演化的一对写入口
-        （gating 的 EMA(AUC) 同款语义）。"""
+        「value/count 直接置位」——与 observe 构成状态演化的一对写入口。"""
         if count < 1:
             raise ValueError(f"EMA 观测计数须 ≥ 1，得到 {count}")
         self._value = value

@@ -10,7 +10,7 @@ iter 事件流 + checkpoint），单进程与 torchrun 多进程同一条代码�
 run 目录的最新续训状态恢复训练（仅单阶段组、须显式 --run-dir）。
 分布式启动（检测到 RANK env）必须显式 --run-dir——默认目录按进程
 时间戳生成，无法跨 rank 对齐。pretrain 执行判别器 warm-start 预训练（ADR-0007）：密集步进至 held-out
-AUC 达 RM readiness gate 或步数上限，产出判别器 checkpoint + 预训练报告；
+AUC 达过线阈值（预训练棘轮）或步数上限，产出判别器 checkpoint + 预训练报告；
 单进程与 torchrun 多进程同一条代码路径（ADR-0016：测量批按卷切片到各
 rank、rank0 gate 单点 + 四态广播分发、产物 rank0 唯一写者），分布式
 启动必须显式 --run-dir。fid/fid-floor/base-smoke 保持单进程，torchrun
@@ -102,7 +102,7 @@ class CynosureCli:
             ("train", "启动 RL 训练（run 目录 + 指标流 + checkpoint）"),
             ("eval", "从 checkpoint + Real sample pool 产出评测指标"),
             ("prepare", "构建 Real sample pool / Held-out real / per-channel 统计量"),
-            ("pretrain", "判别器 warm-start 预训练（RM readiness gate 的上岗产物）"),
+            ("pretrain", "判别器 warm-start 预训练（warm-start 装载守卫的产物源）"),
             ("fid", "裁决性 MR FID 读数（fork 口径 2.5D 仪器，#73 双轨）"),
             ("fid-floor", "real-vs-real 地板半分（病例级 seed 冻结 + 逐格清单）"),
             ("base-smoke", "基座 checkpoint 装载与前向自检（wayfinder #120）"),
@@ -660,7 +660,7 @@ class CynosureCli:
         """判别器 warm-start 预训练（ADR-0007 + ADR-0008-04 + ADR-0016）：
         单进程与 torchrun 同一条代码路径（per-condition 密集步进、
         rank0 gate 单点 + 四态广播、产物 rank0 唯一写者），跑至全部
-        轮转条件过线或步数上限（白名单为空不拒跑——报告与 checkpoint
+        轮转条件过线或步数上限（过线条件为空不拒跑——报告与 checkpoint
         落盘供诊断）。
 
         run 目录默认 = config 的 ``reward.pretrain_report_json`` 所在
@@ -744,12 +744,12 @@ class CynosureCli:
             return 0  # 产物与读数报告 rank0 独写/独打：非 0 rank 静默成功
         assert report is not None
         outcome = (
-            "已达标（全部条件过线）" if report.gate_passed
+            "已达标（全部条件过线）" if report.all_conditions_passed
             else "未达标（步数上限耗尽）"
         )
-        whitelist = (
-            "、".join(report.gate_whitelist)
-            if report.gate_whitelist else "（空）"
+        conditions_passed = (
+            "、".join(report.conditions_passed)
+            if report.conditions_passed else "（空）"
         )
         print(
             f"预训练完成（group={report.group}，步数 "
@@ -757,14 +757,14 @@ class CynosureCli:
             file=self._stdout,
         )
         print(
-            f"  - 条件白名单: {whitelist}（门槛 {report.gate_auc}，{outcome}）",
+            f"  - 过线条件: {conditions_passed}（阈值 {report.pass_threshold}，{outcome}）",
             file=self._stdout,
         )
         # 判据口径随报告明示（ADR-0012 决策 5 的审计面）：预训练的
         # recon-AUC 与在线 iter 事件的 rollout-AUC 不同构、不可横向比较
         # ——准入体检 vs 在岗考核，跨阶段比读数会被误导
         print(
-            f"  - 判据口径: {report.gate_criterion}（held-out real 原始 vs "
+            f"  - 判据口径: {report.auc_criterion}（held-out real 原始 vs "
             "冻结基座同源重构体；与在线 rollout-AUC 不可横向比较）",
             file=self._stdout,
         )

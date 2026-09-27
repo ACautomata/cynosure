@@ -8,7 +8,7 @@ fixture 合成流：小 pool + 小 fake 集 → per-condition 密集步进 → �
 
 per-condition 步进（ADR-0008-04）分两层锁：**轮转与归因**在端到端用例
 （事件流 modality 逐轮转序断言）；**终止状态机**在替身注入用例（测量 /
-判定 / 更新三 seam 换脚本替身，确认棘轮、部分白名单、复测掉线、耗尽
+判定 / 更新三 seam 换脚本替身，确认棘轮、部分过线、复测掉线、耗尽
 补测的语义逐项驱动）。过线判定的支撑度规则本身（CI 下界 / 点估计
 分派）由 test_support_rule 锁，此处锁「判定经 SupportRule 消费」的 seam。
 
@@ -292,13 +292,13 @@ class PretrainReportScenario:
         )
         fields = {
             "group": "modal-label",
-            "gate_criterion": "recon_auc",
+            "auc_criterion": "recon_auc",
             "latent_shape": tuple(Fixture.LATENT_SHAPE),
             "condition_auc": {"t1n": 0.72, "t1c": 0.68, "t2w": 0.70, "t2f": 0.66},
-            "gate_whitelist": ["t1n", "t1c", "t2w", "t2f"],
+            "conditions_passed": ["t1n", "t1c", "t2w", "t2f"],
             "steps_completed": 40,
-            "gate_auc": 0.65,
-            "gate_passed": True,
+            "pass_threshold": 0.65,
+            "all_conditions_passed": True,
             "discriminator_ckpt": "checkpoints/pretrain_discriminator.pt",
             "provenance": provenance,
         }
@@ -332,11 +332,11 @@ class TestPretrainReportConditionDomain:
         report = report_scenario.report(
             latent_shape=None,
             condition_auc={"t1w/axial": 0.72, "flair/axial": 0.61},
-            gate_whitelist=["t1w/axial"],
+            conditions_passed=["t1w/axial"],
         )
         loaded = PretrainReport.load(report_scenario.write(report))
         assert set(loaded.condition_auc) == {"t1w/axial", "flair/axial"}
-        assert loaded.gate_whitelist == ["t1w/axial"]
+        assert loaded.conditions_passed == ["t1w/axial"]
         assert loaded.latent_shape is None
 
     def test_brats_report_keeps_global_shape(
@@ -347,7 +347,7 @@ class TestPretrainReportConditionDomain:
             report_scenario.write(report_scenario.report()),
         )
         assert loaded.latent_shape == tuple(Fixture.LATENT_SHAPE)
-        assert loaded.gate_whitelist == list(MODALITIES)
+        assert loaded.conditions_passed == list(MODALITIES)
 
 
 class TestPretrainReportGuard:
@@ -373,7 +373,7 @@ class TestPretrainReportGuard:
         ValidationError——BraTS 线旧报告同此路径。"""
         data = json.loads(report_scenario.report().model_dump_json())
         del data["condition_auc"]
-        del data["gate_whitelist"]
+        del data["conditions_passed"]
         data["final_heldout_auc"] = 0.72
         path = report_scenario.report_dir / "legacy.json"
         path.write_text(json.dumps(data), encoding="utf-8")
@@ -402,7 +402,7 @@ class TestPretrainReportGuard:
         self, report_scenario: PretrainReportScenario,
     ) -> None:
         """报告组别 ≠ 消费 config 组别（组1/组2 独立 run 的跨组消费）：
-        装载期显式拒绝（#113）——per-condition AUC 与条件白名单是在预
+        装载期显式拒绝（#113）——per-condition AUC 与过线判定是在预
         训练组别自己的 fake 分布上测量的，跨组上岗是口径错位而非可配置
         语义（无逃生门）。判别性构造：数据口径指纹全部对齐，拒绝只能
         来自组别对照；报错含两侧组别值、「同组别口径」与 stage-2 报告
@@ -428,15 +428,15 @@ class TestPretrainReportGuard:
         report.assert_data_provenance(report_scenario.config)
 
     def test_report_roundtrip(self, report_scenario: PretrainReportScenario) -> None:
-        """报告落盘 → 装载无损（含 per-condition 口径与条件白名单）。"""
+        """报告落盘 → 装载无损（含 per-condition 口径与过线条件清单）。"""
         report = report_scenario.report()
         path = report_scenario.write(report)
         loaded = PretrainReport.load(path)
         assert loaded.model_dump() == report.model_dump()
         assert loaded.kind == "pretrain_report"
-        assert loaded.gate_passed is True
+        assert loaded.all_conditions_passed is True
         assert loaded.condition_auc == report.condition_auc
-        assert loaded.gate_whitelist == report.gate_whitelist
+        assert loaded.conditions_passed == report.conditions_passed
         assert loaded.provenance.channel_stats_sha256 == report.provenance.channel_stats_sha256
 
     def test_load_discriminator_restores_saved_weights(
@@ -468,7 +468,7 @@ class TestPretrainReportGuard:
         self, report_scenario: PretrainReportScenario,
     ) -> None:
         """盘上 checkpoint 与报告实测的那份不符（同形态换权重）：装载期
-        拒绝——报告的白名单与 per-condition 实测值只对预训练落盘的这份
+        拒绝——报告的过线判定与 per-condition 实测值只对预训练落盘的这份
         权重负责；启动期重算废止后（ADR-0008 决策 5），「测量对象 =
         装载对象」由 checkpoint 内容指纹对照把守。"""
         report_scenario.write(report_scenario.report())
@@ -560,12 +560,12 @@ class TestPretrainEndToEnd:
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：fixture 合成流上 pretrain 端到端跑通并产出工件（checkpoint
-        + 报告），报告含 per-condition AUC 与条件白名单、完整口径指纹。"""
+        + 报告），报告含 per-condition AUC 与过线条件清单、完整口径指纹。"""
         # 门槛 0.01 恒达标：全部条件首测即过线、换批复测确认 → 4 个轮转
         # 确认步零更新终止（判定分支的专属用例；「密集步进」路径见
         # dense-steps 用例）。fixture held-out 每条件 4 卷 < 支撑度界 20
         # → 判定走 bootstrap CI 下界口径（CI 下界 ≥ 0.01 恒真）
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         result = scenario.pretrain()
         assert result.code == 0, result.stderr
         run_dir = scenario.run_dir_path()
@@ -575,10 +575,10 @@ class TestPretrainEndToEnd:
         assert report.kind == "pretrain_report"
         assert report.group == "modal-label"
         assert report.latent_shape == tuple(Fixture.LATENT_SHAPE)
-        assert report.gate_auc == pytest.approx(0.01)
-        assert report.gate_passed is True
+        assert report.pass_threshold == pytest.approx(0.01)
+        assert report.all_conditions_passed is True
         assert report.steps_completed == 0
-        assert report.gate_whitelist == list(MODALITIES)
+        assert report.conditions_passed == list(MODALITIES)
         assert set(report.condition_auc) == set(MODALITIES)
         assert all(0.0 <= auc <= 1.0 for auc in report.condition_auc.values())
         # 确认步无更新 → 无事件（「事件数 == 完成步数」不变量的零步退化）
@@ -599,7 +599,7 @@ class TestPretrainEndToEnd:
     ) -> None:
         """AC：工件可重载进判别器（报告 → load_discriminator 与落盘
         checkpoint 逐位一致）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         assert scenario.pretrain().code == 0
         report = scenario.report()
         scorer = report.load_discriminator(scenario.config())
@@ -624,7 +624,7 @@ class TestPretrainEndToEnd:
         fixture 端到端 logits 偏离 4.5e-6、held-out AUC 0.5386 vs 0.5389）。"""
         scenario.write_config(reward={
             "spectral_norm_enabled": True,
-            "pretrain_gate_auc": 0.99,  # 不可达：走满步数上限（真训练态）
+            "pretrain_pass_threshold": 0.99,  # 不可达：走满步数上限（真训练态）
             "pretrain_max_steps": 3,
         })
         result = scenario.pretrain()
@@ -659,18 +659,18 @@ class TestPretrainEndToEnd:
             rtol=0.0, atol=1e-6,
         )
 
-    def test_dense_steps_terminate_at_gate_or_cap(
+    def test_dense_steps_terminate_at_threshold_or_cap(
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：终止语义 = 全部条件最近一次 per-condition recon-AUC 过线或
         步数上限——每步落盘预训练事件（判别字段 + 条件 + loss/recon-AUC
         + 重构成本读数），事件流 AUC 随密集步进按条件可归因。
 
-        阈值 0.99 不可达：走满步数上限分支（白名单空仍落盘报告 +
-        checkpoint 供诊断——拒跑由 train gate 把守，诊断产物不丢；
-        「全部条件过线」分支由 0.01 恒达标用例覆盖）。"""
+        阈值 0.99 不可达：走满步数上限分支（过线条件为空仍落盘报告 +
+        checkpoint 供诊断——诊断产物不丢，warm-start 装载无门槛判定
+        ADR-0017；「全部条件过线」分支由 0.01 恒达标用例覆盖）。"""
         scenario.write_config(reward={
-            "pretrain_gate_auc": 0.99,
+            "pretrain_pass_threshold": 0.99,
             "pretrain_max_steps": 12,
             "disc_lr": 2e-4,
         })
@@ -689,17 +689,17 @@ class TestPretrainEndToEnd:
             MODALITIES[step % len(MODALITIES)] for step in range(12)
         ]
         # 曲线的操作者可见面：终点报出指标流路径与事件数（离线查看收敛
-        # 曲线、校准门槛阈值的数据源）
+        # 曲线、校准过线阈值的数据源）
         assert f"{len(events)} 条 pretrain 事件" in result.stdout
-        # 白名单空仍落盘报告 + checkpoint（诊断产物不丢）
-        assert report.gate_whitelist == []
-        assert report.gate_passed is False
+        # 过线条件为空仍落盘报告 + checkpoint（诊断产物不丢）
+        assert report.conditions_passed == []
+        assert report.all_conditions_passed is False
         assert (scenario.run_dir_path() / "checkpoints" /
                 "pretrain_discriminator.pt").is_file()
         # 耗尽路径：未过线条件逐个补测（与落盘 checkpoint 同快照）→ 报告
         # dict 覆盖全部轮转条件，值 < 门槛
         assert set(report.condition_auc) == set(MODALITIES)
-        assert all(auc < report.gate_auc for auc in report.condition_auc.values())
+        assert all(auc < report.pass_threshold for auc in report.condition_auc.values())
         # 密集步进拉动 AUC（条件化口径）：判别力建立按条件分化——fixture
         # 判别器对不同序列的判别力基线不同，池化口径的「整体上升」断言
         # 被取代为「至少一个条件在其自身事件子序列上呈上升趋势」（单步
@@ -721,13 +721,13 @@ class TestPretrainEndToEnd:
         ControlNet 条件分布）；轮转条件集 = 有序对清单的目标端去重
         （12 全组合对 → 四目标端全部在集）。"""
         scenario.write_config(
-            group="cross-modal", reward={"pretrain_gate_auc": 0.01},
+            group="cross-modal", reward={"pretrain_pass_threshold": 0.01},
         )
         result = scenario.pretrain()
         assert result.code == 0, result.stderr
         report = scenario.report()
         assert report.group == "cross-modal"
-        assert sorted(report.gate_whitelist) == sorted(MODALITIES)
+        assert sorted(report.conditions_passed) == sorted(MODALITIES)
 
 
 class TestPretrainCliGuards:
@@ -735,7 +735,7 @@ class TestPretrainCliGuards:
         self, scenario: PretrainScenario,
     ) -> None:
         """run 目录已存在：拒绝（不静默覆盖）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         scenario.run_dir_path().mkdir(parents=True)
         result = scenario.pretrain()
         assert result.code == 2
@@ -749,7 +749,7 @@ class TestPretrainCliGuards:
         把守（跨 rank 目录对齐，train 同款）；RANK env 下缺省 run 目录
         即拒绝，不再言「单进程执行」。多 rank 真跑由 2 卡 slow 档端到端
         覆盖（tests/test_pretrain_distributed.py）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "2")
         result = scenario.pretrain()
@@ -763,7 +763,7 @@ class TestPretrainCliGuards:
         """--run-dir 显式覆盖默认（config 报告路径所在目录）：产物路径
         以 config 声明为准——覆盖目录与声明分叉时拒绝（train 按 config
         声明装载，分叉即 missing-report 或静默装旧）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         override = tmp_path / "override_run"
         result = scenario.pretrain("--run-dir", str(override))
         assert result.code == 2
@@ -777,7 +777,7 @@ class TestPretrainCliGuards:
         内的 ``pretrain_report.json``，train 按声明路径装载——分叉即
         missing-report 或静默装旧报告，入口显式拒绝。"""
         scenario.write_config(reward={
-            "pretrain_gate_auc": 0.01,
+            "pretrain_pass_threshold": 0.01,
             "pretrain_report_json": str(
                 scenario.run_dir / "warm_start_v2.json"
             ),
@@ -792,10 +792,10 @@ class TestPretrainCliGuards:
     ) -> None:
         """--run-dir 与 config 声明路径一致（目录与契约名都对上）：
         显式覆盖放行——一致性不变式只拒绝分叉，不拒绝显式声明。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         result = scenario.pretrain("--run-dir", str(scenario.run_dir))
         assert result.code == 0, result.stderr
-        assert scenario.report().gate_passed is True
+        assert scenario.report().all_conditions_passed is True
 
     def test_same_location_different_spelling_passes(
         self, scenario: PretrainScenario, tmp_path: Path,
@@ -807,12 +807,12 @@ class TestPretrainCliGuards:
         祖先」这些同址写法误判成分叉，拒绝合法调用。"""
         monkeypatch.chdir(tmp_path)
         scenario.write_config(reward={
-            "pretrain_gate_auc": 0.01,
+            "pretrain_pass_threshold": 0.01,
             "pretrain_report_json": "pretrain_run/pretrain_report.json",
         })
         result = scenario.pretrain("--run-dir", str(scenario.run_dir))
         assert result.code == 0, result.stderr
-        assert scenario.report().gate_passed is True
+        assert scenario.report().all_conditions_passed is True
 
 
 class TestPretrainDriverAssembly:
@@ -821,7 +821,7 @@ class TestPretrainDriverAssembly:
     ) -> None:
         """AC：driver 复用在线期同款单步更新原语（OnlineUpdate 实例，
         无第二套判别器训练逻辑）；weight_decay 显式配置且与 policy 同值。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
         driver = PretrainDriver(config, run, device=torch.device("cpu"))
@@ -839,7 +839,7 @@ class TestPretrainDriverAssembly:
         两阶段同一组件类、knobs 同源于 ``config.reward.overfit_*``；
         与在线装配逐位一致（同一调用、同一入参，产物 knobs 无分歧）。
         """
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "overfit_assembly_run")
         driver = PretrainDriver(config, run, device=torch.device("cpu"))
@@ -879,7 +879,7 @@ class TestPretrainDriverAssembly:
         配原语对组2 同样组装（ADR-0012 决策 7：条件构造与重构前向按组
         自然分派——组2 判别任务的语义裁决属 stage-2 专项票）。"""
         scenario.write_config(
-            group="cross-modal", reward={"pretrain_gate_auc": 0.01},
+            group="cross-modal", reward={"pretrain_pass_threshold": 0.01},
         )
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
@@ -896,7 +896,7 @@ class TestPretrainDriverAssembly:
         ADR-0008 决策 3 的调度形态）——替身按步记录条件，步数上限内
         每步一步更新、条件按轮转序循环。"""
         scenario.write_config(reward={
-            "pretrain_gate_auc": 0.99,  # 不可达：跑满上限，逐步观测
+            "pretrain_pass_threshold": 0.99,  # 不可达：跑满上限，逐步观测
             "pretrain_max_steps": 6,
         })
         config = scenario.config()
@@ -992,7 +992,7 @@ class TestPretrainReconstructionFakeSupply:
         """装配面：driver 不再持有 RolloutPhase（``rollout`` 公开面、
         ``_rollout`` 私有位与旧量产入口 `_measurement_batch` 一律不在）
         ——量产路径在预训练相结构性不可达，而非「约定不调用」。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "supply_run")
         driver = PretrainDriver(config, run, device=torch.device("cpu"))
@@ -1009,7 +1009,7 @@ class TestPretrainReconstructionFakeSupply:
         重构（非批次量产）——卷数 = 该条件 held-out 条目数、real 与
         fake 逐样本同形同源（批量量纲随 ADR-0012 量产退役消失，
         ``pretrain_fake_batch`` 字段已删，schema 携带即拒）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -1035,13 +1035,13 @@ class TestPretrainReconstructionFakeSupply:
     def test_report_carries_recon_criterion_and_support_volumes(
         self, scenario: PretrainScenario,
     ) -> None:
-        """报告面（#171 AC2/AC3）：``gate_criterion="recon_auc"`` 明示判据
+        """报告面（#171 AC2/AC3）：``auc_criterion="recon_auc"`` 明示判据
         口径（两阶段读数不可横向比较的审计锚），``condition_volumes``
         给出支撑度判定的卷数轴（逐条件 = 该条件 held-out 全量卷数）。"""
-        scenario.write_config(reward={"pretrain_gate_auc": 0.01})
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         assert scenario.pretrain().code == 0
         report = scenario.report()
-        assert report.gate_criterion == "recon_auc"
+        assert report.auc_criterion == "recon_auc"
         config = scenario.config()
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -1055,7 +1055,7 @@ class TestPretrainReconstructionFakeSupply:
                 encoding="utf-8",
             ),
         )
-        assert payload["gate_criterion"] == "recon_auc"
+        assert payload["auc_criterion"] == "recon_auc"
         assert payload["condition_volumes"] == report.condition_volumes
 
     def test_pretrain_events_carry_reconstruction_cost_readout(
@@ -1066,7 +1066,7 @@ class TestPretrainReconstructionFakeSupply:
         ``num_steps`` 上界）、卷数 = 该条件 held-out 全量卷；量产
         rollout 退出执行路径后再无该量级的固定开销。"""
         scenario.write_config(reward={
-            "pretrain_gate_auc": 0.99,  # 不可达：走满步数上限
+            "pretrain_pass_threshold": 0.99,  # 不可达：走满步数上限
             "pretrain_max_steps": 4,
         })
         assert scenario.pretrain().code == 0
@@ -1183,7 +1183,7 @@ class TestPretrainRotationStateMachine:
     """终止状态机替身用例（ADR-0008-04 决策 3 的判定语义）：测量
     （ScriptedAuc）/ 支撑度判定（ScriptedSupport）/ 更新（RecordingUpdate）
     四 seam 换脚本替身（测量 / 配对批装配 / 支撑度 / 更新），确认棘轮、
-    部分白名单、复测掉线、耗尽补测的语义逐项驱动。事件落盘走真实路径。"""
+    部分过线、复测掉线、耗尽补测的语义逐项驱动。事件落盘走真实路径。"""
 
     @pytest.fixture
     def scripted(self, scenario: PretrainScenario):
@@ -1194,7 +1194,7 @@ class TestPretrainRotationStateMachine:
             max_steps: int = 8, reward_overrides: dict | None = None,
         ) -> tuple[PretrainDriver, ScriptedAuc, ScriptedSupport, RecordingUpdate]:
             scenario.write_config(reward={
-                "pretrain_gate_auc": 0.99,
+                "pretrain_pass_threshold": 0.99,
                 "pretrain_max_steps": max_steps,
                 **(reward_overrides or {}),
             })
@@ -1215,14 +1215,14 @@ class TestPretrainRotationStateMachine:
         self, scripted, scenario: PretrainScenario,
     ) -> None:
         """全部条件确认过线即停（决策 3 终止语义）：每条件首测过线 →
-        换批复测确认 → 棘轮入白名单；全部入列终止，零更新零事件。"""
+        换批复测确认 → 棘轮入列；全部过线终止，零更新零事件。"""
         values = {modality: 0.8 for modality in MODALITIES}
         plan = {modality: [True] for modality in MODALITIES}
         driver, auc, support, recording = scripted(values, plan)
         report = driver.run()
-        assert report.gate_passed is True
+        assert report.all_conditions_passed is True
         assert report.steps_completed == 0
-        assert report.gate_whitelist == list(MODALITIES)
+        assert report.conditions_passed == list(MODALITIES)
         assert report.condition_auc == {modality: 0.8 for modality in MODALITIES}
         assert recording.received == []  # 确认步不更新
         assert driver._run.read_events() == []  # 无更新即无事件
@@ -1237,7 +1237,7 @@ class TestPretrainRotationStateMachine:
     def test_partial_whitelist_on_step_exhaustion(
         self, scripted,
     ) -> None:
-        """步数耗尽 → 白名单 = 已确认者：唯一过线条件的确认发生在首步，
+        """步数耗尽 → 过线条件 = 已确认者：唯一过线条件的确认发生在首步，
         其余条件轮转测量不过线照常更新；已确认条件后续轮转仍测量 +
         更新（棘轮不撤销、报告值保留确认时的两次较小者）；未确认条件
         耗尽后逐个补测（与 checkpoint 同快照）。"""
@@ -1249,8 +1249,8 @@ class TestPretrainRotationStateMachine:
         }
         driver, auc, support, recording = scripted(values, plan, max_steps=8)
         report = driver.run()
-        assert report.gate_passed is False
-        assert report.gate_whitelist == ["t1n"]
+        assert report.all_conditions_passed is False
+        assert report.conditions_passed == ["t1n"]
         assert report.steps_completed == 7  # t1n 确认步无更新，其余 7 步更新
         assert report.condition_auc["t1n"] == pytest.approx(0.8)
         assert report.condition_auc["t1c"] == pytest.approx(0.4)
@@ -1272,7 +1272,7 @@ class TestPretrainRotationStateMachine:
     def test_confirm_failure_continues_updating(
         self, scripted,
     ) -> None:
-        """复测掉线不确认：首测过线换批复测不过 → 该条件不入白名单、
+        """复测掉线不确认：首测过线换批复测不过 → 该条件不入过线清单、
         本步照常更新落事件（事件 AUC = 首测值）——单批贴线越过被
         非确定性拒绝的池化语义按条件化保留。"""
         values = {"t1n": 0.9, "t1c": 0.4, "t2w": 0.4, "t2f": 0.4}
@@ -1282,8 +1282,8 @@ class TestPretrainRotationStateMachine:
         }
         driver, auc, support, recording = scripted(values, plan, max_steps=4)
         report = driver.run()
-        assert report.gate_passed is False
-        assert report.gate_whitelist == []
+        assert report.all_conditions_passed is False
+        assert report.conditions_passed == []
         assert report.steps_completed == 4
         events = driver._run.read_events()
         assert [event["modality"] for event in events] == [

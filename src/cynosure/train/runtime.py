@@ -55,12 +55,10 @@ from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.reward.update import OnlineUpdate
 from cynosure.train.artifacts import RunArtifacts
-from cynosure.train.gating import DynamicWhitelist
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import ConditionSampler, RolloutPhase
 from cynosure.train.rng import TrainingRngStreams
-from cynosure.train.whitelist import ConditionWhitelist
 
 __all__ = ["AMP_DTYPES", "AmpContext", "TrainingRuntime"]
 
@@ -355,27 +353,8 @@ class TrainingRuntime:
             generator=generators["heldout_auc"],
             device=amp.device,
         )
-        # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：train 新 run =
-        # 报告白名单起步（gate 产物）+ 实测快照；resume/预训练冷启动 =
-        # 全条件放行占位（恢复点不重查白名单，恢复应用时分片的门控状态
-        # 整体覆写；driver 自产 per-condition 判定不消费本名单）。条件闸
-        # 关闭（``condition_gate_enabled=false``，维护者裁决）= 白名单退化为
-        # 「不设条件闸」的全条件放行占位——报告仍装载（warm-start 权重
-        # 是 ADR-0007 的另一件事），但其白名单不作上岗判据也不作更新开关。
-        # EMA 动态恢复（决策 8）的名单变更在训练循环内经 observe 驱动
-        gate_active = config.reward.condition_gate_enabled
-        gating = DynamicWhitelist(
-            initial=(
-                ConditionWhitelist.from_report(report)
-                if report is not None and gate_active
-                else ConditionWhitelist.unrestricted(vocabulary.names())
-            ),
-            config=config.reward,
-            dist=dist,
-            conditions=vocabulary.names(),
-        )
         return RewardCoordinator(
-            update, auc, gating,
+            update, auc,
             overfit=OverfitMonitor(
                 config.reward, conditions=vocabulary.names(),
             ),

@@ -269,7 +269,8 @@ class HeldOutAuc:
         NaN/Inf 当普通值排（NaN 排尾、+Inf 排头），数值发散或半损坏的
         判别器因此能伪装出高分（实测全 NaN → 1.5、real 单侧 NaN →
         0.875），「失明的判别器」反被认证为高判别力——宁可在测量层
-        失败，也不让 gate 拿一个无意义的数做上岗判定。
+        失败，也不让下游消费方（hacking 监控、预训练过线判定）拿到
+        一个无意义的数。
         """
         if real_scores.numel() == 0 or fake_scores.numel() == 0:
             raise ValueError("AUC 配对统计需要非空 real/fake 分数")

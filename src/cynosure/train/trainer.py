@@ -4,22 +4,15 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
 
     每 iteration（每 rank，同卡交替）：
       1. eval() + no_grad —— Rollout 与打分（RolloutPhase）
-      1.5 梯度门控（ADR-0008 决策 7/8）：held-out AUC 测得后喂入动态
-         白名单（EMA 滞回判定，rank 0 单点判定 + 快照广播的全 rank
-         集体口径）；目标条件不在名单 → 本 iteration 跳过 policy
-         更新（rollout / 判别器更新照常）
       2. train() —— 逐 k 独立 forward→backward→optimizer.step（|M| 次，
          FSDP 梯度 allreduce）；判别器 Online update（本 rank 配对批 =
-         当前 policy 对同批 real 的同源重构，DDP 梯度 allreduce，门控
-         不影响其节奏）随步做 train 侧干净域复算与 per-condition 分叉
-         观测（ADR-0009-β，越线落 overfit_alert 事件、只报警不动作）
+         当前 policy 对同批 real 的同源重构，DDP 梯度 allreduce）随步做
+         train 侧干净域复算与 per-condition 分叉观测（ADR-0009-β，越线
+         落 overfit_alert 事件、只报警不动作）
       3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
-    train 启动时：RM readiness gate 硬检查（读预训练报告的条件白名单，
-    白名单空拒绝开跑并回滚——ADR-0008 决策 5，启动期池化重算语义
-    废止；续训恢复时跳过，resume 状态已含判别器
-    全量状态）；Baseline manifest
+    train 启动时：Baseline manifest
     条目采样落盘只在 rank 0（冻结只采一次，续训恢复时同样跳过——恢复点
     policy 已非初始权重）；到达里程碑间隔时触发评测相的解码评测 →
     ``milestone`` 事件写入同一指标流（rank 0 独写）→ train 进程内早停
@@ -55,7 +48,6 @@ from cynosure.train.artifacts import (
     RunArtifacts,
 )
 from cynosure.train.earlystop import EarlyStopJudge
-from cynosure.train.gate import ReadinessGate
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.resume import ResumeStore
 from cynosure.train.rewards import RewardCoordinator
@@ -262,10 +254,6 @@ class GranularGrpoTrainer:
             self.stage_tag.checkpoint_prefix,
             self.runtime.dist,
         )
-        # RM readiness gate（ADR-0008 决策 5）：启动期的上岗硬检查——
-        # 判定读运行时白名单（报告产物，RewardCoordinator 接线），resume
-        # 跳过检查（见 run）
-        self.readiness = ReadinessGate(config, self.runtime.rewards.whitelist)
         # 评测相（Baseline 采样 / 里程碑解码评测 / RL 后重采）；测试可注入替身。
         # manifest 由本侧从 run 目录装载注入（eval 不反向依赖 train 契约模块）：
         # 组3 stage-2 各自重读盘上 manifest，天然含 stage-1 已回写的样本路径。
@@ -326,8 +314,7 @@ class GranularGrpoTrainer:
         return self.runtime.amp
 
     def run(self) -> int:
-        """训练主循环：RM readiness gate 白名单检查（ADR-0008 决策 5，
-        resume 跳过）→ Baseline 采样（rank 0，冻结初始 policy）→ 逐
+        """训练主循环：Baseline 采样（rank 0，冻结初始 policy）→ 逐
         iteration 执行序（里程碑触发解码评测 + 早停判定）→ RL 后重采
         （rank 0）→ checkpoint 与续训状态落盘。
         恢复语义由构造的 ``resume`` 单点声明（装配与执行共用同一开关，
@@ -353,14 +340,6 @@ class GranularGrpoTrainer:
         self.policy.eval_phase()  # rollout 与 Baseline 采样同为 eval 相（执行序第 1 相口径）
         self.rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         if not resume:
-            # RM readiness gate（ADR-0008 决策 5）：预训练报告的条件白
-            # 名单为空即拒绝开跑（报错含各条件实测值，沿 preflight 失败
-            # 语义回滚）；非空放行、未过线条件不阻塞 run（逐 iteration
-            # 门控兜底，门控消费票）。判定只读报告产物（重算废止，无需
-            # 样本输入），前置在 Baseline 采样等昂贵启动动作之前。
-            # resume 跳过：续训状态已含判别器全量状态（恢复点判别器
-            # 已在岗），恢复点不重查白名单
-            self.readiness.check()
             # Baseline 采样（冻结只采一次：更新开始前的当前权重即初始
             # policy）。policy 采样前向是 FSDP 集合操作，全 rank 对称
             # 参与；样本落盘与 manifest 回写是 rank 0 独写产物契约
@@ -374,8 +353,8 @@ class GranularGrpoTrainer:
             started = time.monotonic()
             # 成本读数的相位分解（#123）：计时是纯观测，相位边界即执行序
             # 的既有分界（第 1 相 rollout / 诊断轨迹（--dump-trajectory 时
-            # 自占 trajectory 相）/ AUC 测量 / 门控回合 / 第 2 相 policy
-            # 更新 / 判别器更新），不改变任何执行顺序
+            # 自占 trajectory 相）/ AUC 测量 / 第 2 相 policy 更新 /
+            # 判别器更新），不改变任何执行顺序
             phases = PhaseTimer()
             self.policy.eval_phase()  # 执行序第 1 相：eval() + no_grad 的 Rollout
             record = self.loop.run_iteration()
@@ -390,35 +369,18 @@ class GranularGrpoTrainer:
             # held-out AUC 在判别器更新之前测得：与 anchor_eval_reward 同一
             # 判别器快照（更新后测同一 fake 批会把 in-sample 拟合计入 AUC，
             # 联合 hacking 签名失真）；real 侧按本 iteration 采样的目标
-            # 序列过滤（per-target-sequence 归因，#40）。测量先行于门控
-            # 判定——本 iteration 的 rollout 样本分辨率不足即不做策略梯度
+            # 序列过滤（per-target-sequence 归因，#40）——测量与事件本身
+            # 是 hacking 监控的观测面（ADR-0009/ADR-0017：只报警不动作，
+            # 门控链已退役）
             heldout_auc = self.rewards.heldout_auc(
                 record.new_fakes, record.modality,
             )
             phases.mark("heldout_auc")
-            # 门控观测（ADR-0008 决策 8）：AUC 流喂入动态白名单——rank 0
-            # 更新 EMA 并滞回判定（越 enter 恢复 / 跌破 exit 重新门控），
-            # 门控状态快照广播镜像全体。返回值 = 全 rank 集体门控决定
-            # （任一 rank 的条件被门控 → 全体跳过：policy 更新的 FSDP
-            # 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等
-            # 死锁——任 rank 不得私自跳过/恢复）
-            policy_gated = self.rewards.gating.observe(
-                record.modality, heldout_auc,
-            )
-            phases.mark("gating")
-            # 梯度门控（ADR-0008 决策 7）：目标条件不在白名单 → 跳过本
-            # iteration 的 policy 更新（不引入第二重 reward/KL/参考模型）；
-            # rollout、判别器更新、iter 事件照常——被门控条件的判别器
-            # 持续受训，是其建立判别力、白名单得以恢复的前提
             self.policy.train_phase()  # 执行序第 2 相：train() 逐 k 更新（冻结 base 恒 eval）
-            loss_terms: dict[str, float] = {}
-            if not policy_gated:
-                loss_terms = self.loop.update_policy(record)
+            loss_terms = self.loop.update_policy(record)
             phases.mark("policy_update")
             # 判别器 Online update 按 N_d 节奏（每 N_d 个 iteration 一步，
-            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实；跳过的 iteration 不动判别器；
-            # 门控不影响判别器节奏——被门控条件的判别器持续受训，其建立
-            # 判别力是白名单动态恢复的前提）。
+            # D:G 更新比 ≈ 1:1 由 N_d=1 默认落实）。
             # 配对批现做现用（ADR-0012）：fake = 当前 policy 对同批 real 的
             # 同源重构（专属 recon 随机流、先抽 s 后抽 ε、η=0 确定性 ODE
             # 续跑；real 侧条件匹配 + 容量硬守卫照旧）——判别器更新批 =
@@ -466,7 +428,6 @@ class GranularGrpoTrainer:
                 intra_group_reward_std=record.intra_group_reward_std,
                 heldout_auc=heldout_auc,
                 loss=loss_terms,
-                policy_gated=policy_gated,
                 train_pairwise_acc=(
                     report.train_pairwise_acc if report else None
                 ),

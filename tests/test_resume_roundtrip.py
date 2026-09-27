@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.config import ConfigLoader, MODALITIES
+from cynosure.config import ConfigLoader
 from cynosure.eval import ManifestEvaluation
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.train import IterationLoop, PretrainEvent, RunArtifacts
@@ -176,11 +176,7 @@ class TestResumeStateChecklist:
     """AC 2：续训状态清单完整覆盖（spec #15 续训状态全清单）。"""
 
     def test_state_covers_full_checklist(self, scenario: TrainingLoopScenario) -> None:
-        # 门控用静态白名单（动态恢复关闭）：名单逐位恒定、无观测记录，
-        # 不叠加在线测量的恢复语义（其决定论覆盖在 test_gating）；动态
-        # 开启的形态见 test_train_loop.TestGradientGating
         scenario.write_inputs()
-        scenario.patch_config(reward={"gating_dynamic_recovery": False})
         assert scenario.train().code == 0
         state = scenario.resume_state()
         config = ConfigLoader.load(scenario.config_path)
@@ -240,13 +236,8 @@ class TestResumeStateChecklist:
         }
         # EMA 条件项槽（升级项未交付，恒 None）
         assert state["ema"] is None
-
-        # 门控状态（v4，ADR-0008 决策 7/8）：动态白名单当前成员 +
-        # per-condition EMA（恢复逐位复原的落盘面）
-        state = scenario.resume_state()
-        assert set(state["gating"]) == {"members", "ema"}
-        assert state["gating"]["members"] == list(MODALITIES)
-        assert state["gating"]["ema"] == {}
+        # 门控状态键随 ADR-0017 门控链退役移出清单（v11）
+        assert "gating" not in state
 
     def test_ema_enabled_rejected_as_undelivered_upgrade(
         self, scenario: TrainingLoopScenario,
@@ -347,19 +338,6 @@ class TestNoopResumeIntegrity:
         assert calls["resample"] == 0
         assert "2 iteration" in result.stdout
 
-    def test_noop_resume_preserves_gating_state(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """恢复点已达标的续训不重放任何观测：门控状态（名单成员 +
-        per-condition EMA）逐位保留——续训 roundtrip 的落盘侧不变式。"""
-        scenario.write_inputs()
-        scenario.patch_config(schedule={"max_iterations": 2})
-        assert scenario.train().code == 0
-        saved_gating = scenario.resume_state()["gating"]
-        assert saved_gating["ema"]  # 动态恢复开启：两 iteration 的观测流
-        assert scenario.resume().code == 0
-        assert scenario.resume_state()["gating"] == saved_gating
-
     def test_noop_resume_preserves_existing_diagnostic(
         self, scenario: TrainingLoopScenario,
     ) -> None:
@@ -383,7 +361,7 @@ class TestPretrainEventRewindIsolation:
     warm-start 的 ``pretrain`` 事件与 RL 的 iter/milestone 事件住在同一份
     metrics.jsonl 契约流里，而续训回退只重写恢复点之后的 RL 半截执行史：
     **误删**方向——预训练事件没有对应的 checkpoint 可重放，被回退波及即
-    永久丢失（收敛曲线断点、RM readiness gate 的阈值校准数据不可复现）；
+    永久丢失（收敛曲线断点、预训练过线阈值的校准数据不可复现）；
     **漏删**方向——半截 iter 事件必须删干净，否则重执行后同一 iteration
     留下两条事件，污染早停判定与离线曲线。"""
 
@@ -579,3 +557,23 @@ class TestResumeGuards:
         assert result.code == 2
         assert "格式版本" in result.stderr
         assert "ADR-0012" in result.stderr
+
+    def test_resume_rejects_pre_v11_gating_shard(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """v10（门控退役前最后代际，payload 带 ``gating`` 键）分片被 v11
+        版本对账显式拒绝：门控链退役（ADR-0017，#219）把 ``gating`` 键
+        移出续训清单，旧分片携带当前代码无从消费的门控状态——静默接受
+        会让门控决定凭空丢失（跨口径续训不可恢复），报错须指向退役
+        代际（v11 起清单已不含门控状态）。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        state = scenario.resume_state()
+        legacy = dict(state)
+        legacy["format_version"] = 10
+        legacy["gating"] = {"members": [], "ema": {}}
+        torch.save(legacy, scenario.run_dir / RESUME_STATE)
+        result = scenario.resume()
+        assert result.code == 2
+        assert "格式版本" in result.stderr
+        assert "v11" in result.stderr

@@ -168,8 +168,8 @@ class TestAucNumericContract:
         """NaN/Inf 分数显式拒绝：排序把非有限值当普通值排（NaN 排尾、
         +Inf 排头），发散或半损坏的 checkpoint 因此能伪装出高分（实测
         全 NaN → AUC 1.5、real 单侧 NaN → 0.875）——「判别器失明」反被
-        认证为高判别力。有限性校验是所有消费点（在线监控 / 预训练 gate
-        / RM readiness gate）共用的单一闸口。"""
+        认证为高判别力。有限性校验是所有消费点（在线监控 / 预训练
+        过线判定）共用的单一闸口。"""
         for label, real, fake in (
             ("real 含 NaN", torch.tensor([torch.nan, 0.1]), torch.tensor([0.0, 0.5])),
             ("fake 含 NaN", torch.tensor([0.9, 0.1]), torch.tensor([torch.nan, 0.5])),
@@ -308,7 +308,7 @@ class TestScoringPhase:
         """打分前向按定块分块累积（显存上界不随评估批量增长）且与全批
         单次前向逐位等价（判别器归一化定死 GroupNorm：前向对 batch 维
         逐样本独立，分块不改变分数；AUC 是分数上的 rank 统计，拼接
-        等价）。RM readiness gate 的 fake 侧 = 本 rank base 分区
+        等价）。在线监控的 fake 侧 = 当前 rollout 终点（ADR-0012 决策 4），
         （capacity//2 个 3D 体，量产侧限 ``_BASE_BATCH`` 分块生成），
         一次性全量前向会让评估显存随 buffer 容量无界增长——训练开始前
         就可能耗尽加速器。"""

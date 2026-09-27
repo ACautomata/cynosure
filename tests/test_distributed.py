@@ -312,7 +312,7 @@ class RankResumeShards:
     @staticmethod
     def _assert_entry_equal(left, right, where: str) -> None:
         """单条状态条目的逐位对账：Tensor 键形用 torch.equal，嵌套
-        原语（list/dict/str/int/float——门控状态等非张量槽位，经
+        原语（list/dict/str/int/float——非张量槽位，经
         broadcast_object 镜像落盘）用相等性。"""
         if isinstance(left, torch.Tensor):
             assert torch.equal(left, right), f"{where} 在 rank 间漂移"
@@ -648,69 +648,6 @@ class TestTwoRankSharding:
             not torch.equal(dist_policy[key], inproc_policy[key])
             for key in dist_policy
         )
-
-
-class TestTwoRankGating:
-    """门控决定的全 rank 集体口径（ADR-0008 决策 7/8，issue #89）。
-
-    协议面：观测 all_gather → rank 0 单点判定（EMA + 滞回）→ 门控状态
-    快照 broadcast 镜像——各 rank 的（动态）白名单字面一致，「任 rank
-    不得私自跳过/恢复」的分布式不变式以分片逐位一致为承重断言；门控
-    iteration 的 policy 更新被跳过而判别器照常更新（全 rank 同一条
-    执行序——跳过本身若分叉，FSDP 集合操作互等死锁，spawn world 的
-    完整跑绿即为错配防线）。
-    """
-
-    @pytest.fixture
-    def scenario(self, cli, tmp_path: Path) -> TrainingLoopScenario:
-        return TrainingLoopScenario(cli, tmp_path)
-
-    def test_gating_state_bitwise_identical_across_ranks(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """世界=2、白名单收窄（部分条件在名单外，门控分支真实出现）：
-        跑绿本身 = 门控决定全 rank 一致（分歧即 FSDP 集合错配死锁）；
-        各 rank 续训分片的门控状态（名单成员 + per-condition EMA）
-        逐位一致 = 广播镜像的落盘侧证据。"""
-        scenario.write_inputs()
-        scenario.patch_config(
-            schedule={"max_iterations": 2, "checkpoint_interval": 2},
-        )
-        scenario.narrow_whitelist(["t1n"])
-        result = SpawnedTrainWorld(
-            scenario.config_path, scenario.run_dir, world=2,
-        ).launch()
-        result.assert_green()
-
-        shards = RankResumeShards(scenario.run_dir, world=2)
-        shards.assert_bitwise_identical_across_ranks(keys=["gating"])
-        gating = shards.state(0)["gating"]
-        # 名单内容不恒断言：动态恢复开启，名单外条件在线 AUC 越过
-        # enter 即被恢复（真实行为）——分布式承重面是各 rank 逐位
-        # 一致（上句），名单只需保持合法形态
-        assert set(gating["members"]) <= set(MODALITIES)
-        assert "t1n" in gating["members"]  # 启动名单成员不被门控出带
-        assert gating["ema"]  # 观测流记录（rank 0 合并的全 world 观测）
-
-        events = RunArtifacts(
-            RunArtifacts.layout(scenario.run_dir),
-        ).read_events()
-        # iter 事件带门控观测面：policy_gated 是全 rank OR 归约的集体
-        # 决定——同 iteration 的各 rank 事件判定必然一致（任一 rank
-        # 条件被门控 → 全体跳过，FSDP 集合操作不错配）。只对照 iter
-        # 事件：overfit_alert 合法插入流中，且不带 policy_gated 字段
-        iter_events = [
-            event for event in events if event["event"] == "iter"
-        ]
-        assert [
-            (event["iteration"], event["rank"]) for event in iter_events
-        ] == [(0, 0), (0, 1), (1, 0), (1, 1)]
-        for iteration in (0, 1):
-            flags = {
-                event["policy_gated"]
-                for event in iter_events if event["iteration"] == iteration
-            }
-            assert len(flags) == 1
 
 
 class TestResumeGeneration:

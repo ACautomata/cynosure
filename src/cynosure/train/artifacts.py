@@ -54,12 +54,6 @@ class IterEvent(BaseModel):
     intra_group_reward_std: float
     heldout_auc: float
     loss: dict[str, float]
-    policy_gated: bool = False
-    """policy 更新门控标记（ADR-0008 决策 7）：全 rank 集体门控决定——
-    任一 rank 的目标条件不在（动态）白名单，本 iteration 全体跳过
-    policy 更新（loss 无 policy_step_* 项；rollout / 判别器更新照常）。
-    单 rank 下退化为「本 iteration 的目标条件不在白名单」。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度。
-    False = 正常更新步。观测面扩展：事件契约可扩不可改名。"""
     train_pairwise_acc: float | None = None
     """train 侧干净域 pairwise 准确率（ADR-0009-β）：本 iteration 判别器
     更新批上的干净域 no_grad 复算（更新前快照，随单步更新报告上行）。
@@ -75,12 +69,14 @@ class IterEvent(BaseModel):
     phase_seconds: dict[str, float] = Field(default_factory=dict)
     """逐 iter 卡时分解（#123 tracer 首跑的成本读数面）：本 iteration 各
     相位的墙钟秒数，键 = 相位名（``rollout`` / ``heldout_auc`` /
-    ``gating`` / ``policy_update`` / ``discriminator``，可扩）。
+    ``policy_update`` / ``discriminator``，可扩）。
     覆盖区间与 ``elapsed_s`` 同界——[iteration 起点, 本事件构造]：周期
     checkpoint、里程碑解码评测与迭代末 barrier 在该区间之外（随既有
     ``elapsed_s`` 口径，不单列）。各相位之和 ≤ ``elapsed_s``（差额 =
     相位边界上的簿记开销，不追求逐字节闭合）。空 dict = 调用方未做
-    相位计量（测试/替身直调场景）。观测面扩展：事件契约可扩不可改名。"""
+    相位计量（测试/替身直调场景）。观测面扩展：事件契约可扩不可改名。
+    （``gating`` 键随 ADR-0017 门控链退役移出——字典键集收缩，解析
+    无破坏；``policy_gated`` 字段同期退役，收缩特例由 ADR-0017 记录。）"""
 
 
 class MilestoneEvent(BaseModel):
@@ -121,7 +117,8 @@ class OverfitAlertEvent(BaseModel):
     之后写出；分布式预训练经 gather 归并到 rank0、``rank`` 归因观测
     rank，ADR-0016 决策 8）——按 rank 独立计算（rank 间离散是数据切片
     异质性的诊断信号，不跨 rank 平均）。**报警不动作**：事件只承载
-    读数，白名单与噪声 σ 不被联动（人工裁决，ADR-0009 决策 5）。回退
+    读数，无任何自动动作（人工裁决，ADR-0009 决策 5；门控链已随
+    ADR-0017 退役——「无机制可实现自动动作」的结构性保证）。回退
     记账按相分轨（γ）：RL 相按 iteration 轴随所属 iteration 删除
     （``REWIND_ACCOUNTING`` 的 ``ITERATION`` 口径——恢复点之后的告警
     由重执行重发）；预训练相（``phase="pretrain"``）与预训练事件同
@@ -178,9 +175,9 @@ class PretrainEvent(BaseModel):
     """本步更新前测得的 **recon-AUC**（ADR-0012 决策 5）：该条件 held-out
     全量卷原始 vs 其冻结基座同源重构体的池化点估计（与在线期 iter 事件
     同「更新前快照」测量时点——更新后测同一测量批会把 in-sample 拟合
-    计入 AUC）。字段名沿用「可扩不可改名」契约（口径已换域，见
-    ``PretrainReport.gate_criterion``）；**与 iter 事件的 rollout-AUC
-    不可跨相直接比较**：预训练判据测的是判别器训练任务上的 out-of-sample
+    计入 AUC）。口径标识见 ``PretrainReport.auc_criterion``；**与 iter
+    事件的 rollout-AUC 不可跨相直接比较**：预训练判据测的是判别器
+    训练任务上的 out-of-sample
     泛化力、在线口径测的是对打分对象（rollout 终点）的分辨力。"""
     reconstruction_forwards: int | None = None
     """本步测量批重构消耗的 policy 前向次数（#171 AC5 的成本口径读数：
@@ -210,7 +207,7 @@ class RewindAccounting(Enum):
       的评测历史（FID 序列断点、早停 verdict 消失且不再重放）；
     - ``EXEMPT``：不参与回退记账，全量保留。warm-start 预训练事件属此类：
       它没有对应的 checkpoint 可重放，按任何边界删都是永久丢失（收敛
-      曲线断点、RM readiness gate 的阈值校准数据不可复现）；表外事件
+      曲线断点、预训练过线阈值的校准数据不可复现）；表外事件
       类型（未登记 / 新增未声明）的兜底同为 ``EXEMPT``——同一条「不参与
       记账」语义在已登记与未登记两侧共用。
     """

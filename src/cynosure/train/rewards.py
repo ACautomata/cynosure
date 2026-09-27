@@ -16,42 +16,26 @@ from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import OnlineUpdate, UpdateReport
-from cynosure.train.gating import DynamicWhitelist
-from cynosure.train.whitelist import ConditionWhitelist
 
 
 class RewardCoordinator:
-    """判别器侧动作面（装配/更新/AUC/分叉监控）与条件白名单的单点持有。"""
+    """判别器侧动作面（装配/更新/AUC/分叉监控）的单点持有。"""
 
     def __init__(
         self, update: OnlineUpdate, auc: HeldOutAuc,
-        gating: DynamicWhitelist,
         overfit: OverfitMonitor,
         assembler: ReconstructionAssembler | None,
     ) -> None:
         self.update = update
         self.auc = auc
-        # 条件白名单的动态运行时对象（ADR-0008 决策 5/8）：readiness
-        # gate 判定与 train 循环逐 iteration 门控查询的同源消费面
-        # （经 whitelist 快照视图）；名单变更（EMA 动态恢复）由它以
-        # 快照替换驱动，判定为全 rank 集体口径
-        self.gating = gating
         # 过拟合分叉监控器（ADR-0009 决策 4/5）：per-condition 分叉 EMA
         # 的 rank 本地单点——train 循环逐判别器步喂入两侧干净域读数、
         # 消费越线判定落 overfit_alert 事件；按 rank 独立（无集合通信），
-        # 报警不动作（白名单不被它联动）
+        # 报警不动作（人工裁决，无机制可实现自动动作）
         self.overfit = overfit
         # 判别器更新批装配原语（ADR-0012 唯一新缝）：两阶段装配缝注入；
         # None = 替身测试场景，生产装配恒注入（trainer 装配期校验）
         self.assembler = assembler
-
-    @property
-    def whitelist(self) -> ConditionWhitelist:
-        """条件白名单当前快照（ADR-0008 决策 5 的接线面）：readiness
-        gate 的上岗判定与循环侧 ``modality in whitelist`` 逐 iteration
-        查询读同一来源——动态恢复变更名单后，查询面即时见到新快照
-        （上岗名单与更新开关永不分叉）。"""
-        return self.gating.whitelist
 
     @property
     def discriminator(self) -> torch.nn.Module:
@@ -76,8 +60,9 @@ class RewardCoordinator:
     ) -> float:
         """held-out real vs 当前 fake 的判别器 AUC（hacking 监控信号）。
 
-        fake 侧维持 rollout 终点（gate 的运行语义 = 判别器对打分对象
-        的分辨力，ADR-0012 决策 4）；real 侧按本 iteration 采样的目标
+        fake 侧维持 rollout 终点（监控口径 = 判别器对**打分对象**
+        （rollout 终点）的分辨力，ADR-0012 决策 4；rollout 侧的 RNG/
+        数值路径不因监控用途而改变）；real 侧按本 iteration 采样的目标
         条件过滤——iter 事件按序列归因 reward/loss/AUC，混采会让其他
         序列的判别器分数偏移伪装成本序列 realism 变化
         （per-target-sequence 健康监控）。"""

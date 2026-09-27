@@ -147,32 +147,20 @@ _Avoid_: 跨卡拼批（数据跨卡搬运的 gather 方案，已否决）、逐
 _Avoid_: 每 iter 每卡 K 对（有效批随 N_d 膨胀，已否决）、N_d 计数器状态（节奏恒 `iteration % N_d`）
 
 **Warm-start pre-training（判别器预训练）**:
-RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构；训练至通过 RM readiness gate，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012）。
+RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构；训练至预训练棘轮终止，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012；终止判据见 预训练棘轮）。
 _Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）、量产 rollout 当 fake 源（旧语义，ADR-0012）
 
-**RM readiness gate（RM 上岗门槛）**:
-RL 启动的硬前置：判别器预训练后按条件报告 recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012），过线条件构成条件白名单；白名单为空拒绝开跑，非空即放行。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值——预训练放行、在线实测重新洗牌名单是预期行为（准入体检 vs 在岗考核，ADR-0012）。条件闸总开关（`reward.condition_gate_enabled`，默认开）关闭时本门槛整体不适用（白名单既不作上岗判据也不作更新开关，见 条件闸）；**warm-start 权重装载不属门控链、不受开关影响**。上岗口径含组别绑定（#113）：预训练报告的 group 与消费 config 的组别严格等值——warm-start 装载守卫（assert_data_provenance）对照，跨组消费显式拒绝、无逃生门（组间 fake 分布不同，per-condition 判定只在本组分布上测量；组3 序贯 stage-2 的合法消费路径 = `experiment.stage2_pretrain_report_json` 绑定的 cross-modal 报告，stage 级绑定、不继承 stage-1 报告——#116）。
-_Avoid_: 软警告、早停（早停是训练期机制，门槛是启动期机制）、池化达标（全池单一标量口径，已被按条件取代）、跨组上岗（报告组别 ≠ 消费组别的装载——守卫期即拒绝，非 gate 白名单判定对象）
-
-**条件闸（Condition gate）**:
-held-out AUC 驱动更新决定的整条链的总开关（ADR-0008 决策 5/7/8 的统一关闭形态，维护者裁决 2026-09-17）：`reward.condition_gate_enabled=false` 时上岗判定不拒绝开跑、运行时白名单退化为全条件放行、逐 iteration 门控与 EMA 动态恢复停步——policy 每 iteration 对目标条件全量更新。**关的是「AUC 驱动决定」，不是「AUC 被测量」**：AUC 照常逐 iteration 测量并落 `iter` 事件、分叉监控（ADR-0009）照常——观测面正是本开关的裁决输入。诊断/执行期口径，不改变条件匹配采样、容量守卫、支撑度规则任何语义。
-_Avoid_: 关监控（观测面不退化）、关判别器训练（判别器照常受训与更新）、白名单降级（`gating_dynamic_recovery=false` 是静态白名单降级，本开关幅度更大）
+**预训练棘轮（Pretrain ratchet）**:
+判别器预训练的终止判据（ADR-0007/0008 决策 3/6，ADR-0017 门控链退役后保留面的升格口径）：per-condition recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012）逐条件「首测过线 → 换批复测确认」棘轮式入列（报告值取两次较小者，确认步不更新），全部条件过线即提前终止；`pretrain_max_steps` 耗尽则过线条件 = 已确认者、未确认条件对落盘权重补测。过线判定含支撑度规则（小样本条件走 bootstrap CI 下界）。**不设 train 侧上岗门槛**（ADR-0017：白名单空拒绝开跑的启动期硬检查已退役）——报告的过线条件清单与达标与否只承载预训练自身的终止形态与人工判读面；warm-start 装载守卫只对账数据口径指纹与形态指纹（组别绑定 #113：报告 group 与消费 config 严格等值，跨组显式拒绝；组3 序贯 stage-2 的合法消费路径 = `experiment.stage2_pretrain_report_json` 绑定的 cross-modal 报告，stage 级绑定、不继承 stage-1 报告——#116）。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值（准入体检 vs 在岗考核，ADR-0012）。
+_Avoid_: 上岗门槛/RM readiness gate（启动期拒绝语义已随 ADR-0017 退役）、池化达标（全池单一标量口径，已被按条件取代）、把过线清单当更新开关（policy 每 iteration 无条件更新，ADR-0017）
 
 **支撑度规则（Support rule）**:
 门槛判定的统计形态（ADR-0008 决策 6）：条件 held-out 卷数 < 支撑度界（暂定 20，config `reward.gate_support_min_volumes`）时，该条件过线判据从池化点估计改为 bootstrap CI 下界 ≥ 门槛——重采样单元是卷级聚类（每卷一组 patch 分数整卷进出；patch 级打散把同卷强相关 patch 当独立观测、低估 CI 宽度），重复数与分位固化在 `cynosure.reward.support`。MRA ≈ 16 卷命中（bootstrap 判定）、T2w ≈ 67 卷不命中（点估计判定）。
 _Avoid_: 小支撑的点估计直接过线、patch 级 bootstrap、换被估计量（两口径同为池化 AUC，只差判据形态）
 
-**条件白名单（Condition whitelist）**:
-RM readiness gate 的产物：预训练后逐条件判定的「判别器在该条件上有分辨率」清单。RL 期间它是 policy 更新的按条件开关（消费见 梯度门控）——名单内正常更新，名单外只跑 rollout 与判别器更新。名单不是静态产物：动态恢复（EMA 滞回）驱动名单进出——gated 条件的在线 per-condition held-out AUC 经 EMA 平滑越过 enter 阈值即恢复更新，名单内条件跌破 exit 阈值即重新门控（enter/exit/EMA 跨度三 knob 进 config、暂定值待校准；可配置关闭，静态白名单为降级路径）。门控决定全 rank 集体口径（rank 0 判定 + broadcast），门控状态随续训分片落盘逐位复原。条件闸关闭时名单不参与任何决定（见 条件闸）。
-_Avoid_: 条件调度（rollout 条件分布的配平，另一概念）
-
 **生成条件（Generation condition）**:
 RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 线条件单位仍是序列/有序对）：#81 终审白名单全量 11 个——T1w/T2w/FLAIR 各三平面 + SWI/AXIAL（仅轴位可得）+ MRA/ALL-PLANES（全平面一格；T2w 读数三格并池但条件独立成格）。每条件是**五元组**（modality token / plane / 推荐 FOV / 统一网格 / 等效 spacing），唯一来源是仓库工件 `data/conditions/mrrate_conditions.json`（#127 工件化，取代 #119 的 config 内嵌词表——config 不内嵌词表、代码内无常量副本）：token 映射 9/10/11/20/16 为上游 `configs/modality_mapping.json` 权威、条件 token 由映射派生（skull-stripped 29–33 不进本轮生成词汇）；统一网格 = #78 普查工件逐条件众数 latent 网格 ×4、等效 spacing = FOV / 网格（条件属性）。装载面 = `cynosure.conditions.MrConditionVocabulary`（config 经 `artifacts.condition_vocabulary_json` 携带路径）：装载期字段级拒绝（缺格 / 网格不符 / 字段缺失），生产模式逐条件对账普查期望网格；小词汇表只能经 `fixture_mode=True` 显式装载。两套口径经 `experiment.dataset` 互斥激活（`BraTS2023` 默认、既有 BraTS 线行为不变；`MR-RATE` 必带词汇工件绑定、BraTS 携带即拒），MR-RATE 线只定义组1（上游无 MR ControlNet）。词表的运行时消费（#129 + #131 均已接线）：`cynosure.conditions.ConditionVocabulary` 协议是两域统一解析面（rollout 条件组装、latent 形状按条件贯通、逐条件 sigma 锚、token/spacing 取数）——MR 侧 = 词汇表工件装载产物、BraTS 侧 = 单域常量策略（四序列、任意条件恒 config `latent_shape`，单域 = 单条件词汇特例）；rollout 初始噪声与 eval/baseline 采样的形状逐条件解析（批内同条件即同形状）、sigma 日程经 `ConditionSchedules` 按条件名选择（锚 = 该条件空间 numel，与形状同源派生、结构性防错位；MR 线 config 显式携带单域锚字段 `latent_shape`/`policy.input_img_size_numel` 即字段级拒绝）；real pool 条带切片的分层轴、manifest 逐条件形状契约的装配期对照与预训练报告的条件域/词表指纹同属词表消费面（#129：切片轴经注入、同名异形在装配期拒绝、报告键 = 本域条件名 + 词表工件内容 sha256）；域边界守卫同属 #129 消费侧收口——多条件域 real 工件缺逐条件形状契约即装配期拒绝（判据 = `ConditionVocabulary.single_condition`；缺表会静默回退全局 `latent_shape` 对账），未交付的 MR 面在构造/装配期显式拒绝而非深炸 BraTS 布局错误或单域默认锚（轨迹诊断一处）。里程碑参照影像库 #124 已交付（`MrReferenceVolumeStore`：参照卷集与卷→条件映射唯一来源 = real pool manifest 条目——病例级 train split 泄漏守卫与 BraTS 侧同源；组1 参照轮转**按目标条件过滤**（一卷一条件，BraTS 式全病例池轮转在条件维度上不成立）；装载 = dataset_root 平铺 NIfTI 经逐条件统一网格预处理链，与 prepare 预编码同口径；两域共同满足 `ReferenceVolumes` 协议、装配期 `_build_reals` 单点分派）——监控相装配守卫绑定「本 run 有无里程碑触发点」不变：`schedule.max_iterations < milestone_interval` 的 run 不装配监控相、不消费参照库。预处理半边 #130 已落地（`UpstreamPreprocessChain` 两臂旋钮——强度臂 BraTS `clip=True` / MR-RATE `clip=False` #71 裁决、resize 目标 BraTS dim 公式 / MR-RATE 词汇表统一网格绝对目标；`MrConditionVocabulary.spacing_condition` 条件属性解析面与 `latent_shape` 对偶，换算因子 `SPACING_CONDITION_SCALE` 提升至 config 单一来源）；prepare 数据链 #131 已落地（#121 票内：官方 split join + 评估集互斥硬守卫 + train split 内 patient 级 held-out 二分 + pool 与 held-out 两侧逐条件配额抽样 + 抽样留痕 + 装配期容量守卫，条件分层经 `LatentManifest.modalities`/`condition_latent_shapes`——口径见 `docs/spec/data-preparation.md`「MR-RATE 换域」节）。完整口径见 `docs/spec/experiment-design.md`「条件词表口径」节。
 _Avoid_: 把 skull-stripped 码当生成 token（生成分组恒用 whole-brain 条目）、在 BraTS config 里携带 MR 词汇工件（互斥携带即拒）、在 MR config 里声明单域锚字段（形状/锚逐条件派生，#129 互斥携带即拒）、在代码里写 token/网格常量副本（唯一来源是工件）
-
-**梯度门控（Gradient gating）**:
-白名单的按 iteration 消费（ADR-0008 决策 7）：目标条件不在名单 → 该 iteration 跳过 policy 更新——rollout、判别器更新（同源重构 fake 现做现用）、iter 事件照常。语义 = 拒绝在 RM 无分辨率的样本上做策略梯度（GRPO 无效样本不参与 advantage 的既有实践），不引入第二重 reward、KL 或参考模型。被门控条件的判别器持续受训——其建立判别力是白名单动态恢复的前提。门控决定是全 rank 集体口径：任一 rank 的条件被门控即全体跳过（policy 更新的 FSDP 梯度 allreduce 是全 rank 集合操作，部分 rank 跳过会互等死锁）；iter 事件以 policy_gated 标记区分门控 iteration（loss 缺 policy 项）。名单恢复由 条件白名单 词条的动态恢复机制驱动。条件闸关闭时本词条整体停用（无 iteration 被跳过，policy_gated 恒 false；见 条件闸）。
-_Avoid_: 条件过滤（判别器侧条件匹配采样，另一概念）
 
 **Online update（在线更新）**:
 reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start）：fake = 当前 policy 的同源重构、现做现用（ADR-0012），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
@@ -183,8 +171,8 @@ _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 
 **过拟合分叉监控（Overfit divergence monitoring）**:
-判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量——复算保证两侧同一估计量口径），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件独立记账（**rank 轴随执行模型退役**——async 执行模型裁决 #220：单进程多卡全池共享下数据切片异质性结构性消失、rank 间离散失去诊断对象，AUC 与 train acc 池化为 per-condition 单值；现行多进程 DDP 的「按 rank 独立记账、rank 离散 = 切片异质性诊断信号」口径随之退役，AUC 侧消费 per-condition 池化读数、观测面 RNG 拆流入 per-(卡×流名) 注册表），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：不自动移出白名单（升级项留曲线校准后另议）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在 RM readiness gate 之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；分布式预训练（ADR-0016）下越线告警经 gather 归并到 rank0 事件流、仅 rank0 写出（train 侧 EventMerger 同构，rank 归因观测 rank，写出序 = 步序 + 步内 pretrain 先于告警）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
-_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动动作（只报警、人工裁决；旧「自动降 σ」升级项随噪声注入取消作废，ADR-0012）、把 rank 离散当诊断信号（#220 后 rank 轴退役——其诊断对象是数据切片异质性，单进程全池下不存在）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
+判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量——复算保证两侧同一估计量口径），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件独立记账（**rank 轴随执行模型退役**——async 执行模型裁决 #220：单进程多卡全池共享下数据切片异质性结构性消失、rank 间离散失去诊断对象，AUC 与 train acc 池化为 per-condition 单值；现行多进程 DDP 的「按 rank 独立记账、rank 离散 = 切片异质性诊断信号」口径随之退役，AUC 侧消费 per-condition 池化读数、观测面 RNG 拆流入 per-(卡×流名) 注册表），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：系统侧无任何自动动作（门控链已随 ADR-0017 退役，无机制可实现自动动作）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在预训练棘轮终止之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；分布式预训练（ADR-0016）下越线告警经 gather 归并到 rank0 事件流、仅 rank0 写出（train 侧 EventMerger 同构，rank 归因观测 rank，写出序 = 步序 + 步内 pretrain 先于告警）；per-condition EMA 状态随续训分片落盘（v6），恢复逐位复原。
+_Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动动作（只报警、人工裁决；旧「自动降 σ」升级项随噪声注入取消作废，ADR-0012；门控联动已随 ADR-0017 退役）、把 rank 离散当诊断信号（#220 后 rank 轴退役——其诊断对象是数据切片异质性，单进程全池下不存在）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
 
 **Reward hacking（奖励攻击）**:
 policy 学会骗过判别器拿高分，而非真正提升样本质量——静止判别器的必然结局（见 对抗博弈）。
@@ -242,7 +230,7 @@ iter 事件由各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出
 _Avoid_: 单机模式（单机也可多进程）
 
 **分片自持（Component-owned resume state）**:
-续训分片的读写知识归各协作者自身（ADR-0014，实施票未启动）：协作者实现 `state()` / `adopt()` 小接口（gating / overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 trainer 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分片格式变更循升版拒旧先例（v10 清单退役、legacy 拒载），不写迁移读取。
+续训分片的读写知识归各协作者自身（ADR-0014，实施票未启动）：协作者实现 `state()` / `adopt()` 小接口（overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 trainer 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分片格式变更循升版拒旧先例（v10 清单退役、v11 门控状态退役、legacy 拒载），不写迁移读取。
 _Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）
 
 **静态分配表（static allocation table）**:

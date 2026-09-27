@@ -3,13 +3,10 @@
 MR 线的 prepare → pretrain 两段已在 ``test_mr_pretrain.py`` 贯通；本票
 补的是**主循环第三段**：G 轨迹 rollout → PatchDiscriminator latent 域打分
 → GRPO update → checkpoint + metrics 流落盘，在 MR 线的条件词汇表 / 逐
-条件形状 / 逐条件 sigma 日程上跑通，并覆盖本票新交付的两个面：
+条件形状 / 逐条件 sigma 日程上跑通，并覆盖本票交付的面：
 
-1. **条件闸开关**（``reward.condition_gate_enabled``）：关闭时 held-out
-   AUC 不作任何更新开关（空白名单也开跑、每 iteration 全条件更新），
-   开启（既定口径）时空白名单仍硬拒绝、名单外条件仍跳过 policy 更新；
-2. **逐 iter 卡时分解**（``iter`` 事件的 ``phase_seconds``）：rollout /
-   held-out AUC / 门控回合 / policy 更新 / 判别器更新五相位。
+1. **逐 iter 卡时分解**（``iter`` 事件的 ``phase_seconds``）：rollout /
+   held-out AUC / policy 更新 / 判别器更新四相位。
 
 监控链路（里程碑 FID 双轨 / 监控子样本 decode / overfit_alert 订阅面，
 #124）的专项测试在 ``test_mr_monitoring.py``；本文件保留装配分界的
@@ -38,12 +35,11 @@ CONDITIONS = ["t1w/axial", "flair/axial"]
 """夹具词表的两条件（t1w/axial [4,16,16,8]、flair/axial [4,8,8,16]）——
 异形状是本文件「逐条件形状贯通」的输入面。"""
 
-PHASES = (
-    "rollout", "heldout_auc", "gating", "policy_update", "discriminator",
-)
+PHASES = ("rollout", "heldout_auc", "policy_update", "discriminator")
 """逐 iter 卡时分解的相位键（#123：iter 事件 ``phase_seconds``；
 未开 ``--dump-trajectory`` 的口径——开了诊断另加 ``trajectory`` 相，
-见 test_trajectory_diagnostic）。"""
+见 test_trajectory_diagnostic；``gating`` 相随 ADR-0017 门控链退役
+移出）。"""
 
 
 class MrTrainScenario:
@@ -111,31 +107,11 @@ class MrTrainScenario:
         )
 
     def patch_config(self, **sections: dict) -> None:
-        """按 section 覆写训练 config（条件闸开关、门控退化等）。"""
+        """按 section 覆写训练 config（schedule / reward 覆写的通用口）。"""
         data = json.loads(self.config_path().read_text(encoding="utf-8"))
         for section, values in sections.items():
             data[section].update(values)
         self.config_path().write_text(json.dumps(data), encoding="utf-8")
-
-    def narrow_whitelist(self, members: list[str]) -> None:
-        """把预训练报告的条件白名单收窄为 ``members``（门控场景的条件
-        构造，与 ``TrainingLoopScenario.narrow_whitelist`` 同款）：报告
-        fork 到场景私有目录后改写，实测值与判别器 checkpoint 不动——
-        warm-start 守卫链不受影响。"""
-        data = json.loads(self.config_path().read_text(encoding="utf-8"))
-        report_path = Path(data["reward"]["pretrain_report_json"])
-        private = self._work_dir / "narrowed_pretrain"
-        shutil.copytree(report_path.parent, private)
-        report = json.loads(
-            (private / report_path.name).read_text(encoding="utf-8"),
-        )
-        report["gate_whitelist"] = members
-        (private / report_path.name).write_text(
-            json.dumps(report), encoding="utf-8",
-        )
-        self.patch_config(reward={
-            "pretrain_report_json": str(private / report_path.name),
-        })
 
     def set_schedule(self, **values: object) -> None:
         """改 schedule 并重落盘（续训扩迭代数的场景）。"""
@@ -161,14 +137,6 @@ class MrTrainScenario:
 
     def run_dir(self) -> Path:
         return self._run_dir
-
-    def whitelist(self) -> list[str]:
-        report = json.loads(
-            (self._pretrain_dir / "pretrain_report.json").read_text(
-                encoding="utf-8",
-            ),
-        )
-        return report["gate_whitelist"]
 
     def events(self) -> list[dict]:
         return [
@@ -219,12 +187,11 @@ class TestMrMainLoop:
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """AC：N iter 全绿（无 NaN、无异常终止），iter 事件字段齐全——
-        reward（anchor_eval_reward / intra_group_reward_std）、门控状态
-        （policy_gated）、per-condition 记账（modality）、逐 iter 卡时
-        分解（phase_seconds 五相位）；条件按词汇表轮转（异条件异形状在
-        同一 run 内贯通）。"""
+        reward（anchor_eval_reward / intra_group_reward_std）、per-condition
+        记账（modality）、逐 iter 卡时分解（phase_seconds 四相位）；
+        条件按词汇表轮转（异条件异形状在同一 run 内贯通）。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared))
         result = scenario.train()
         assert result.code == 0, result.stderr
@@ -234,7 +201,6 @@ class TestMrMainLoop:
             CONDITIONS[index % len(CONDITIONS)] for index in range(3)
         ]
         for event in events:
-            assert event["policy_gated"] is False  # 全条件在名单内
             assert set(event["loss"]) == {"policy_step_1", "discriminator"}
             for key in ("anchor_eval_reward", "intra_group_reward_std",
                         "heldout_auc"):
@@ -257,7 +223,7 @@ class TestMrMainLoop:
         跑到 4 iteration：事件流回退半截后重执行（无重复/无丢失），
         收官 checkpoint 经 netbuild 重新装载成功且权重已演化。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared), max_iterations=2)
         first = scenario.train()
         assert first.code == 0, first.stderr
@@ -295,7 +261,7 @@ class TestMrMainLoop:
         """监控相缺席不影响评测相的另两条路径：Baseline 采样与 RL 后重采
         （二者不消费参照影像库）照常在 MR 线落盘。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared), max_iterations=1,
                      baseline_samples=2)
         result = scenario.train()
@@ -304,84 +270,6 @@ class TestMrMainLoop:
         assert len(entries) == 2
         assert all(entry["baseline_sample"] for entry in entries)
         assert all(entry["resample_sample"] for entry in entries)
-
-
-class TestConditionGateSwitch:
-    """条件闸总开关（``reward.condition_gate_enabled``）。"""
-
-    def _empty_whitelist_scenario(
-        self, cli: CliSession, tmp_path: Path,
-    ) -> MrTrainScenario:
-        """门槛不可达 → 空白名单（复刻 MR-RATE 真实首跑的报告形态）。"""
-        scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={
-            "pretrain_gate_auc": 0.99, "pretrain_max_steps": 1,
-        })
-        scenario.use(scenario.pretrain(prepared), max_iterations=2)
-        assert scenario.whitelist() == []
-        return scenario
-
-    def test_empty_whitelist_is_refused_by_default(
-        self, cli: CliSession, tmp_path: Path,
-    ) -> None:
-        """既定口径不回归：空白名单 → readiness gate 硬拒绝（报错含
-        per-condition 实测值），run 目录不留半成品。"""
-        scenario = self._empty_whitelist_scenario(cli, tmp_path)
-        result = scenario.train()
-        assert result.code != 0
-        assert "白名单为空" in result.stderr
-        assert f"AUC[{CONDITIONS[0]}]" in result.stderr
-        assert not (scenario.run_dir() / "metrics.jsonl").exists()
-
-    @pytest.mark.gpu  # 2 iteration 训练（大轮次口径）
-    def test_disabled_gate_runs_every_iteration(
-        self, cli: CliSession, tmp_path: Path,
-    ) -> None:
-        """关闸语义：空白名单也开跑，且 AUC 不作任何更新开关——每
-        iteration 都做 policy 更新（policy_gated 全 False、loss 带
-        policy_step），同时 AUC 照常测量落盘（观测面不退化）。"""
-        scenario = self._empty_whitelist_scenario(cli, tmp_path)
-        scenario.patch_config(reward={"condition_gate_enabled": False})
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-        events = scenario.iter_events()
-        assert len(events) == 2
-        assert [event["policy_gated"] for event in events] == [False, False]
-        for event in events:
-            assert "policy_step_1" in event["loss"]
-            assert "discriminator" in event["loss"]
-            assert 0.0 <= event["heldout_auc"] <= 1.0
-
-    @pytest.mark.gpu  # 4 iteration 训练（大轮次口径与既有门控测试一致）
-    def test_narrow_whitelist_skips_policy_update_only(
-        self, cli: CliSession, tmp_path: Path,
-    ) -> None:
-        """既定口径的门控语义在 MR 线贯通：名单外条件的 iteration 跳过
-        policy 更新（loss 无 policy_step_*、事件带 policy_gated），
-        rollout / 判别器更新（同源重构 fake 现做现用）/ AUC 观测照常；
-        静态白名单（动态恢复关闭）下名单逐位恒定并随续训分片落盘。"""
-        scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
-        scenario.use(scenario.pretrain(prepared), max_iterations=4)
-        scenario.narrow_whitelist([CONDITIONS[0]])
-        scenario.patch_config(reward={"gating_dynamic_recovery": False})
-        result = scenario.train()
-        assert result.code == 0, result.stderr
-        events = scenario.iter_events()
-        assert len(events) == 4
-        gated = [event for event in events if event["policy_gated"]]
-        assert gated  # 名单外条件 2/4：4 iteration 至少一个 gated
-        for event in gated:
-            assert event["modality"] != CONDITIONS[0]
-            assert not [
-                key for key in event["loss"] if key.startswith("policy_step")
-            ]
-            assert "discriminator" in event["loss"]
-            assert 0.0 <= event["heldout_auc"] <= 1.0
-            assert event["train_pairwise_acc"] is not None  # 判别器步照常
-        # 判别器更新批不受门控影响（ADR-0008 决策 7；混采占比与近期分区
-        # 滚动读数随 ADR-0012 退役——更新批为装配原语配对批、无 push）
-        assert scenario.resume_state()["gating"]["members"] == [CONDITIONS[0]]
 
 
 class TestMonitoringPhasePresence:
@@ -397,7 +285,7 @@ class TestMonitoringPhasePresence:
         （见 TestMrMainLoop.test_baseline_sampling_runs_without_
         monitoring_phase 的缺席面）。"""
         scenario = MrTrainScenario(cli, tmp_path)
-        prepared = scenario.prepare(reward_overrides={"pretrain_gate_auc": 0.01})
+        prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         pretrained = scenario.pretrain(prepared)
         scenario.use(pretrained)
         scenario.set_schedule(
