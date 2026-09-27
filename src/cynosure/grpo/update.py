@@ -63,3 +63,37 @@ class StepwisePolicyUpdate:
         loss.backward()
         self.optimizer.step()
         return float(loss.detach())
+
+    def accumulate(
+        self,
+        step_index: int,
+        x_k: torch.Tensor,
+        condition: RolloutCondition,
+        directions: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        example_count: int,
+    ) -> float:
+        """逐 k 收集-同步的单例累积任务（async 执行序，#217 决议 2）：
+        log π 重算 → clipped loss → **loss 侧 × 1/example_count** 反传——
+        只累积梯度，不 zero_grad、不 optimizer.step（零梯度与优化器步归
+        barrier 相：k 内多例本卡累积 → 跨卡 allreduce SUM → 各卡一次
+        step；loss 侧 1/N × SUM ≡ 现行 FSDP/DDP AVG 的数学等价形态，
+        N = 全 iteration 例子数）。
+
+        返回**未缩放**的 reported loss（上报口径 = 先 ``float(loss.
+        detach())`` 取值、再对缩放副本 backward——上报与现行逐位一致，
+        不做回乘 D 的浮点往返）。``example_count`` < 1 显式拒绝。"""
+        if example_count < 1:
+            raise ValueError(
+                f"全 iteration 例子数须 ≥ 1，得到 {example_count}"
+                "（loss×(1/N)+SUM 口径的缩放分母）"
+            )
+        with torch.autocast(self._device_type, dtype=self._amp_dtype):
+            new_log_probs = self.sampler.evaluate_log_prob(
+                x_k, step_index, condition, directions,
+            )
+            loss = self.loss_fn.loss(new_log_probs, old_log_probs, advantages)
+        reported = float(loss.detach())
+        (loss / example_count).backward()
+        return reported

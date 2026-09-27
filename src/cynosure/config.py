@@ -968,6 +968,24 @@ class DeploymentConfig(BaseModel):
     )
 
 
+class AsyncExecutionConfig(BaseModel):
+    """async 执行模型 knobs（#217 调度单元契约）：单进程门面执行序的
+    拓扑可设面。既有执行序（单进程 world-1 / torchrun 多进程）不消费
+    本节——新执行序仅被 fixture 测试驱动（#226 决策 1：生产入口直到
+    切换期才改指）。"""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    coroutines: int | None = SpecField(
+        "tunable", "async 执行模型（#217）",
+        "调度槽（协程）数：缺省 None = 卡数（每卡一例的默认拓扑，与"
+        "现行 per-(iteration, rank) 事件数逐位重合）；显式值可 > 卡数"
+        "（CPU fixture 多协程档的机器面：调度/分配表/barrier/RNG 轴"
+        "全可测，#217 CPU fixture 口径）",
+        default=None, ge=1,
+    )
+
+
 _MR_ASSEMBLY_ARTIFACTS: tuple[str, ...] = (
     "mrrate_metadata_csv",
     "mrrate_splits_csv",
@@ -1018,6 +1036,11 @@ class CynosureConfig(BaseModel):
         "部署默认", "orchestration + ADR-0005",
         "部署默认（SothisAI 单实例 4 卡、产物落持久分区）",
         default_factory=DeploymentConfig,
+    )
+    execution: AsyncExecutionConfig = SpecField(
+        "tunable", "async 执行模型（#217）",
+        "async 执行模型 knobs（调度槽数）；既有执行序不消费",
+        default_factory=AsyncExecutionConfig,
     )
 
     @model_serializer(mode="wrap")
