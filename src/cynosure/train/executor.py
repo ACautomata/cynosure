@@ -640,11 +640,13 @@ class AsyncTrainingExecutor:
         """训练主循环（骨架期口径）：预热 → 绑卡线程启动 → 逐 iteration
         （rollout 相 → 逐 k barrier → 事件发射）→ 线程收尾。返回完成的
         iteration 数。无续训/评测/判别器链/checkpoint——各进加厚期
-        （#226 决策 3 骨架期包含面）。"""
+        （#226 决策 3 骨架期包含面）。启动序在收尾兜底的 ``try`` 内：
+        第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）时已启动
+        的前序卡同样经 ``finally`` 收尾。"""
         self._warmup()
-        for card in self.cards:
-            card.start()
         try:
+            for card in self.cards:
+                card.start()
             return asyncio.run(self._run_iterations())
         finally:
             for card in self.cards:
