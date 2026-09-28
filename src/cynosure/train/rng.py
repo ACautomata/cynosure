@@ -13,6 +13,16 @@ ADR-0012 的新流）由 rank 无关的 shared seed 派生——其 s 抽样的�
 #230 聚合先行已并入原 generators 裸 dict 载体）——装配缝与消费面
 一律经本对象取流。
 
+偏移布局权威（#218 §5 单点化）：本模块注释是流 seed 偏移的唯一权威
+登记处——数据侧 +0（rollout）/ +1（real_pool）/ +3（heldout_auc）/
++9（recon，shared 轴或槽轴见下）；+2/+4/+5/+8 为退役流空置偏移、
+**不回收再用**（含 v10 退役流的「历史占位不回收」口径，assembly.py
+的 MEASUREMENT_STREAM_OFFSET 描述为历史占位）；注册表之外：+6 =
+冷启动判别器初始化的全局 fork seed（跨卡一致，不经派生）、+7 =
+预训练 SupportRule 的 bootstrap 流、+19 = 预训练测量模板（宿主随
+#221）。async 执行序（#231 骨架期）的槽轴派生见 ``SlotRngRegistry``
+（线性步长 = 旧 rank 步长的沿用，槽 0 恒等）。
+
 历史（ADR-0012 退役，#173）：``disc_noise``（训练期噪声注入）、
 ``disc_update``（回放抽样）、``fake_shuffle``（fake 全批置换）、
 ``base_partition``（base 分区量产）四条流随旧判别器供给机制整体退役
@@ -20,7 +30,15 @@ ADR-0012 的新流）由 rank 无关的 shared seed 派生——其 s 抽样的�
 不变（同 seed 下序列与退役前逐位一致）。
 """
 
+import threading
+
 import torch
+
+SLOT_SEED_STRIDE = 1_000_000
+"""async 执行序槽间 seed 派生的间隔步长（#218：线性步长沿用——
+``DistributedContext`` rank 步长的同一取值，派生公式本体复用、调用方
+dist.rank → 槽号）。槽 0 恒等（数值面与现行单进程派生值逐位相同）；
+流轴最大偏移差 19 ≪ 槽间距 10⁶，任何槽 × 流组合不撞位。"""
 
 
 class TrainingRngStreams:
@@ -60,3 +78,116 @@ class TrainingRngStreams:
             self.HELDOUT_AUC: self.heldout_auc,
             self.RECON: self.recon,
         }
+
+
+class SlotRngRegistry:
+    """async 执行序的 per-槽流注册表（#218 全口径的载体）：N = 协程数
+    个 ``TrainingRngStreams`` 实例、seed 经槽派生（线性步长，槽 0 恒等）。
+
+    - **RL 侧不传 shared_seed**：recon 流走槽轴（``seed_slot + 9``），
+      shared 特例消灭（#217 drift #2 的机制落地；pretrain torchrun
+      过渡期继续传 shared_seed，同一类两语境分叉）。
+    - **四流全顺序推进 / 在线零复位**：流实例注册期一次性实例化，
+      ``get_stream`` 重复取同一实例（无复位入口）；在线主循环按任务
+      枚举连续消耗、跨 iteration 不复位（按任务复位 = 同槽跨 iteration
+      首任务吃同段初始噪声的 GRPO 组间结构相关，#218 不变式）。
+    - **消耗序机器断言 = 出口 owner-thread 断言**（#218 评审修订形态；
+      generator 为 pybind C++ 类不可子类化，断言只能挂访问面）：
+      ``owner_check=True`` 时 ``get_stream`` 出口记录首次取流线程，
+      异线程再取即 fail-fast——共享 generator 并发 draw 是静默不可重放
+      失败（#215 三律 3），断言是唯一主动暴露手段。默认关闭（热路径
+      零开销），测试档开启。
+
+    本注册对象归 TrainingRuntime 聚合层口径持有（#218 禁裸容器）；
+    消费面（RolloutPhase / HeldOutAuc 等）一律经 ``get_stream`` 取流，
+    无第二取数通道。
+    """
+
+    def __init__(
+        self, seed: int, slots: int, *, owner_check: bool = False,
+    ) -> None:
+        if slots < 1:
+            raise ValueError(f"槽数须 ≥ 1，得到 {slots}")
+        self._slots = tuple(
+            TrainingRngStreams(seed + slot * SLOT_SEED_STRIDE)
+            for slot in range(slots)
+        )
+        self._owner_check = owner_check
+        self._owners: dict[tuple[int, str], int] | None = (
+            {} if owner_check else None
+        )
+
+    @property
+    def slot_count(self) -> int:
+        """注册的槽数（= 协程数；分配表槽轴与静态绑卡的取数面）。"""
+        return len(self._slots)
+
+    def get_stream(self, slot: int, stream: str) -> torch.Generator:
+        """槽 × 流名的 generator 取数出口（注册表唯一访问面）。
+
+        ``owner_check`` 开启时本出口记录首次取流的线程 id，异线程再取
+        即拒绝（fail-fast）——静态绑卡下每槽的流只应被其绑卡线程触碰
+        （主线程装配期取流 + 绑卡线程消费的混用在此显式暴露）。"""
+        generator = self._stream(slot, stream)
+        if self._owners is not None:
+            self._assert_owner(slot, stream)
+        return generator
+
+    def stream_state(self, slot: int, stream: str) -> torch.Tensor:
+        """槽 × 流的 generator 状态**只读**观测面（锚测试断言流推进/零
+        复位的取数口）：读状态不消费流、不触发 owner-thread 断言——
+        观测不是消耗，注册表消费面（``get_stream``）与本观测面分离。"""
+        return self._stream(slot, stream).get_state()
+
+    def _stream(self, slot: int, stream: str) -> torch.Generator:
+        """槽 × 流的 generator 解析（槽界与流名在册校验单点；``get_stream``
+        与 ``stream_state`` 的共享前段）。"""
+        streams = self._slots[self._resolve_slot(slot)]
+        if stream not in streams.named():
+            raise ValueError(
+                f"流名 {stream!r} 不在注册表（在册：{sorted(streams.named())}）"
+            )
+        return getattr(streams, stream)
+
+    def _resolve_slot(self, slot: int) -> int:
+        if not 0 <= slot < len(self._slots):
+            raise ValueError(
+                f"槽号 {slot} 越界（注册槽数 {len(self._slots)}）"
+            )
+        return slot
+
+    def _assert_owner(self, slot: int, stream: str) -> None:
+        """出口 owner-thread 断言（#218：结构保证外的观测面）。"""
+        assert self._owners is not None
+        thread = threading.get_ident()
+        key = (slot, stream)
+        recorded = self._owners.get(key)
+        if recorded is None:
+            self._owners[key] = thread
+        elif recorded != thread:
+            raise RuntimeError(
+                f"流 {stream!r}（槽 {slot}）被异线程触碰：注册 owner "
+                f"thread {recorded:#x}，当前 thread {thread:#x}——同槽流"
+                "只允许绑卡线程消费（#215 三律：跨线程共享 generator "
+                "并发 draw 静默不可重放）"
+            )
+
+
+class DropoutGuard:
+    """装配期 dropout 守卫（#218 §3）：policy 与判别器构建后断言模块树
+    内全部 dropout 概率为 0——dropout 的随机消耗绕开 per-槽流注册表
+    （模块内部直抽全局流），是「流派生可重放」锚的结构破坏者；违者
+    装配期 fail-fast，机器锚长期成立的前提。"""
+
+    @staticmethod
+    def assert_clean(module: torch.nn.Module, origin: str) -> None:
+        """模块树内凡持概率属性 ``p`` 的子模块断言其为 0（torch 与
+        MONAI 的 dropout 层同约定）；``origin`` = 违例文案的装配来源。"""
+        for name, child in module.named_modules():
+            probability = getattr(child, "p", None)
+            if isinstance(probability, float) and probability > 0:
+                raise ValueError(
+                    f"{origin} 的子模块 {name!r} dropout={probability}："
+                    "dropout 绕开注册表直接消耗随机流（#218），装配期"
+                    "拒绝——把网络配置的 dropout 置 0"
+                )

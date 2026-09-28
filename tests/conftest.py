@@ -122,11 +122,12 @@ class CliResult:
     stderr: str
 
 
-WALL_CLOCK_EVENT_FIELDS = ("elapsed_s", "phase_seconds")
-"""iter 事件里的**墙钟量**字段（跨执行语境对比的豁免面）：总耗时与
-逐相位分解都是运行环境量、不参与轨迹逐位/容差比对（#123 加入
-``phase_seconds`` 后本常量是唯一豁免清单——两处对比器共用一个来源，
-新增加时不会出现「一处豁免一处漏」）。"""
+WALL_CLOCK_EVENT_FIELDS = ("elapsed_s", "phase_seconds", "waited_s", "threshold_s")
+"""iter 族事件里的**墙钟量**字段（跨执行语境对比的豁免面）：总耗时、
+逐相位分解与 barrier 超时事件的等待读数都是运行环境量、不参与轨迹逐位
+/容差比对（#123 加入 ``phase_seconds`` 后本常量是唯一豁免清单——两处
+对比器共用一个来源，新增加时不会出现「一处豁免一处漏」；#231 的
+``barrier_soft_timeout`` 事件两字段随批入列）。"""
 
 
 class RunTrajectory:

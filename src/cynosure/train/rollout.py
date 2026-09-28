@@ -396,9 +396,21 @@ class RolloutPhase:
         """本运行时的条件词汇表（rollout 形状解析的取数面，#129）。"""
         return self._vocabulary
 
-    def run_iteration(self) -> IterationRollout:
-        """单条件组的完整 rollout 与打分（执行序第 1 相的单进程版）。"""
-        condition, condition_name = self._condition_sampler.sample()
+    def run_iteration(self, condition_name: str | None = None) -> IterationRollout:
+        """单条件组的完整 rollout 与打分（执行序第 1 相的单进程版）。
+
+        ``condition_name`` 给定 = 分配表驱动的条件装配（async 执行序，
+        #217/#231：目标条件来自静态分配表、不再从条件分布 i.i.d. 采样）
+        ——经 ``sample_target`` 构造条件，组2 的「源序列自由度」按本相
+        的 rollout 流抽取（#218：pair_index 全域一笔消失、端内候选与
+        source_index 保留在槽内流）；缺省 = 条件分布均匀采样（既有单
+        进程执行序，行为不变）。"""
+        if condition_name is None:
+            condition, condition_name = self._condition_sampler.sample()
+        else:
+            condition = self._condition_sampler.sample_target(
+                condition_name, generator=self._generator,
+            )
         shape = self._vocabulary.latent_shape(condition_name)
         with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
             noise = torch.randn(

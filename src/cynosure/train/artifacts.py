@@ -193,6 +193,32 @@ class PretrainEvent(BaseModel):
     elapsed_s: float
 
 
+class BarrierSoftTimeoutEvent(BaseModel):
+    """训练指标流的 per-k barrier 软超时告警事件（#217 门面形态：软超时
+    告警 + 硬超时 abort——告警是观测面，硬超时才动作）。
+
+    async 执行序（#231 骨架期）的 barrier 等待越过软超时阈值时由门面
+    主线程发出（单进程多卡下主线程即「卡 0 写出」的语义载体）；等待
+    继续、硬超时阈值到即 fail-fast 中止。字段为门面最小集，随 #222
+    续训与事件契约期收口（事件契约「可扩不可改名」——扩字段兼容）。
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    event: Literal["barrier_soft_timeout"] = "barrier_soft_timeout"
+    iteration: int
+    """告警所属 iteration（回退记账轴，与 iter 事件同 ITERATION 口径）。"""
+    stage: int = 1
+    """告警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    step_index: int
+    """越过软超时阈值的被优化训练步 k。"""
+    waited_s: float
+    """本 barrier 已等待的墙钟秒数（越线读数）。"""
+    threshold_s: float
+    """软超时阈值（硬超时 = ``CYNOSURE_PG_TIMEOUT_MIN`` 语义换绑的口径，
+    见执行器 BarrierTimeoutPolicy；软阈值 = 硬阈值的一半，门面常量）。"""
+
+
 class RewindAccounting(Enum):
     """事件类型在续训回退（rewind）中的记账口径（每型事件声明的保留策略）。
 
@@ -237,6 +263,7 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
     "milestone": RewindAccounting.COMPLETION,
     "pretrain": RewindAccounting.EXEMPT,
     "overfit_alert": RewindAccounting.ITERATION,
+    "barrier_soft_timeout": RewindAccounting.ITERATION,
 }
 """事件判别值 → 回退记账口径的登记表（契约「可扩不可改名」的记账面）。
 
@@ -250,7 +277,10 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
 （``phase="pretrain"``）与 ``pretrain`` 事件同口径全量保留，分派在
 ``RunArtifacts._kept_by_rewind`` 的相特判——登记表按判别值索引，相是
 事件级字段，一型两轨的判定不进表。
-"""
+
+``barrier_soft_timeout`` 登记 ITERATION：告警是本 iteration barrier
+等待的执行史观测，随所属 iteration 参与回退（恢复点之后由重执行按
+当次等待实况重写，#231 门面的告警与 iter 事件同轴）。"""
 
 
 class ManifestEntry(BaseModel):
@@ -461,7 +491,10 @@ class RunArtifacts:
 
     def append_event(
         self,
-        event: IterEvent | MilestoneEvent | PretrainEvent | OverfitAlertEvent,
+        event: (
+            IterEvent | MilestoneEvent | PretrainEvent | OverfitAlertEvent
+            | BarrierSoftTimeoutEvent
+        ),
     ) -> None:
         """向训练指标流追加一行 JSON 事件（按行追加、rank 0 归并）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:

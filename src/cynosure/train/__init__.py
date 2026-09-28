@@ -19,6 +19,7 @@
 
 from cynosure.train.artifacts import (
     REWIND_ACCOUNTING,
+    BarrierSoftTimeoutEvent,
     BaselineManifest,
     IterEvent,
     ManifestEntry,
@@ -53,6 +54,7 @@ from cynosure.train.trainer import (
 __all__ = [
     "REWIND_ACCOUNTING",
     "AmpContext",
+    "BarrierSoftTimeoutEvent",
     "BaselineManifest",
     "ConditionSampler",
     "CrossModalConditionSampler",

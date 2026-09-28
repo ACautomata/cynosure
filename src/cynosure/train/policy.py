@@ -20,6 +20,7 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
 from cynosure.policy.field import BareConditionField, CfgCombinedField, VelocityField
 from cynosure.reward.artifacts import LatentManifest
+from cynosure.train.rng import DropoutGuard
 from cynosure.train.rollout import (
     ConditionSampler,
     CrossModalConditionSampler,
@@ -114,6 +115,9 @@ class GroupPolicy:
             )
         else:
             field = CfgCombinedField(network)
+        DropoutGuard.assert_clean(
+            network, origin=f"group={group} 的 policy 网络",
+        )
         optimizer = torch.optim.AdamW(
             network.parameters(),
             lr=config.policy.policy_lr,

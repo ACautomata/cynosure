@@ -53,6 +53,7 @@ from cynosure.train import (
     RunArtifacts,
     TrainingRuntime,
 )
+from cynosure.train.artifacts import BarrierSoftTimeoutEvent
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
@@ -119,7 +120,8 @@ def event_type_vocabulary() -> set[str]:
         event.event
         for event in (
             iter_event(0), milestone_event(0), pretrain_event(0),
-            alert_event(0),
+            alert_event(0), BarrierSoftTimeoutEvent(iteration=0, step_index=0,
+                                                    waited_s=0.0, threshold_s=0.0),
         )
     }
 
