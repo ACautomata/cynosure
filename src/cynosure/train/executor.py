@@ -37,11 +37,28 @@
 
 骨架期包含面（#226 决策 3）：静态分配表轮（轮内置换）+ per-槽协程骨架
 + 逐 k barrier 收集-同步 + 事件发射 + RNG 注册表 per-槽实例化 + 异常
-fail-fast + barrier 软/硬超时；两域（MR + BraTS）贯穿。**不含**（各进
-加厚期，#226）：续训分片、评测路径、判别器链（判别器更新步/混合条件
-配对批/u-v broadcast——骨架期判别器仅承载打分与 AUC 的 rollout 消费，
-恒 eval 相）、pretrain driver、生产入口（本门面仅被 fixture 测试驱动，
-#226 决策 1 生产入口单口径）。
+fail-fast + barrier 软/硬超时；两域（MR + BraTS）贯穿。
+
+rollout 期增量（#232，加厚 1/6）：**同源重构任务进 rollout 相**——per-槽
+``ReconstructionAssembler``（real 侧全池直读 + 槽 real_pool 流、重构流 =
+槽 recon 流，#218 五处消费面注入面零改动），消耗节奏钉 N_d（仅判别器步
+iteration ``iteration % N_d == 0`` 重构，recon/real_pool 流消耗节奏不漂，
+#217/#218）；配对批 fake = rollout 相当前权重 θ_t（drift #1 时点前移的
+机制落地——旧执行序在 update_policy 之后的 θ_{t+1}；装配前向
+模态同帧归位 eval——旧序装配位在 train_phase 之后，数值零影响：
+``_build`` 恒 no_grad、GroupNorm 无 batch 统计、全库无
+Dropout/BatchNorm）。打分归位消费点
+= ``RolloutPhase._to_pool_domain`` 单点除 scale factor——域换算缝按
+#226 接缝备忘保持开放（ADR-0015 DomainLatent 载体另行择期，实施时不
+动现有域换算点形态）。held-out AUC 并入 rollout 相的口径自骨架期保持
+（``SlotRunner.run_example`` 内 rollout → AUC，AUC 计时并入 rollout 相
+——旧侧独立 heldout_auc 相的映射来源，#217 §3）。
+
+**不含**（各进加厚期，#226）：续训分片、评测路径、判别器链（判别器更
+新步/混合条件配对批/u-v broadcast——本门面判别器仅承载打分与 AUC 的
+rollout 消费，恒 eval 相；重构任务的配对批记账待判别器步接上后消费，
+窗口批语义随判别器链期定型）、pretrain driver、生产入口（本门面仅被
+fixture 测试驱动，#226 决策 1 生产入口单口径）。
 """
 
 import asyncio
@@ -65,7 +82,9 @@ from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import LatentManifest
+from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
+from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import (
@@ -112,6 +131,12 @@ class SlotExample:
     steps: dict[int, StepRollout] = field(default_factory=dict)
     """按被优化训练步 k 索引的 rollout 记录（更新相任务的取数面）。"""
     update_seconds: float = 0.0
+    pair_batch: PairBatch | None = None
+    """同源重构配对批（rollout 相尾部任务产出，#232）：判别器步
+    iteration（``iteration % N_d == 0``）每槽装配一批，其余 iteration
+    为 None。判别器更新步属判别器链期——本记账是重构任务在 rollout
+    相的编排面与消耗序观测面（recon/real_pool 流随批消耗），消费点
+    随判别器链期接上。"""
 
 
 class CardReplica:
@@ -186,7 +211,14 @@ class CardReplica:
 class SlotRunner:
     """per-槽协程骨架：一个例子的 rollout 相协程与逐 k 更新任务协程的
     载体（#217 调度单元契约——每协程承载一个「例子」；协程经门面多路
-    复用到绑卡线程，torch 调用全部落在绑卡线程）。"""
+    复用到绑卡线程，torch 调用全部落在绑卡线程）。
+
+    rollout 相本体的编排序（#217 §3）：rollout（anchor → 扰动 → λ 续跑
+    → 打分）→ held-out AUC → 同源重构（判别器步 iteration）——三段同属
+    rollout 相，``rollout_seconds`` 计时窗口整体涵盖（AUC 与重构计入
+    rollout 相，phase_seconds 无独立条目——旧侧独立 heldout_auc 相的
+    映射口径，#217 相位集 rollout/trajectory/policy_update/discriminator）。
+    """
 
     def __init__(
         self,
@@ -194,26 +226,41 @@ class SlotRunner:
         updater: StepwisePolicyUpdate,
         rollout: RolloutPhase,
         auc: HeldOutAuc,
+        assembler: ReconstructionAssembler,
         advantage_clamp: float,
     ) -> None:
         self.slot = slot
         self._updater = updater
         self._rollout = rollout
         self._auc = auc
+        self._assembler = assembler
         self._advantage = MgaiAdvantage(clamp=advantage_clamp)
 
-    async def run_example(self, condition_name: str) -> SlotExample:
+    async def run_example(
+        self, condition_name: str, *, reconstruct: bool,
+    ) -> SlotExample:
         """一个例子的 rollout 相（分配表条件 → 初始噪声/扰动/续跑 →
-        打分 → held-out AUC——AUC 属 rollout 相口径，#217 §3）。"""
+        打分 → held-out AUC → 同源重构——AUC 与重构属 rollout 相口径，
+        #217 §3）。
+
+        ``reconstruct`` = 本 iteration 是否判别器步（门面按
+        ``iteration % N_d`` 判定派发）：真则 rollout 相尾部用本槽
+        assembler 装配同源重构配对批（fake = rollout 相当前权重 θ_t，
+        drift #1 时点前移；recon/real_pool 流消耗节奏钉 N_d——仅判别器
+        步 iteration 消耗、跨 iteration 连续不复位，#218）。"""
         started = time.monotonic()
         record = self._rollout.run_iteration(condition_name)
         heldout = self._auc.compute(record.new_fakes, record.modality)
+        pair = (
+            self._assembler.assemble(record.modality) if reconstruct else None
+        )
         return SlotExample(
             slot=self.slot,
             record=record,
             heldout_auc=heldout,
             rollout_seconds=time.monotonic() - started,
             steps={step.step_index: step for step in record.steps},
+            pair_batch=pair,
         )
 
     async def run_k(
@@ -300,12 +347,17 @@ class CardWorker:
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
 
     async def run_examples(
-        self, conditions: dict[int, str],
+        self, conditions: dict[int, str], *, reconstruct: bool,
     ) -> dict[int, SlotExample]:
         """本卡全部例子的 rollout 相（槽间并发 gather——协程多路复用
-        形态；torch 调用在本线程内串行落卡）。"""
+        形态；torch 调用在本线程内串行落卡）。``reconstruct`` = 判别器
+        步标志（门面按 N_d 节奏判定，透传各槽——同 iteration 全槽一致，
+        流消耗节奏跨槽同拍）。"""
         examples = await asyncio.gather(*(
-            slot.run_example(conditions[slot.slot]) for slot in self.slots
+            slot.run_example(
+                conditions[slot.slot], reconstruct=reconstruct,
+            )
+            for slot in self.slots
         ))
         return {example.slot: example for example in examples}
 
@@ -528,11 +580,18 @@ class AsyncTrainingExecutor:
         rng = SlotRngRegistry(
             config.schedule.seed, slot_count, owner_check=owner_check,
         )
+        # real 侧装载与守卫（两执行序共用装配缝）：全池直读、每槽独立
+        # 无放回采样 K 条——需量倍数传 1（判别器窗口的全局无放回批语义
+        # 随判别器链期定型，见 ``TrainingRuntime.assemble_real_pool``）
+        real_pool = TrainingRuntime.assemble_real_pool(
+            config, vocabulary, world_size=1,
+        )
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
         )
         # 逐条件形状契约的装配期对照（#129 消费侧守卫沿袭——词表工件与
-        # held-out manifest 的同名异形在首例测量时才炸属失败后移）
+        # held-out manifest 的同名异形在首例测量时才炸属失败后移；
+        # real 侧的对照在 assemble_real_pool 内）
         heldout.assert_condition_shapes(vocabulary)
         replicas = [replica] + [
             CardReplica.build(config, index, device, scorer_prototype)
@@ -550,7 +609,8 @@ class AsyncTrainingExecutor:
                 replica=replica,
                 slot_ids=bound_slots,
                 build_slots=cls._slot_assembly(
-                    config, replica, rng, vocabulary, heldout, bound_slots,
+                    config, replica, rng, vocabulary, real_pool, heldout,
+                    bound_slots,
                 ),
             ))
         return cls(
@@ -572,13 +632,16 @@ class AsyncTrainingExecutor:
         replica: CardReplica,
         rng: SlotRngRegistry,
         vocabulary: ConditionVocabulary,
+        real_pool: LatentManifest,
         heldout: LatentManifest,
         slot_ids: list[int],
     ) -> Callable[[], list[SlotRunner]]:
         """本卡槽装配的闭包工厂：在绑卡线程执行（流 owner-thread 断言
         的记录点 = 绑卡线程）——per-槽 RolloutPhase（槽 rollout 流注入，
-        #218 五处消费面注入面零改动口径）与 HeldOutAuc（槽 heldout 流）。
-        """
+        #218 五处消费面注入面零改动口径）、HeldOutAuc（槽 heldout 流）
+        与 ReconstructionAssembler（槽 real_pool 流的 real 侧全池直读
+        采样器 + 槽 recon 流的重构流——同源重构任务进 rollout 相，
+        #232；assembler 构造只读流种子、不消耗流位置）。"""
         amp = TrainingRuntime.amp_context(config, replica.device)
 
         def build_slots() -> list[SlotRunner]:
@@ -603,11 +666,24 @@ class AsyncTrainingExecutor:
                     ),
                     device=replica.device,
                 )
+                assembler = TrainingRuntime.assemble_pair_assembler(
+                    config,
+                    real_sampler=RealPoolSampler(
+                        real_pool,
+                        rng.get_stream(slot, TrainingRngStreams.REAL_POOL),
+                        replica.device,
+                    ),
+                    sampler=replica.sampler,
+                    conditions=replica.policy.conditions,
+                    generator=rng.get_stream(slot, TrainingRngStreams.RECON),
+                    amp=amp,
+                )
                 runners.append(SlotRunner(
                     slot,
                     replica.updater,
                     rollout,
                     auc,
+                    assembler,
                     config.grpo.advantage_clamp,
                 ))
             return runners
@@ -637,12 +713,13 @@ class AsyncTrainingExecutor:
         )
 
     def run(self) -> int:
-        """训练主循环（骨架期口径）：预热 → 绑卡线程启动 → 逐 iteration
-        （rollout 相 → 逐 k barrier → 事件发射）→ 线程收尾。返回完成的
-        iteration 数。无续训/评测/判别器链/checkpoint——各进加厚期
-        （#226 决策 3 骨架期包含面）。启动序在收尾兜底的 ``try`` 内：
-        第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）时已启动
-        的前序卡同样经 ``finally`` 收尾。"""
+        """训练主循环（骨架期口径 + rollout 期重构任务，#232）：预热 →
+        绑卡线程启动 → 逐 iteration（rollout 相 → 逐 k barrier → 事件
+        发射）→ 线程收尾。返回完成的 iteration 数。无续训/评测/判别器
+        链/checkpoint——各进加厚期（#226 决策 3 骨架期包含面；重构任务
+        的配对批记账无消费点属判别器链期，#234）。启动序在收尾兜底的
+        ``try`` 内：第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）
+        时已启动的前序卡同样经 ``finally`` 收尾。"""
         self._warmup()
         try:
             for card in self.cards:
@@ -671,14 +748,19 @@ class AsyncTrainingExecutor:
 
     async def _run_iteration(self, iteration: int) -> None:
         """单 iteration 执行序（#217 §3 相位结构）：rollout 相（全并发
-        零梯度耦合）→ train 相逐 k barrier（loss×(1/N)+SUM → 各卡一次
-        step）→ 事件发射（(iteration, slot) 排序写）。判别器更新步缺位
-        属骨架期口径（判别器链期落地，#226）。phase_seconds 只发
-        rollout / policy_update 两相（#217 §3 全集含 trajectory /
-        discriminator 的记档偏差）：trajectory 相现行仅 --dump 诊断
-        打点消费、骨架期无诊断路径，discriminator 相属判别器链期——
-        两相随各自加厚期补入。"""
+        零梯度耦合：rollout → held-out AUC → 同源重构）→ train 相逐 k
+        barrier（loss×(1/N)+SUM → 各卡一次 step）→ 事件发射（(iteration,
+        slot) 排序写）。同源重构钉判别器步节奏（``iteration % N_d == 0``,
+        #232——recon/real_pool 流消耗节奏不漂）；判别器更新步缺位属判
+        别器链期口径（#234）。phase_seconds 只发 rollout / policy_update
+        两相（#217 §3 全集含 trajectory / discriminator 的记档偏差）：
+        AUC 与重构计入 rollout 相（旧侧独立 heldout_auc 相的映射口径），
+        trajectory 相现行仅 --dump 诊断打点消费、本门面无诊断路径，
+        discriminator 相属判别器链期——两相随各自加厚期补入。"""
         started = time.monotonic()
+        reconstruct = (
+            iteration % self.config.reward.disc_update_interval_n_d == 0
+        )
         conditions = {
             slot: self.allocation.condition_for(iteration, slot)
             for slot in range(self.allocation.slot_count)
@@ -689,9 +771,10 @@ class AsyncTrainingExecutor:
             card.replica.policy.eval_phase()
         per_card = await self._collect(
             [
-                card.submit(card.run_examples({
-                    slot: conditions[slot] for slot in card.slot_ids
-                }))
+                card.submit(card.run_examples(
+                    {slot: conditions[slot] for slot in card.slot_ids},
+                    reconstruct=reconstruct,
+                ))
                 for card in self.cards
             ],
             iteration,

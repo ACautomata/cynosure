@@ -22,6 +22,7 @@ import math
 import random
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -30,20 +31,27 @@ import torch
 
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
+from cynosure.reward.artifacts import LatentManifest
+from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
+from cynosure.reward.sampler import RealPoolSampler
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import RunArtifacts
 from cynosure.train.executor import (
     AsyncTrainingExecutor,
     BarrierTimeoutPolicy,
+    SlotExample,
+    SlotRunner,
     TrainingAborted,
 )
+from cynosure.train.policy import GroupPolicy
 from cynosure.train.rng import (
     SLOT_SEED_STRIDE,
     DropoutGuard,
     SlotRngRegistry,
     TrainingRngStreams,
 )
+from cynosure.train.runtime import TrainingRuntime
 from tests.conftest import CliSession, FixtureArtifactLibrary, RunTrajectory
 from tests.test_mr_train import MrTrainScenario
 
@@ -98,6 +106,66 @@ class ExecutorScenario:
         return RunArtifacts(
             RunArtifacts.layout(self._tmp_path / run_name),
         ).read_events()
+
+    def spy_pair_batches(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> list[PairBatch]:
+        """``ReconstructionAssembler.assemble`` 的产出记录 spy（#232
+        重构任务的观测面：``SlotExample.pair_batch`` 记账的消费点属判
+        别器链期，测试面经类级 spy 观测产出——``HeldOutAuc`` 构造序
+        spy 同款先例）。单绑卡线程内调用序串行，list.append 无竞争。"""
+        calls: list[PairBatch] = []
+        real_assemble = ReconstructionAssembler.assemble
+
+        def recording(assembler, modality):
+            pair = real_assemble(assembler, modality)
+            calls.append(pair)
+            return pair
+
+        monkeypatch.setattr(ReconstructionAssembler, "assemble", recording)
+        return calls
+
+    def spy_slot_examples(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> list[SlotExample]:
+        """``SlotRunner.run_example`` 的返回记录 spy（#232 spec 评审第 3
+        轮补强）：``SlotExample`` 协程内创建、run 后不可达，经 wrap 真
+        实现取返回值观测记账链路的消费者端——装配层 spy
+        （``spy_pair_batches``）与流锚之下，若 ``run_example`` 返回构造
+        漏写 ``pair_batch=pair``，装配照调、流照耗、spy 照记而记账字段
+        静默缺失（全部测试照绿），本 spy 捕获的实例恰暴露 ``None``。"""
+        examples: list[SlotExample] = []
+        real_run_example = SlotRunner.run_example
+
+        async def recording(runner, condition_name, *, reconstruct):
+            example = await real_run_example(
+                runner, condition_name, reconstruct=reconstruct,
+            )
+            examples.append(example)
+            return example
+
+        monkeypatch.setattr(SlotRunner, "run_example", recording)
+        return examples
+
+    @staticmethod
+    def replay_recon_stream(
+        before: torch.Tensor,
+        *,
+        strokes: int,
+        batch_k: int,
+        latent_shape: tuple[int, ...],
+        step_count: int,
+    ) -> torch.Tensor:
+        """recon 流消耗序的重放终态（消耗序锚的共享重放面）：每笔 =
+        先抽 s（``randint(step_count, (K,))``）后抽 ε（``randn((K,
+        *latent),)``）——「先 s 后 ε」次序契约的消耗形状单点；与注册表
+        ``stream_state`` 逐位比较，任一失守（次序/消耗量/复位）即分道。"""
+        replay = torch.Generator()
+        replay.set_state(before)
+        for _ in range(strokes):
+            torch.randint(step_count, (batch_k,), generator=replay)
+            torch.randn((batch_k, *latent_shape), generator=replay)
+        return replay.get_state()
 
     def assert_state_dicts_bitwise(
         self, first: dict, second: dict, label: str,
@@ -528,13 +596,18 @@ class TestExecutorFixtureTier:
     ) -> None:
         """在线零复位不变式（#218）：流跨 iteration 连续推进——run 后的
         流状态 ≠ 注册时的初始派生状态（槽 0 的线性派生 = seed + 流偏移），
-        且无复位换装（同一实例，见 TestSlotRngRegistry）。"""
+        且无复位换装（同一实例，见 TestSlotRngRegistry）。rollout 期起
+        recon/real_pool 流随重构任务进场（#232：判别器步 iteration 的
+        rollout 相消耗，默认 N_d=1 每 iteration 一笔）。"""
         scenario = ExecutorScenario(cli, tmp_path)
         config = scenario.prepare(seed=4)
         config.schedule.max_iterations = 2
         executor = scenario.build(config, coroutines=2)
         executor.run()
-        for stream, offset in (("rollout", 0), ("heldout_auc", 3)):
+        for stream, offset in (
+            ("rollout", 0), ("heldout_auc", 3),
+            ("recon", 9), ("real_pool", 1),
+        ):
             state = executor.rng.stream_state(0, stream)
             initial = torch.Generator().manual_seed(4 + offset)
             assert not torch.equal(state, initial.get_state()), stream
@@ -655,6 +728,188 @@ class TestExecutorFixtureTier:
 
 @pytest.mark.gpu
 @pytest.mark.slow
+class TestRolloutPhaseReconstruction:
+    """rollout 期同源重构任务锚（#232）：任务进 rollout 相 + recon 流
+    per-槽消耗序（先 s 后 ε、跨 iteration 连续、节奏钉 N_d——#217 §3
+    相位序「打分 → held-out AUC → 同源重构」/#218 recon per-槽语义）
+    + 配对批 fake = rollout 相当前权重 θ_t（drift #1 时点前移的机制
+    锚；recon per-槽 = drift #2 的机制落地，迁移验收与 #1 并列归因）。
+
+    BraTS 单域逐条件同形（fixture latent 恒 [4,16,16,8]）：消耗序重放的
+    ε 形状与分配表采中的条件无关——消耗量锚在单域档钉死，MR 异形档的
+    消耗面由既有 full-width 锚隐式覆盖（N_d=1 默认跑重构在场）。"""
+
+    def test_reconstruction_task_produces_pair_batch_per_disc_step(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """N_d=1（默认节奏）：每槽每 iteration 一批——批属性（K 对、
+        两侧同形同源、条件 = 分配表条件、inference 产物无梯度）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=0)
+        config.schedule.max_iterations = 2
+        calls = scenario.spy_pair_batches(monkeypatch)
+        examples = scenario.spy_slot_examples(monkeypatch)
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        executor.run()
+        batch_k = config.reward.disc_batch_size_k
+        assert len(calls) == 4  # 2 iteration × 2 槽（槽间完成序不定，集合断言）
+        assert len(examples) == 4
+        assert all(
+            example.pair_batch is not None for example in examples
+        ), "SlotExample.pair_batch 记账缺失（run_example 返回构造断开）"
+        produced = Counter(pair.modality for pair in calls)
+        expected = Counter(
+            executor.allocation.condition_for(iteration, slot)
+            for iteration in range(2) for slot in range(2)
+        )
+        assert produced == expected, "重构批条件 ≠ 分配表派发条件"
+        for pair in calls:
+            assert pair.reals.shape[0] == batch_k
+            assert pair.fakes.shape == pair.reals.shape  # 同源配对逐样本同形
+            assert pair.fakes.requires_grad is False  # inference 前向无图
+            assert torch.isfinite(pair.fakes).all()
+
+    def test_reconstruction_pinned_to_n_d_cadence(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """消耗节奏钉 N_d（#217/#218：仅判别器步 iteration 重构，
+        recon/real_pool 流消耗节奏不漂）：N_d=2 两 iteration——装配恰
+        每槽一笔、recon 流恰一笔消耗（若非判别器步也重构即两笔，重放
+        分道）、real_pool 流恰一笔 randperm（条件候选域全量排列，非判
+        别器步多余消耗即分道）。「跨 iteration 连续不复位」不在本档分
+        界面——单笔重放下「判别器步前复位」与「跨步连续」终态同形不可
+        区分，连续性由 N_d=1 档 strokes=2 锚（
+        test_recon_stream_consumption_order_s_before_epsilon）钉死。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=4)
+        config.schedule.max_iterations = 2
+        config.reward.disc_update_interval_n_d = 2
+        calls = scenario.spy_pair_batches(monkeypatch)
+        examples = scenario.spy_slot_examples(monkeypatch)
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        before = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        before_pool = executor.rng.stream_state(
+            0, TrainingRngStreams.REAL_POOL,
+        )
+        executor.run()
+        assert len(calls) == 2  # 1 判别器步 × 2 槽（iter1 无重构调用）
+        assert Counter(
+            example.pair_batch is not None for example in examples
+        ) == Counter({True: 2, False: 2}), (
+            "记账对偶失守：判别器步 iteration 的 SlotExample.pair_batch 须"
+            "非 None、非判别器步须为 None"
+        )
+        assert Counter(pair.modality for pair in calls) == Counter(
+            executor.allocation.condition_for(0, slot) for slot in range(2)
+        ), (
+            "重构相位失守：装配批须来自 iteration 0（判别器步）的条件派发"
+            "——相位反转（重构落 iteration 1）时批条件来自 iter1 置换集"
+        )
+        after = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        assert torch.equal(after, scenario.replay_recon_stream(
+            before,
+            strokes=1,
+            batch_k=config.reward.disc_batch_size_k,
+            latent_shape=tuple(config.latent_shape),
+            step_count=len(sorted(config.policy.train_step_indices_m)),
+        )), (
+            "recon 流消耗 ≠ 恰一笔（先 s 后 ε）——N_d 节奏失守或跨 "
+            "iteration 复位/额外消耗"
+        )
+        after_pool = executor.rng.stream_state(
+            0, TrainingRngStreams.REAL_POOL,
+        )
+        manifest = LatentManifest.load(
+            config.reward.real_pool_manifest, kind="real_pool",
+        )
+        pool_n = sum(
+            1 for entry in manifest.entries
+            if entry.modality == executor.allocation.condition_for(0, 0)
+        )
+        replay_pool = torch.Generator()
+        replay_pool.set_state(before_pool)
+        torch.randperm(pool_n, generator=replay_pool)
+        assert torch.equal(after_pool, replay_pool.get_state()), (
+            "real_pool 流消耗 ≠ 恰一笔 randperm（条件候选域全量排列）——"
+            "判别器步之间的多余消耗或复位"
+        )
+
+    def test_recon_stream_consumption_order_s_before_epsilon(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """per-槽消耗序锚（#218「先 s 后 ε」次序契约的 executor 面）：
+        N_d=1 两 iteration 的槽 0 recon 流状态差 = randint(|M|,(K,)) +
+        randn((K, *latent)) × 2 笔的全序重放——消耗量与次序任一失守即
+        逐位分道。real_pool 流（real 侧采样轴，#218 裁流轴）同场推进由
+        ``test_streams_advance_without_reset`` 覆盖。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=3)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        before = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        executor.run()
+        after = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        assert torch.equal(after, scenario.replay_recon_stream(
+            before,
+            strokes=2,  # 2 iteration × N_d=1 = 2 个判别器步各一笔
+            batch_k=config.reward.disc_batch_size_k,
+            latent_shape=tuple(config.latent_shape),
+            step_count=len(sorted(config.policy.train_step_indices_m)),
+        )), (
+            "recon 流 2 iteration 全序重放失配——消耗序非「先 s 后 ε」"
+            "或消耗量非每判别器步恰一笔"
+        )
+
+    def test_reconstruction_uses_rollout_phase_weights(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """drift #1 机制锚：配对批 fake = rollout 相当前权重 θ_t（#217
+        §3 时点前移——旧执行序为 update_policy 之后的 θ_{t+1}）。同
+        seed 同 config 下，run 内 iter0 的装配批与「未 run 的等价装配
+        （θ_0 权重 + 流初始位消耗一笔）」逐位一致——若重构错误地落在
+        policy 更新后（θ_1 权重），逐位比较必然分道。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=6)
+        config.schedule.max_iterations = 1
+        calls = scenario.spy_pair_batches(monkeypatch)
+        executor = scenario.build(config, coroutines=1, owner_check=True)
+        executor.run()
+        pair_run = calls[0]
+        condition_name = executor.allocation.condition_for(0, 0)
+        # θ_0 权重 + 同源流位的等价装配（同 config 同 seed：网络经
+        # checkpoint 装载逐位等价、槽 0 流 = 注册表同派生公式的初始位）
+        device = torch.device("cpu")
+        policy = GroupPolicy.build(
+            config, torch.Generator().manual_seed(config.schedule.seed), device,
+        )
+        real_pool = LatentManifest.load(
+            config.reward.real_pool_manifest, kind="real_pool",
+        )
+        registry = SlotRngRegistry(config.schedule.seed, slots=1)
+        manual_assembler = TrainingRuntime.assemble_pair_assembler(
+            config,
+            real_sampler=RealPoolSampler(
+                real_pool,
+                registry.get_stream(0, TrainingRngStreams.REAL_POOL),
+                device,
+            ),
+            sampler=TrainingRuntime.assemble_sampler(
+                config, policy.field, device=device,
+            ),
+            conditions=policy.conditions,
+            generator=registry.get_stream(0, TrainingRngStreams.RECON),
+            amp=TrainingRuntime.amp_context(config, device),
+        )
+        pair_manual = manual_assembler.assemble(condition_name)
+        scenario.assert_state_dicts_bitwise(
+            {"reals": pair_run.reals, "fakes": pair_run.fakes},
+            {"reals": pair_manual.reals, "fakes": pair_manual.fakes},
+            "rollout 相重构批 vs θ_0 等价装配",
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
 class TestExecutorMultiCardTier:
     """gauss 多卡 e2e 档（slow+gpu；换发射方式重建，#217 门面 + M1）：
     跨卡一致性 + 层 3 同 seed 多卡重放锚薄切片形态。"""
@@ -705,9 +960,15 @@ class TestExecutorMultiCardTier:
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """层 3 薄切片锚（#218 三层锚③，gauss 多卡）：同 seed 两 run——
-        卡 0 权重 + spectral buffer + RunTrajectory 事件流逐位一致
-        （NCCL allreduce 逐位确定，#215 双栈实证；全强度形态随判别器
-        链期，#226）。"""
+        卡 0 权重 + spectral buffer + RunTrajectory 事件流 + recon/
+        real_pool 流终态逐位一致（NCCL allreduce 逐位确定，#215 双栈
+        实证；全强度形态随判别器链期，#226）。
+
+        流终态在比较面（#232 spec 评审补强）：recon/real_pool 流终态
+        是重构消耗序的确定函数——重构 no_grad 不改权重、pair_batch 无
+        事件，重构在多卡路径被静默跳过或消耗序漂移时权重/事件面不敏
+        感，逐位比较把盲区关上（rollout/heldout 流已分别被权重与事件
+        heldout_auc 间接涵盖，不重复入面）。"""
         card_count = self._visible_card_count()
         if card_count < 2:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）")
@@ -737,3 +998,12 @@ class TestExecutorMultiCardTier:
         assert RunTrajectory(scenario.events("run1")) == RunTrajectory(
             scenario.events("run2"),
         )
+        for slot in range(first.allocation.slot_count):
+            for stream in (
+                TrainingRngStreams.RECON,
+                TrainingRngStreams.REAL_POOL,
+            ):
+                assert torch.equal(
+                    first.rng.stream_state(slot, stream),
+                    second.rng.stream_state(slot, stream),
+                ), f"槽 {slot} 流 {stream} 终态失配：重构消耗序在多卡路径漂移"

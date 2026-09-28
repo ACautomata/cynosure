@@ -330,12 +330,8 @@ class TrainingRuntime:
         # 条件集 = 本域条件名清单（#129 经词汇表装配注入）；切片视图供
         # RealPoolSampler 消费（分布式 = 本 rank 条带切片，单进程 = 全池恒等）
         vocabulary = cls.assemble_vocabulary(config)
-        real_pool = LatentManifest.load(
-            config.reward.real_pool_manifest, kind="real_pool",
-        )
-        real_pool.assert_condition_capacity(
-            config.reward.disc_batch_size_k, dist.world_size,
-            vocabulary.names(),
+        real_pool = cls.assemble_real_pool(
+            config, vocabulary, dist.world_size,
         )
         heldout_real = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -344,8 +340,8 @@ class TrainingRuntime:
         # fake 侧形状经 vocabulary.latent_shape(name) 解析、real 侧经
         # manifest 的 condition_latent_shapes 装载，两来源同名异形（词表
         # 工件改动而 manifest 未重建）此前只在首次判别器拼接时才炸——
-        # 装配期显式拒绝（held-out 侧同款：分簇/AUC 的 real 侧同源）
-        real_pool.assert_condition_shapes(vocabulary)
+        # 装配期显式拒绝（held-out 侧同款：分簇/AUC 的 real 侧同源；
+        # real 侧的对照在 assemble_real_pool 内）
         heldout_real.assert_condition_shapes(vocabulary)
         real_view = RankSlicedPool(real_pool, dist, vocabulary.names()).view()
         update = OnlineUpdate(
@@ -363,7 +359,7 @@ class TrainingRuntime:
             overfit=OverfitMonitor(
                 config.reward, conditions=vocabulary.names(),
             ),
-            assembler=cls._assemble_pair_assembler(
+            assembler=cls.assemble_pair_assembler(
                 config,
                 real_sampler=RealPoolSampler(
                     real_view, rng.real_pool, amp.device,
@@ -376,7 +372,35 @@ class TrainingRuntime:
         )
 
     @classmethod
-    def _assemble_pair_assembler(
+    def assemble_real_pool(
+        cls,
+        config: CynosureConfig,
+        vocabulary: ConditionVocabulary,
+        world_size: int,
+    ) -> LatentManifest:
+        """real sample pool manifest 的装载与守卫单点（两执行序共用装配
+        缝）：装载 → 逐条件容量守卫（全量 ≥ K × ``world_size``）→ 逐条件
+        形状契约对照（#129 消费侧守卫）。
+
+        ``world_size`` = 守卫的需量倍数，按执行序的 real 侧数据访问形态
+        取值：旧执行序条带切片（``entries[rank::world]``）下「每 rank 视图
+        ≥ K」的等价条件 = K × world_size（判定放全量保失败路径全 rank
+        一致，ADR-0008 决策 4 / ADR-0008-03）；async 执行序全池直读、
+        每槽独立无放回采样 K 条（槽间独立抽取，判别器窗口的全局无放回
+        批语义随判别器链期定型，#232）——每槽供满的真实前提 = 全池
+        ≥ K，传 1。无放回采样语义不动，不引入有放回采样补洞。"""
+        real_pool = LatentManifest.load(
+            config.reward.real_pool_manifest, kind="real_pool",
+        )
+        real_pool.assert_condition_capacity(
+            config.reward.disc_batch_size_k, world_size,
+            vocabulary.names(),
+        )
+        real_pool.assert_condition_shapes(vocabulary)
+        return real_pool
+
+    @classmethod
+    def assemble_pair_assembler(
         cls,
         config: CynosureConfig,
         real_sampler: RealPoolSampler,
@@ -394,7 +418,12 @@ class TrainingRuntime:
         按组装配的采样场）。跨模态阶段（组2）同源重构的**语义**未裁决：
         真正的「同源」需要（源影像, 目标标签）配对条件化、真实样本库现
         无源影像（ADR-0012 非目标，stage-2 到来时另行设计）——机制缝本
-        票照常对组2 开放（机械链路可行），判别任务语义留待专项票。"""
+        票照常对组2 开放（机械链路可行），判别任务语义留待专项票。
+
+        两执行序共用：旧执行序经 ``assemble_rewards``（real 侧 = 本 rank
+        条带切片采样器）；async 执行序经执行门面的 per-槽装配（real 侧
+        = 全池直读采样器 + 槽 real_pool 流、重构流 = 槽 recon 流，
+        #218 五处消费面注入面零改动口径、#232 rollout 相重构任务）。"""
         if (sampler is None) != (conditions is None):
             raise ValueError(
                 "配对批装配原语的 policy 侧依赖须成对提供：sampler 与 "
