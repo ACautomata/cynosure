@@ -55,13 +55,13 @@ from typing import Any, TypeVar
 
 import torch
 
+from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.distributed.process import (
     DistributedContext,
     PG_TIMEOUT_MINUTES_ENV,
 )
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
-from cynosure.policy.numerics import AMP_DTYPES, AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import LatentManifest
@@ -150,9 +150,7 @@ class CardReplica:
         #165 挂死类结构性消失）+ 逐 k 更新编排。判别器副本钉 eval 相
         （骨架期无判别器更新步，打分/AUC 前向不得推进 spectral norm
         幂迭代）。"""
-        amp = AmpContext(
-            device=device, dtype=AMP_DTYPES[config.policy.amp_dtype],
-        )
+        amp = TrainingRuntime.amp_context(config, device)
         # GroupPolicy 的条件分布主流在新执行序无消费（目标条件来自分配
         # 表、组2 端内自由度显式传槽流，见 SlotRunner/RolloutPhase）——
         # 此处注入独立一次性 generator 仅满足装配签名
@@ -573,7 +571,7 @@ class AsyncTrainingExecutor:
         config: CynosureConfig,
         replica: CardReplica,
         rng: SlotRngRegistry,
-        vocabulary,
+        vocabulary: ConditionVocabulary,
         heldout: LatentManifest,
         slot_ids: list[int],
     ) -> Callable[[], list[SlotRunner]]:
@@ -581,9 +579,7 @@ class AsyncTrainingExecutor:
         的记录点 = 绑卡线程）——per-槽 RolloutPhase（槽 rollout 流注入，
         #218 五处消费面注入面零改动口径）与 HeldOutAuc（槽 heldout 流）。
         """
-        amp = AmpContext(
-            device=replica.device, dtype=AMP_DTYPES[config.policy.amp_dtype],
-        )
+        amp = TrainingRuntime.amp_context(config, replica.device)
 
         def build_slots() -> list[SlotRunner]:
             runners = []
@@ -762,7 +758,7 @@ class AsyncTrainingExecutor:
         iteration: int,
         step_index: int | None,
         enforce_timeout: bool,
-    ) -> list:
+    ) -> list[Any]:
         """barrier 等待与 fail-fast 门面：任一槽线程异常 →
         ``TrainingAborted``（原异常挂 cause）；软超时 → 告警事件（主
         线程 = 卡 0 写出口径）后继续等待；硬超时 → fail-fast。rollout

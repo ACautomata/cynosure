@@ -130,11 +130,9 @@ class TrainingRuntime:
         # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
         # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
         # （cuda:LOCAL_RANK）错位；CPU fixture 下即 cpu
-        amp = AmpContext(
-            device=(
-                device if device is not None else dist.local_device()
-            ),
-            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        amp = cls.amp_context(
+            config,
+            device if device is not None else dist.local_device(),
         )
         sharding = PolicySharding.from_config(dist, config)
         # FSDP 包装在 optimizer 构建之前（优化器状态活在分片后参数上）
@@ -451,3 +449,13 @@ class TrainingRuntime:
                 config.reward,
                 ChannelStats.load(config.reward.channel_stats_json),
             )
+
+    @staticmethod
+    def amp_context(
+        config: CynosureConfig, device: torch.device,
+    ) -> AmpContext:
+        """数值口径的装配单点（amp_dtype → ``AmpContext`` 的同形构造
+        单点：本类 ``build`` 与 async 门面的副本/槽装配三处共享）。"""
+        return AmpContext(
+            device=device, dtype=AMP_DTYPES[config.policy.amp_dtype],
+        )
