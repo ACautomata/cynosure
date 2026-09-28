@@ -54,11 +54,9 @@ class StepwisePolicyUpdate:
         ``advantages`` 已是 MGAI 融合后的组内方向 advantage（rollout 相
         产出）；``old_log_probs`` 是 rollout 记录的 π_old、本方法不改动。
         """
-        with torch.autocast(self._device_type, dtype=self._amp_dtype):
-            new_log_probs = self.sampler.evaluate_log_prob(
-                x_k, step_index, condition, directions,
-            )
-            loss = self.loss_fn.loss(new_log_probs, old_log_probs, advantages)
+        loss = self._surrogate_loss(
+            step_index, x_k, condition, directions, old_log_probs, advantages,
+        )
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -97,3 +95,21 @@ class StepwisePolicyUpdate:
         reported = float(loss.detach())
         (loss / example_count).backward()
         return reported
+
+    def _surrogate_loss(
+        self,
+        step_index: int,
+        x_k: torch.Tensor,
+        condition: RolloutCondition,
+        directions: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """autocast 场内的共享前段：log π 重算（当前权重）→ clipped
+        surrogate loss（``step`` 与 ``accumulate`` 的同形块单点；纯代码
+        移动，数值路径与提取前逐位一致）。"""
+        with torch.autocast(self._device_type, dtype=self._amp_dtype):
+            new_log_probs = self.sampler.evaluate_log_prob(
+                x_k, step_index, condition, directions,
+            )
+            return self.loss_fn.loss(new_log_probs, old_log_probs, advantages)

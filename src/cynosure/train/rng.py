@@ -128,12 +128,7 @@ class SlotRngRegistry:
         ``owner_check`` 开启时本出口记录首次取流的线程 id，异线程再取
         即拒绝（fail-fast）——静态绑卡下每槽的流只应被其绑卡线程触碰
         （主线程装配期取流 + 绑卡线程消费的混用在此显式暴露）。"""
-        streams = self._slots[self._resolve_slot(slot)]
-        if stream not in streams.named():
-            raise ValueError(
-                f"流名 {stream!r} 不在注册表（在册：{sorted(streams.named())}）"
-            )
-        generator = getattr(streams, stream)
+        generator = self._stream(slot, stream)
         if self._owners is not None:
             self._assert_owner(slot, stream)
         return generator
@@ -142,12 +137,17 @@ class SlotRngRegistry:
         """槽 × 流的 generator 状态**只读**观测面（锚测试断言流推进/零
         复位的取数口）：读状态不消费流、不触发 owner-thread 断言——
         观测不是消耗，注册表消费面（``get_stream``）与本观测面分离。"""
+        return self._stream(slot, stream).get_state()
+
+    def _stream(self, slot: int, stream: str) -> torch.Generator:
+        """槽 × 流的 generator 解析（槽界与流名在册校验单点；``get_stream``
+        与 ``stream_state`` 的共享前段）。"""
         streams = self._slots[self._resolve_slot(slot)]
         if stream not in streams.named():
             raise ValueError(
                 f"流名 {stream!r} 不在注册表（在册：{sorted(streams.named())}）"
             )
-        return getattr(streams, stream).get_state()
+        return getattr(streams, stream)
 
     def _resolve_slot(self, slot: int) -> int:
         if not 0 <= slot < len(self._slots):
@@ -171,3 +171,23 @@ class SlotRngRegistry:
                 "只允许绑卡线程消费（#215 三律：跨线程共享 generator "
                 "并发 draw 静默不可重放）"
             )
+
+
+class DropoutGuard:
+    """装配期 dropout 守卫（#218 §3）：policy 与判别器构建后断言模块树
+    内全部 dropout 概率为 0——dropout 的随机消耗绕开 per-槽流注册表
+    （模块内部直抽全局流），是「流派生可重放」锚的结构破坏者；违者
+    装配期 fail-fast，机器锚长期成立的前提。"""
+
+    @staticmethod
+    def assert_clean(module: torch.nn.Module, origin: str) -> None:
+        """模块树内凡持概率属性 ``p`` 的子模块断言其为 0（torch 与
+        MONAI 的 dropout 层同约定）；``origin`` = 违例文案的装配来源。"""
+        for name, child in module.named_modules():
+            probability = getattr(child, "p", None)
+            if isinstance(probability, float) and probability > 0:
+                raise ValueError(
+                    f"{origin} 的子模块 {name!r} dropout={probability}："
+                    "dropout 绕开注册表直接消耗随机流（#218），装配期"
+                    "拒绝——把网络配置的 dropout 置 0"
+                )

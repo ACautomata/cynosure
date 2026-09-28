@@ -46,12 +46,12 @@ fail-fast + barrier 软/硬超时；两域（MR + BraTS）贯穿。**不含**（
 
 import asyncio
 import copy
-import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 import torch
 
@@ -62,6 +62,7 @@ from cynosure.distributed.process import (
 )
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
+from cynosure.policy.sampler import RolloutSampler
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.auc import HeldOutAuc
@@ -74,8 +75,10 @@ from cynosure.train.artifacts import (
 )
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase, StepRollout
-from cynosure.train.rng import SlotRngRegistry, TrainingRngStreams
+from cynosure.train.rng import DropoutGuard, SlotRngRegistry, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
+
+_T = TypeVar("_T")
 
 _STAGE_TAG = 1
 """骨架期事件的阶段号（单阶段组缺省；组3 StageTag 机制属 trainer 面，
@@ -122,7 +125,7 @@ class CardReplica:
         device: torch.device,
         policy: GroupPolicy,
         scorer: RewardScorer,
-        sampler,
+        sampler: RolloutSampler,
         updater: StepwisePolicyUpdate,
     ) -> None:
         self.index = index
@@ -170,7 +173,16 @@ class CardReplica:
         )
         scorer = copy.deepcopy(scorer_prototype).to(device)
         scorer.eval()
+        DropoutGuard.assert_clean(scorer, origin="判别器 scorer 副本")
         return cls(index, device, policy, scorer, sampler, updater)
+
+    def gradient_tensors(self) -> list[torch.Tensor | None]:
+        """可训练网络的逐参梯度出口（逐 k 归约的取数面——归约器不摸
+        副本内部结构）；无梯度参数以 None 占位（跨副本结构性一致，
+        归约器恒跳过）。"""
+        return [
+            parameter.grad for parameter in self.policy.network.parameters()
+        ]
 
 
 class SlotRunner:
@@ -284,7 +296,7 @@ class CardWorker:
                 f"卡 {self.index} 的槽装配失败"
             ) from self._failure
 
-    def submit(self, coroutine) -> Future:
+    def submit(self, coroutine: Coroutine[Any, Any, Any]) -> Future:
         """协程派发到本卡线程（concurrent Future 回传：异常自动传播，
         research T10 的通道形态）。"""
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
@@ -356,13 +368,13 @@ class PerKCollectReduce:
 
     def reduce(self, replicas: list[CardReplica]) -> None:
         """单 k 的跨卡梯度归约：逐 tensor 串行发射（~30 调用/barrier 的
-        实证形态；分桶 ~25MB 属性能缝，骨架期取最简逐 tensor）。"""
-        tensors = self._across_cards(replicas, lambda device: None)
-        if tensors is None:
+        实证形态；分桶 ~25MB 属性能缝，骨架期取最简逐 tensor）。梯度经
+        副本出口（``gradient_tensors``）取数，归约器不触碰副本内部
+        结构。"""
+        if not self._validate_multicard(replicas):
             return
         for grads in zip(*(
-            [parameter.grad for parameter in replica.policy.network.parameters()]
-            for replica in replicas
+            replica.gradient_tensors() for replica in replicas
         )):
             if grads[0] is None:
                 # 无梯度参数跨副本结构性一致（同一前向图）；全零参与只会
@@ -373,17 +385,27 @@ class PerKCollectReduce:
             )
 
     @staticmethod
-    def _across_cards(replicas: list[CardReplica], make) -> list | None:
-        """多卡 CUDA 拓扑判定的归一出口：非多卡（单副本）返回 None（无
-        跨卡归约面）；多卡副本设备须全为 CUDA（M1 前提——NCCL 只收
-        CUDA/HIP 张量；CPU fixture 恒单卡）。"""
+    def _validate_multicard(replicas: list[CardReplica]) -> bool:
+        """多卡归约面的判定单点：单副本 = False（无跨卡归约面，结构性
+        退化为本卡累积即全局平均）；多卡副本设备须全为 CUDA（M1 前提
+        ——NCCL 只收 CUDA/HIP 张量；CPU fixture 恒单卡）。"""
         if len(replicas) <= 1:
-            return None
+            return False
         devices = {replica.device for replica in replicas}
         if any(device.type != "cuda" for device in devices):
             raise ValueError(
                 f"多副本归约要求全部副本落 CUDA 设备，得到 {sorted(map(str, devices))}"
             )
+        return True
+
+    @staticmethod
+    def _across_cards(
+        replicas: list[CardReplica], make: Callable[[torch.device], _T],
+    ) -> list[_T] | None:
+        """多卡逐副本产值（预热占位张量等）：``_validate_multicard``
+        判定通过后逐副本调 ``make``；单副本返回 None。"""
+        if not PerKCollectReduce._validate_multicard(replicas):
+            return None
         return [make(replica.device) for replica in replicas]
 
 
@@ -428,13 +450,11 @@ class BarrierTimeoutPolicy:
     @classmethod
     def from_env(cls) -> "BarrierTimeoutPolicy":
         """生产口径：环境变量（分钟）→ 硬超时秒数；未设置 = 缺省 10
-        分钟；非正整数显式拒绝。"""
-        raw = os.environ.get(cls.ENV)
-        minutes = cls.DEFAULT_HARD_MINUTES if raw is None else int(raw)
-        if minutes <= 0:
-            raise ValueError(
-                f"{cls.ENV} 须为正整数分钟，得到 {raw!r}"
-            )
+        分钟；非正整数显式拒绝（读取/校验单点 =
+        ``DistributedContext.parse_timeout_minutes``）。"""
+        minutes = DistributedContext.parse_timeout_minutes()
+        if minutes is None:
+            minutes = cls.DEFAULT_HARD_MINUTES
         return cls(minutes * 60)
 
 

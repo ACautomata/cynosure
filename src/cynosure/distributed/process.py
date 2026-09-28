@@ -89,9 +89,10 @@ class DistributedContext:
         return "nccl" if torch.cuda.is_available() else "gloo"
 
     @staticmethod
-    def _pg_timeout() -> datetime.timedelta | None:
-        """进程组 watchdog 超时（``PG_TIMEOUT_MINUTES_ENV`` 分钟数；未设置
-        返回 None = init_process_group 不传参、保持 torch 默认）。"""
+    def parse_timeout_minutes() -> int | None:
+        """``PG_TIMEOUT_MINUTES_ENV`` 的分钟值解析单点（两执行序共享的
+        读取/校验段，#231 语义换绑的另一半）：未设置 = None（各执行序
+        自取缺省）；非正整数显式拒绝。"""
         raw = os.environ.get(PG_TIMEOUT_MINUTES_ENV)
         if raw is None:
             return None
@@ -100,6 +101,15 @@ class DistributedContext:
             raise ValueError(
                 f"{PG_TIMEOUT_MINUTES_ENV} 须为正整数分钟，得到 {raw!r}"
             )
+        return minutes
+
+    @staticmethod
+    def _pg_timeout() -> datetime.timedelta | None:
+        """进程组 watchdog 超时（``PG_TIMEOUT_MINUTES_ENV`` 分钟数；未设置
+        返回 None = init_process_group 不传参、保持 torch 默认）。"""
+        minutes = DistributedContext.parse_timeout_minutes()
+        if minutes is None:
+            return None
         return datetime.timedelta(minutes=minutes)
 
     @property

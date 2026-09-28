@@ -40,6 +40,7 @@ from cynosure.train.executor import (
 )
 from cynosure.train.rng import (
     SLOT_SEED_STRIDE,
+    DropoutGuard,
     SlotRngRegistry,
     TrainingRngStreams,
 )
@@ -324,6 +325,25 @@ class TestSlotRngRegistry:
             registry.get_stream(0, "nope")
         with pytest.raises(ValueError):
             registry.get_stream(5, "rollout")
+
+
+class TestDropoutGuard:
+    """装配期 dropout 守卫锚（#218 §3：dropout 绕开注册表消耗随机流，
+    装配期 fail-fast；policy/scorer 两侧的装配通过由 fixture 档全流程
+    隐式覆盖——真实网络树全零 dropout 才能装配）。"""
+
+    def test_rejects_positive_dropout(self) -> None:
+        block = torch.nn.Sequential(
+            torch.nn.Linear(4, 4), torch.nn.Dropout(p=0.2),
+        )
+        with pytest.raises(ValueError, match="dropout=0.2"):
+            DropoutGuard.assert_clean(block, origin="探针")
+
+    def test_allows_zero_dropout_and_plain_modules(self) -> None:
+        block = torch.nn.Sequential(
+            torch.nn.Linear(4, 4), torch.nn.Dropout(p=0.0),
+        )
+        DropoutGuard.assert_clean(block, origin="探针")
 
 
 class TestBarrierTimeoutPolicy:
