@@ -36,6 +36,30 @@ class LsganTerms:
     fake_term: torch.Tensor
 
 
+SCORE_CHUNK = 8
+"""判别器打分前向的定块上界（3D 体数/块）：GroupNorm 前向对 batch 维
+逐样本独立，分块与全批逐位等价；rank 统计在展平分数上拼接不改口径。
+``HeldOutAuc.SCORE_CHUNK`` 的单一来源（#234 提取——分块打分循环在
+HeldOutAuc / PooledHeldOutAuc / 门面 fake 打分三处的同一实现）。"""
+
+
+class ChunkedScorer:
+    """判别器定块打分的单一实现（score 前向的 SCORE_CHUNK 分块 +
+    展平拼接）。AUC 是分数上的 rank 统计，分块只约束显存、不改数值
+    口径；打分前向恒 no_grad（调用方保证 eval 相——spectral norm
+    幂迭代不被监控/打分推进）。"""
+
+    def __init__(self, scorer: "LatentScorer") -> None:
+        self._scorer = scorer
+
+    def scores(self, latents: torch.Tensor) -> torch.Tensor:
+        """定块打分 → 展平分数（一维；块序 = 批序，拼接不改秩口径）。"""
+        return torch.cat([
+            self._scorer.patch_logits(latents[start:start + SCORE_CHUNK])
+            for start in range(0, latents.shape[0], SCORE_CHUNK)
+        ]).flatten()
+
+
 class LatentScorer(Protocol):
     """给 rollout 的 latent 打分的策略接口（glossary「Reward model」：
     给 rollout 的 latent 打标量分的在线判别器）。

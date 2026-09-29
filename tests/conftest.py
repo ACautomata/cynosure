@@ -23,7 +23,7 @@ from cynosure.cli import CynosureCli
 from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIES
 from cynosure.fixtures import Fixture
 from cynosure.reward.assembly import PairBatch
-from cynosure.reward.update import UpdateReport
+from cynosure.reward.update import ConditionUpdateDetail, UpdateReport
 
 
 def enforce_deterministic_kernels() -> None:
@@ -631,13 +631,21 @@ class RecordingUpdate:
         self.received.append(pair)
         self.modalities.append(pair.modality)
         self.training_at_call.append(self.scorer.discriminator.training)
-        return UpdateReport(
+        # 升格形态（#220 决议 11）：单条件一步 = 单桶明细；单值消费面
+        # 经 property 派生
+        detail = ConditionUpdateDetail(
+            condition=pair.modality,
             loss_discriminator=0.0,
             loss_real_term=0.0,
             loss_fake_term=0.0,
-            batch_size=pair.reals.shape[0],
-            modality=pair.modality,
+            pair_count=pair.reals.shape[0],
             train_pairwise_acc=0.5,
+        )
+        return UpdateReport(
+            conditions=(detail,),
+            batch_size=pair.reals.shape[0],
+            global_batch_size=pair.reals.shape[0],
+            loss_discriminator=0.0,
         )
 
 

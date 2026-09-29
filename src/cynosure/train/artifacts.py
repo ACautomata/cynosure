@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
+from cynosure.train.allocation import SeedMixer
 
 _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
@@ -26,6 +27,34 @@ _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 POLICY_CHECKPOINT_TEMPLATE = "policy_iter{iteration}.pt"
 """policy checkpoint 文件名模板（契约布局的一部分：组3 stage-1 的复用
 查找 ``SequentialTrainer._locate_stage1_product`` 按同一形态解析）。"""
+
+
+class DiscConditionReading(BaseModel):
+    """判别器步单条件的观测读数（#220 决议 11/13：per-condition 明细
+    的事件面）。loss 组件为未缩放本桶值；``divergence_ema`` 为该条件
+    分叉 EMA 的本步读数（N_d 跳过或非本卡桶条件为 None）。"""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    loss: float
+    loss_real_term: float
+    loss_fake_term: float
+    pair_count: int
+    train_pairwise_acc: float
+    divergence_ema: float | None = None
+
+
+class DiscUpdateDetail(BaseModel):
+    """判别器步的逐条件明细事件面（#220 决议 11：UpdateReport 升格在
+    iter 事件的映射；可扩不可改名）。``weighted_loss`` = 本卡
+    Σ_b loss_b×(n_b/N_total)（#220 决议 8 逐对等权全局 mean 的上报
+    面）；``global_batch_size`` = N_total = K×卡数。"""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    global_batch_size: int
+    weighted_loss: float
+    conditions: dict[str, DiscConditionReading]
 
 
 class IterEvent(BaseModel):
@@ -52,18 +81,36 @@ class IterEvent(BaseModel):
     loss/AUC 按目标序列归因的轴（per-sequence 健康监控，experiment-design）。"""
     anchor_eval_reward: float
     intra_group_reward_std: float
-    heldout_auc: float
+    heldout_auc: float | None = None
+    """本例条件的 held-out AUC 池化读数（判别器更新前快照测量，#220
+    决议 12/14）：判别器步 iter = 本窗口本条件读数；非判别器步 iter =
+    该条件最后一次有效池化读数的桥接值（「窗口内最后一次有效测量」的
+    窗口延拓）；该条件在本 run 尚无读数（首现于非判别器步 iter、所在
+    窗口的测量尚未发生）= None——「每活跃条件恰一次读数」的消耗面：
+    非判别器步 iter 不采样不打分。与 ``train_pairwise_acc``/
+    ``disc_update`` 的 N_d 跳过 None 惯用法同构。观测面扩展：事件契约
+    可扩不可改名。"""
     loss: dict[str, float]
     train_pairwise_acc: float | None = None
     """train 侧干净域 pairwise 准确率（ADR-0009-β）：本 iteration 判别器
     更新批上的干净域 no_grad 复算（更新前快照，随单步更新报告上行）。
-    N_d 跳过的 iteration（无判别器步）为 None。观测面扩展：事件契约
-    可扩不可改名。"""
+    N_d 跳过的 iteration（无判别器步）为 None。判别器链期（#234）升格
+    per-condition：判别器步时填**本例条件**桶的复算值（本卡 per-condition
+    全量见 ``disc_update.conditions``）。观测面扩展：事件契约可扩不可改
+    名。"""
     overfit_divergence_ema: float | None = None
     """per-condition 分叉 EMA（ADR-0009-β）：EMA(train pairwise acc −
-    held-out AUC) 的本 rank 读数——按 rank 独立计算落盘（rank 间离散
-    是数据切片异质性的诊断信号，不跨 rank 平均）。N_d 跳过的 iteration
-    为 None。观测面扩展：事件契约可扩不可改名。"""
+    held-out AUC) 的本例条件读数——rank 轴随执行模型退役（#220 决议
+    13：AUC 与 train acc 池化为 per-condition 单值、分叉每条件一条，
+    rank 离散的数据切片异质性诊断对象在单进程全池下结构性消失）；本
+    字段为 per-例事件上的桥接单值（判别器步时 = 本例条件读数）。
+    N_d 跳过的 iteration 为 None。观测面扩展：事件契约可扩不可改名。"""
+    disc_update: DiscUpdateDetail | None = None
+    """判别器步明细（#220 决议 11，判别器链期 #234 落地）：N_d 跳过的
+    iteration 为 None；判别器步时携带全局量（N_total = K×卡数）+ 本卡
+    逐条件明细（loss 组件 / pair_count / train acc / 分叉 EMA）——
+    同卡同 iteration 的各例事件各带本卡全量明细（一致读数）。观测面
+    扩展：事件契约可扩不可改名。"""
     lr: float
     elapsed_s: float
     phase_seconds: dict[str, float] = Field(default_factory=dict)
@@ -115,8 +162,11 @@ class OverfitAlertEvent(BaseModel):
     自下而上越线时由编排方产出——RL 相由 train 循环产出（随 iter 事件
     同归并序写出），预训练相由预训练 driver 产出（随 pretrain 事件
     之后写出；分布式预训练经 gather 归并到 rank0、``rank`` 归因观测
-    rank，ADR-0016 决策 8）——按 rank 独立计算（rank 间离散是数据切片
-    异质性的诊断信号，不跨 rank 平均）。**报警不动作**：事件只承载
+    rank，ADR-0016 决策 8）。**rank 轴随执行模型退役**（#220 决议 13）：
+    async 执行序的 per-condition 分叉是池化单值（rank 离散的数据切片
+    异质性诊断对象结构性消失），``rank`` 字段在 async 门面填 0（主
+    线程 = 卡 0 写出口径，与 barrier_soft_timeout 同）；预训练相的
+    rank 归因语义随旧执行序留存至其删除。**报警不动作**：事件只承载
     读数，无任何自动动作（人工裁决，ADR-0009 决策 5；门控链已随
     ADR-0017 退役——「无机制可实现自动动作」的结构性保证）。回退
     记账按相分轨（γ）：RL 相按 iteration 轴随所属 iteration 删除
@@ -136,7 +186,10 @@ class OverfitAlertEvent(BaseModel):
     stage: int = 1
     """报警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
     rank: int = 0
-    """观测到越线的 rank（分叉按 rank 独立计算落盘的归因轴）。"""
+    """产出本事件的 rank（分布式归并的排序轴）：预训练相 = 观测 rank
+    （ADR-0016 决策 8 的归因语义）；async 执行序 RL 相 = 0（per-condition
+    池化分叉是主线程单点观测，主线程 = 卡 0 写出口径；字段名随事件
+    契约「可扩不可改名」保留，语义随执行模型重定义，#217 同款）。"""
     phase: Literal["pretrain", "rl"] = "rl"
     """告警所属相（γ 的回退记账分轨轴）：``"rl"`` = RL 在线循环（默认，
     既有构造点与旧事件零改动兼容）；``"pretrain"`` = warm-start 预训练
@@ -330,16 +383,9 @@ class BaselineManifest(BaseModel):
 
     @staticmethod
     def noise_seed(seed: int, stage: int, index: int) -> int:
-        """采样位初始噪声种子的确定性派生（splitmix64 终混）：
+        """采样位初始噪声种子的确定性派生（``SeedMixer`` 单一实现）：
         纯函数、与生成顺序无关——baseline / 重采 / 里程碑三侧独立重算同值。"""
-        mask = 0xFFFFFFFFFFFFFFFF
-        h = (seed + 0x9E3779B97F4A7C15 + (stage << 32) + index) & mask
-        h ^= h >> 30
-        h = (h * 0xBF58476D1CE4E5B9) & mask
-        h ^= h >> 27
-        h = (h * 0x94D049BB133111EB) & mask
-        h ^= h >> 31
-        return h
+        return SeedMixer.mix(seed, stage << 32, index)
 
     @classmethod
     def build(cls, config: CynosureConfig) -> "BaselineManifest":

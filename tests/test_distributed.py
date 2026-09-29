@@ -13,7 +13,11 @@ AC 对应：
    world=1 与进程内单进程逐位一致（分布式装配路径无副作用、rank 0 的
    seed 派生恒等）+ world=2 各 rank 训练后权重逐位一致（allreduce 同步
    生效）+ world=2 结果 ≠ 单进程对照（梯度混入他 rank rollout 数据）；
-2. 判别器 DDP：各 rank 本 rank fake + pool 切片更新，同步后参数一致；
+2. 判别器分布式语义（#234 判别器链期改裁）：RL 装配缝的
+   ``ReplicatedDiscriminator`` 构造点解耦退役——旧 RL torchrun 路径各
+   rank 独立更新判别器（跨 rank 一致性断言随退役移除；本体留存至
+   pretrain driver 期删除）；torchrun **预训练**路径仍 DDP（driver
+   自行装配，语义不受影响）；
 3. rank 0 指标归并：无重复、无丢失、顺序稳定（(iteration, rank) 序）；
 4. 多 rank 续训 roundtrip：中断恢复后与一步到位 run 一致——权重逐位
    （RankResumeShards）、事件轨迹在跨路径容差内（独立进程世界的
@@ -546,35 +550,36 @@ class TestTwoRankSharding:
             if event["event"] == "overfit_alert":
                 assert (event["iteration"], event["rank"]) in iter_pairs
 
-        # AC1/AC2：各 rank 训练后 policy（FSDP full state）与判别器（DDP
-        # 副本）逐位一致——梯度 allreduce 同步生效、无 rank 漂移
+        # AC1/AC2：各 rank 训练后 policy（FSDP full state）逐位一致
+        # （梯度 allreduce 同步生效、无 rank 漂移）。判别器跨 rank 一致
+        # 断言随 #234 RL DDP 构造点退役——旧执行序各 rank 独立更新判别
+        # 器，无同步机制可断言（预训练路径的 DDP 语义由 test_pretrain_
+        # distributed 全量覆盖）
         shards = RankResumeShards(scenario.run_dir, world=2)
-        shards.assert_bitwise_identical_across_ranks(
-            keys=["policy_network", "discriminator_network"],
-        )
+        shards.assert_bitwise_identical_across_ranks(keys=["policy_network"])
 
-        # AC2：判别器确实被更新过（≠ 冷启动 checkpoint）
+        # AC2 后半（退役改裁）：判别器确实被更新过（≠ 冷启动 checkpoint）
+        # ——各 rank 独立更新，更新事实本身仍须在事件/分片面上可观测
         initial = torch.load(
             scenario.fixture_dir / "discriminator.pt",
             map_location="cpu", weights_only=True,
         )
-        synced = shards.state(0)["discriminator_network"]
-        assert any(
-            not torch.equal(initial[name], synced[name]) for name in initial
-        )
+        for rank in range(2):
+            rank_state = shards.state(rank)["discriminator_network"]
+            assert any(
+                not torch.equal(initial[name], rank_state[name])
+                for name in initial
+            ), f"rank {rank} 判别器应被独立更新（#234 退役改裁后更新事实不变）"
 
-    def test_two_rank_spectral_norm_buffers_stay_bitwise_identical(
+    def test_two_rank_spectral_norm_buffers_present_and_updated(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """SN 启用（判别器带 ``_u``/``_v`` buffer）+ world=2 在线多步推进
-        （``ReplicatedDiscriminator`` 关闭前向期 buffer 广播的论证兜底）：
-        u/v 只在 train 相前向就地推进，而推进点只有在线更新（各 rank
-        前向次数对称、权重经梯度 allreduce 逐位一致）；打分/监控前向恒
-        eval 相不推进——广播关闭后各 rank 的参数化 buffer 仍不得漂移。
-        「rank 间前向次数不对称 → 分叉」的子风险只有论证面、无测试构造
-        （注入不对称前向须异常路径，超出常规回归面）。warm-start 链路
-        同 regime：预训练（SN 启用）产物为谱归一化形态，train 装载走
-        形态分派的逐位还原。"""
+        """SN 启用的退役改裁锚（#234 判别器链期）：RL DDP 构造点退役后
+        跨 rank 一致性断言失去机制前提（原
+        ``test_two_rank_spectral_norm_buffers_stay_bitwise_identical``
+        的断言对象不复存在）——保留的判别面：SN buffer 在场（参数化
+        形态契约）+ 各 rank 判别器独立推进后仍含参数化状态（装载面
+        形态的 roundtrip 兼容性由 test_pretrain 装载族覆盖）。"""
         scenario.write_inputs(reward={"spectral_norm_enabled": True})
         scenario.patch_config(
             schedule={"max_iterations": 2, "checkpoint_interval": 2},
@@ -583,13 +588,12 @@ class TestTwoRankSharding:
             scenario.config_path, scenario.run_dir, world=2,
         ).launch()
         result.assert_green()
-        # SN 真的启用（断言有判别力）：参数化 buffer 在分片状态里
         shards = RankResumeShards(scenario.run_dir, world=2)
-        names = shards.state(0)["discriminator_network"]
-        assert any(name.endswith("._u") for name in names)
-        shards.assert_bitwise_identical_across_ranks(
-            keys=["policy_network", "discriminator_network"],
-        )
+        for rank in range(2):
+            names = shards.state(rank)["discriminator_network"]
+            assert any(name.endswith("._u") for name in names), (
+                f"rank {rank}：SN 启用下参数化 buffer 须在场（断言有判别力）"
+            )
 
     def test_two_rank_milestone_eval_and_stop_broadcast(
         self, scenario: TrainingLoopScenario,

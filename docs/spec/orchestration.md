@@ -48,6 +48,28 @@ PatchDiscriminator 几层 3D conv、算力可忽略，**不参与 FSDP 分片**�
 - 用**本 rank 的 fake latent** + **共享 real 池的切片**更新（real 池 = 训练集 VAE 预编码 latent，固定不更新）；
 - 梯度 **allreduce**（标准 DDP），回放缓冲 **per-rank FIFO**（`reward-model.md` 的封顶 FIFO）。
 
+**async 执行序改裁（#234 判别器链期，#220 结票全口径）**：新执行序的判别器步
+= 混合条件配对批经**判别器桶**（单条件同形 (real,fake) 对集合、构造期断言）承载，
+相位序列先全桶 eval 后全桶 train（同一参数快照）→ 跨卡梯度 allreduce **SUM** →
+optimizer.step → 步末谱归一化 u/v **broadcast（卡 0 权威）**；loss 聚合 =
+**逐对等权全局 mean**（loss×桶对数/N_total，N_total = K×卡数——显式新裁，
+与现行 patch 级 mean 分离，#220 决议 8）。**窗口节奏**（#220 决议 5）：每窗口每卡
+恰 K 任务、逐 iter 发射 `floor(K/L)`（L = 实际窗口长，**余数补窗口首 iter——
+K < N_d 时「均匀」名不副实，spec 注明**；首窗口退化为单 iter、K 任务全落窗口
+首 iter）；任务创建序 = 桶序（条件名排序）×对序。real 侧窗口起点**全局无放回抽取**
+（(seed, 窗口号, 条件名) 一次性派生 generator，不进 RNG 注册表），fake 产出
+即 CPU 暂存、步前 join 按桶序回迁——**CPU RAM 预算 = K 对 × 最大条件 latent
+× 2 侧（real+fake）× 卡数**（#220 决议 16 的预算公式）。AUC **per-condition 池化**
+（每活跃条件恰一次读数、**打分在 fakes 所在卡、分数 all_gather（卡号升序写进
+spec）**、单点 float64 midrank）取代 per-rank 轴——分叉 = EMA(逐条件 train
+acc − 池化 AUC)（#220 决议 13，per-rank 离散诊断对象结构性消失；多卡同条件
+多桶时 train acc 按桶对数加权聚合为条件级单值、每条件每步恰一次观测——决议 14
+未明文的多卡聚合形态，#234 补记）。
+``ReplicatedDiscriminator`` 的 **RL 构造点随本票解耦退役**（本体留存至
+pretrain driver 期删除）：旧 RL torchrun 路径各 rank 独立更新判别器（跨
+rank 一致性断言随退役移除），torchrun **预训练**路径仍 DDP（driver 自行
+装配，语义不受影响）。
+
 ## 降级预案（ticket 问题④）
 
 主路径 = 单实例 4 卡 torchrun + FSDP，降级链：

@@ -100,7 +100,7 @@ class ReconstructionAssembler:
 
     def __init__(
         self,
-        real_sampler: RealSampling,
+        real_sampler: RealSampling | None,
         sampler: RolloutSampler,
         schedules: ConditionSchedules,
         conditions: "ConditionSampler",
@@ -143,17 +143,39 @@ class ReconstructionAssembler:
     def assemble(self, modality: str) -> PairBatch:
         """装配该条件的判别器更新批：real 无放回采样 → 条件构造 → 先抽 s
         后抽 ε → 同源重构 → 配对批（no_grad + autocast 口径——重构是
-        policy 的 inference 前向，与 rollout 相同数值口径）。"""
+        policy 的 inference 前向，与 rollout 相同数值口径）。
+
+        real 侧采样须本原语持有采样器（供给语义装配——
+        ``real_sampler=None`` 的窗口任务形态经
+        ``reconstruct_assigned`` 供 real，本入口显式拒绝）。"""
+        if self._real_sampler is None:
+            raise ValueError(
+                "assemble 入口需要 real 侧采样器，本原语按供给语义装配"
+                "（real_sampler=None，#220 决议 10 窗口抽取形态）——"
+                "real 由调用方经 reconstruct_assigned 注入"
+            )
         reals = self._real_sampler.sample(
             self._batch_size_k, modality=modality,
         )
+        return self.reconstruct_assigned(reals, modality)
+
+    def reconstruct_assigned(
+        self, reals: torch.Tensor, modality: str,
+    ) -> PairBatch:
+        """窗口任务的 fake 构造（#234 判别器链期）：real 由调用方给定
+        （窗口起点全局无放回抽取的供给语义——real 侧是池数据不是随机
+        流），本入口只做 fake 侧随机性（条件构造 + 先 s 后 ε）+ 同源
+        重构；real 侧零采样零流消耗。``reals`` 须在 policy 前向设备
+        （pool 存储域，乘法进工作域发生在 ``reconstruct`` 内部）。"""
+        if reals.shape[0] < 1:
+            raise ValueError("窗口任务供给入口需要非空 real 批")
         # 条件构造在抽取序列的首位（组2 实现会消耗本流——次序即重放锚，
         # ADR-0007 交付期的抽取序逐位保持）
         condition = self._resolve_condition(modality, self._generator)
         # 采样契约（先 s 后 ε）：先抽逐样本日程位（= 噪声水平 s），再抽
         # ε 张量——同 seed 重放的次序锚；ε 全量抽（消耗量与 s 取值无关）
         position = torch.randint(
-            len(self._step_indices), (self._batch_size_k,),
+            len(self._step_indices), (reals.shape[0],),
             generator=self._generator,
         )
         steps = [self._step_indices[i] for i in position.tolist()]
@@ -164,6 +186,11 @@ class ReconstructionAssembler:
             reals.shape, generator=self._generator,
         ).to(reals.device)
         return self._build(reals, condition, modality, sigmas, noise)
+
+    def generator_state(self) -> torch.Tensor:
+        """本原语持有流（recon 流）的只读观测面（消耗序锚取数口；
+        ``SlotRngRegistry.stream_state`` 同款：读状态不消耗、不推进）。"""
+        return self._generator.get_state()
 
     def measure_condition(
         self,

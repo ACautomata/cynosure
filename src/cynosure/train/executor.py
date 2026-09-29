@@ -39,20 +39,14 @@
 + 逐 k barrier 收集-同步 + 事件发射 + RNG 注册表 per-槽实例化 + 异常
 fail-fast + barrier 软/硬超时；两域（MR + BraTS）贯穿。
 
-rollout 期增量（#232，加厚 1/6）：**同源重构任务进 rollout 相**——per-槽
-``ReconstructionAssembler``（real 侧全池直读 + 槽 real_pool 流、重构流 =
-槽 recon 流，#218 五处消费面注入面零改动），消耗节奏钉 N_d（仅判别器步
-iteration ``iteration % N_d == 0`` 重构，recon/real_pool 流消耗节奏不漂，
-#217/#218）；配对批 fake = rollout 相当前权重 θ_t（drift #1 时点前移的
-机制落地——旧执行序在 update_policy 之后的 θ_{t+1}；装配前向
-模态同帧归位 eval——旧序装配位在 train_phase 之后，数值零影响：
-``_build`` 恒 no_grad、GroupNorm 无 batch 统计、全库无
-Dropout/BatchNorm）。打分归位消费点
+rollout 期增量（#232，加厚 1/6）：**同源重构任务进 rollout 相**——
+per-槽 ``ReconstructionAssembler``（重构流 = 槽 recon 流，#218 五处
+消费面注入面零改动），消耗节奏钉 N_d（判别器窗口的逐 iter 摊派形态随
+#234 定型）；配对批 fake = rollout 相当前权重 θ_t（drift #1 时点前移的
+机制落地——旧执行序在 update_policy 之后的 θ_{t+1}）。打分归位消费点
 = ``RolloutPhase._to_pool_domain`` 单点除 scale factor——域换算缝按
 #226 接缝备忘保持开放（ADR-0015 DomainLatent 载体另行择期，实施时不
-动现有域换算点形态）。held-out AUC 并入 rollout 相的口径自骨架期保持
-（``SlotRunner.run_example`` 内 rollout → AUC，AUC 计时并入 rollout 相
-——旧侧独立 heldout_auc 相的映射来源，#217 §3）。
+动现有域换算点形态）。
 
 policy 更新期增量（#233，加厚 2/6）：**梯度检查点解耦**（#217 §4 最重
 配套项随首个有梯度前向的真实消费点落地）——应用缝移 ``GroupPolicy.build``
@@ -62,11 +56,28 @@ gradient_checkpointing` 默认开、fixture 可关），装配期 bitwise 探针
 同步（loss×(1/N) + 逐 tensor SUM allreduce，骨架期已落的机器面）的
 验收锚升 multi-k 日程（重放锚 num_steps=5、M={1,2,3}，单卡与多卡档）。
 
-**不含**（各进加厚期，#226）：续训分片、评测路径、判别器链（判别器更
-新步/混合条件配对批/u-v broadcast——本门面判别器仅承载打分与 AUC 的
-rollout 消费，恒 eval 相；重构任务的配对批记账待判别器步接上后消费，
-窗口批语义随判别器链期定型）、pretrain driver、生产入口（本门面仅被
-fixture 测试驱动，#226 决策 1 生产入口单口径）。
+判别器链期增量（#234，加厚 3/6，#220 结票全口径）：**判别器步在 k 循
+环后落地**——混合条件配对批经判别器桶（``DiscriminatorBucket``，单
+条件同形对集合、构造期断言）承载，相位序列先全桶 eval 后全桶 train
+（``DiscriminatorPhase.accumulate``）→ 跨卡梯度 allreduce SUM →
+optimizer.step → 步末 u/v broadcast（卡 0 权威）；**逐对等权全局
+mean**（loss×n_b/N_total）显式新裁落地。窗口语义（``Discriminator
+Window``）：每窗口每卡恰 K 任务、逐 iter 发射 floor(K/L)（余数补窗
+口首 iter）、任务创建序 = 桶序×对序；real 侧窗口起点全局无放回抽取
+（``WindowRealDraw``：splitmix64 一次性派生 generator、不进 RNG 注册
+表），fake 产出即 CPU 暂存、步前 join 后按桶序回迁；**AUC per-condition
+池化**（``PooledHeldOutAuc``：本卡 real 采样打分按条件名排序、分数
+卡号升序收集、单点 float64 midrank、每活跃条件恰一次读数）进 iter
+事件 heldout_auc 与分叉原料——per-rank 轴退役：分叉 = EMA(逐条件
+train acc − 池化 AUC)、每条件一条、窗口内最后一次有效测量配窗口末
+train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
+明细（可扩不可改名）。ReplicatedDiscriminator 的 RL 构造点随本票
+解耦退役（本体留存至 pretrain driver 期删除，#226 用户故事 8）：
+RL 装配缝（``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器，
+预训练 driver 自行装配副本语义。
+
+**不含**（各进加厚期，#226）：续训分片、评测路径、pretrain driver、
+生产入口（本门面仅被 fixture 测试驱动，#226 决策 1 生产入口单口径）。
 """
 
 import asyncio
@@ -89,16 +100,30 @@ from cynosure.distributed.process import (
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.pretrain.artifacts import PretrainReport
-from cynosure.reward.artifacts import LatentManifest
-from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
+from cynosure.reward.assembly import ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.sampler import RealPoolSampler
-from cynosure.reward.scorer import RewardScorer
+from cynosure.reward.overfit import DivergenceReading, OverfitMonitor
+from cynosure.reward.scorer import ChunkedScorer, RewardScorer
+from cynosure.reward.update import ConditionUpdateDetail, OnlineUpdate, UpdateReport
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import (
     BarrierSoftTimeoutEvent,
+    DiscConditionReading,
+    DiscUpdateDetail,
     IterEvent,
+    OverfitAlertEvent,
     RunArtifacts,
+)
+from cynosure.train.discriminator import (
+    DiscriminatorBucket,
+    DiscriminatorPhase,
+    DiscriminatorWindow,
+    DiscriminatorWindowRun,
+    PooledHeldOutAuc,
+    WindowPairRecord,
+    WindowRealDraw,
+    WindowTask,
 )
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase, StepRollout
@@ -134,23 +159,27 @@ class SlotExample:
 
     slot: int
     record: IterationRollout
-    heldout_auc: float
     rollout_seconds: float
     steps: dict[int, StepRollout] = field(default_factory=dict)
     """按被优化训练步 k 索引的 rollout 记录（更新相任务的取数面）。"""
     update_seconds: float = 0.0
-    pair_batch: PairBatch | None = None
-    """同源重构配对批（rollout 相尾部任务产出，#232）：判别器步
-    iteration（``iteration % N_d == 0``）每槽装配一批，其余 iteration
-    为 None。判别器更新步属判别器链期——本记账是重构任务在 rollout
-    相的编排面与消耗序观测面（recon/real_pool 流随批消耗），消费点
-    随判别器链期接上。"""
+    fake_scores: torch.Tensor | None = None
+    """本例 new_fakes 的判别器展平分数（CPU，#234 池化 AUC 的原料：
+    rollout 相内打分——打分在 fakes 所在卡，判别器副本同值；每活跃条
+    件的池化 midrank 由门面在相末单点合成）。"""
+    window_pairs: tuple[tuple[WindowTask, WindowPairRecord], ...] = ()
+    """本例承载的窗口重构任务产出（(任务, 单对记录) 序，#234）：
+    判别器步 iteration 所在窗口内各 iter 摊派的任务——fake = 本
+    iteration rollout 相当前权重 θ_t（drift #1 时点前移保持），产出
+    即 CPU 暂存；判别器步前 join（rollout 相 gather 即 join 形态），
+    门面按任务累计进窗口记录、步前按桶序回迁装配。"""
 
 
 class CardReplica:
     """每卡完整副本（#217 §4）：本卡的 policy 装配 + 判别器 scorer 副本
-    + 采样封装 + 逐 k 更新编排——副本间无共享可变张量状态，跨卡一致性
-    由「同初始化 + 确定性 allreduce + 同步 step 序列」结构性保证。"""
+    + 采样封装 + 逐 k 更新编排 + 判别器步相位编排（#234）——副本间无
+    共享可变张量状态，跨卡一致性由「同初始化 + 确定性 allreduce + 同
+    步 step 序列」结构性保证。"""
 
     def __init__(
         self,
@@ -160,6 +189,7 @@ class CardReplica:
         scorer: RewardScorer,
         sampler: RolloutSampler,
         updater: StepwisePolicyUpdate,
+        disc_phase: DiscriminatorPhase,
     ) -> None:
         self.index = index
         self.device = device
@@ -167,6 +197,7 @@ class CardReplica:
         self.scorer = scorer
         self.sampler = sampler
         self.updater = updater
+        self.disc_phase = disc_phase
 
     @classmethod
     def build(
@@ -175,14 +206,16 @@ class CardReplica:
         index: int,
         device: torch.device,
         scorer_prototype: RewardScorer,
+        total_pairs: int,
     ) -> "CardReplica":
         """本卡副本装配：policy 网络构建（checkpoint 装载，单进程无
         FSDP 包装——分片随执行模型退役）+ 判别器副本（原型 deepcopy 后
         迁卡——单点装载、逐位复制）+ 采样封装（前向激活预算本地解析，
         ``chunk_sync`` 恒 None：无 FSDP 即无「前向调用次数绑定集合序列」，
-        #165 挂死类结构性消失）+ 逐 k 更新编排。判别器副本钉 eval 相
-        （骨架期无判别器更新步，打分/AUC 前向不得推进 spectral norm
-        幂迭代）。"""
+        #165 挂死类结构性消失）+ 逐 k 更新编排 + 判别器步相位编排
+        （``DiscriminatorPhase``，判别器链期 #234——判别器更新步的
+        train/eval 相位切换自此组件自持，打分/AUC 前向的 eval 钉相由
+        步编排的 finally 语义保证）。"""
         amp = TrainingRuntime.amp_context(config, device)
         # GroupPolicy 的条件分布主流在新执行序无消费（目标条件来自分配
         # 表、组2 端内自由度显式传槽流，见 SlotRunner/RolloutPhase）——
@@ -205,7 +238,12 @@ class CardReplica:
         scorer = copy.deepcopy(scorer_prototype).to(device)
         scorer.eval()
         DropoutGuard.assert_clean(scorer, origin="判别器 scorer 副本")
-        return cls(index, device, policy, scorer, sampler, updater)
+        disc_phase = DiscriminatorPhase(
+            scorer,
+            OnlineUpdate.assemble_optimizer(scorer, config.reward),
+            total_pairs,
+        )
+        return cls(index, device, policy, scorer, sampler, updater, disc_phase)
 
     def gradient_tensors(self) -> list[torch.Tensor | None]:
         """可训练网络的逐参梯度出口（逐 k 归约的取数面——归约器不摸
@@ -221,11 +259,12 @@ class SlotRunner:
     载体（#217 调度单元契约——每协程承载一个「例子」；协程经门面多路
     复用到绑卡线程，torch 调用全部落在绑卡线程）。
 
-    rollout 相本体的编排序（#217 §3）：rollout（anchor → 扰动 → λ 续跑
-    → 打分）→ held-out AUC → 同源重构（判别器步 iteration）——三段同属
-    rollout 相，``rollout_seconds`` 计时窗口整体涵盖（AUC 与重构计入
-    rollout 相，phase_seconds 无独立条目——旧侧独立 heldout_auc 相的
-    映射口径，#217 相位集 rollout/trajectory/policy_update/discriminator）。
+    rollout 相本体的编排序（#217 §3 + #234 判别器链期）：rollout
+    （anchor → 扰动 → λ 续跑 → 打分）→ 池化 AUC 原料打分（本例
+    fakes 的判别器分数）→ 窗口重构任务（fake 构造即 CPU 暂存）——
+    三段同属 rollout 相，``rollout_seconds`` 计时窗口整体涵盖
+    （phase_seconds 无独立条目：AUC 池化与判别器步的计时归位见门面
+    _run_iteration）。
     """
 
     def __init__(
@@ -233,42 +272,72 @@ class SlotRunner:
         slot: int,
         updater: StepwisePolicyUpdate,
         rollout: RolloutPhase,
-        auc: HeldOutAuc,
+        scorer: RewardScorer,
         assembler: ReconstructionAssembler,
+        real_pool: LatentManifest,
+        device: torch.device,
         advantage_clamp: float,
     ) -> None:
         self.slot = slot
         self._updater = updater
         self._rollout = rollout
-        self._auc = auc
+        self._chunked = ChunkedScorer(scorer)
         self._assembler = assembler
+        self._real_pool = real_pool
+        self._device = device
         self._advantage = MgaiAdvantage(clamp=advantage_clamp)
 
     async def run_example(
-        self, condition_name: str, *, reconstruct: bool,
+        self,
+        condition_name: str,
+        *,
+        window_tasks: tuple[tuple[WindowTask, PoolEntry], ...] = (),
     ) -> SlotExample:
         """一个例子的 rollout 相（分配表条件 → 初始噪声/扰动/续跑 →
-        打分 → held-out AUC → 同源重构——AUC 与重构属 rollout 相口径，
-        #217 §3）。
+        打分 → 池化原料打分 → 窗口重构任务）。
 
-        ``reconstruct`` = 本 iteration 是否判别器步（门面按
-        ``iteration % N_d`` 判定派发）：真则 rollout 相尾部用本槽
-        assembler 装配同源重构配对批（fake = rollout 相当前权重 θ_t，
-        drift #1 时点前移；recon/real_pool 流消耗节奏钉 N_d——仅判别器
-        步 iteration 消耗、跨 iteration 连续不复位，#218）。"""
+        ``window_tasks`` = 本 (iteration, 槽) 摊派的重构任务及其
+        real 池条目（窗口起点全局无放回抽取的切片，#220 决议 10）：
+        逐任务加载 real（CPU）→ 供给入口 fake 构造（recon 流消耗
+        「先 s 后 ε」、批维 1）→ 产出即 CPU 暂存（WindowPairRecord）。
+        无任务（非窗口 iter 或本槽未摊派）为空 tuple。"""
         started = time.monotonic()
         record = self._rollout.run_iteration(condition_name)
-        heldout = self._auc.compute(record.new_fakes, record.modality)
-        pair = (
-            self._assembler.assemble(record.modality) if reconstruct else None
+        fake_scores = self._score_fakes(record.new_fakes)
+        pairs = tuple(
+            (task, self._reconstruct(task, entry))
+            for task, entry in window_tasks
         )
         return SlotExample(
             slot=self.slot,
             record=record,
-            heldout_auc=heldout,
             rollout_seconds=time.monotonic() - started,
             steps={step.step_index: step for step in record.steps},
-            pair_batch=pair,
+            fake_scores=fake_scores,
+            window_pairs=pairs,
+        )
+
+    def _score_fakes(self, new_fakes: torch.Tensor) -> torch.Tensor:
+        """本例 fakes 的判别器展平分数（no_grad + 定块打分，池化 AUC
+        原料；CPU 形态跨线程传递——打分在 fakes 所在卡，判别器副本
+        同值、步末 u/v 同步保证，#220 决议 12）。"""
+        with torch.no_grad():
+            return self._chunked.scores(new_fakes).cpu()
+
+    def _reconstruct(
+        self, task: WindowTask, entry: PoolEntry,
+    ) -> WindowPairRecord:
+        """单窗口任务：real 加载（CPU 池懒加载）→ 供给入口 fake 构造
+        （recon 流、先 s 后 ε、no_grad + autocast 与 rollout 同数值
+        口径）→ 单对 CPU 暂存（两侧同形断言在 WindowPairRecord）。"""
+        real_cpu = self._real_pool.load_latent(entry).unsqueeze(0)
+        pair = self._assembler.reconstruct_assigned(
+            real_cpu.to(self._device), task.condition,
+        )
+        return WindowPairRecord(
+            condition=task.condition,
+            real=real_cpu,
+            fake=pair.fakes.cpu(),
         )
 
     async def run_k(
@@ -295,38 +364,54 @@ class SlotRunner:
 class CardWorker:
     """每卡专用执行线程（research P2/P6 静态绑卡）：线程宿主本卡事件
     循环，槽协程经 ``submit`` 多路复用；线程启动即完成设备绑定与槽装配
-    （流 owner-thread 断言的记录点 = 绑卡线程，#218 出口断言口径）。"""
+    （流 owner-thread 断言的记录点 = 绑卡线程，#218 出口断言口径）。
+
+    判别器链期（#234）追加的卡级消费面：``pooled_auc``（池化 AUC 本卡
+    测量段，绑卡线程装配——heldout 流 owner 即绑卡线程）、
+    ``discriminate``（窗口记录 → 桶装配 → 全桶 eval/train/加权
+    backward）、``disc_step``（optimizer.step + eval 归位）——跨卡
+    集合段（梯度 allreduce、u/v broadcast）由门面主线程单点编排
+    （``DiscriminatorPhase.reduce_gradients`` / ``synchronize_spectral``）。"""
 
     def __init__(
         self,
-        index: int,
-        device: torch.device,
         replica: CardReplica,
         slot_ids: list[int],
-        build_slots: Callable[[], list[SlotRunner]],
+        build_components: Callable[
+            [], "tuple[list[SlotRunner], PooledHeldOutAuc]",
+        ],
     ) -> None:
-        self.index = index
-        self.device = device
         self.replica = replica
         self.slot_ids = slot_ids
         self.slots: list[SlotRunner] = []
-        self._build_slots = build_slots
+        self.pooled_auc: PooledHeldOutAuc | None = None
+        self._build_components = build_components
         self._failure: BaseException | None = None
         self._ready = threading.Event()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._serve,
             daemon=True,
-            name=f"cynosure-card-{index}",
+            name=f"cynosure-card-{replica.index}",
         )
 
+    @property
+    def index(self) -> int:
+        """卡号（副本装配面的委托出口——静态绑卡身份的唯一来源）。"""
+        return self.replica.index
+
+    @property
+    def device(self) -> torch.device:
+        """本卡设备（副本装配面的委托出口）。"""
+        return self.replica.device
+
     def _serve(self) -> None:
-        """线程本体：静态绑卡（current device 线程局部）→ 槽装配（本
-        线程取流，owner 记录即绑卡线程）→ 事件循环常驻。"""
+        """线程本体：静态绑卡（current device 线程局部）→ 槽装配 + 卡
+        级组件装配（本线程取流，owner 记录即绑卡线程）→ 事件循环常驻。"""
         try:
             if self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
-            self.slots = self._build_slots()
+            self.slots, self.pooled_auc = self._build_components()
         except BaseException as error:  # 线程边界必须接住：装配失败经
             self._failure = error      # _ready 唤醒主线程显式失败
         finally:
@@ -355,19 +440,69 @@ class CardWorker:
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
 
     async def run_examples(
-        self, conditions: dict[int, str], *, reconstruct: bool,
+        self,
+        conditions: dict[int, str],
+        *,
+        window_tasks: dict[int, tuple[tuple[WindowTask, PoolEntry], ...]],
     ) -> dict[int, SlotExample]:
         """本卡全部例子的 rollout 相（槽间并发 gather——协程多路复用
-        形态；torch 调用在本线程内串行落卡）。``reconstruct`` = 判别器
-        步标志（门面按 N_d 节奏判定，透传各槽——同 iteration 全槽一致，
-        流消耗节奏跨槽同拍）。"""
+        形态；torch 调用在本线程内串行落卡）。``window_tasks`` = 每槽
+        本 iteration 摊派的窗口任务（real 条目切片随任务下发）。"""
         examples = await asyncio.gather(*(
             slot.run_example(
-                conditions[slot.slot], reconstruct=reconstruct,
+                conditions[slot.slot],
+                window_tasks=window_tasks.get(slot.slot, ()),
             )
             for slot in self.slots
         ))
         return {example.slot: example for example in examples}
+
+    async def score_heldout(
+        self, conditions: tuple[str, ...], count: int,
+    ) -> dict[str, torch.Tensor]:
+        """池化 AUC 本卡测量段：活跃条件（条件名排序）的 held-out real
+        采样 + 打分（消耗本卡 heldout 流；#220 决议 12/15）。"""
+        assert self.pooled_auc is not None
+        return self.pooled_auc.score_conditions(conditions, count)
+
+    async def discriminate(
+        self,
+        window_records: list[tuple[WindowTask, WindowPairRecord]],
+        expected: int,
+    ) -> UpdateReport:
+        """判别器步的卡内段：窗口记录按桶装配（桶序恒条件名排序、桶内
+        对序 = 任务创建序）→ ``DiscriminatorPhase.accumulate``（先全桶
+        eval 后全桶 train + 逐对等权加权 backward）。
+
+        ``expected`` = 窗口计划的本卡任务数——join 后逐位对账，缺失 /
+        多余即拒绝（#220 决议 6 的「不静默降批」机器面：任务在 rollout
+        相内同步完成，异常早已 fail-fast 中止，正常路径恒对账相等）。"""
+        if len(window_records) != expected:
+            raise ValueError(
+                f"判别器步窗口记录数 {len(window_records)} ≠ 计划任务数 "
+                f"{expected}——任务缺失/多余不静默降批（#220 决议 6；"
+                "fail-fast 门面之外的双重对账）"
+            )
+        buckets: list[DiscriminatorBucket] = []
+        by_condition: dict[str, list[tuple[WindowTask, WindowPairRecord]]] = {}
+        for item in window_records:
+            by_condition.setdefault(item[1].condition, []).append(item)
+        for condition in sorted(by_condition):
+            members = sorted(
+                by_condition[condition],
+                key=lambda member: (member[0].iteration, member[0].index),
+            )
+            buckets.append(DiscriminatorBucket.assemble(
+                condition,
+                [record for _, record in members],
+                self.device,
+            ))
+        return self.replica.disc_phase.accumulate(buckets)
+
+    async def disc_step(self) -> None:
+        """判别器步收尾：optimizer.step + eval 相恢复（门面跨卡梯度
+        allreduce 之后；步末 u/v broadcast 由门面主线程单点编排）。"""
+        self.replica.disc_phase.step()
 
     async def accumulate_k(
         self,
@@ -530,6 +665,8 @@ class AsyncTrainingExecutor:
         cards: list[CardWorker],
         collect_reduce: PerKCollectReduce,
         timeout: BarrierTimeoutPolicy,
+        window_run: DiscriminatorWindowRun,
+        overfit: OverfitMonitor,
     ) -> None:
         self.config = config
         self.artifacts = artifacts
@@ -538,6 +675,19 @@ class AsyncTrainingExecutor:
         self.cards = cards
         self._collect_reduce = collect_reduce
         self._timeout = timeout
+        self._window_run = window_run
+        self._overfit = overfit
+
+    @property
+    def window(self) -> DiscriminatorWindow:
+        """判别器窗口计划纯函数（事件面/测试锚的取数口）。"""
+        return self._window_run.window
+
+    @property
+    def window_run(self) -> DiscriminatorWindowRun:
+        """判别器窗口运行期账簿（测试锚的观测面：窗口内最后一次池化
+        读数的对拍取数口）。"""
+        return self._window_run
 
     @classmethod
     def build(
@@ -552,11 +702,12 @@ class AsyncTrainingExecutor:
     ) -> "AsyncTrainingExecutor":
         """config 驱动装配：设备发现（卡数）→ 条件轴（条件分布
         ``targets()``，集合知识归条件分布自身）→ 分配表 + 槽注册表 →
-        每卡副本与绑卡线程（槽静态 round-robin 绑卡）。``coroutines``
-        缺省 = 卡数（每卡一例的默认拓扑）；``devices`` 显式设备集（
-        CPU fixture 档钉单 CPU 设备——生产口径缺省 = 本进程可见全卡，
-        卡集裁剪经 ``CUDA_VISIBLE_DEVICES``）；``owner_check`` 透传注册
-        表（测试档开启，#218 debug-only 口径）。"""
+        判别器窗口计划 + real 抽取 + 分叉监控（#234）→ 每卡副本与
+        绑卡线程（槽静态 round-robin 绑卡）。``coroutines`` 缺省 = 卡数
+        （每卡一例的默认拓扑）；``devices`` 显式设备集（CPU fixture 档
+        钉单 CPU 设备——生产口径缺省 = 本进程可见全卡，卡集裁剪经
+        ``CUDA_VISIBLE_DEVICES``）；``owner_check`` 透传注册表（测试档
+        开启，#218 debug-only 口径）。"""
         if DistributedContext.env_rank() is not None:
             raise ValueError(
                 "async 门面是单进程执行序：检测到 torchrun 注入的 RANK "
@@ -577,7 +728,10 @@ class AsyncTrainingExecutor:
             raise ValueError(f"调度槽数须 ≥ 1，得到 {slot_count}")
         scorer_prototype = cls.assemble_discriminator(config)
         vocabulary = TrainingRuntime.assemble_vocabulary(config)
-        replica = CardReplica.build(config, 0, devices[0], scorer_prototype)
+        total_pairs = config.reward.disc_batch_size_k * len(devices)
+        replica = CardReplica.build(
+            config, 0, devices[0], scorer_prototype, total_pairs,
+        )
         conditions = replica.policy.conditions.targets()
         if config.experiment.group == "cross-modal":
             AllocationTable.assert_pair_symmetry(
@@ -588,11 +742,34 @@ class AsyncTrainingExecutor:
         rng = SlotRngRegistry(
             config.schedule.seed, slot_count, owner_check=owner_check,
         )
-        # real 侧装载与守卫（两执行序共用装配缝）：全池直读、每槽独立
-        # 无放回采样 K 条——需量倍数传 1（判别器窗口的全局无放回批语义
-        # 随判别器链期定型，见 ``TrainingRuntime.assemble_real_pool``）
+        # 卡槽绑定（静态 round-robin 的纯函数镜像）：判别器窗口计划的
+        # 任务→槽分派与门面的槽绑卡同源。空卡（槽数 < 卡数）显式拒绝
+        # ——「每窗口每卡恰 K 对」的窗口语义前提每卡至少一槽，半绑定
+        # 拓扑不静默可用（卡内槽装配与池化测量段都以非空槽为前提）
+        card_slots = {
+            index: tuple(
+                slot for slot in range(slot_count)
+                if slot % len(devices) == index
+            )
+            for index in range(len(devices))
+        }
+        if any(not slots for slots in card_slots.values()):
+            raise ValueError(
+                f"卡槽绑定存在空卡 {sorted(k for k, v in card_slots.items() if not v)}"
+                f"（槽数 {slot_count} < 卡数 {len(devices)}）——每窗口每卡"
+                "恰 K 对的窗口语义前提每卡至少一槽：减卡数或加协程数"
+            )
+        window = DiscriminatorWindow(
+            allocation,
+            n_d=config.reward.disc_update_interval_n_d,
+            batch_size_k=config.reward.disc_batch_size_k,
+            card_slots=card_slots,
+        )
+        # real 侧装载与守卫（两执行序共用装配缝）：全池直读、窗口起点
+        # 全局无放回抽取——需量倍数传卡数（窗口单条件最大需求上界 =
+        # K×卡数，#220 决议 9/10；装配期容量守卫把门不变）
         real_pool = TrainingRuntime.assemble_real_pool(
-            config, vocabulary, world_size=1,
+            config, vocabulary, world_size=len(devices),
         )
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -602,21 +779,19 @@ class AsyncTrainingExecutor:
         # real 侧的对照在 assemble_real_pool 内）
         heldout.assert_condition_shapes(vocabulary)
         replicas = [replica] + [
-            CardReplica.build(config, index, device, scorer_prototype)
+            CardReplica.build(
+                config, index, device, scorer_prototype, total_pairs,
+            )
             for index, device in enumerate(devices[1:], 1)
         ]
+        overfit = OverfitMonitor(config.reward, conditions=vocabulary.names())
         cards = []
         for replica in replicas:
-            bound_slots = [
-                slot for slot in range(slot_count)
-                if slot % len(devices) == replica.index
-            ]
+            bound_slots = list(card_slots[replica.index])
             cards.append(CardWorker(
-                index=replica.index,
-                device=replica.device,
                 replica=replica,
                 slot_ids=bound_slots,
-                build_slots=cls._slot_assembly(
+                build_components=cls._card_components(
                     config, replica, rng, vocabulary, real_pool, heldout,
                     bound_slots,
                 ),
@@ -632,10 +807,14 @@ class AsyncTrainingExecutor:
                 timeout if timeout is not None
                 else BarrierTimeoutPolicy.from_env()
             ),
+            window_run=DiscriminatorWindowRun(
+                window, WindowRealDraw(real_pool), config.schedule.seed,
+            ),
+            overfit=overfit,
         )
 
     @staticmethod
-    def _slot_assembly(
+    def _card_components(
         config: CynosureConfig,
         replica: CardReplica,
         rng: SlotRngRegistry,
@@ -643,16 +822,18 @@ class AsyncTrainingExecutor:
         real_pool: LatentManifest,
         heldout: LatentManifest,
         slot_ids: list[int],
-    ) -> Callable[[], list[SlotRunner]]:
-        """本卡槽装配的闭包工厂：在绑卡线程执行（流 owner-thread 断言
-        的记录点 = 绑卡线程）——per-槽 RolloutPhase（槽 rollout 流注入，
-        #218 五处消费面注入面零改动口径）、HeldOutAuc（槽 heldout 流）
-        与 ReconstructionAssembler（槽 real_pool 流的 real 侧全池直读
-        采样器 + 槽 recon 流的重构流——同源重构任务进 rollout 相，
-        #232；assembler 构造只读流种子、不消耗流位置）。"""
-        amp = TrainingRuntime.amp_context(config, replica.device)
+    ) -> Callable[[], "tuple[list[SlotRunner], PooledHeldOutAuc]"]:
+        """本卡组件装配的闭包工厂（绑卡线程执行；流 owner-thread 断言的
+        记录点 = 绑卡线程）：per-槽 RolloutPhase（槽 rollout 流注入，
+        #218 五处消费面注入面零改动口径）+ ReconstructionAssembler
+        （供给语义装配，#234：real_sampler=None——real 由窗口起点全局
+        无放回抽取经任务注入，per-槽 real_pool 流随 #232 过渡形态退役、
+        fake 侧随机性 = 槽 recon 流；assembler 构造只读流种子、不消耗
+        流位置）+ 池化 AUC 测量段（heldout 流 = 卡首槽——per-卡测量取代
+        per-例测量后的卡内单一消耗面）。"""
 
-        def build_slots() -> list[SlotRunner]:
+        def build_components() -> "tuple[list[SlotRunner], PooledHeldOutAuc]":
+            amp = TrainingRuntime.amp_context(config, replica.device)
             runners = []
             for slot in slot_ids:
                 rollout = RolloutPhase(
@@ -666,21 +847,9 @@ class AsyncTrainingExecutor:
                     autocast_dtype=amp.dtype,
                     device=replica.device,
                 )
-                auc = HeldOutAuc(
-                    heldout_manifest=heldout,
-                    scorer=replica.scorer,
-                    generator=rng.get_stream(
-                        slot, TrainingRngStreams.HELDOUT_AUC,
-                    ),
-                    device=replica.device,
-                )
                 assembler = TrainingRuntime.assemble_pair_assembler(
                     config,
-                    real_sampler=RealPoolSampler(
-                        real_pool,
-                        rng.get_stream(slot, TrainingRngStreams.REAL_POOL),
-                        replica.device,
-                    ),
+                    real_sampler=None,
                     sampler=replica.sampler,
                     conditions=replica.policy.conditions,
                     generator=rng.get_stream(slot, TrainingRngStreams.RECON),
@@ -690,13 +859,23 @@ class AsyncTrainingExecutor:
                     slot,
                     replica.updater,
                     rollout,
-                    auc,
+                    replica.scorer,
                     assembler,
+                    real_pool,
+                    replica.device,
                     config.grpo.advantage_clamp,
                 ))
-            return runners
+            pooled = PooledHeldOutAuc(
+                heldout_manifest=heldout,
+                scorer=replica.scorer,
+                generator=rng.get_stream(
+                    slot_ids[0], TrainingRngStreams.HELDOUT_AUC,
+                ),
+                device=replica.device,
+            )
+            return runners, pooled
 
-        return build_slots
+        return build_components
 
     @staticmethod
     def execution_devices() -> list[torch.device]:
@@ -755,23 +934,33 @@ class AsyncTrainingExecutor:
         return completed
 
     async def _run_iteration(self, iteration: int) -> None:
-        """单 iteration 执行序（#217 §3 相位结构）：rollout 相（全并发
-        零梯度耦合：rollout → held-out AUC → 同源重构）→ train 相逐 k
-        barrier（loss×(1/N)+SUM → 各卡一次 step）→ 事件发射（(iteration,
-        slot) 排序写）。同源重构钉判别器步节奏（``iteration % N_d == 0``,
-        #232——recon/real_pool 流消耗节奏不漂）；判别器更新步缺位属判
-        别器链期口径（#234）。phase_seconds 只发 rollout / policy_update
-        两相（#217 §3 全集含 trajectory / discriminator 的记档偏差）：
-        AUC 与重构计入 rollout 相（旧侧独立 heldout_auc 相的映射口径），
-        trajectory 相现行仅 --dump 诊断打点消费、本门面无诊断路径，
-        discriminator 相属判别器链期——两相随各自加厚期补入。"""
+        """单 iteration 执行序（#217 §3 相位结构 + #234 判别器链期）：
+
+        窗口起点 real 抽取（``step_for_launch`` 判定）→ rollout 相
+        （全并发零梯度耦合：rollout → 池化原料打分 → 窗口重构任务）→
+        池化 AUC（本卡 real 采样打分 → 卡号升序收集 → 单点 midrank，
+        每活跃条件恰一次读数）→ train 相逐 k barrier（loss×(1/N)+SUM
+        → 各卡一次 step）→ 判别器步（is_step：桶装配 → 全桶 eval/train
+        + 逐对等权 backward → 跨卡梯度 allreduce SUM → optimizer.step
+        → 步末 u/v broadcast）→ 分叉观测与事件发射（(iteration, slot)
+        排序写）。
+
+        phase_seconds 发 rollout / policy_update / discriminator 三相
+        （#217 §3 全集含 trajectory：现行仅 --dump 诊断打点消费、本
+        门面无诊断路径——trajectory 相随诊断路径加厚）；AUC 池化原料
+        打分计入 rollout 相（fake 打分在 fakes 所在卡、随例执行），
+        判别器步计时（池化 real 打分 + 桶装配 + 相位两段 + 集合段）
+        记入 discriminator 相。"""
         started = time.monotonic()
-        reconstruct = (
-            iteration % self.config.reward.disc_update_interval_n_d == 0
-        )
+        # —— 判别器窗口：窗口首 iter 的起点抽取（任务 → real 条目）——
+        self._window_run.launch(iteration)
         conditions = {
             slot: self.allocation.condition_for(iteration, slot)
             for slot in range(self.allocation.slot_count)
+        }
+        slot_tasks = {
+            slot: self._window_run.tasks_for(iteration, slot)
+            for slot in conditions
         }
         examples: dict[int, SlotExample] = {}
         # —— rollout 相：eval() + no_grad（执行序第 1 相口径）——
@@ -781,7 +970,9 @@ class AsyncTrainingExecutor:
             [
                 card.submit(card.run_examples(
                     {slot: conditions[slot] for slot in card.slot_ids},
-                    reconstruct=reconstruct,
+                    window_tasks={
+                        slot: slot_tasks[slot] for slot in card.slot_ids
+                    },
                 ))
                 for card in self.cards
             ],
@@ -791,6 +982,10 @@ class AsyncTrainingExecutor:
         )
         for mapping in per_card:
             examples.update(mapping)
+        # rollout 相即 join 形态（协程 gather 完成 = 任务产出全部落账）：
+        # 逐卡累计窗口记录，判别器步装配消费
+        for example in examples.values():
+            self._window_run.collect(example)
         # —— train 相：逐 k barrier（k 间严格串行）——
         for card in self.cards:
             card.replica.policy.train_phase()
@@ -820,30 +1015,253 @@ class AsyncTrainingExecutor:
                 step_index,
                 enforce_timeout=True,
             )
+        # —— 判别器步（k 循环全部完成后，#217 §3 排程）——
+        disc_started = time.monotonic()
+        reports: dict[int, UpdateReport] = {}
+        divergences: dict[str, DivergenceReading] = {}
+        pooled_auc: dict[str, float] = {}
+        if self.window.is_step(iteration):
+            # —— 池化 AUC：每活跃条件恰一次读数（#220 决议 12）——
+            # 窗口末（判别器更新前）快照、覆盖式入持久账（本窗口活跃
+            # 条件刷新读数）；非判别器步 iter 不打分（「恰一次」的消耗
+            # 面），iter 事件的 heldout_auc 桥接持久账的逐条件末次读数
+            # 或 None（下方事件段）。
+            active = tuple(sorted(
+                {example.record.modality for example in examples.values()}
+            ))
+            fake_total = sum(
+                example.record.new_fakes.shape[0]
+                for example in examples.values()
+            )
+            per_card_real = await self._collect(
+                [
+                    card.submit(card.score_heldout(active, fake_total))
+                    for card in self.cards
+                ],
+                iteration,
+                step_index=0,  # 判别器步非 policy k——pretrain 先例口径
+                enforce_timeout=False,
+            )
+            pooled_auc = self._pool_auc(examples, per_card_real)
+            self._window_run.record_auc(pooled_auc)
+            planned = {
+                card.index: self._window_run.planned_count(card.index)
+                for card in self.cards
+            }
+            per_card_reports = await self._collect(
+                [
+                    card.submit(card.discriminate(
+                        self._window_run.records(card.index),
+                        planned[card.index],
+                    ))
+                    for card in self.cards
+                ],
+                iteration,
+                step_index=0,  # 同上：判别器步 barrier 的非 k 口径
+                enforce_timeout=True,
+            )
+            reports = {
+                card.index: report
+                for card, report in zip(self.cards, per_card_reports)
+            }
+            DiscriminatorPhase.reduce_gradients(
+                [card.replica.disc_phase for card in self.cards]
+            )
+            await self._collect(
+                [card.submit(card.disc_step()) for card in self.cards],
+                iteration,
+                step_index=0,  # 同上：判别器步 barrier 的非 k 口径
+                enforce_timeout=True,
+            )
+            DiscriminatorPhase.synchronize_spectral(
+                [card.replica.disc_phase for card in self.cards]
+            )
+            # 分叉观测（#220 决议 13/14 + 多卡聚合裁决补记）：**每条件
+            # 每判别器步恰一次 observe**（每条件一个 EMA 的决议字面——
+            # 同条件跨卡多桶时先按桶对数加权聚合成条件级单值 train
+            # acc（逐对等权估计量的同构聚合，与 loss×n_b/N_total 同
+            # 口径），再喂一次观测；多卡同条件多桶的聚合形态为 #220
+            # 决议 14 未明文的补记，确定性纯函数、随本票 docstring
+            # 立此存照）
+            condition_buckets: dict[str, list[tuple[int, float]]] = {}
+            for card in self.cards:
+                for detail in reports[card.index].conditions:
+                    condition_buckets.setdefault(
+                        detail.condition, [],
+                    ).append((detail.pair_count, detail.train_pairwise_acc))
+            condition_train_accs: dict[str, float] = {}
+            for condition, buckets in sorted(condition_buckets.items()):
+                heldout = self._window_run.window_auc(condition)
+                if heldout is None:
+                    raise ValueError(
+                        f"条件 {condition!r} 有判别器桶但本 run 无任何池化 "
+                        "AUC 读数——「窗口内最后一次有效测量」的跨窗口回退"
+                        "点失守。生产几何（槽数 ≥ 条件数，轮长 1）每 iter "
+                        "全条件活跃、桶条件必有本步读数；fixture 几何（槽数 "
+                        "< 条件数）下非退化窗口可摊到从未被测的条件（轮长 "
+                        "对齐 N_d 时逐轮条件置换不相交）——fail-fast 不"
+                        "静默跳测，几何扩面随用例另行裁决（#220 决议 14 "
+                        "回退点 = 该条件最后被分配的判别器步 iter）"
+                    )
+                total = sum(count for count, _ in buckets)
+                train_acc = sum(
+                    acc * count for count, acc in buckets
+                ) / total
+                condition_train_accs[condition] = train_acc
+                divergences[condition] = self._overfit.observe(
+                    condition,
+                    train_pairwise_acc=train_acc,
+                    heldout_auc=heldout,
+                )
+            # 越线告警原料在清窗前收集（heldout_auc 读窗口记账）——
+            # 事件构造推迟到事件发射段（elapsed 计时完整覆盖）
+            alert_data = [
+                (
+                    condition,
+                    reading,
+                    condition_train_accs[condition],
+                    self._window_run.window_auc(condition),
+                )
+                for condition, reading in sorted(divergences.items())
+                if reading.alerted
+            ]
+            self._window_run.clear()
+        else:
+            alert_data = []
+        disc_seconds = time.monotonic() - disc_started
         # —— 事件发射：iter 族 (iteration, slot) 排序写（单进程单写者，
         # slot 升序即归并序；rank 字段语义 = 槽号，#217 契约口径）——
         elapsed = time.monotonic() - started
+        alerts = [
+            OverfitAlertEvent(
+                iteration=iteration,
+                stage=_STAGE_TAG,
+                rank=0,  # 主线程 = 卡 0 写出口径（barrier_soft_timeout 同款）
+                phase="rl",
+                modality=condition,
+                divergence_ema=reading.divergence,
+                train_pairwise_acc=train_acc,
+                heldout_auc=heldout,
+            )
+            for condition, reading, train_acc, heldout in alert_data
+        ]
         for slot in sorted(conditions):
             example = examples[slot]
+            card_index = next(
+                card.index for card in self.cards if slot in card.slot_ids
+            )
+            report = reports.get(card_index)
+            detail = (
+                self._disc_detail(report, example.record.modality)
+                if report is not None else None
+            )
+            condition = example.record.modality
+            if condition in pooled_auc:
+                heldout_auc: float | None = pooled_auc[condition]
+            else:
+                # 非判别器步 iter：桥接该条件最后一次有效池化读数
+                # （#220 决议 14「窗口内最后一次有效测量」的窗口延拓——
+                # AUC 账跨窗口持久，本窗口未活跃条件回退到上次读数）；
+                # 本 run 尚无读数 = None（首现于非判别器步 iter 的条件，
+                # 其所在窗口的测量尚未发生）——「每活跃条件恰一次读数」
+                # 的消耗面：非判别器步 iter 不采样不打分，与
+                # train_pairwise_acc/disc_update 的 N_d 跳过 None
+                # 惯用法同构，不静默写零。
+                heldout_auc = self._window_run.window_auc(condition)
+            event_loss = {
+                f"policy_step_{step_index}": value
+                for step_index, value in losses[slot].items()
+            }
+            phase_seconds = {
+                "rollout": example.rollout_seconds,
+                "policy_update": example.update_seconds,
+            }
+            if report is not None:
+                event_loss["discriminator"] = report.loss_discriminator
+                phase_seconds["discriminator"] = disc_seconds
+            divergence = divergences.get(condition)
             self.artifacts.append_event(IterEvent(
                 iteration=iteration,
                 stage=_STAGE_TAG,
                 rank=slot,
-                modality=example.record.modality,
+                modality=condition,
                 anchor_eval_reward=example.record.anchor_eval_reward,
                 intra_group_reward_std=example.record.intra_group_reward_std,
-                heldout_auc=example.heldout_auc,
-                loss={
-                    f"policy_step_{step_index}": value
-                    for step_index, value in losses[slot].items()
-                },
+                heldout_auc=heldout_auc,
+                loss=event_loss,
+                train_pairwise_acc=(
+                    detail.train_pairwise_acc if detail is not None else None
+                ),
+                overfit_divergence_ema=(
+                    divergence.divergence if divergence is not None else None
+                ),
+                disc_update=self._disc_update_event(
+                    report, divergences,
+                ) if report is not None else None,
                 lr=self.config.policy.policy_lr,
                 elapsed_s=elapsed,
-                phase_seconds={
-                    "rollout": example.rollout_seconds,
-                    "policy_update": example.update_seconds,
-                },
+                phase_seconds=phase_seconds,
             ))
+        for alert in alerts:
+            self.artifacts.append_event(alert)
+
+    @staticmethod
+    def _pool_auc(
+        examples: dict[int, SlotExample],
+        per_card_real: list[dict[str, torch.Tensor]],
+    ) -> dict[str, float]:
+        """每活跃条件恰一次池化读数（#220 决议 12）：fake 分数按例记账
+        （打分在 fakes 所在卡）+ real 分数按卡号升序（future 回传序）
+        收集 → 单点 float64 midrank Mann-Whitney。"""
+        fake_scores: dict[str, list[torch.Tensor]] = {}
+        for example in examples.values():
+            fake_scores.setdefault(
+                example.record.modality, [],
+            ).append(example.fake_scores)
+        pooled: dict[str, float] = {}
+        for condition in sorted(fake_scores):
+            real = torch.cat([
+                scores[condition] for scores in per_card_real
+            ])
+            fake = torch.cat(fake_scores[condition])
+            pooled[condition] = HeldOutAuc.auc_from_scores(real, fake)
+        return pooled
+
+    @staticmethod
+    def _disc_detail(
+        report: UpdateReport, modality: str,
+    ) -> ConditionUpdateDetail | None:
+        """本例条件的报告明细（判别器步时；本例条件无桶 = None——该卡
+        窗口未摊派本条件的任务）。"""
+        for detail in report.conditions:
+            if detail.condition == modality:
+                return detail
+        return None
+
+    @staticmethod
+    def _disc_update_event(
+        report: UpdateReport, divergences: dict[str, DivergenceReading],
+    ) -> DiscUpdateDetail:
+        """判别器步的逐条件事件明细（#220 决议 11：升格面在 iter 事件
+        的映射；同卡各例一致读数）。"""
+        return DiscUpdateDetail(
+            global_batch_size=report.global_batch_size,
+            weighted_loss=report.loss_discriminator,
+            conditions={
+                detail.condition: DiscConditionReading(
+                    loss=detail.loss_discriminator,
+                    loss_real_term=detail.loss_real_term,
+                    loss_fake_term=detail.loss_fake_term,
+                    pair_count=detail.pair_count,
+                    train_pairwise_acc=detail.train_pairwise_acc,
+                    divergence_ema=(
+                        divergences[detail.condition].divergence
+                        if detail.condition in divergences else None
+                    ),
+                )
+                for detail in report.conditions
+            },
+        )
 
     async def _collect(
         self,

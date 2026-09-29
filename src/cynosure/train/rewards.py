@@ -15,6 +15,7 @@ import torch
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.overfit import OverfitMonitor
+from cynosure.reward.scorer import LatentScorer
 from cynosure.reward.update import OnlineUpdate, UpdateReport
 
 
@@ -41,6 +42,13 @@ class RewardCoordinator:
     def discriminator(self) -> torch.nn.Module:
         """底层判别器（checkpoint 落盘用；DDP 装配下为解包后的裸网络）。"""
         return self.update.scorer.discriminator
+
+    @property
+    def scorer(self) -> LatentScorer:
+        """判别器 scorer 的直接访问面（DDP 副本装配等编排面消费）——
+        单跳出口取代 ``coordinator.update.scorer`` 穿透链（分片自持
+        词条的 resume 穿透 Avoid 在编排面同口径适用）。"""
+        return self.update.scorer
 
     def update_step(self, pair: PairBatch) -> UpdateReport:
         """判别器 Online update 一步：消费配对批（real 与 fake 同源，

@@ -14,9 +14,11 @@ pairwise 准确率（随单步更新报告上行，更新原语 ``OnlineUpdate.s
 - per-condition 独立记账：条件间 EMA 与越线判定互不可见（观测流是
   per-condition 稀疏序列——该条件的判别器步才有一条观测，EMA 跨度
   语义 = 该条件观测条数的平滑尺度）；
-- **按 rank 独立**：监控器是 rank 本地状态、无任何集合通信——判别器
-  是 DDP 完整副本、权重各 rank 同步，分叉的 rank 间离散反映数据切片
-  异质性，本身是诊断信号（不跨 rank 平均，随 iter 事件同归并序落盘）；
+- **rank 轴随执行模型退役**（#220 决议 13，#234 判别器链期落地）：
+  per-rank 离散的诊断对象（数据切片异质性）在单进程全池共享下结构
+  性消失——监控器本体无集合通信、按条件记账不变；消费编排升格为
+  「逐条件 train acc − 逐条件池化 AUC」（各条件窗口内最后一次有效
+  测量配窗口末判别器步 train acc，#220 决议 14），每条件一条 EMA；
 - 报警触发边界 = 分叉 EMA **自下而上**达到阈值（线上滞留不重发、
   回落后再越线重发；阈值点本身算越线，与门控 enter 判定的 ``>=`` 同
   语义；首观测即越线 = 出生即分叉，同样报警）；
@@ -98,15 +100,15 @@ class DivergenceEma:
 
 class OverfitMonitor:
     """per-condition 过拟合分叉监控器（ADR-0009-β）：分叉 EMA 记账与
-    越线判定的 rank 本地单点。
+    越线判定的单点持有。
 
-    ``observe`` 由编排方（train 循环）在**每个判别器步**调用一次：
-    train 侧干净域复算准确率（更新报告上行）与本 iteration 的 held-out
-    AUC 合成分叉观测、递推该条件 EMA、做上升沿越线判定。阈值与跨度是
-    暂定 knob（config ``reward.overfit_*``，标注「MR-RATE 预训练曲线
-    校准后定版」）。
+    ``observe`` 由编排方（train 循环 / async 门面）在**每个判别器步**
+    调用一次：train 侧干净域复算准确率（更新报告上行）与池化 AUC
+    （更新前快照）合成分叉观测、递推该条件 EMA、做上升沿越线判定。
+    阈值与跨度是暂定 knob（config ``reward.overfit_*``，标注「MR-RATE
+    预训练曲线校准后定版」）。
 
-    监控器无集合通信（按 rank 独立，见模块 docstring）；续训状态经
+    监控器无集合通信（rank 轴已退役，见模块 docstring）；续训状态经
     ``state``/``adopt`` 与 ResumeStore 对接（resume v6 的 ``overfit``
     键，恢复逐位复原）。
     """
