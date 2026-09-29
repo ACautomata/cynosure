@@ -317,6 +317,28 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert "num_inference_steps" in str(exc_info.value.errors())
 
+    def test_production_gradient_checkpointing_without_fixture_mode(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """生产 config（fixture_mode 缺省 = false）下 gradient_checkpointing 定死 true：静默关闭（训练相激活全量驻留的 OOM 风险）必须拒绝。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["policy"] = {"gradient_checkpointing": False}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "gradient_checkpointing" in str(exc_info.value.errors())
+
+    def test_retired_sharding_gradient_checkpointing_key_rejected(
+        self, valid_config_dict: dict,
+    ) -> None:
+        """#233 退役键拒绝面：旧 run 快照的 ``sharding.gradient_checkpointing``
+        键装载即拒（extra_forbidden，无迁移 shim）——orchestration.md
+        退役声明口径的回归锚（旧 run 请从产物 checkpoint 重启新 run）。"""
+        data = copy.deepcopy(valid_config_dict)
+        data["sharding"] = {"gradient_checkpointing": True}
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert "gradient_checkpointing" in str(exc_info.value.errors())
+
     def test_artifacts_declare_source_dataset_root(self, valid_config_dict: dict) -> None:
         """prepare 的输入 = 原始影像 + VAE：源数据集根目录是必填工件路径（experiment-design「real 样本库」）。"""
         data = copy.deepcopy(valid_config_dict)

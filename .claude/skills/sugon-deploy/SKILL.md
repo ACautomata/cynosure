@@ -130,6 +130,14 @@ CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=4 -m cynosure.cli train \
 `<run>/pretrain_run/metrics.jsonl`（首条 `pretrain` 事件），train 相在
 `<run>/metrics.jsonl`（首条 `iter` 事件）；进程活着 ≠ 在训练。
 
+DCU 首跑注意（#233）：`train` 装配期跑梯度检查点 bitwise 探针
+（plain/wrapped 双腿逐位比较，`src/cynosure/train/checkpointing.py`）。
+fixture 网络已在 CPU/A6000 验证逐位一致；生产网络 × DTK 内核组合首跑
+若探针 fail-fast，先分辨归因再动作：复跑仍稳定失配 = wrapper 真实破坏
+（装配拒绝正确，查 MONAI/torch 版本差）；复跑通过 = 内核 run-to-run
+非确定性（GroupNorm dweight 原子归约类），届时议探针口径（复跑确认或
+容差档），不要直接绕关 `gradient_checkpointing`。
+
 ### 6. 监控
 
 ```bash

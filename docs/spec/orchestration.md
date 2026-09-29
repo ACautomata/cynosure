@@ -24,7 +24,7 @@ Ray 不进入主路径：它的三项独有能力（actor 级容错、placement 
   2. `train()`：每个训练步 k 一次独立 forward → backward → optimizer.step（|M| 次），再判别器在线更新。
 - **无独立 rollout worker、无 reward actor、无参数服务器**；rollout → train 是同进程内的 mode toggle，不是跨 actor 权重同步。
 - **显存规划**（目标 SothisAI BW/gfx936，4×64GiB/实例，ADR-0005）：policy UNet 约 1e8 级参数量（用户口径，待 checkpoint 实测校正）→ fp32 master + AdamW 优化器经 FSDP full-shard 后每卡仅数百 MB；**内存不是瓶颈**。真正的绑定是 **rollout 吞吐**（每 iter 数百至上千次 CFG-batched UNet 前向，train:rollout ≈ 5%）。G=12 轨迹 latent 每张 `[4,64,64,32]` ~1–2MB，全量常驻也仅数百 MB，但**仍以 profile 实测为准**（见「开工前门槛」）。
-- **梯度检查点独立必选**（#217 §4「最重配套项」，#233 解耦落地）：`policy.gradient_checkpointing`（默认开，生产 config 定死、`fixture_mode=true` 可关）不再是 FSDP 配套——FSDP 退役后（async 执行模型 per-card 完整副本）关闭即训练相激活全量驻留（48GB 卡真实 OOM 风险）。应用缝 = `GroupPolicy` 构建面（FSDP wrap 之前，torch 官方 `checkpoint_wrapper(NO_REENTRANT)` 包装 MONAI resnet 块）；装配期跑真实梯度前向的 bitwise 一致性探针（plain/wrapped 双腿逐位比较，失配 fail-fast）；no_grad 前向（rollout 相）下重算包装直通，数值路径零扰动。
+- **梯度检查点独立必选**（#217 §4「最重配套项」，#233 解耦落地）：`policy.gradient_checkpointing`（默认开，生产 config 定死、`fixture_mode=true` 可关）不再是 FSDP 配套——FSDP 退役后（async 执行模型 per-card 完整副本）关闭即训练相激活全量驻留（48GB 卡真实 OOM 风险）。应用缝 = `GroupPolicy` 构建面（FSDP wrap 之前，torch 官方 `checkpoint_wrapper(NO_REENTRANT)` 包装 MONAI resnet 块）；装配期跑真实梯度前向的 bitwise 一致性探针（plain/wrapped 双腿逐位比较，失配 fail-fast）；no_grad 前向（rollout 相）下重算包装直通，数值路径零扰动。schema 退役与 v11 同纪律：本票删除 `sharding.gradient_checkpointing` 旧键后，更早 run 的 config 快照在装载面显式拒绝（`extra_forbidden`），不设迁移 shim——旧 run 请从产物 checkpoint 重启新 run（续训状态面同口径，resume 版本守卫同语义）。
 
 ## 实例部署结构（ticket 问题②）
 

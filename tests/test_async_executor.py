@@ -592,6 +592,11 @@ class TestExecutorFixtureTier:
         scenario.assert_state_dicts_bitwise(
             first_buffers, second_buffers, "spectral",
         )
+        for run in ("run1", "run2"):
+            for event in scenario.events(run):
+                assert set(event["loss"]) == {
+                    "policy_step_1", "policy_step_2", "policy_step_3",
+                }, "M={1,2,3} 的每个 k 都须真实发生累积与 step"
         assert RunTrajectory(scenario.events("run1")) == RunTrajectory(
             scenario.events("run2"),
         )
@@ -1006,6 +1011,11 @@ class TestExecutorMultiCardTier:
             scenario.spectral_buffers(second.cards[0].replica.scorer),
             "spectral(card0)",
         )
+        for run in ("run1", "run2"):
+            for event in scenario.events(run):
+                assert set(event["loss"]) == {
+                    "policy_step_1", "policy_step_2", "policy_step_3",
+                }, "M={1,2,3} 的每个 k 都须真实发生累积与 step（多卡档）"
         assert RunTrajectory(scenario.events("run1")) == RunTrajectory(
             scenario.events("run2"),
         )
