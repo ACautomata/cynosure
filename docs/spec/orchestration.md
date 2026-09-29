@@ -13,7 +13,7 @@
 | 层 | 选定 | 弃 |
 |---|---|---|
 | 编排 | **torchrun**（rank launch + `torch.distributed` init） | Ray Core / Ray Train |
-| 分片 | **FSDP full-shard + 梯度检查点** | DeepSpeed ZeRO-3（仅显存 fallback） |
+| 分片 | **FSDP full-shard**（梯度检查点独立必选，#233 解耦） | DeepSpeed ZeRO-3（仅显存 fallback） |
 
 Ray 不进入主路径：它的三项独有能力（actor 级容错、placement groups、异步角色池）在本 workload 全部用不上——训练是同步的 FSDP 集体通信 lockstep，中途节点故障必须整作业 checkpoint 重启（Ray 的 actor 重启无法救回 in-flight allreduce）；且 Ray-on-DCU 需付全额的设备可见性地雷 + 实验性代价（`research/ray-on-dcu-slurm.md` §1.3）。**Ray 记为升级项**：若未来加独立 rollout 引擎或 KL/参考模型，再启用（且须先过 DCU 实测）。
 
@@ -24,6 +24,7 @@ Ray 不进入主路径：它的三项独有能力（actor 级容错、placement 
   2. `train()`：每个训练步 k 一次独立 forward → backward → optimizer.step（|M| 次），再判别器在线更新。
 - **无独立 rollout worker、无 reward actor、无参数服务器**；rollout → train 是同进程内的 mode toggle，不是跨 actor 权重同步。
 - **显存规划**（目标 SothisAI BW/gfx936，4×64GiB/实例，ADR-0005）：policy UNet 约 1e8 级参数量（用户口径，待 checkpoint 实测校正）→ fp32 master + AdamW 优化器经 FSDP full-shard 后每卡仅数百 MB；**内存不是瓶颈**。真正的绑定是 **rollout 吞吐**（每 iter 数百至上千次 CFG-batched UNet 前向，train:rollout ≈ 5%）。G=12 轨迹 latent 每张 `[4,64,64,32]` ~1–2MB，全量常驻也仅数百 MB，但**仍以 profile 实测为准**（见「开工前门槛」）。
+- **梯度检查点独立必选**（#217 §4「最重配套项」，#233 解耦落地）：`policy.gradient_checkpointing`（默认开，生产 config 定死、`fixture_mode=true` 可关）不再是 FSDP 配套——FSDP 退役后（async 执行模型 per-card 完整副本）关闭即训练相激活全量驻留（48GB 卡真实 OOM 风险）。应用缝 = `GroupPolicy` 构建面（FSDP wrap 之前，torch 官方 `checkpoint_wrapper(NO_REENTRANT)` 包装 MONAI resnet 块）；装配期跑真实梯度前向的 bitwise 一致性探针（plain/wrapped 双腿逐位比较，失配 fail-fast）；no_grad 前向（rollout 相）下重算包装直通，数值路径零扰动。
 
 ## 实例部署结构（ticket 问题②）
 

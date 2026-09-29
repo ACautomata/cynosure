@@ -1111,7 +1111,8 @@ class TestStatusAnnotations:
         assert missing == [], f"缺状态标注的字段: {missing}"
 
     def test_status_vocabulary_is_bounded(self) -> None:
-        allowed = {"定死", "定死（fixture 可缩小）", "定死 + fallback", "tunable",
+        allowed = {"定死", "定死（fixture 可缩小）", "定死（fixture 可关）",
+                   "定死 + fallback", "tunable",
                    "消融", "运行时", "起步值", "扫描接口", "配置化 + 扫描", "触发式",
                    "升级项", "部署默认"}
         for model in self.ALL_MODELS:

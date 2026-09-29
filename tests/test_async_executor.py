@@ -565,10 +565,15 @@ class TestExecutorFixtureTier:
     ) -> None:
         """多协程重放锚（#218 三层锚②，协程数 > 1）：同 config 同 seed
         两次 run——权重 + 判别器 u/v buffer + RunTrajectory 事件流逐位
-        一致（SN 启用使 u/v buffer 在场）。"""
+        一致（SN 启用使 u/v buffer 在场）。#233 起日程升 multi-k
+        （num_steps=5、M={1,2,3}）——更新相逐 k barrier 收集-同步的
+        完整形态进重放锚（单 k 薄切片锚随 #231 结票退役）。"""
         scenario = ExecutorScenario(cli, tmp_path)
         config = scenario.prepare(
-            seed=3, reward={"spectral_norm_enabled": True},
+            seed=3,
+            num_steps=5,
+            train_steps={1, 2, 3},
+            reward={"spectral_norm_enabled": True},
         )
         config.schedule.max_iterations = 2
         first = scenario.build(config, run_name="run1", coroutines=2)
@@ -962,7 +967,10 @@ class TestExecutorMultiCardTier:
         """层 3 薄切片锚（#218 三层锚③，gauss 多卡）：同 seed 两 run——
         卡 0 权重 + spectral buffer + RunTrajectory 事件流 + recon/
         real_pool 流终态逐位一致（NCCL allreduce 逐位确定，#215 双栈
-        实证；全强度形态随判别器链期，#226）。
+        实证；全强度形态随判别器链期，#226）。#233 起日程升 multi-k
+        （num_steps=5、M={1,2,3}）——多卡更新相逐 k 收集-同步（逐
+        tensor 串行 allreduce × |M| barrier）进重放锚，验收逐 k 协议
+        的多卡档。
 
         流终态在比较面（#232 spec 评审补强）：recon/real_pool 流终态
         是重构消耗序的确定函数——重构 no_grad 不改权重、pair_batch 无
@@ -974,7 +982,10 @@ class TestExecutorMultiCardTier:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）")
         scenario = ExecutorScenario(cli, tmp_path)
         config = scenario.prepare(
-            seed=3, reward={"spectral_norm_enabled": True},
+            seed=3,
+            num_steps=5,
+            train_steps={1, 2, 3},
+            reward={"spectral_norm_enabled": True},
         )
         config.schedule.max_iterations = 2
         first = scenario.build(

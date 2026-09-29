@@ -449,6 +449,14 @@ class PolicyConfig(BaseModel):
         "fp32 master weights（bf16 autocast 配套）",
         default="fp32",
     )
+    gradient_checkpointing: bool = SpecField(
+        "定死（fixture 可关）", "async 执行模型（#217 §4/#233 spec 补钉）",
+        "梯度检查点（MONAI resnet 块 activation 重算，应用缝 = GroupPolicy "
+        "构建面）：FSDP 退役后仍独立必选——关闭则训练相激活全量驻留（48GB "
+        "卡真实 OOM 风险）；生产 config 定死 true，fixture_mode=true 可关"
+        "（bitwise 校验的双档测试面）",
+        default=True,
+    )
     source_latent_scale_factor: float = SpecField(
         "运行时", "policy-modeling",
         "组2 双条件之一：ControlNet 条件 = 源影像 latent × scale_factor"
@@ -930,7 +938,10 @@ class ScheduleConfig(BaseModel):
 
 
 class ShardingConfig(BaseModel):
-    """分布式分片（orchestration 章 + ADR-0003）：torchrun + FSDP 同卡交替。"""
+    """分布式分片（orchestration 章 + ADR-0003）：torchrun + FSDP 同卡交替。
+
+    梯度检查点不再是本节配套（#233 解耦为 ``policy.gradient_checkpointing``
+    独立 config 项，应用缝 = GroupPolicy 构建面）。"""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -938,11 +949,6 @@ class ShardingConfig(BaseModel):
         "定死 + fallback", "orchestration",
         "分片策略：FSDP full-shard 起步（降级链 DDP → ZeRO-3，fallback 非默认）",
         default="fsdp",
-    )
-    gradient_checkpointing: Literal[True] = SpecField(
-        "定死", "orchestration",
-        "FSDP 配套梯度检查点",
-        default=True,
     )
 
 
@@ -1357,6 +1363,22 @@ class CynosureConfig(BaseModel):
                 f"生产 config（fixture_mode=false）下 N_baseline 口径 200–500"
                 f"（experiment-design 章），得到 {self.schedule.baseline_samples}；"
                 "缩小样本量属 fixture，须经顶层 fixture_mode=true 显式声明"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _gradient_checkpointing_matches_mode(self) -> "CynosureConfig":
+        """梯度检查点的通道显式化（#233）：fixture_mode=false 时定死开启。
+
+        关闭即训练相激活全量驻留（48GB 卡真实 OOM 风险，#217 §4）——
+        生产静默关闭等于换显存口径，装配期 schema 拒绝；fixture 双档
+        测试面（bitwise 校验 on/off 对照）经 fixture_mode=true 显式声明。"""
+        if not self.fixture_mode and not self.policy.gradient_checkpointing:
+            raise ValueError(
+                "生产 config（fixture_mode=false）下 policy."
+                "gradient_checkpointing 定死 true（async 执行模型 #217 §4："
+                "训练相激活全量驻留的 OOM 风险），得到 false；关闭属 "
+                "fixture，须经顶层 fixture_mode=true 显式声明"
             )
         return self
 
