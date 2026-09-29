@@ -54,6 +54,14 @@ Dropout/BatchNorm）。打分归位消费点
 （``SlotRunner.run_example`` 内 rollout → AUC，AUC 计时并入 rollout 相
 ——旧侧独立 heldout_auc 相的映射来源，#217 §3）。
 
+policy 更新期增量（#233，加厚 2/6）：**梯度检查点解耦**（#217 §4 最重
+配套项随首个有梯度前向的真实消费点落地）——应用缝移 ``GroupPolicy.build``
+（FSDP wrap 之前，``GradientCheckpointing``，`config.policy.
+gradient_checkpointing` 默认开、fixture 可关），装配期 bitwise 探针
+（plain/wrapped 双腿真实梯度前向逐位比较）fail-fast；更新相逐 k 收集-
+同步（loss×(1/N) + 逐 tensor SUM allreduce，骨架期已落的机器面）的
+验收锚升 multi-k 日程（重放锚 num_steps=5、M={1,2,3}，单卡与多卡档）。
+
 **不含**（各进加厚期，#226）：续训分片、评测路径、判别器链（判别器更
 新步/混合条件配对批/u-v broadcast——本门面判别器仅承载打分与 AUC 的
 rollout 消费，恒 eval 相；重构任务的配对批记账待判别器步接上后消费，

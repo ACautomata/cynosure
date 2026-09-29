@@ -952,7 +952,7 @@ class RolloutChunkWorker:
             self.fixture_dir / "condition_vocabulary.json", fixture_mode=True,
         )
         torch.manual_seed(7)  # fixture 网络固定 seed：跨 rank 逐位一致初始权重
-        network = PolicySharding(context, gradient_checkpointing=False).wrap(
+        network = PolicySharding(context).wrap(
             Fixture().unet().eval(),
         )
         forwards: list[int] = []

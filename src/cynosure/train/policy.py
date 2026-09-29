@@ -20,6 +20,7 @@ from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
 from cynosure.policy.field import BareConditionField, CfgCombinedField, VelocityField
 from cynosure.reward.artifacts import LatentManifest
+from cynosure.train.checkpointing import GradientCheckpointing
 from cynosure.train.rng import DropoutGuard
 from cynosure.train.rollout import (
     ConditionSampler,
@@ -60,7 +61,9 @@ class GroupPolicy:
         可训练对象与采样场/条件分布按 experiment.group 落位。
 
         ``sharding``（FSDP 封装）在 optimizer 构建之前应用——优化器状态
-        活在分片后参数上；单进程为 None（网络原样透传）。
+        活在分片后参数上；单进程为 None（网络原样透传）。梯度检查点
+        （#233 解耦，``GradientCheckpointing``）在分片之前应用于裸网络，
+        并以装配期 bitwise 探针 fail-fast。
         """
         group = config.experiment.group
         if group == "sequential":
@@ -73,6 +76,7 @@ class GroupPolicy:
             checkpoint=config.artifacts.unet_ckpt,
         )).to(device)
         mapping = ModalityMapping.load(config.artifacts.modality_mapping_json)
+        vocabulary: ConditionVocabulary | None = None
         conditions: ConditionSampler
         if group == "cross-modal":
             network = cls._assemble_cross_modal(unet, config, device)
@@ -94,14 +98,22 @@ class GroupPolicy:
                 # MR-RATE 组1 条件分布：词汇表生成条件均匀轮转（spec #125
                 # 决策 5）——装配走 ConditionVocabulary.assemble 统一分派
                 # （本类不经 runtime 装配面，防 import 环），token/spacing
-                # 取数单一来源
-                conditions = MrConditionSampler(
-                    ConditionVocabulary.assemble(config), generator, device,
-                )
+                # 取数单一来源；vocabulary 提升局部变量（#233：探针的
+                # latent 形状同源取数）
+                vocabulary = ConditionVocabulary.assemble(config)
+                conditions = MrConditionSampler(vocabulary, generator, device)
             else:
                 conditions = ModalLabelConditionSampler(
                     mapping, generator, device,
                 )
+        DropoutGuard.assert_clean(
+            network, origin=f"group={group} 的 policy 网络",
+        )
+        # 检查点先于分片（#233）：包装作用于裸网络（根模块身份不变），
+        # 探针 fail-fast 在任何分片/优化器状态构建之前
+        GradientCheckpointing(
+            config, device, vocabulary,
+        ).verify_and_apply(unet, network)
         if sharding is not None:
             # 分片先于采样场构建：field 必须引用 FSDP wrapper（裸网络的
             # 前向不进分片的梯度聚合路径）；optimizer 最后构建（状态活在
@@ -115,9 +127,6 @@ class GroupPolicy:
             )
         else:
             field = CfgCombinedField(network)
-        DropoutGuard.assert_clean(
-            network, origin=f"group={group} 的 policy 网络",
-        )
         optimizer = torch.optim.AdamW(
             network.parameters(),
             lr=config.policy.policy_lr,
