@@ -285,7 +285,9 @@ class TestWindowRealDraw:
         with pytest.raises(ValueError, match="容量|无放回"):
             draw.assign(seed=7, step_iteration=0, window=window)
 
-    def test_condition_call_order_is_name_sorted(self) -> None:
+    def test_condition_call_order_is_name_sorted(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """抽取调用序 = 条件名排序（#220 决议 10：与桶序同源的确定性
         遍历锚）——观测派生种子的调用记录。"""
         window = self._window(n_d=1, k=2, slots=2)
@@ -298,12 +300,10 @@ class TestWindowRealDraw:
             calls.append(condition)
             return real_derive(seed, step_iteration, condition)
 
-        original = WindowRealDraw._derive_seed
-        WindowRealDraw._derive_seed = staticmethod(spy)
-        try:
-            draw.assign(seed=7, step_iteration=0, window=window)
-        finally:
-            WindowRealDraw._derive_seed = original
+        monkeypatch.setattr(
+            WindowRealDraw, "_derive_seed", staticmethod(spy),
+        )
+        draw.assign(seed=7, step_iteration=0, window=window)
         assert calls == ["a", "b"]
 
 

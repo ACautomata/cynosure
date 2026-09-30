@@ -571,7 +571,7 @@ class TestTwoRankSharding:
                 for name in initial
             ), f"rank {rank} 判别器应被独立更新（#234 退役改裁后更新事实不变）"
 
-    def test_two_rank_spectral_norm_buffers_present_and_updated(
+    def test_two_rank_spectral_norm_buffers_present(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """SN 启用的退役改裁锚（#234 判别器链期）：RL DDP 构造点退役后

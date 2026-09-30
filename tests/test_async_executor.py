@@ -655,7 +655,12 @@ class TestExecutorFixtureTier:
         iter_pairs = {(e["iteration"], e["rank"]) for e in iter_events}
         for event in events:
             if event["event"] == "overfit_alert":
-                assert (event["iteration"], event["rank"]) in iter_pairs
+                # 主线程写出口径（executor 事件段）：alert rank 恒 0——
+                # 原 (iteration, rank) 成员资格断言对 rank 轴无判别力
+                # （alert 无槽面、槽 0 每 iter 恒有 iter 事件，恒真）；
+                # 显式锁 rank 常量 + iteration 不越调度域两可判别面
+                assert event["rank"] == 0
+                assert (event["iteration"], 0) in iter_pairs
         targets = executor.allocation.conditions
         assert len(targets) == 4  # 组2 条件轴 = 4 目标端
         for event in iter_events:
@@ -1176,9 +1181,9 @@ class TestExecutorMultiCardTier:
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
         """层 3 薄切片锚（#218 三层锚③，gauss 多卡）：同 seed 两 run——
-        卡 0 权重 + spectral buffer + 事件流 + recon/real_pool 流终态的
-        重放一致性（NCCL allreduce 逐位确定，#215 双栈实证；全强度形态
-        随判别器链期，#226）。#233 起日程升 multi-k（num_steps=5、
+        结构面逐位（事件流完备序 + 流终态）+ 数值面容差对拍（卡 0
+        权重/事件值；spectral buffer 在场非零、跨 run 不比较，口径
+        见下）。#233 起日程升 multi-k（num_steps=5、
         M={1,2,3}）——多卡更新相逐 k 收集-同步（逐 tensor 串行
         allreduce × |M| barrier）进重放锚，验收逐 k 协议的多卡档。
 
@@ -1215,8 +1220,8 @@ class TestExecutorMultiCardTier:
         的强确定性锚：数值可随 kernel 路径漂移，消耗序不可。
 
         流终态在比较面（#232 spec 评审补强）：recon/real_pool 流终态
-        是重构消耗序的确定函数——重构 no_grad 不改权重、pair_batch 无
-        事件，重构在多卡路径被静默跳过或消耗序漂移时权重/事件面不敏
+        是重构消耗序的确定函数——重构 no_grad 不改权重、无事件面，
+        重构在多卡路径被静默跳过或消耗序漂移时权重/事件面不敏
         感，逐位比较把盲区关上（rollout/heldout 流已分别被权重与事件
         heldout_auc 间接涵盖，不重复入面）。"""
         card_count = self._visible_card_count()

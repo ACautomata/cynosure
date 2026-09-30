@@ -64,9 +64,10 @@ class UpdateReport:
     - ``global_batch_size`` = 全局 N_total（K×卡数，逐对等权分母）；
     - ``loss_discriminator`` = 本步上报 loss——单条件一步（DDP AVG
       语义）为**未缩放** terms.total；混合条件步（新执行序 SUM 语义）
-      为 ``Σ_b loss_b×(n_b/N_total)`` 的全局加权值（
-      ``DiscriminatorPhase`` 构造）。口径随执行序，以构造点 docstring
-      为准。
+      为 ``Σ_b loss_b×(n_b/N_total)`` 的本卡加权部分和（单卡即全局；
+      多卡 loss 不做 allreduce——#220 决议 8 只钉梯度口径；事件面
+      ``DiscUpdateDetail.weighted_loss`` 同「本卡」表述）。以构造点
+      （``DiscriminatorPhase.accumulate``）行为为准。
     """
 
     conditions: tuple[ConditionUpdateDetail, ...]
