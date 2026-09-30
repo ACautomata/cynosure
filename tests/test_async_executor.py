@@ -37,7 +37,7 @@ import torch
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.reward.artifacts import LatentManifest
-from cynosure.reward.assembly import ReconstructionAssembler
+from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.scorer import ChunkedScorer
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import RunArtifacts
@@ -119,12 +119,12 @@ class ExecutorScenario:
 
     def spy_window_pairs(
         self, monkeypatch: pytest.MonkeyPatch,
-    ) -> list:
+    ) -> list[tuple[torch.Tensor, str, PairBatch]]:
         """``ReconstructionAssembler.reconstruct_assigned`` 的产出记录
         spy（#234 窗口任务的消费面：供给入口的 (reals, modality) 与
         返回 PairBatch 一并记录——桶构造/任务粒度的观测原料）。单绑卡
         线程内调用序串行，list.append 无竞争。"""
-        calls: list = []
+        calls: list[tuple[torch.Tensor, str, PairBatch]] = []
         real_reconstruct = ReconstructionAssembler.reconstruct_assigned
 
         def recording(assembler, reals, modality):
@@ -1219,11 +1219,13 @@ class TestExecutorMultiCardTier:
         逐位相等本身就是 #234 RNG 消耗序（窗口摊派 + 池化恰一次读数）
         的强确定性锚：数值可随 kernel 路径漂移，消耗序不可。
 
-        流终态在比较面（#232 spec 评审补强）：recon/real_pool 流终态
-        是重构消耗序的确定函数——重构 no_grad 不改权重、无事件面，
-        重构在多卡路径被静默跳过或消耗序漂移时权重/事件面不敏
-        感，逐位比较把盲区关上（rollout/heldout 流已分别被权重与事件
-        heldout_auc 间接涵盖，不重复入面）。"""
+        流终态在比较面（#232 spec 评审补强）：recon 流终态是重构消耗
+        序的确定函数；real_pool 流本期**零消耗**（窗口 real 抽取 =
+        splitmix64 一次性派生 generator、不进 RNG 注册表）——其终态
+        == 初始派生快照，构成「抽取确定性」锚——重构 no_grad 不改权
+        重、无事件面，重构在多卡路径被静默跳过或消耗序漂移时权重/
+        事件面不敏感，逐位比较把盲区关上（rollout/heldout 流已分别被
+        权重与事件 heldout_auc 间接涵盖，不重复入面）。"""
         card_count = self._visible_card_count()
         if card_count < 2:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）")

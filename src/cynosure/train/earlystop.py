@@ -122,10 +122,11 @@ class EarlyStopJudge:
         """单模态两要素：最新 AUC 落 chance 带 且 最近窗口 reward 斜率 > 0。
 
         AUC 腿读「组内最后一次**有效**读数」：判别器链期（#234）非判别
-        器步 iter 的事件 heldout_auc 为 None（本条件尚无池化读数——桥
-        接口径见 IterEvent 契约），None 无 AUC 证据、跳过不猜（宁缓停、
-        不误停）；全组皆 None 同理不猜。每步有读数的旧路径（pretrain/
-        torchrun  trainer）行为逐字不变。"""
+        器步 iter 的事件 heldout_auc = 桥接的该条件最后一次有效池化读
+        数；本 run 尚无读数（条件首现于非判别器步 iter、所在窗口的测
+        量尚未发生）才为 None（桥接口径见 IterEvent 契约）——None 无
+        AUC 证据、跳过不猜（宁缓停、不误停）；全组皆 None 同理不猜。
+        每步有读数的旧路径（pretrain/torchrun trainer）行为逐字不变。"""
         if not events:
             return False
         aucs = [
