@@ -138,19 +138,17 @@ class OnlineUpdate:
             weight_decay=config.disc_weight_decay,
         )
 
-    def step(
-        self, pair: PairBatch, global_batch_size: int | None = None,
-    ) -> UpdateReport:
+    def step(self, pair: PairBatch) -> UpdateReport:
         """一步更新：干净域前向 → LSGAN loss → AdamW step。
 
         ``pair`` = 装配原语产出的配对批（real 与 fake 同源、同条件、
         同量）——本方法对批的构造（重构链、随机流）无感知。train 侧
         干净域复算发生在参数更新之前（与同 iteration 的 held-out AUC
-        同刻，ADR-0009-β）。
-
-        ``global_batch_size`` = 全局有效批 N_total（信息字段，DDP 语义
-        下 = K×world_size）——上报 loss 保持未缩放（DDP AVG 口径，与
-        升格前逐位一致）；缺省 = 本批对数（单进程口径）。"""
+        同刻，ADR-0009-β）。单条件一步（旧执行序/pretrain）：上报
+        loss 保持未缩放（DDP AVG 口径，与升格前逐位一致），
+        ``global_batch_size`` = 本批对数（单进程口径——多卡 N_total
+        由新执行序 ``DiscriminatorPhase`` 在构造点直接供给，不经本
+        路径）。"""
         count = pair.reals.shape[0]
         # train 侧干净域复算（ADR-0009-β）：参数更新前、同一批上重算一次
         # 干净域准确率随报告上行
@@ -174,9 +172,7 @@ class OnlineUpdate:
         return UpdateReport(
             conditions=(detail,),
             batch_size=count,
-            global_batch_size=(
-                count if global_batch_size is None else global_batch_size
-            ),
+            global_batch_size=count,
             loss_discriminator=terms.total.item(),
         )
 

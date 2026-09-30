@@ -292,9 +292,15 @@ class SlotRunner:
         condition_name: str,
         *,
         window_tasks: tuple[tuple[WindowTask, PoolEntry], ...] = (),
+        score_fakes: bool = True,
     ) -> SlotExample:
         """一个例子的 rollout 相（分配表条件 → 初始噪声/扰动/续跑 →
-        打分 → 池化原料打分 → 窗口重构任务）。
+        池化原料打分（门控）→ 窗口重构任务）。
+
+        ``score_fakes`` = 本例 fakes 的池化原料打分门控：判别器步由
+        门面经 ``run_examples`` 显式供给 True（#220 决议 12「每活跃
+        条件恰一次读数」的 fake 原料，即产即用）；非判别器步 False——
+        打分前不进静默丢弃面白付。缺省 True（直调/单测路径完整产出）。
 
         ``window_tasks`` = 本 (iteration, 槽) 摊派的重构任务及其
         real 池条目（窗口起点全局无放回抽取的切片，#220 决议 10）：
@@ -303,7 +309,9 @@ class SlotRunner:
         无任务（非窗口 iter 或本槽未摊派）为空 tuple。"""
         started = time.monotonic()
         record = self._rollout.run_iteration(condition_name)
-        fake_scores = self._score_fakes(record.new_fakes)
+        fake_scores = (
+            self._score_fakes(record.new_fakes) if score_fakes else None
+        )
         pairs = tuple(
             (task, self._reconstruct(task, entry))
             for task, entry in window_tasks
@@ -444,26 +452,32 @@ class CardWorker:
         conditions: dict[int, str],
         *,
         window_tasks: dict[int, tuple[tuple[WindowTask, PoolEntry], ...]],
+        score_fakes: bool = True,
     ) -> dict[int, SlotExample]:
         """本卡全部例子的 rollout 相（槽间并发 gather——协程多路复用
         形态；torch 调用在本线程内串行落卡）。``window_tasks`` = 每槽
-        本 iteration 摊派的窗口任务（real 条目切片随任务下发）。"""
+        本 iteration 摊派的窗口任务（real 条目切片随任务下发）；
+        ``score_fakes`` = 池化原料打分门控（透传 ``SlotRunner.run_example``，
+        门面按判别器步显式供给）。"""
         examples = await asyncio.gather(*(
             slot.run_example(
                 conditions[slot.slot],
                 window_tasks=window_tasks.get(slot.slot, ()),
+                score_fakes=score_fakes,
             )
             for slot in self.slots
         ))
         return {example.slot: example for example in examples}
 
     async def score_heldout(
-        self, conditions: tuple[str, ...], count: int,
+        self, conditions: tuple[str, ...], counts: dict[str, int],
     ) -> dict[str, torch.Tensor]:
         """池化 AUC 本卡测量段：活跃条件（条件名排序）的 held-out real
-        采样 + 打分（消耗本卡 heldout 流；#220 决议 12/15）。"""
+        采样 + 打分（消耗本卡 heldout 流；#220 决议 12/15）。
+        ``counts`` = 本卡本条件 fake 数（逐卡对称采样平面，见
+        ``PooledHeldOutAuc.score_conditions``）。"""
         assert self.pooled_auc is not None
-        return self.pooled_auc.score_conditions(conditions, count)
+        return self.pooled_auc.score_conditions(conditions, counts)
 
     async def discriminate(
         self,
@@ -966,6 +980,10 @@ class AsyncTrainingExecutor:
         # —— rollout 相：eval() + no_grad（执行序第 1 相口径）——
         for card in self.cards:
             card.replica.policy.eval_phase()
+        # 判别器步判定先行：fake 池化原料打分（score_fakes）只在判别
+        # 器步产——非判别器步 iter 的打分前向不进静默丢弃面白付
+        # （#220 决议 12「每活跃条件恰一次读数」消耗面的两侧同门控）
+        disc_step_now = self.window.is_step(iteration)
         per_card = await self._collect(
             [
                 card.submit(card.run_examples(
@@ -973,6 +991,7 @@ class AsyncTrainingExecutor:
                     window_tasks={
                         slot: slot_tasks[slot] for slot in card.slot_ids
                     },
+                    score_fakes=disc_step_now,
                 ))
                 for card in self.cards
             ],
@@ -1020,7 +1039,7 @@ class AsyncTrainingExecutor:
         reports: dict[int, UpdateReport] = {}
         divergences: dict[str, DivergenceReading] = {}
         pooled_auc: dict[str, float] = {}
-        if self.window.is_step(iteration):
+        if disc_step_now:
             # —— 池化 AUC：每活跃条件恰一次读数（#220 决议 12）——
             # 窗口末（判别器更新前）快照、覆盖式入持久账（本窗口活跃
             # 条件刷新读数）；非判别器步 iter 不打分（「恰一次」的消耗
@@ -1029,14 +1048,27 @@ class AsyncTrainingExecutor:
             active = tuple(sorted(
                 {example.record.modality for example in examples.values()}
             ))
-            fake_total = sum(
-                example.record.new_fakes.shape[0]
-                for example in examples.values()
-            )
+            # 采样计数 = 本卡本条件 fake 数（非卡级 fake 总量）——池化
+            # 后 real ≈ fake 的逐卡对称平面：旧卡级总量驱动使 n:m 不
+            # 对称随卡数 × 条件数放大（少 fake 条件吃多 fake 条件的
+            # 采样量），评审定裁改逐卡配平（#220 决议 12 未规定计数）
+            per_card_fake_counts = [
+                {
+                    condition: sum(
+                        example.record.new_fakes.shape[0]
+                        for example in mapping.values()
+                        if example.record.modality == condition
+                    )
+                    for condition in active
+                }
+                for mapping in per_card
+            ]
             per_card_real = await self._collect(
                 [
-                    card.submit(card.score_heldout(active, fake_total))
-                    for card in self.cards
+                    card.submit(
+                        card.score_heldout(active, per_card_fake_counts[i])
+                    )
+                    for i, card in enumerate(self.cards)
                 ],
                 iteration,
                 step_index=0,  # 判别器步非 policy k——pretrain 先例口径
@@ -1083,14 +1115,14 @@ class AsyncTrainingExecutor:
             # 口径），再喂一次观测；多卡同条件多桶的聚合形态为 #220
             # 决议 14 未明文的补记，确定性纯函数、随本票 docstring
             # 立此存照）
-            condition_buckets: dict[str, list[tuple[int, float]]] = {}
+            condition_pair_accs: dict[str, list[tuple[int, float]]] = {}
             for card in self.cards:
                 for detail in reports[card.index].conditions:
-                    condition_buckets.setdefault(
+                    condition_pair_accs.setdefault(
                         detail.condition, [],
                     ).append((detail.pair_count, detail.train_pairwise_acc))
             condition_train_accs: dict[str, float] = {}
-            for condition, buckets in sorted(condition_buckets.items()):
+            for condition, reads in sorted(condition_pair_accs.items()):
                 heldout = self._window_run.window_auc(condition)
                 if heldout is None:
                     raise ValueError(
@@ -1103,9 +1135,9 @@ class AsyncTrainingExecutor:
                         "静默跳测，几何扩面随用例另行裁决（#220 决议 14 "
                         "回退点 = 该条件最后被分配的判别器步 iter）"
                     )
-                total = sum(count for count, _ in buckets)
+                total = sum(count for count, _ in reads)
                 train_acc = sum(
-                    acc * count for count, acc in buckets
+                    acc * count for count, acc in reads
                 ) / total
                 condition_train_accs[condition] = train_acc
                 divergences[condition] = self._overfit.observe(
@@ -1145,11 +1177,15 @@ class AsyncTrainingExecutor:
             )
             for condition, reading, train_acc, heldout in alert_data
         ]
+        # 槽 → 卡映射一次建立（事件段逐槽查卡的线性扫描收敛为 O(1)）
+        slot_card_index = {
+            slot: card.index
+            for card in self.cards
+            for slot in card.slot_ids
+        }
         for slot in sorted(conditions):
             example = examples[slot]
-            card_index = next(
-                card.index for card in self.cards if slot in card.slot_ids
-            )
+            card_index = slot_card_index[slot]
             report = reports.get(card_index)
             detail = (
                 self._disc_detail(report, example.record.modality)

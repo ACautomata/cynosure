@@ -40,9 +40,11 @@ _GOLDEN = 0x9E3779B97F4A7C15
 _SEED_MASK = 0xFFFFFFFFFFFFFFFF
 """64 位混合的掩码（混合中间值全程无符号 64 位运算）。"""
 
-_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
+POSITIVE_INT64_MASK = 0x7FFFFFFFFFFFFFFF
 """torch.Generator.manual_seed 的正 int64 域掩码（混合产物超 int64 时
-截取低 63 位——同一 (seed, 轮号) 恒得同值，确定性不受影响）。"""
+截取低 63 位——同一 (seed, 轮号) 恒得同值，确定性不受影响）。分配表
+轮种子与窗口 real 抽取两消费方共享（#234 评审收敛：原两处同款私有
+常量合一）。"""
 
 _MIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
 _MIX_MULTIPLIER_2 = 0x94D049BB133111EB
@@ -142,8 +144,8 @@ class AllocationTable:
     def _round_seed(self, round_index: int) -> int:
         """轮种子 = (seed, 轮号) 的 splitmix64 终混（``SeedMixer`` 单一
         实现；与命名流偏移域异构，撞位无语义）——截取正 int64 域
-        （``Generator.manual_seed`` 域，本消费方的历史私有口径）。"""
-        return SeedMixer.mix(self._seed, round_index << 32) & _MANUAL_SEED_MASK
+        （``Generator.manual_seed`` 域，共享 ``POSITIVE_INT64_MASK``）。"""
+        return SeedMixer.mix(self._seed, round_index << 32) & POSITIVE_INT64_MASK
 
     @staticmethod
     def assert_pair_symmetry(

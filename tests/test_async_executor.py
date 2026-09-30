@@ -147,9 +147,12 @@ class ExecutorScenario:
         examples: list[SlotExample] = []
         real_run_example = SlotRunner.run_example
 
-        async def recording(runner, condition_name, *, window_tasks=()):
+        async def recording(
+            runner, condition_name, *, window_tasks=(), score_fakes=True,
+        ):
             example = await real_run_example(
                 runner, condition_name, window_tasks=window_tasks,
+                score_fakes=score_fakes,
             )
             examples.append(example)
             return example
@@ -1086,6 +1089,8 @@ class TestDiscriminatorChainWindow:
             )
 
 
+@pytest.mark.gpu
+@pytest.mark.slow
 class TestExecutorMultiCardTier:
     """gauss 多卡 e2e 档（slow+gpu；换发射方式重建，#217 门面 + M1）：
     跨卡一致性 + 层 3 同 seed 多卡重放锚薄切片形态。"""

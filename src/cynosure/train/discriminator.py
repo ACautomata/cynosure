@@ -49,15 +49,14 @@ from cynosure.reward.auc import HeldOutAuc
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import ChunkedScorer, LatentScorer
 from cynosure.reward.update import ConditionUpdateDetail, UpdateReport
-from cynosure.train.allocation import AllocationTable, SeedMixer
+from cynosure.train.allocation import (
+    POSITIVE_INT64_MASK,
+    AllocationTable,
+    SeedMixer,
+)
 
 if TYPE_CHECKING:
     from cynosure.train.executor import SlotExample
-
-_POSITIVE_INT64_MASK = 0x7FFFFFFFFFFFFFFF
-"""torch.Generator.manual_seed 的正 int64 域掩码（窗口抽取种子的
-私有截取口径——分配表轮种子同款；Baseline manifest 不截取的历史
-分歧见 ``SeedMixer`` docstring）。"""
 
 
 @dataclass(frozen=True)
@@ -325,12 +324,12 @@ class WindowRealDraw:
     def _derive_seed(seed: int, step_iteration: int, condition: str) -> int:
         """(seed, 窗口号, 条件名) 的 splitmix64 终混（``SeedMixer`` 单一
         实现；条件名经 crc32 内容寻址混入——与 PreparePipeline.noise_seed
-        同款机制）——截取正 int64 域（``Generator.manual_seed`` 域，本
-        消费方的历史私有口径）。"""
+        同款机制）——截取正 int64 域（``Generator.manual_seed`` 域，共享
+        ``POSITIVE_INT64_MASK``）。"""
         digest = zlib.crc32(condition.encode("utf-8"))
         return (
             SeedMixer.mix(seed, step_iteration << 32, digest)
-            & _POSITIVE_INT64_MASK
+            & POSITIVE_INT64_MASK
         )
 
     def assign(
@@ -343,7 +342,10 @@ class WindowRealDraw:
 
         抽取调用序 = 条件名排序（sorted 的显式遍历锚）；抽取量超过条件
         池即拒绝（容量守卫的抽取期兜底——装配期逐条件 ≥ K×卡数把门，
-        正常路径不可达）。"""
+        正常路径不可达）。候选过滤 + randperm 定序复用
+        ``RealPoolSampler.permutation``（候选序 = manifest 序、同派生
+        generator，逐位等价）——一次性 generator 不进 RNG 注册表的
+        口径不变。"""
         tasks = window.tasks(step_iteration)
         by_condition: dict[str, list[WindowTask]] = {}
         for task in tasks:
@@ -351,24 +353,20 @@ class WindowRealDraw:
         assigned: dict[WindowTask, PoolEntry] = {}
         for condition in sorted(by_condition):
             group = by_condition[condition]
-            candidates = [
-                entry for entry in self._manifest.entries
-                if entry.modality == condition
-            ]
-            if len(group) > len(candidates):
-                raise ValueError(
-                    f"窗口 real 抽取超出条件 {condition!r} 的池容量：需 "
-                    f"{len(group)} 条、池 {len(candidates)} 条（全局无放回；"
-                    "装配期容量守卫 = 逐条件全池 ≥ K×卡数应已把门——"
-                    "直调路径或工件缺条的防御兜底）"
-                )
             generator = torch.Generator().manual_seed(
                 self._derive_seed(seed, step_iteration, condition),
             )
-            permutation = torch.randperm(
-                len(candidates), generator=generator,
-            ).tolist()
-            chosen = [candidates[i] for i in permutation[:len(group)]]
+            pool = RealPoolSampler(self._manifest, generator).permutation(
+                modality=condition,
+            )
+            if len(group) > len(pool):
+                raise ValueError(
+                    f"窗口 real 抽取超出条件 {condition!r} 的池容量：需 "
+                    f"{len(group)} 条、池 {len(pool)} 条（全局无放回；"
+                    "装配期容量守卫 = 逐条件全池 ≥ K×卡数应已把门——"
+                    "直调路径或工件缺条的防御兜底）"
+                )
+            chosen = pool[:len(group)]
             for task, entry in zip(group, chosen):
                 assigned[task] = entry
         return assigned
@@ -404,20 +402,26 @@ class PooledHeldOutAuc:
         self._device = device
 
     def score_conditions(
-        self, conditions: tuple[str, ...], count: int,
+        self, conditions: tuple[str, ...], counts: dict[str, int],
     ) -> dict[str, torch.Tensor]:
-        """条件名排序逐条件：无放回采 ``count`` 条 held-out real（上限
-        = 该条件池）+ 定块打分 → CPU 展平分数（门面的池化原料）。
+        """条件名排序逐条件：无放回采 ``counts[condition]`` 条 held-out
+        real（上限 = 该条件池）+ 定块打分 → CPU 展平分数（门面的池化
+        原料）。
 
-        采样数钳到 min(count, 该条件池)——与 per-例口径同构（Mann-
-        Whitney 对非对称 n×m 有效）；消耗本卡 heldout 流（流终态锚的
-        比较面）。``conditions`` 传入即消耗序（调用方按条件名排序）。
-        """
+        计数 = **本卡本条件** fake 数（门面按卡供给）——池化后
+        real ≈ fake（逐卡对称平面：每卡 real 侧配平本卡贡献，与
+        per-例口径同构的池化形态，卡数与卡间条件分布不放大 n:m
+        不对称；#220 决议 12 未规定计数，本形态为评审立据的定裁）。
+        采样数钳到 min(计数, 该条件池)——池不足时 Mann-Whitney 对
+        非对称 n×m 仍有效（per-例口径同款钳制）；零 fake 卡仍采 1
+        条（流 consume 序恒条件名排序的确定性锚不空缺）。消耗本卡
+        heldout 流（流终态锚的比较面）。``conditions`` 传入即消耗序
+        （调用方按条件名排序）。"""
         with torch.no_grad():
             scores: dict[str, torch.Tensor] = {}
             for condition in conditions:
                 pool_size = self._pool_size(condition)
-                sample_count = max(1, min(count, pool_size))
+                sample_count = max(1, min(counts[condition], pool_size))
                 latents = self._real_sampler.sample(
                     sample_count, modality=condition,
                 )
@@ -425,11 +429,9 @@ class PooledHeldOutAuc:
             return scores
 
     def _pool_size(self, condition: str) -> int:
-        """该条件的 held-out 条目数（采样上界钳制面）。"""
-        return sum(
-            1 for entry in self._manifest.entries
-            if entry.modality == condition
-        )
+        """该条件的 held-out 条目数（采样上界钳制面）——manifest
+        ``modalities`` 计数图（``HeldOutAuc._pool_size`` 同款面）。"""
+        return self._manifest.modalities.get(condition, 0)
 
     def _chunked_scores(self, latents: torch.Tensor) -> torch.Tensor:
         """定块打分前向（``ChunkedScorer`` 单一实现：GroupNorm 分块与
@@ -642,7 +644,7 @@ class DiscriminatorPhase:
         if len(phases) <= 1:
             return
         devices = {
-            phase._scorer.discriminator.parameters().__next__().device
+            next(phase._scorer.discriminator.parameters()).device
             for phase in phases
         }
         if any(device.type != "cuda" for device in devices):
@@ -668,7 +670,7 @@ class DiscriminatorPhase:
             if grads[0].grad is None:
                 continue
             torch.cuda.nccl.all_reduce(
-                [grad for grad in (p.grad for p in grads)],
+                [p.grad for p in grads],
                 op=torch.cuda.nccl.SUM,
             )
 
