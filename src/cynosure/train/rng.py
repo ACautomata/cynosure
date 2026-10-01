@@ -109,7 +109,7 @@ class SlotRngRegistry:
         if slots < 1:
             raise ValueError(f"槽数须 ≥ 1，得到 {slots}")
         self._slots = tuple(
-            TrainingRngStreams(seed + slot * SLOT_SEED_STRIDE)
+            TrainingRngStreams(self.slot_seed(seed, slot))
             for slot in range(slots)
         )
         self._owner_check = owner_check
@@ -121,6 +121,13 @@ class SlotRngRegistry:
     def slot_count(self) -> int:
         """注册的槽数（= 协程数；分配表槽轴与静态绑卡的取数面）。"""
         return len(self._slots)
+
+    @staticmethod
+    def slot_seed(base: int, slot: int) -> int:
+        """逐槽 seed 派生的单点公式：注册表构造面与 v12 分片记录面
+        共用（seeds 记录值须与实际派生同源——公式两处手写漂移即
+        记录静默失真，#236 review 收拢）。"""
+        return base + slot * SLOT_SEED_STRIDE
 
     def get_stream(self, slot: int, stream: str) -> torch.Generator:
         """槽 × 流名的 generator 取数出口（注册表唯一访问面）。
@@ -138,6 +145,15 @@ class SlotRngRegistry:
         复位的取数口）：读状态不消费流、不触发 owner-thread 断言——
         观测不是消耗，注册表消费面（``get_stream``）与本观测面分离。"""
         return self._stream(slot, stream).get_state()
+
+    def restore_stream(
+        self, slot: int, stream: str, state: torch.Tensor,
+    ) -> None:
+        """槽 × 流的 generator 状态回填（续训恢复入口，v12 分片
+        ``generators`` 键的应用面）：恢复是状态写入、不是流消费——
+        不触发 owner-thread 断言（与 ``stream_state`` 观测面同口径的
+        写对应；#218 恢复序「generators 状态回填、不重派生对账」）。"""
+        self._stream(slot, stream).set_state(state)
 
     def _stream(self, slot: int, stream: str) -> torch.Generator:
         """槽 × 流的 generator 解析（槽界与流名在册校验单点；``get_stream``

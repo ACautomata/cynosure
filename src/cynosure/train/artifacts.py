@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -114,9 +114,11 @@ class IterEvent(BaseModel):
     lr: float
     elapsed_s: float
     phase_seconds: dict[str, float] = Field(default_factory=dict)
-    """逐 iter 卡时分解（#123 tracer 首跑的成本读数面）：本 iteration 各
-    相位的墙钟秒数，键 = 相位名（``rollout`` / ``heldout_auc`` /
-    ``policy_update`` / ``discriminator``，可扩）。
+    """逐 iter 相位**墙钟**分解（#123 tracer 首跑的成本读数面；「卡时」
+    措辞随 #222 §4 退役——实现是 ``time.monotonic`` 墙钟，协程数 >
+    卡数时字面「卡时」为假）：本 iteration 各相位的墙钟秒数，键 = 相位
+    名（``rollout`` / ``heldout_auc`` / ``policy_update`` /
+    ``discriminator``，可扩）。
     覆盖区间与 ``elapsed_s`` 同界——[iteration 起点, 本事件构造]：周期
     checkpoint、里程碑解码评测与迭代末 barrier 在该区间之外（随既有
     ``elapsed_s`` 口径，不单列）。各相位之和 ≤ ``elapsed_s``（差额 =
@@ -145,13 +147,15 @@ class MilestoneEvent(BaseModel):
     early_stop_reason: str | None = None
     """触发早停的签名（"plateau" / "reward_hacking"）；未停为 None。"""
     elapsed_s: float | None = None
-    """里程碑评测总卡时（#124 监控成本读数：采样 + 解码 + FID 的全
-    区间，监控相在 RL 主循环外的独立成本行）。None = 调用方未计量
+    """里程碑评测总**墙钟**（#124 监控成本读数：采样 + 解码 + FID 的
+    全区间，监控相在 RL 主循环外的独立成本行；「总卡时」措辞随
+    #222 §4 退役——实现是墙钟）。None = 调用方未计量
     （替身直调场景）。"""
     phase_seconds: dict[str, float] = Field(default_factory=dict)
-    """里程碑评测相位卡时分解（#124，#111 监控账的成本行取数面）：
-    ``decode`` = 合成侧 VAE 分块解码；``fid`` = 参照装载 + 特征提取 +
-    距离核。空 dict = 调用方未做相位计量（替身直调场景）。"""
+    """里程碑评测相位**墙钟**分解（#124，#111 监控账的成本行取数面；
+    「卡时分解」措辞随 #222 §4 退役，同为墙钟口径）：``decode`` =
+    合成侧 VAE 分块解码；``fid`` = 参照装载 + 特征提取 + 距离核。
+    空 dict = 调用方未做相位计量（替身直调场景）。"""
 
 
 class OverfitAlertEvent(BaseModel):
@@ -165,7 +169,7 @@ class OverfitAlertEvent(BaseModel):
     rank，ADR-0016 决策 8）。**rank 轴随执行模型退役**（#220 决议 13）：
     async 执行序的 per-condition 分叉是池化单值（rank 离散的数据切片
     异质性诊断对象结构性消失），``rank`` 字段在 async 门面填 0（主
-    线程 = 卡 0 写出口径，与 barrier_soft_timeout 同）；预训练相的
+    线程 = 卡 0 写出口径，与 barrier_timeout_alert 同）；预训练相的
     rank 归因语义随旧执行序留存至其删除。**报警不动作**：事件只承载
     读数，无任何自动动作（人工裁决，ADR-0009 决策 5；门控链已随
     ADR-0017 退役——「无机制可实现自动动作」的结构性保证）。回退
@@ -246,30 +250,66 @@ class PretrainEvent(BaseModel):
     elapsed_s: float
 
 
-class BarrierSoftTimeoutEvent(BaseModel):
-    """训练指标流的 per-k barrier 软超时告警事件（#217 门面形态：软超时
-    告警 + 硬超时 abort——告警是观测面，硬超时才动作）。
+class BarrierTimeoutAlertEvent(BaseModel):
+    """训练指标流的 per-k barrier 软超时告警事件（#217 §4 门面形态：
+    软超时告警 + 硬超时 abort——告警是观测面，硬超时才动作）。
 
     async 执行序（#231 骨架期）的 barrier 等待越过软超时阈值时由门面
     主线程发出（单进程多卡下主线程即「卡 0 写出」的语义载体）；等待
-    继续、硬超时阈值到即 fail-fast 中止。字段为门面最小集，随 #222
-    续训与事件契约期收口（事件契约「可扩不可改名」——扩字段兼容）。
+    继续、硬超时阈值到即 fail-fast 中止。**两档 flush 的告警族即写**
+    （#222）：产生即写、不进 iter 族缓冲——软超时的运营价值 = 硬超时
+    前的人工介入窗口，缓冲吃掉窗口；单写者下告警时序先于下一 iter
+    块、即写不破坏块内连续性（事件契约「可扩不可改名」）。
+
+    类型定名与字段随 #236 续训与事件契约期按 #222 决议收口：骨架期
+    的 ``barrier_soft_timeout`` 类型（#231 的临时落地，其 docstring
+    明记「随 #222 收口」）整体退役——新执行序无生产 run 落盘，定名
+    ``barrier_timeout_alert``、字段对齐决议清单（``step_index`` →
+    ``k``、``waited_s`` → ``elapsed_s``；``threshold_s`` 阈值读数随
+    收口移除——软阈值口径见执行器 ``BarrierTimeoutPolicy``）。
     """
 
     model_config = ConfigDict(allow_inf_nan=False)
 
-    event: Literal["barrier_soft_timeout"] = "barrier_soft_timeout"
+    event: Literal["barrier_timeout_alert"] = "barrier_timeout_alert"
     iteration: int
     """告警所属 iteration（回退记账轴，与 iter 事件同 ITERATION 口径）。"""
     stage: int = 1
     """告警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
-    step_index: int
-    """越过软超时阈值的被优化训练步 k。"""
-    waited_s: float
-    """本 barrier 已等待的墙钟秒数（越线读数）。"""
-    threshold_s: float
-    """软超时阈值（硬超时 = ``CYNOSURE_PG_TIMEOUT_MIN`` 语义换绑的口径，
-    见执行器 BarrierTimeoutPolicy；软阈值 = 硬阈值的一半，门面常量）。"""
+    k: int | None = Field(None, ge=1)
+    """越过软超时阈值的被优化训练步 k；非 k barrier（判别器步的集合
+    段：桶装配 / optimizer.step）= None——判别器步非 policy k 相位，
+    ``0`` 不是合法 k 值（train_step_indices_m 集合不含 0，``ge=1``
+    把注释契约固化成类型契约），None 显式表达「无 k 归因」。"""
+    elapsed_s: float
+    """本 barrier 已等待的墙钟秒数（越线读数；软超时是墙钟时机事件，
+    #222 决议字段口径）。硬超时 = ``CYNOSURE_PG_TIMEOUT_MIN`` 语义换
+    绑的口径，见执行器 BarrierTimeoutPolicy（软阈值 = 硬阈值的一半，
+    门面常量）。"""
+
+
+class WeightDivergenceAlertEvent(BaseModel):
+    """训练指标流的跨卡权重分叉告警事件（#217 checkpoint 周期 bitwise
+    校验的告警臂；#222 接口缝补账、#236 落地）：checkpoint 周期点上
+    各卡 policy 与判别器权重的跨卡逐位比较失配时由门面主线程发出。
+
+    **无槽归因轴**（#222）：AND-allreduce 全卡一致失败，分叉不归因单
+    卡——事件不带 rank/slot 字段。校验失败 = fail-fast（告警事件 +
+    abort + checkpoint 重启，#217 §4）——分叉是吸收态（allreduce 只
+    作用梯度、不能纠正权重分叉），与 overfit_alert「报警不动作」哲学
+    不同类。多卡拓扑才有跨卡校验面；单卡结构性恒一致、无产出点。
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    event: Literal["weight_divergence_alert"] = "weight_divergence_alert"
+    iteration: int
+    """告警所属 iteration（回退记账轴，与 iter 事件同 ITERATION 口径；
+    已完成的 iteration 数 = 校验触发点）。"""
+    stage: int = 1
+    """告警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    elapsed_s: float
+    """权重一致性校验窗口的墙钟秒数（校验耗时读数，越线时的耗时背景）。"""
 
 
 class RewindAccounting(Enum):
@@ -316,7 +356,8 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
     "milestone": RewindAccounting.COMPLETION,
     "pretrain": RewindAccounting.EXEMPT,
     "overfit_alert": RewindAccounting.ITERATION,
-    "barrier_soft_timeout": RewindAccounting.ITERATION,
+    "barrier_timeout_alert": RewindAccounting.ITERATION,
+    "weight_divergence_alert": RewindAccounting.ITERATION,
 }
 """事件判别值 → 回退记账口径的登记表（契约「可扩不可改名」的记账面）。
 
@@ -331,9 +372,13 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
 ``RunArtifacts._kept_by_rewind`` 的相特判——登记表按判别值索引，相是
 事件级字段，一型两轨的判定不进表。
 
-``barrier_soft_timeout`` 登记 ITERATION：告警是本 iteration barrier
-等待的执行史观测，随所属 iteration 参与回退（恢复点之后由重执行按
-当次等待实况重写，#231 门面的告警与 iter 事件同轴）。"""
+``barrier_timeout_alert`` / ``weight_divergence_alert`` 登记 ITERATION
+（#222 结票，#236 落地）：两者都是墙钟时机事件的执行史观测——软超时
+/分叉告警随所属 iteration 参与回退（恢复点之后由重执行按当次实况
+重写），**显式接受史实蒸发**（#222 论证：重执行负载已变大概率不再
+超时，删除后不重发；abort 证据链由进程日志承载运维史）。骨架期的
+``barrier_soft_timeout`` 登记行随类型收口退役——其旧行若存在即表外，
+按「宁可留痕不可误删」兜底全量保留。"""
 
 
 class ManifestEntry(BaseModel):
@@ -535,18 +580,44 @@ class RunArtifacts:
         """
         return BaselineManifest.build(config)
 
+    @staticmethod
+    def _encode_event(event: "BaseModel") -> str:
+        """单事件 → JSONL 行的编码单点：``allow_nan=False`` 是事件
+        契约参数（非有限浮点构造期拒绝的落盘侧镜像），追加面两处
+        共用、不得分叉。"""
+        return json.dumps(
+            event.model_dump(), ensure_ascii=False, allow_nan=False,
+        ) + "\n"
+
     def append_event(
         self,
         event: (
             IterEvent | MilestoneEvent | PretrainEvent | OverfitAlertEvent
-            | BarrierSoftTimeoutEvent
+            | BarrierTimeoutAlertEvent | WeightDivergenceAlertEvent
         ),
     ) -> None:
-        """向训练指标流追加一行 JSON 事件（按行追加、rank 0 归并）。"""
+        """向训练指标流追加一行 JSON 事件（执行序无关的**单事件
+        追加面**）：async 序的告警族即写经此面（#222 两档 flush 的
+        第二档——产生即写、不进 iter 族缓冲）；旧执行序 EventMerger
+        的逐事件归并写与 milestone/pretrain 事件同样走此面。iter 族
+        在 async 序走 ``append_events`` 批写面（排序 + 单点写）。"""
         with open(self.paths.metrics, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(
-                event.model_dump(), ensure_ascii=False, allow_nan=False,
-            ) + "\n")
+            fh.write(self._encode_event(event))
+
+    def append_events(
+        self,
+        events: "Sequence[IterEvent]",
+    ) -> None:
+        """iter 族事件的**单点写**面（#222 两档 flush 的第一档）：缓冲
+        到 iteration 边界、按 (iteration, slot) 排序后一次 open 顺序
+        追加——「同一 iteration N 条按槽号升序连续排列」的流形态由
+        调用方的排序保证，本方法保持清单序原样写出。空清单 = 无操作
+        （不产生空 open）。"""
+        if not events:
+            return
+        with open(self.paths.metrics, "a", encoding="utf-8") as fh:
+            for event in events:
+                fh.write(self._encode_event(event))
 
     def read_events(self) -> list[dict]:
         """读回指标流全部事件（早停判定与评测脚本共同消费）。"""

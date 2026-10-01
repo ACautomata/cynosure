@@ -26,8 +26,8 @@
   互等由 barrier 硬超时（``BarrierTimeoutPolicy``）有界化；进程级
   退出由入口层承载（``TrainingAborted`` 抛给调用方，骨架期无 CLI
   装配、生产入口票面明确不含，#226 决策 1）。
-- **barrier 软/硬超时**（#217 §4）：软超时 → ``barrier_soft_timeout``
-  事件（主线程 = 卡 0 写出口径）后继续等待；硬超时 → fail-fast。
+- **barrier 软/硬超时**（#217 §4）：软超时 → ``barrier_timeout_alert``
+  告警事件（#222 两档 flush 告警族即写）后继续等待；硬超时 → fail-fast。
   ``CYNOSURE_PG_TIMEOUT_MIN`` 变量沿用、**语义换绑** per-k barrier 硬
   超时（分钟；sugon 已设 40，零部署变更；未设置 = torch 默认 10 分钟
   口径沿用）。
@@ -76,7 +76,24 @@ train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
 RL 装配缝（``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器，
 预训练 driver 自行装配副本语义。
 
-**不含**（各进加厚期，#226）：续训分片、评测路径、pretrain driver、
+续训与事件契约期增量（#236，加厚 4/6，#222/#218 结票全口径）：
+**v12 单文件续训分片**——``AsyncResumeStore``（独立 nominal-v12
+常量，旧 v11 分片被新 store 拒、新 v12 分片被旧 resume 拒 = 版本
+对账承载跨执行器拒绝）、marker/集合化拒绝整体退役（单进程
+fail-fast）、拓扑守卫只对账 slots（卡数不进对账）、generators
+per-(槽×流) 嵌套、seeds 记录性字段、全局 RNG/world_size/ema 预留槽
+删除；checkpoint 节奏（周期 + 收尾兜底）**同写者顺序定死**——跨卡
+权重 bitwise 校验（#217，失配 = weight_divergence_alert 即写 +
+abort）→ 续训分片 → 产物 checkpoint（policy_iter*.pt /
+discriminator_iter*.pt）；resume 单点声明（占位装配 + 恢复 = 契约
+校验 → 下发各卡 → 流状态回填 → 分叉 adopt → 指标流回退）。
+**事件两档 flush**——iter 族缓冲到 iteration 边界、按 (iteration,
+slot) 排序后单点写（``append_events``）；告警族（barrier_timeout_
+alert / weight_divergence_alert / overfit_alert）产生即写。软超时
+事件随本票按 #222 收口定名（骨架期 barrier_soft_timeout 临时类型
+退役：barrier_timeout_alert、字段 iteration/k/elapsed_s）。
+
+**不含**（各进加厚期，#226）：评测路径、pretrain driver、
 生产入口（本门面仅被 fixture 测试驱动，#226 决策 1 生产入口单口径）。
 """
 
@@ -108,12 +125,18 @@ from cynosure.reward.scorer import ChunkedScorer, RewardScorer
 from cynosure.reward.update import ConditionUpdateDetail, OnlineUpdate, UpdateReport
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import (
-    BarrierSoftTimeoutEvent,
+    POLICY_CHECKPOINT_TEMPLATE,
+    BarrierTimeoutAlertEvent,
     DiscConditionReading,
     DiscUpdateDetail,
     IterEvent,
     OverfitAlertEvent,
     RunArtifacts,
+    WeightDivergenceAlertEvent,
+)
+from cynosure.train.async_resume import (
+    ASYNC_RESUME_FORMAT_VERSION,
+    AsyncResumeStore,
 )
 from cynosure.train.discriminator import (
     DiscriminatorBucket,
@@ -127,7 +150,11 @@ from cynosure.train.discriminator import (
 )
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase, StepRollout
-from cynosure.train.rng import DropoutGuard, SlotRngRegistry, TrainingRngStreams
+from cynosure.train.rng import (
+    DropoutGuard,
+    SlotRngRegistry,
+    TrainingRngStreams,
+)
 from cynosure.train.runtime import TrainingRuntime
 
 _T = TypeVar("_T")
@@ -135,6 +162,16 @@ _T = TypeVar("_T")
 _STAGE_TAG = 1
 """骨架期事件的阶段号（单阶段组缺省；组3 StageTag 机制属 trainer 面，
 本门面 fixture 薄切片不承载序贯）。"""
+
+_STREAM_NAMES: tuple[str, ...] = (
+    TrainingRngStreams.ROLLOUT,
+    TrainingRngStreams.REAL_POOL,
+    TrainingRngStreams.HELDOUT_AUC,
+    TrainingRngStreams.RECON,
+)
+"""v12 分片 generators 键的流名轴：从 TrainingRngStreams 流常量派生
+（async_resume 校验面同源派生——嵌套校验/状态导出/状态回填共用，
+无字面量副本；tuple 保序、那边 frozenset 比集合）。"""
 
 _WORKER_JOIN_TIMEOUT_S = 10.0
 """线程收尾的 join 上限（秒）：正常停转远快于此；卡死在 in-flight CUDA
@@ -518,6 +555,38 @@ class CardWorker:
         allreduce 之后；步末 u/v broadcast 由门面主线程单点编排）。"""
         self.replica.disc_phase.step()
 
+    async def export_states(self) -> tuple[dict, dict]:
+        """本卡权重快照（checkpoint 校验/续训存取的取数面）：policy
+        网络 + 判别器网络的 CPU clone state_dict——主线程的跨卡逐位
+        比较与 ``torch.save`` 序列化不受卡上存储别名影响；checkpoint
+        点各卡 idle（iteration 已完成），读取无并发写者。"""
+        replica = self.replica
+        return (
+            AsyncResumeStore.to_cpu_snapshot(
+                replica.policy.network.state_dict(),
+            ),
+            AsyncResumeStore.to_cpu_snapshot(
+                replica.scorer.discriminator.state_dict(),
+            ),
+        )
+
+    async def load_restored(self, payload: dict) -> None:
+        """恢复应用（本卡）：policy 权重 + optimizer、判别器权重 +
+        optimizer 整体覆写——装配期随机性被整体覆写的既有语义
+        （resume 占位装配不消费任何 checkpoint 工件，覆写即落盘时刻
+        的训练机状态）。分片张量 CPU 形态装载：模块 ``load_state_dict``
+        跨设备 copy_、optimizer ``load_state_dict`` cast 到参数设备，
+        均不依赖分片保存时的设备环境。"""
+        replica = self.replica
+        replica.policy.load_full_state(payload["policy_network"])
+        replica.policy.optimizer.load_state_dict(payload["policy_optimizer"])
+        replica.scorer.discriminator.load_state_dict(
+            payload["discriminator_network"], strict=True,
+        )
+        replica.disc_phase.optimizer.load_state_dict(
+            payload["discriminator_optimizer"],
+        )
+
     async def accumulate_k(
         self,
         examples: dict[int, SlotExample],
@@ -619,7 +688,7 @@ class PerKCollectReduce:
 class BarrierTimeoutPolicy:
     """per-k barrier 软/硬超时口径（#217 §4；``CYNOSURE_PG_TIMEOUT_MIN``
     语义换绑）：硬超时 = fail-fast 中止；软超时 = 硬阈值 ×
-    ``SOFT_FRACTION`` 处发 ``barrier_soft_timeout`` 告警事件后继续等待。
+    ``SOFT_FRACTION`` 处发 ``barrier_timeout_alert`` 告警事件后继续等待。
     生产读环境变量（分钟）；测试按构造注入小值快速触发。"""
 
     SOFT_FRACTION = 0.5
@@ -665,6 +734,44 @@ class BarrierTimeoutPolicy:
         return cls(minutes * 60)
 
 
+class RunContinuation:
+    """续训与 checkpoint 节奏的编排协作者（#236 续训与事件契约期）：
+
+    - 持有 v12 ``AsyncResumeStore``（分片存取的校验单点）；
+    - **resume 单点声明**（装配与 run 执行共用同一开关，旧 trainer
+      口径平移——无双点声明可错位）：build(resume=True) 驱动占位装配
+      （判别器不消费任何 checkpoint 工件），run() 经本类声明从分片
+      恢复；
+    - checkpoint 周期判定（收尾兜底由门面按 last_checkpoint 前向
+      推进口径裁决，旧 trainer 同口径）。
+
+    分片的具体攒装（收集各卡权威状态）与恢复应用（下发各卡、流状态
+    回填）由门面承担——它持有 cards 与注册表；本类不触碰门面内部
+    结构（「ResumeStore 挂运行时聚合层」裁决在新执行序的落点：
+    #231 骨架期后新执行序的聚合层 = 本门面，store 与其节奏编排收为
+    门面单一协作者，#222 §1 / ADR-0014 平移口径）。
+    """
+
+    def __init__(self, artifacts: RunArtifacts, *, resume: bool) -> None:
+        self._store = AsyncResumeStore(artifacts)
+        self._resume = resume
+
+    @property
+    def resume_assembled(self) -> bool:
+        """resume 单点声明的读面（装配分派与 run 恢复共用）。"""
+        return self._resume
+
+    @property
+    def store(self) -> AsyncResumeStore:
+        """v12 续训分片存取（门面 save/restore 的经手面）。"""
+        return self._store
+
+    def checkpoint_due(self, completed: int, interval: int) -> bool:
+        """周期判定：completed % interval == 0（completed > 0 由调用
+        循环保证——iteration 从 0 起、checkpoint 点在完成后）。"""
+        return completed % interval == 0
+
+
 class AsyncTrainingExecutor:
     """async 执行序门面：静态分配表轮 + per-槽协程骨架 + 逐 k barrier
     收集-同步 + 事件发射 + fail-fast/超时口径的单点编排（#231 骨架期
@@ -681,6 +788,7 @@ class AsyncTrainingExecutor:
         timeout: BarrierTimeoutPolicy,
         window_run: DiscriminatorWindowRun,
         overfit: OverfitMonitor,
+        continuation: RunContinuation,
     ) -> None:
         self.config = config
         self.artifacts = artifacts
@@ -691,6 +799,7 @@ class AsyncTrainingExecutor:
         self._timeout = timeout
         self._window_run = window_run
         self._overfit = overfit
+        self._continuation = continuation
 
     @property
     def window(self) -> DiscriminatorWindow:
@@ -713,6 +822,7 @@ class AsyncTrainingExecutor:
         devices: list[torch.device] | None = None,
         owner_check: bool = False,
         timeout: BarrierTimeoutPolicy | None = None,
+        resume: bool = False,
     ) -> "AsyncTrainingExecutor":
         """config 驱动装配：设备发现（卡数）→ 条件轴（条件分布
         ``targets()``，集合知识归条件分布自身）→ 分配表 + 槽注册表 →
@@ -740,7 +850,15 @@ class AsyncTrainingExecutor:
         )
         if slot_count < 1:
             raise ValueError(f"调度槽数须 ≥ 1，得到 {slot_count}")
-        scorer_prototype = cls.assemble_discriminator(config)
+        # resume 装配分派（单点声明经 RunContinuation 贯穿装配与执行）：
+        # 新 run = warm-start 装载（ADR-0007 守卫链）；resume = 占位装配
+        # ——判别器不消费任何 checkpoint 工件（预训练产物被清理的中断
+        # run 永不可恢复的问题在此结构性消失），随机初始化被 restore
+        # 整体覆写（旧 trainer「装配期随机性被整体覆写」口径平移）。
+        scorer_prototype = (
+            TrainingRuntime.assemble_scorer(config, None, resume=True)
+            if resume else cls.assemble_discriminator(config)
+        )
         vocabulary = TrainingRuntime.assemble_vocabulary(config)
         total_pairs = config.reward.disc_batch_size_k * len(devices)
         replica = CardReplica.build(
@@ -825,6 +943,7 @@ class AsyncTrainingExecutor:
                 window, WindowRealDraw(real_pool), config.schedule.seed,
             ),
             overfit=overfit,
+            continuation=RunContinuation(run_artifacts, resume=resume),
         )
 
     @staticmethod
@@ -914,12 +1033,13 @@ class AsyncTrainingExecutor:
         )
 
     def run(self) -> int:
-        """训练主循环（骨架期口径 + rollout 期重构任务，#232）：预热 →
-        绑卡线程启动 → 逐 iteration（rollout 相 → 逐 k barrier → 事件
-        发射）→ 线程收尾。返回完成的 iteration 数。无续训/评测/判别器
-        链/checkpoint——各进加厚期（#226 决策 3 骨架期包含面；重构任务
-        的配对批记账无消费点属判别器链期，#234）。启动序在收尾兜底的
-        ``try`` 内：第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）
+        """训练主循环（#236 续训与事件契约期口径）：预热 → 绑卡线程
+        启动 → 逐 iteration（rollout 相 → 逐 k barrier → 事件发射）
+        → 线程收尾。返回完成的 iteration 数。续训（resume 单点声明
+        经 ``RunContinuation``：恢复 + checkpoint 周期/收尾兜底 +
+        v12 分片与产物落盘）与判别器链（#234）已进本门面；评测仍未
+        进（评测脚本独立消费产物工件）。启动序在收尾兜底的 ``try``
+        内：第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）
         时已启动的前序卡同样经 ``finally`` 收尾。"""
         self._warmup()
         try:
@@ -941,11 +1061,212 @@ class AsyncTrainingExecutor:
         self._collect_reduce.warmup([card.replica for card in self.cards])
 
     async def _run_iterations(self) -> int:
-        completed = 0
-        for iteration in range(self.config.schedule.max_iterations):
+        """训练主循环（骨架期口径 + rollout 期重构任务 + 判别器链 +
+        续训与 checkpoint 节奏，#236）：resume 装配时先恢复（契约
+        校验 → 下发各卡 → 流回填 → 指标流回退）→ 逐 iteration →
+        周期/收尾兜底 checkpoint（分片先、产物后）。返回完成的
+        iteration 数（config 口径累计完成数；恢复点已达标 = 无操作
+        续训报告恢复点本身）。"""
+        start_iteration = 0
+        if self._continuation.resume_assembled:
+            start_iteration = await self._restore()
+        completed = start_iteration
+        last_checkpoint = start_iteration
+        interval = self.config.schedule.checkpoint_interval
+        for iteration in range(start_iteration, self.config.schedule.max_iterations):
             await self._run_iteration(iteration)
             completed = iteration + 1
+            if self._continuation.checkpoint_due(completed, interval):
+                await self._checkpoint_at(completed)
+                last_checkpoint = completed
+        if last_checkpoint < completed:
+            # 收尾兜底只允许前向推进：恢复点已在目标之后（收缩
+            # max_iterations 的续训 = 无操作）时不得把更后的训练态
+            # 改写成更小的 iteration 标签（旧 trainer 口径平移）
+            await self._checkpoint_at(completed)
         return completed
+
+    async def _restore(self) -> int:
+        """续训恢复（#222 恢复序直线）：分片输入契约校验（store：
+        版本/键清单/slots 拓扑/generators 嵌套/config 漂移守卫）→
+        权重与 optimizer 下发各卡（全卡覆写，非只卡 0——恢复的是
+        整机的落盘时刻状态）→ lr 槽位实测对账 → 命名流状态回填
+        （不重派生对账，#222 记录性字段口径）→ 分叉监控 adopt →
+        指标流回退（删除恢复点之后的半截事件，重执行重写）。
+        返回恢复点 iteration。"""
+        payload = self._continuation.store.restore(
+            self.config, slot_count=self.rng.slot_count,
+        )
+        iteration = payload["iteration"]
+        await self._collect(
+            [card.submit(card.load_restored(payload)) for card in self.cards],
+            iteration,
+            step_index=None,
+            enforce_timeout=False,
+        )
+        self._assert_restored_lr(payload["lr"])
+        saved_streams = payload["generators"]
+        for slot in range(self.rng.slot_count):
+            for stream in _STREAM_NAMES:
+                self.rng.restore_stream(
+                    slot, stream, saved_streams[f"slot{slot}"][stream],
+                )
+        self._overfit.adopt(payload["overfit"])
+        self.artifacts.rewind_events(iteration, _STAGE_TAG)
+        return iteration
+
+    def _assert_restored_lr(self, lr_slots: dict) -> None:
+        """LR 槽位对账（应用后实测）：常数 LR 实现的 scheduler 状态 =
+        两 optimizer ``param_groups`` 的 lr（load_state_dict 已随
+        param_groups 回归）——槽位与其实测值显式对账，不一致 = 分片
+        损坏/篡改；全卡一致由结构保证，卡 0 实测（旧执行序 resume
+        模块同口径平移）。"""
+        card0 = self.cards[0].replica
+        optimizers = {
+            "policy": card0.policy.optimizer,
+            "discriminator": card0.disc_phase.optimizer,
+        }
+        if set(lr_slots) != set(optimizers):
+            raise ValueError(f"续训状态 lr 槽位字段不符: {sorted(lr_slots)}")
+        for name, optimizer in optimizers.items():
+            saved_lr = float(lr_slots[name])
+            for group in optimizer.param_groups:
+                if group["lr"] != saved_lr:
+                    raise ValueError(
+                        f"续训状态 lr 槽位与 optimizer state 不一致"
+                        f"（{name}: {saved_lr} vs {group['lr']}）"
+                    )
+
+    async def _checkpoint_at(self, iteration: int) -> None:
+        """checkpoint 节奏点（#222 同写者顺序定死）：跨卡权重逐位
+        校验（#217 checkpoint 周期 bitwise 校验，多卡面）→ v12 续训
+        分片（单文件原子写）→ 产物 checkpoint（契约工件，外部消费）。
+        校验失败 = ``weight_divergence_alert`` 告警即写 + abort——分叉
+        是吸收态（allreduce 只作用梯度、不能纠正权重分叉，#217 §4），
+        不产出分叉产物。"""
+        started = time.monotonic()
+        per_card = await self._collect(
+            [card.submit(card.export_states()) for card in self.cards],
+            iteration,
+            step_index=None,
+            enforce_timeout=False,
+        )
+        divergence = self.detect_card_divergence(per_card)
+        if divergence is not None:
+            self.artifacts.append_event(WeightDivergenceAlertEvent(
+                iteration=iteration,
+                stage=_STAGE_TAG,
+                elapsed_s=time.monotonic() - started,
+            ))
+            raise TrainingAborted(
+                f"checkpoint 周期跨卡权重分叉（iteration {iteration}）："
+                f"{divergence}——#217 bitwise 校验 fail-fast（分叉是吸收态，"
+                "告警 + abort + 从最近一致 checkpoint 重启）"
+            )
+        self._continuation.store.save(
+            self._capture_resume_payload(iteration, per_card[0]),
+        )
+        self._write_product_checkpoints(iteration, per_card[0])
+
+    @staticmethod
+    def detect_card_divergence(per_card: list[tuple[dict, dict]]) -> str | None:
+        """跨卡权重逐位比较（policy + 判别器网络 state_dict 的每个
+        张量，含 spectral norm ``_u``/``_v`` buffer）：全部卡与卡 0
+        快照逐位相等 = None；失配 = 「网络:参数名（卡 i 与卡 0 逐位
+        失配）」的定位描述（告警事件的归因文案与 abort 消息共用）。
+        单卡拓扑无跨卡面，结构性恒一致（返回 None，无跳过日志——
+        单卡的「一致」是结构事实不是测量结论）。"""
+        if len(per_card) <= 1:
+            return None
+        reference_policy, reference_disc = per_card[0]
+        for card_index, (policy_state, disc_state) in enumerate(
+            per_card[1:], 1,
+        ):
+            for name, reference in reference_policy.items():
+                if not torch.equal(reference, policy_state[name]):
+                    return f"policy:{name}（卡 {card_index} 与卡 0 逐位失配）"
+            for name, reference in reference_disc.items():
+                if not torch.equal(reference, disc_state[name]):
+                    return (
+                        f"discriminator:{name}"
+                        f"（卡 {card_index} 与卡 0 逐位失配）"
+                    )
+        return None
+
+    def _capture_resume_payload(
+        self, iteration: int, card0_states: tuple[dict, dict],
+    ) -> dict:
+        """v12 全清单快照的攒装（#222 终稿键清单）：卡 0 权威取数
+        （各卡副本经「同初始化 + 确定性 allreduce + 同步 step」结构
+        保证逐位一致，checkpoint 点的跨卡 bitwise 校验刚把守过）；
+        optimizer 与 lr 卡 0 单份。``seeds`` = per-槽 seed 派生值的
+        记录性落痕（恢复不对账，#222 §1）。"""
+        policy_state, disc_state = card0_states
+        card0 = self.cards[0].replica
+        streams = _STREAM_NAMES
+        return {
+            "version": ASYNC_RESUME_FORMAT_VERSION,
+            "iteration": int(iteration),
+            "slots": self.rng.slot_count,
+            "policy_network": policy_state,
+            "policy_optimizer": AsyncResumeStore.to_cpu_snapshot(
+                card0.policy.optimizer.state_dict(),
+            ),
+            "discriminator_network": disc_state,
+            "discriminator_optimizer": AsyncResumeStore.to_cpu_snapshot(
+                card0.disc_phase.optimizer.state_dict(),
+            ),
+            "lr": {
+                "policy": card0.policy.optimizer.param_groups[0]["lr"],
+                "discriminator": (
+                    card0.disc_phase.optimizer.param_groups[0]["lr"]
+                ),
+            },
+            "generators": {
+                f"slot{slot}": {
+                    stream: self.rng.stream_state(slot, stream)
+                    for stream in streams
+                }
+                for slot in range(self.rng.slot_count)
+            },
+            "overfit": self._overfit.state(),
+            "seeds": {
+                "base": self.config.schedule.seed,
+                "per_slot": [
+                    SlotRngRegistry.slot_seed(
+                        self.config.schedule.seed, slot,
+                    )
+                    for slot in range(self.rng.slot_count)
+                ],
+            },
+        }
+
+    def _write_product_checkpoints(
+        self, iteration: int, card0_states: tuple[dict, dict],
+    ) -> None:
+        """产物 checkpoint（契约工件：policy_iter*.pt /
+        discriminator_iter*.pt，外部消费/评测装载形态）——续训分片
+        先行落盘、产物后写（#222 同写者顺序）：恢复以分片为准、产物
+        只为外部消费；崩溃窗口内二者独立原子，最坏缺产物不缺分片。
+        权重快照与分片共享同一份卡 0 导出（checkpoint 期 host 内存
+        不双份，旧执行序「一次导出、两处共享」纪律平移）。判别器与
+        分片**同形**：``loadable_state_dict`` 即 ``state_dict()`` 直
+        通（``_u``/``_v`` 幂迭代 buffer 与参数化状态两处都在），此处
+        直接写卡 0 已导出的 CPU 快照——不二次取数模块，CUDA 拓扑下
+        产物也落 CPU 张量（评测装载面 ``map_location="cpu"`` 语义下
+        与 policy 产物形态统一）。"""
+        policy_state, disc_state = card0_states
+        checkpoints = self.artifacts.paths.checkpoints
+        torch.save(
+            policy_state,
+            checkpoints / POLICY_CHECKPOINT_TEMPLATE.format(
+                iteration=iteration,
+            ),
+        )
+        torch.save(
+            disc_state,
+            checkpoints / f"discriminator_iter{iteration}.pt",
+        )
 
     async def _run_iteration(self, iteration: int) -> None:
         """单 iteration 执行序（#217 §3 相位结构 + #234 判别器链期）：
@@ -1071,7 +1392,7 @@ class AsyncTrainingExecutor:
                     for i, card in enumerate(self.cards)
                 ],
                 iteration,
-                step_index=0,  # 判别器步非 policy k——pretrain 先例口径
+                step_index=None,  # 池化段不套超时；k=None 的非 k 口径
                 enforce_timeout=False,
             )
             pooled_auc = self._pool_auc(examples, per_card_real)
@@ -1089,7 +1410,7 @@ class AsyncTrainingExecutor:
                     for card in self.cards
                 ],
                 iteration,
-                step_index=0,  # 同上：判别器步 barrier 的非 k 口径
+                step_index=None,  # 同上：判别器步 barrier 的非 k 口径
                 enforce_timeout=True,
             )
             reports = {
@@ -1102,7 +1423,7 @@ class AsyncTrainingExecutor:
             await self._collect(
                 [card.submit(card.disc_step()) for card in self.cards],
                 iteration,
-                step_index=0,  # 同上：判别器步 barrier 的非 k 口径
+                step_index=None,  # 同上：判别器步 barrier 的非 k 口径
                 enforce_timeout=True,
             )
             DiscriminatorPhase.synchronize_spectral(
@@ -1161,14 +1482,19 @@ class AsyncTrainingExecutor:
         else:
             alert_data = []
         disc_seconds = time.monotonic() - disc_started
-        # —— 事件发射：iter 族 (iteration, slot) 排序写（单进程单写者，
-        # slot 升序即归并序；rank 字段语义 = 槽号，#217 契约口径）——
+        # —— 事件发射：两档 flush（#222）——
+        # iter 族：缓冲到 iteration 边界、按 (iteration, slot) 排序后
+        # 单点写（单进程单写者，slot 升序即归并序；rank 字段语义 =
+        # 槽号，#217 契约口径）；告警族：产出即写、不进 iter 族缓冲
+        # （barrier 软超时在 _collect 内已即写；此处 overfit_alert
+        # 产出即写、排在 iter 族块之后——同 iteration 告警随本槽
+        # iter 事件之后的归并序口径不变）。
         elapsed = time.monotonic() - started
         alerts = [
             OverfitAlertEvent(
                 iteration=iteration,
                 stage=_STAGE_TAG,
-                rank=0,  # 主线程 = 卡 0 写出口径（barrier_soft_timeout 同款）
+                rank=0,  # 主线程 = 卡 0 写出口径（barrier_timeout_alert 同款）
                 phase="rl",
                 modality=condition,
                 divergence_ema=reading.divergence,
@@ -1183,6 +1509,7 @@ class AsyncTrainingExecutor:
             for card in self.cards
             for slot in card.slot_ids
         }
+        iter_events: list[IterEvent] = []
         for slot in sorted(conditions):
             example = examples[slot]
             card_index = slot_card_index[slot]
@@ -1216,7 +1543,7 @@ class AsyncTrainingExecutor:
                 event_loss["discriminator"] = report.loss_discriminator
                 phase_seconds["discriminator"] = disc_seconds
             divergence = divergences.get(condition)
-            self.artifacts.append_event(IterEvent(
+            iter_events.append(IterEvent(
                 iteration=iteration,
                 stage=_STAGE_TAG,
                 rank=slot,
@@ -1238,6 +1565,7 @@ class AsyncTrainingExecutor:
                 elapsed_s=elapsed,
                 phase_seconds=phase_seconds,
             ))
+        self.artifacts.append_events(iter_events)
         for alert in alerts:
             self.artifacts.append_event(alert)
 
@@ -1307,11 +1635,13 @@ class AsyncTrainingExecutor:
         enforce_timeout: bool,
     ) -> list[Any]:
         """barrier 等待与 fail-fast 门面：任一槽线程异常 →
-        ``TrainingAborted``（原异常挂 cause）；软超时 → 告警事件（主
-        线程 = 卡 0 写出口径）后继续等待；硬超时 → fail-fast。rollout
-        相派发不套超时（超时口径属 per-k barrier，#217 §4），异常
-        fail-fast 恒生效。"""
+        ``TrainingAborted``（原异常挂 cause）；软超时 → 告警事件（#222
+        告警族即写：产生即写、先于 iter 族块）后继续等待；硬超时 →
+        fail-fast。rollout 相派发不套超时（超时口径属 per-k barrier，
+        #217 §4），异常 fail-fast 恒生效。``step_index`` = None 的非 k
+        口径（判别器步集合段、restore 下发）经 ``k_label`` 显式标注。"""
         started = time.monotonic()
+        k_label = f"k{step_index}" if step_index is not None else "非k段"
         wrapped = [asyncio.wrap_future(future) for future in futures]
         soft_warned = False
         while True:
@@ -1330,8 +1660,8 @@ class AsyncTrainingExecutor:
                 error = future.exception()
                 if error is not None:
                     raise TrainingAborted(
-                        f"槽线程异常（iteration {iteration}、step "
-                        f"{step_index}）：{error}——fail-fast 门面中止训练"
+                        f"槽线程异常（iteration {iteration}、{k_label}）："
+                        f"{error}——fail-fast 门面中止训练"
                     ) from error
             if not pending:
                 return [future.result() for future in wrapped]
@@ -1340,17 +1670,16 @@ class AsyncTrainingExecutor:
                 continue
             if not soft_warned:
                 soft_warned = True
-                self.artifacts.append_event(BarrierSoftTimeoutEvent(
+                self.artifacts.append_event(BarrierTimeoutAlertEvent(
                     iteration=iteration,
                     stage=_STAGE_TAG,
-                    step_index=step_index,
-                    waited_s=waited,
-                    threshold_s=self._timeout.soft_seconds,
+                    k=step_index,  # None = 非 k barrier（判别器步集合段）
+                    elapsed_s=waited,
                 ))
             if waited >= self._timeout.hard_seconds:
                 raise TrainingAborted(
-                    f"per-k barrier 硬超时（iteration {iteration}、step "
-                    f"{step_index}）：等待 {waited:.1f}s ≥ 阈值 "
+                    f"per-k barrier 硬超时（iteration {iteration}、"
+                    f"{k_label}）：等待 {waited:.1f}s ≥ 阈值 "
                     f"{self._timeout.hard_seconds:.1f}s——"
                     "CYNOSURE_PG_TIMEOUT_MIN 语义换绑口径的 fail-fast"
                 )

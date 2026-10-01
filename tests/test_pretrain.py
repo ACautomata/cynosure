@@ -44,6 +44,7 @@ from cynosure.reward.update import OnlineUpdate
 from cynosure.train import (
     REWIND_ACCOUNTING,
     AmpContext,
+    BarrierTimeoutAlertEvent,
     CrossModalConditionSampler,
     IterEvent,
     MilestoneEvent,
@@ -52,8 +53,8 @@ from cynosure.train import (
     RewindAccounting,
     RunArtifacts,
     TrainingRuntime,
+    WeightDivergenceAlertEvent,
 )
-from cynosure.train.artifacts import BarrierSoftTimeoutEvent
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
@@ -120,8 +121,9 @@ def event_type_vocabulary() -> set[str]:
         event.event
         for event in (
             iter_event(0), milestone_event(0), pretrain_event(0),
-            alert_event(0), BarrierSoftTimeoutEvent(iteration=0, step_index=0,
-                                                    waited_s=0.0, threshold_s=0.0),
+            alert_event(0),
+            BarrierTimeoutAlertEvent(iteration=0, k=1, elapsed_s=0.0),
+            WeightDivergenceAlertEvent(iteration=0, elapsed_s=0.0),
         )
     }
 
@@ -170,12 +172,20 @@ class TestEventRewindAccounting:
 
     def test_registry_covers_event_type_vocabulary(self) -> None:
         """记账口径登记表与事件类型词汇表逐项对齐：每型事件的判别值都有
-        显式登记的口径（新增事件类型必须声明口径，不得静默继承删除口径）。"""
+        显式登记的口径（新增事件类型必须声明口径，不得静默继承删除口径；
+        #236 的 barrier_timeout_alert / weight_divergence_alert 随
+        事件模型 / 登记表 / spec 清单三处同批入列）。"""
         assert set(REWIND_ACCOUNTING) == event_type_vocabulary()
         assert REWIND_ACCOUNTING["iter"] is RewindAccounting.ITERATION
         assert REWIND_ACCOUNTING["milestone"] is RewindAccounting.COMPLETION
         assert REWIND_ACCOUNTING["pretrain"] is RewindAccounting.EXEMPT
         assert REWIND_ACCOUNTING["overfit_alert"] is RewindAccounting.ITERATION
+        assert REWIND_ACCOUNTING["barrier_timeout_alert"] is (
+            RewindAccounting.ITERATION
+        )
+        assert REWIND_ACCOUNTING["weight_divergence_alert"] is (
+            RewindAccounting.ITERATION
+        )
 
     def test_recovery_point_covers_by_event_own_accounting(self) -> None:
         """保留边界按各型自身口径取（恢复点 = 最近 checkpoint 的计数）：

@@ -271,6 +271,36 @@ class TestNoFalseTrigger:
         assert judge.judge(stream_events, current_fid=9.7).stop is True  # 当前值入判
 
 
+class TestPrefixEvents:
+    """里程碑喂入的前缀化过滤（#222 早停 judge 落口径）：判定纯函数
+    化、消除对落盘时序的依赖——trainer 侧 ``read_events()`` 的全量流
+    先经本过滤再喂 judge。"""
+
+    def test_iteration_beyond_milestone_excluded(self) -> None:
+        events = [
+            {"event": "iter", "iteration": 3, "stage": 1},
+            {"event": "iter", "iteration": 5, "stage": 1},
+            {"event": "milestone", "iteration": 4, "stage": 1},
+        ]
+        assert EarlyStopJudge.prefix_events(events, iteration=4, stage=1) == [
+            {"event": "iter", "iteration": 3, "stage": 1},
+            {"event": "milestone", "iteration": 4, "stage": 1},
+        ]
+
+    def test_other_stage_and_iterationless_events_kept(self) -> None:
+        """跨 stage 历史隔离照旧；无 iteration 键的事件（pretrain 步
+        事件——记账轴与 iteration 正交）按 0 取、恒过过滤。"""
+        events = [
+            {"event": "pretrain", "step": 7, "stage": 1},
+            {"event": "iter", "iteration": 2, "stage": 2},
+            {"event": "iter", "iteration": 2, "stage": 1},
+        ]
+        assert EarlyStopJudge.prefix_events(events, iteration=2, stage=1) == [
+            {"event": "pretrain", "step": 7, "stage": 1},
+            {"event": "iter", "iteration": 2, "stage": 1},
+        ]
+
+
 class TestJudgeConfigSensitivity:
     def test_n_plateau_one_stops_immediately_on_first_stall(self) -> None:
         config = CynosureConfig.model_validate({

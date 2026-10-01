@@ -48,6 +48,22 @@ class EarlyStopJudge:
         self._auc_chance_epsilon = config.schedule.auc_chance_epsilon
         self._reward_trend_window = config.schedule.reward_trend_window
 
+    @staticmethod
+    def prefix_events(
+        events: list[dict], iteration: int, stage: int,
+    ) -> list[dict]:
+        """里程碑判定喂入的前缀化过滤（#222 落口径）：只保留本 stage
+        且 iteration ≤ 当前里程碑的事件——判定纯函数化、消除对落盘
+        时序的依赖（写出路径的将来变化/防御性重试不得让判定漂移；
+        缺失的 ≤ iteration 事件如实缺席，不由本过滤补造）。无
+        ``iteration`` 键的事件（pretrain 步事件等）按 0 取、恒过过滤
+        （其记账轴与 iteration 正交）。"""
+        return [
+            event for event in events
+            if event.get("stage", 1) == stage
+            and event.get("iteration", 0) <= iteration
+        ]
+
     def judge(
         self, events: list[dict], current_fid: float | None = None,
     ) -> EarlyStopVerdict:

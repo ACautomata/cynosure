@@ -23,6 +23,7 @@ slow+gpu 挂法：默认跳过、CPU 环境跳过（conftest 双 marker 轴）�
 职责由 gauss ``pytest --run-slow`` 全量承担（仓库纪律：测试一律上集群）。
 """
 
+import builtins
 import math
 import random
 import threading
@@ -40,7 +41,8 @@ from cynosure.reward.artifacts import LatentManifest
 from cynosure.reward.assembly import PairBatch, ReconstructionAssembler
 from cynosure.reward.scorer import ChunkedScorer
 from cynosure.train.allocation import AllocationTable
-from cynosure.train.artifacts import RunArtifacts
+from cynosure.train.artifacts import IterEvent, RunArtifacts
+from cynosure.train.async_resume import AsyncResumeStore
 from cynosure.train.discriminator import WindowRealDraw
 from cynosure.train.executor import (
     AsyncTrainingExecutor,
@@ -110,6 +112,19 @@ class ExecutorScenario:
         kwargs.setdefault("devices", [torch.device("cpu")])
         artifacts = RunArtifacts.init(config, self._tmp_path / run_name)
         return AsyncTrainingExecutor.build(config, artifacts, **kwargs)
+
+    def resume_build(
+        self, config: CynosureConfig, run_name: str = "run", **kwargs,
+    ) -> AsyncTrainingExecutor:
+        """续训装配（复用既有 run 目录：不 ``RunArtifacts.init``；占位
+        装配 + resume 单点声明——装配与执行共用同一开关，旧 trainer
+        口径平移）。判别器占位不消费任何 checkpoint 工件，装配期
+        随机性被 restore 整体覆写。"""
+        kwargs.setdefault("devices", [torch.device("cpu")])
+        artifacts = RunArtifacts(RunArtifacts.layout(self._tmp_path / run_name))
+        return AsyncTrainingExecutor.build(
+            config, artifacts, resume=True, **kwargs,
+        )
 
     def events(self, run_name: str = "run") -> list[dict]:
         """run 目录指标流的外部读取面。"""
@@ -793,9 +808,10 @@ class TestExecutorFixtureTier:
         self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """barrier 软超时（#217 §4）：越过软阈值发
-        ``barrier_soft_timeout`` 事件（主线程 = 卡 0 写出口径）后继续
-        等待，训练正常完成。软阈值钉到远小于 barrier 实耗时（睡眠主导
-        ——触发与机器计算耗时无关），硬阈值放大到不构成中止压力。"""
+        ``barrier_timeout_alert`` 告警事件（#222 两档 flush 的告警族即
+        写：产出即写、写出序先于本 iteration 的 iter 族块）后继续等待，
+        训练正常完成。软阈值钉到远小于 barrier 实耗时（睡眠主导——
+        触发与机器计算耗时无关），硬阈值放大到不构成中止压力。"""
         scenario = ExecutorScenario(cli, tmp_path)
         config = scenario.prepare(seed=6)
         executor = scenario.build(
@@ -813,15 +829,34 @@ class TestExecutorFixtureTier:
             return real_accumulate(*args, **kwargs)
 
         monkeypatch.setattr(updater, "accumulate", sluggish)
+        writes: list[tuple[str, str]] = []
+        real_append_event = RunArtifacts.append_event
+        real_append_events = RunArtifacts.append_events
+
+        def spy_append_event(artifacts, event):
+            writes.append(("alert", event.event))
+            return real_append_event(artifacts, event)
+
+        def spy_append_events(artifacts, events):
+            writes.append(("iter_block", f"n={len(events)}"))
+            return real_append_events(artifacts, events)
+
+        monkeypatch.setattr(RunArtifacts, "append_event", spy_append_event)
+        monkeypatch.setattr(RunArtifacts, "append_events", spy_append_events)
         executor.run()
         warnings = [
             event for event in scenario.events()
-            if event["event"] == "barrier_soft_timeout"
+            if event["event"] == "barrier_timeout_alert"
         ]
         assert warnings
         assert warnings[0]["iteration"] == 0
-        assert warnings[0]["step_index"] == 1
-        assert warnings[0]["waited_s"] >= warnings[0]["threshold_s"]
+        assert warnings[0]["k"] == 1  # 告警归属的被优化训练步
+        assert warnings[0]["elapsed_s"] >= executor._timeout.soft_seconds
+        # 两档 flush 时序（#222）：告警族即写先于 iter 族块写——屏障等待
+        # 中产出的事件不得缓冲进 iteration 边界块（缓冲吃掉软超时的人工
+        # 介入窗口）
+        assert writes[0] == ("alert", "barrier_timeout_alert")
+        assert ("iter_block", "n=2") in writes[1:]
         iter_events = [
             event for event in scenario.events()
             if event["event"] == "iter"
@@ -854,7 +889,7 @@ class TestExecutorFixtureTier:
             executor.run()
         warnings = [
             event for event in scenario.events()
-            if event["event"] == "barrier_soft_timeout"
+            if event["event"] == "barrier_timeout_alert"
         ]
         assert warnings  # 硬超时前先有软超时告警
         # 中止后的线程退绕（槽内串行睡眠 + 运行时间歇停顿）可能超出
@@ -1309,3 +1344,477 @@ class TestExecutorMultiCardTier:
                     ),
                     expected_pool,
                 ), f"槽 {slot} real_pool 流应零消耗（判别器链期退役）"
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+class TestContinuationContract:
+    """续训与事件契约期锚（#236；#222/#218 结票口径）：v12 单文件
+    自写自读 + 恢复连续性变体（#218 锚②的续训形态：中断恢复后继续
+    vs 不中断跑完，事件流豁免 wall-clock 逐位一致 + 收官权重逐位）
+    + checkpoint 节奏（周期/收尾兜底/分片先产物后的同写者顺序）+
+    两档 flush 的 iter 族排序块（告警族时序在软超时测试承载）。"""
+
+    V12_KEYS = {
+        "version", "iteration", "slots",
+        "policy_network", "policy_optimizer",
+        "discriminator_network", "discriminator_optimizer",
+        "lr", "generators", "overfit", "seeds",
+    }
+
+    def test_v12_roundtrip_and_resume_continuity(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """AC 1：截断 2 iteration（收尾兜底落盘分片@2）→ 延长 config
+        到 4 并 resume → 事件流与收官 checkpoint 和不中断 4-iteration
+        run 逐条/逐位一致（RunTrajectory 豁免墙钟——恢复连续性锚的
+        fixture 形态）。分片的 v12 键清单/嵌套 generators/删除面在
+        此处锚「门面攒装产物」端到端面（store 输入契约的单元锚在
+        test_async_resume 双挂）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=0)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        executor.run()
+
+        checkpoints = tmp_path / "run" / "checkpoints"
+        shard = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        assert set(shard) == self.V12_KEYS
+        assert shard["version"] == 12
+        assert shard["iteration"] == 2  # 收尾兜底 = max_iterations
+        assert shard["slots"] == 2  # 协程数（拓扑对账唯一字段）
+        assert set(shard["generators"]) == {"slot0", "slot1"}
+        assert set(shard["generators"]["slot0"]) == {
+            "rollout", "real_pool", "heldout_auc", "recon",
+        }
+        for retired in ("rng", "gating", "world_size", "ema"):
+            assert retired not in shard
+        # 产物 checkpoint 与分片同节奏（契约文件名沿袭）
+        assert (checkpoints / "policy_iter2.pt").is_file()
+        assert (checkpoints / "discriminator_iter2.pt").is_file()
+
+        # —— 恢复连续性：延长到 4 → resume → 与不中断 run 逐位一致 ——
+        config.schedule.max_iterations = 4
+        resumed = scenario.resume_build(config, coroutines=2, owner_check=True)
+        # 观测窗 = 装配完成后 → run 结束（#218 既有口径：装配期的
+        # 网络初始化消耗在观测窗之外）——恢复路径不碰进程全局 RNG
+        # （分片无全局 RNG 键、恢复动作零全局消耗）
+        snapshot = scenario.global_rng_snapshot(cuda=torch.cuda.is_available())
+        assert resumed.run() == 4
+        scenario.assert_global_rng_untouched(snapshot)
+
+        baseline_config = scenario.prepare(seed=0)
+        baseline_config.schedule.max_iterations = 4
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=2, owner_check=True,
+        )
+        assert baseline.run() == 4
+        assert RunTrajectory(scenario.events("run")) == RunTrajectory(
+            scenario.events("run_baseline"),
+        )
+        for name in ("policy_iter4.pt", "discriminator_iter4.pt"):
+            scenario.assert_state_dicts_bitwise(
+                torch.load(checkpoints / name, weights_only=True),
+                torch.load(
+                    tmp_path / "run_baseline" / "checkpoints" / name,
+                    weights_only=True,
+                ),
+                name,
+            )
+        assert torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )["iteration"] == 4
+
+    def test_mid_run_crash_resumes_from_periodic_shard(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """崩溃变体（#236 AC 1 的恢复连续性锚变体）：checkpoint 周期
+        2、iteration 3 中途崩溃（KeyboardInterrupt 注入 _run_iteration）
+        → 恢复点 = 最近周期落盘@2、指标流半截事件被回退重写 → resume
+        到 4 与不中断 run 一致。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=1)
+        config.schedule.max_iterations = 4
+        config.schedule.checkpoint_interval = 2
+        real_run_iteration = AsyncTrainingExecutor._run_iteration
+        calls = {"count": 0}
+
+        async def crashing(executor, iteration):
+            calls["count"] += 1
+            if calls["count"] == 4:  # iteration 3 的执行序入口
+                raise KeyboardInterrupt(
+                    f"模拟作业边界崩溃（iteration {iteration}）"
+                )
+            return await real_run_iteration(executor, iteration)
+
+        monkeypatch.setattr(
+            AsyncTrainingExecutor, "_run_iteration", crashing,
+        )
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        with pytest.raises(KeyboardInterrupt):
+            executor.run()
+        checkpoints = tmp_path / "run" / "checkpoints"
+        shard = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        assert shard["iteration"] == 2  # 周期落盘@2（崩溃点之前的节奏点）
+        # 门面 iter 事件粒度 = 每槽每 iteration 一条（(iteration, slot)
+        # 排序）：2 槽 × iter 0..2；overfit_alert 等其它族事件不参与
+        # iteration 序列断言
+        crashed = scenario.events()
+        assert [
+            event["iteration"] for event in crashed if event["event"] == "iter"
+        ] == [0, 0, 1, 1, 2, 2]
+
+        resumed = scenario.resume_build(config, coroutines=2, owner_check=True)
+        assert resumed.run() == 4
+        baseline_config = scenario.prepare(seed=1)
+        baseline_config.schedule.max_iterations = 4
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=2, owner_check=True,
+        )
+        assert baseline.run() == 4
+        events = scenario.events()
+        assert [
+            event["iteration"] for event in events if event["event"] == "iter"
+        ] == [0, 0, 1, 1, 2, 2, 3, 3]
+        assert RunTrajectory(events) == RunTrajectory(
+            scenario.events("run_baseline"),
+        )
+        scenario.assert_state_dicts_bitwise(
+            torch.load(checkpoints / "policy_iter4.pt", weights_only=True),
+            torch.load(
+                tmp_path / "run_baseline" / "checkpoints" / "policy_iter4.pt",
+                weights_only=True,
+            ),
+            "policy_iter4",
+        )
+
+    def test_resume_past_completion_is_clean_noop(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """恢复点已达标（max_iterations 未延长）的续训 = 完整无操作：
+        零重执行、零重复事件、分片不被改写，完成数报告恢复点本身
+        （旧 trainer 口径平移）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=2)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=2)
+        assert executor.run() == 2
+        events_before = scenario.events()
+        shard_before = (
+            tmp_path / "run" / "checkpoints" / "resume_state.pt"
+        ).read_bytes()
+
+        resumed = scenario.resume_build(config, coroutines=2)
+        assert resumed.run() == 2  # 完成数 = 恢复点（非 0）
+        assert scenario.events() == events_before
+        assert (
+            tmp_path / "run" / "checkpoints" / "resume_state.pt"
+        ).read_bytes() == shard_before
+
+    def test_checkpoint_cycle_and_writer_order(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """checkpoint 节奏（周期 + 收尾兜底）与**同写者顺序**（#222：
+        续训分片先、产物 checkpoint 后——恢复以分片为准，产物只为
+        外部消费；崩溃窗口内二者独立原子，最坏缺产物不缺分片）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=3)
+        config.schedule.max_iterations = 4
+        config.schedule.checkpoint_interval = 2
+        writes: list[str] = []
+        real_save = AsyncResumeStore.save
+        real_products = AsyncTrainingExecutor._write_product_checkpoints
+
+        def spy_save(store, payload):
+            writes.append("shard")
+            return real_save(store, payload)
+
+        def spy_products(executor, iteration, card0_states):
+            writes.append("products")
+            return real_products(executor, iteration, card0_states)
+
+        monkeypatch.setattr(AsyncResumeStore, "save", spy_save)
+        monkeypatch.setattr(
+            AsyncTrainingExecutor, "_write_product_checkpoints", spy_products,
+        )
+        executor = scenario.build(config, coroutines=2)
+        assert executor.run() == 4
+        checkpoints = tmp_path / "run" / "checkpoints"
+        # 周期 2 + 收尾兜底不重复（4 % 2 == 0 已覆盖）：分片/产物各 2 次
+        assert writes == ["shard", "products", "shard", "products"]
+        for iteration in (2, 4):
+            assert (
+                checkpoints / f"policy_iter{iteration}.pt"
+            ).is_file(), f"产物 policy_iter{iteration}.pt 缺失"
+            assert (
+                checkpoints / f"discriminator_iter{iteration}.pt"
+            ).is_file(), f"产物 discriminator_iter{iteration}.pt 缺失"
+        # 产物判别器 = 可装载形态（loadable_state_dict 导出的契约形态）
+        disc = torch.load(
+            checkpoints / "discriminator_iter4.pt", weights_only=True,
+        )
+        assert isinstance(disc, dict) and disc
+
+    def test_iter_family_sorted_single_write_per_iteration(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """两档 flush 的 iter 族（#222）：缓冲到 iteration 边界、按
+        (iteration, slot) 排序后**单点写**——每个 iteration 恰一次
+        ``append_events`` 调用、块内 rank（槽号）升序；告警族的即写
+        时序在 test_barrier_soft_timeout_warns_then_completes 承载。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=8)
+        config.schedule.max_iterations = 2
+        blocks: list[list[int]] = []
+        leaked: list[str] = []
+        real_append_events = RunArtifacts.append_events
+        real_append_event = RunArtifacts.append_event
+
+        def spy_append_events(artifacts, events):
+            blocks.append([event.rank for event in events])
+            return real_append_events(artifacts, events)
+
+        def spy_append_event(artifacts, event):
+            leaked.append(event.event)
+            return real_append_event(artifacts, event)
+
+        monkeypatch.setattr(
+            RunArtifacts, "append_events", spy_append_events,
+        )
+        monkeypatch.setattr(
+            RunArtifacts, "append_event", spy_append_event,
+        )
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == 2
+        assert blocks == [[0, 1, 2, 3], [0, 1, 2, 3]]
+        # 单点写铁锚：iter 族绝不走逐事件面（探针式逐条 IO 回归复活
+        # 即红）；告警族即写属正当（本场景如有 overfit 告警不受限）
+        assert "iter" not in leaked
+        # 落盘流形态：同一 iteration 的 N 条按槽号升序连续排列
+        events = scenario.events()
+        assert [
+            (event["iteration"], event["rank"])
+            for event in events if event["event"] == "iter"
+        ] == [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3)]
+
+    def test_v11_shard_rejected_by_new_executor(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """版本对账（#222 跨执行器拒绝的双向之一，门面端到端面）：
+        旧执行序形态的分片（format_version=11）被 async 门面的恢复
+        入口显式拒绝；新 v12 分片被旧 resume 拒在
+        test_resume_roundtrip 的 trainer 场景承载。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=9)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=2)
+        executor.run()
+        shard_path = tmp_path / "run" / "checkpoints" / "resume_state.pt"
+        shard = torch.load(shard_path, weights_only=True)
+        legacy = {k: v for k, v in shard.items() if k != "version"}
+        legacy["format_version"] = 11
+        torch.save(legacy, shard_path)
+
+        resumed = scenario.resume_build(config, coroutines=2)
+        with pytest.raises(ValueError, match="格式版本"):
+            resumed.run()
+
+    def test_resume_rejects_slot_topology_change(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """拓扑守卫（#218 的门面端到端面）：恢复的调度拓扑（协程数）
+        与分片 slots 不符即显式拒绝——跨拓扑续训不受支持；卡数不进
+        对账（同一槽数跨卡数放行，分片里无 world_size 键可对）。
+        单卡设备上 2 槽分片 + 缺省（设备数）槽装配即触发该拒绝。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=10)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=2)
+        executor.run()
+
+        resumed = scenario.resume_build(config)  # 缺省槽数 = 设备数 = 1
+        with pytest.raises(ValueError, match="协程数"):
+            resumed.run()
+
+
+class TestWeightDivergenceCheck:
+    """checkpoint 周期权重一致性校验（#217 §4）的纯函数锚（无标记）：
+
+    逐卡 state_dict 快照的跨卡逐位比较——失配定位到 (网络, 参数) 级；
+    单卡拓扑无跨卡面，结构性恒一致（跳过）。告警事件 + abort 的编排
+    在门面 _checkpoint_at（多卡档端到端由 gauss 承担）。"""
+
+    @staticmethod
+    def _states(value: float) -> tuple[dict, dict]:
+        return (
+            {"w": torch.full((2, 2), value)},
+            {"d": torch.full((3,), value)},
+        )
+
+    def test_matching_cards_pass(self) -> None:
+        per_card = [self._states(1.0), self._states(1.0), self._states(1.0)]
+        assert (
+            AsyncTrainingExecutor.detect_card_divergence(per_card) is None
+        )
+
+    def test_single_card_structurally_consistent(self) -> None:
+        assert (
+            AsyncTrainingExecutor.detect_card_divergence(
+                [self._states(1.0)],
+            ) is None
+        )
+
+    def test_policy_divergence_located(self) -> None:
+        per_card = [self._states(1.0), self._states(2.0)]
+        assert AsyncTrainingExecutor.detect_card_divergence(per_card) == (
+            "policy:w（卡 1 与卡 0 逐位失配）"
+        )
+
+    def test_discriminator_divergence_located(self) -> None:
+        second = ({"w": torch.full((2, 2), 1.0)}, {"d": torch.full((3,), 9.0)})
+        per_card = [self._states(1.0), second]
+        assert AsyncTrainingExecutor.detect_card_divergence(per_card) == (
+            "discriminator:d（卡 1 与卡 0 逐位失配）"
+        )
+
+
+class TestAppendEventsFlushFace:
+    """iter 族单点写面（#222 两档 flush 第一档）的实现面锚（无标记）：
+
+    ``append_events`` 一次调用恰一次 metrics open、批内顺序写出
+    （单点写语义的实现锚——调用面「每 iteration 恰一次」+ iter 族
+    不走逐事件面的端到端锚在 TestContinuationContract 承载，gauss
+    档）；空清单无操作（不产生空 open）。"""
+
+    @staticmethod
+    def _iter_event(slot: int) -> IterEvent:
+        return IterEvent(
+            iteration=0, rank=slot, modality="t1n",
+            anchor_eval_reward=0.0, intra_group_reward_std=0.0,
+            loss={"discriminator": 0.0}, lr=1e-4, elapsed_s=0.0,
+        )
+
+    @staticmethod
+    def _metrics_open_spy(artifacts: RunArtifacts, opens: list[str]):
+        real_open = builtins.open
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            if Path(file) == artifacts.paths.metrics and "a" in mode:
+                opens.append(mode)
+            return real_open(file, mode, *args, **kwargs)
+
+        return spy_open
+
+    def test_batch_write_is_single_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        artifacts = RunArtifacts(RunArtifacts.layout(tmp_path))
+        opens: list[str] = []
+        monkeypatch.setattr(
+            builtins, "open",
+            self._metrics_open_spy(artifacts, opens),
+        )
+        artifacts.append_events(
+            [self._iter_event(slot) for slot in range(3)],
+        )
+        assert opens == ["a"]
+        lines = artifacts.paths.metrics.read_text(
+            encoding="utf-8",
+        ).splitlines()
+        assert len(lines) == 3
+
+    def test_empty_events_produce_no_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        artifacts = RunArtifacts(RunArtifacts.layout(tmp_path))
+        opens: list[str] = []
+        monkeypatch.setattr(
+            builtins, "open",
+            self._metrics_open_spy(artifacts, opens),
+        )
+        artifacts.append_events([])
+        assert opens == []
+
+
+class TestResumeAcrossCardCount:
+    """跨卡数恢复放行（#222 拓扑守卫裁决的**行为**锚；slow+gpu，
+    真多卡档——async 门面多副本归约要求全 CUDA（``_validate_
+    multicard``），CPU fixture 恒单卡、无法构造卡数变化）：
+
+    payload 只对账 ``slots``（协程数）、卡数不进对账——2 卡写出分片、
+    1 卡恢复（槽数不变）**不被拒**、续跑行为连续。数值逐位对拍不在
+    本锚职责内（跨卡数恢复的数值等价是 ADR-0011 容差口径——2 卡
+    allreduce SUM 与 1 卡本地累积浮点结合序不同，裁决明言「代价逐位
+    一致断」；同卡数恢复的逐位连续性由
+    test_mid_run_crash_resumes_from_periodic_shard 承载）。"""
+
+    def test_two_cards_resume_on_one_card_same_slots(
+        self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        card_count = (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        )
+        if card_count < 2:
+            pytest.skip("多卡档：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）")
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = TestExecutorMultiCardTier._multicard_config(
+            scenario, seed=3,
+        )
+        config.schedule.max_iterations = 4
+        config.schedule.checkpoint_interval = 2
+        real_run_iteration = AsyncTrainingExecutor._run_iteration
+        calls = {"count": 0}
+
+        async def crashing(executor, iteration):
+            calls["count"] += 1
+            if calls["count"] == 4:  # iteration 3 的执行序入口
+                raise KeyboardInterrupt(
+                    f"模拟作业边界崩溃（iteration {iteration}）"
+                )
+            return await real_run_iteration(executor, iteration)
+
+        monkeypatch.setattr(
+            AsyncTrainingExecutor, "_run_iteration", crashing,
+        )
+        executor = scenario.build(
+            config, coroutines=2,
+            devices=TestExecutorMultiCardTier._devices(2),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            executor.run()
+        checkpoints = tmp_path / "run" / "checkpoints"
+        shard = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        assert shard["iteration"] == 2
+        # 恢复侧单卡（槽数 2 不变）：卡数 2 → 1 放行、续跑完成
+        resumed = scenario.resume_build(
+            config, coroutines=2,
+            devices=TestExecutorMultiCardTier._devices(1),
+        )
+        assert resumed.run() == 4
+        # 结构性连续：iter 族完备有序 + 恢复侧收官产物在
+        events = [
+            event for event in scenario.events() if event["event"] == "iter"
+        ]
+        assert [
+            (event["iteration"], event["rank"]) for event in events
+        ] == [
+            (iteration, slot)
+            for iteration in range(4) for slot in range(2)
+        ]
+        assert (checkpoints / "policy_iter4.pt").exists()
+        final_shard = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        assert final_shard["iteration"] == 4

@@ -78,7 +78,7 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 
 ## 指标事件流的事件类型清单（metrics.jsonl）
 
-指标流是 run 目录的契约工件：一行一事件的 JSONL，`event` 为类型判别字段。契约口径**可扩不可改名**——新增事件类型 = 新判别值 + 新字段，既有类型的判别值、字段名与语义不动；三处同批同步：事件模型（`train/artifacts`）、回退记账登记表（`REWIND_ACCOUNTING`）、本节清单。消费方按判别字段分派，未知类型跳过而非报错。
+指标流是 run 目录的契约工件：一行一事件的 JSONL，`event` 为类型判别字段。契约口径**可扩不可改名**——新增事件类型 = 新判别值 + 新字段，既有类型的判别值、字段名与语义不动；三处同批同步：事件模型（`train/artifacts`）、回退记账登记表（`REWIND_ACCOUNTING`）、本节清单。消费方按判别字段分派，未知类型跳过而非报错。**字段/类型退役循收缩特例：ADR 记录 + 宽松 dict 消费容忍旧行**（rewind 逐行 round-trip、早停按判别值取键均为宽松 dict 面——旧行多余字段无害；`policy_gated` 随 ADR-0017 退役 = 首个适用例）。
 
 | 事件类型 | 产出方 | 字段 | 回退（rewind）记账口径 |
 |---|---|---|---|
@@ -86,10 +86,15 @@ T12/T13 取证（#56）：判别器在线 1 step/iter 的训练量结构性不�
 | `milestone` | 里程碑解码评测（train 循环） | `iteration` / `stage` / `fid` / `kid` / `ssim` / `mae` / `psnr` / `criteria_summary` / `early_stop` / `early_stop_reason` | 以完成数记账：保留完成数 ≤ 恢复点（评测与恢复点 checkpoint 同批产出） |
 | `pretrain` | 判别器 warm-start（pretrain 子命令） | `step` / `loss_discriminator` / `modality`（本步条件，ADR-0008 per-condition 步进）/ `heldout_auc`（本步条件的 AUC）/ `lr` / `elapsed_s` | **不参与回退**：全量保留 |
 | `overfit_alert` | 过拟合分叉报警（RL 相：train 循环，ADR-0009 决策 4/5，越线 rank 产出、随 iter 事件同归并序；预训练相：warm-start driver，ADR-0009-γ，随 pretrain 事件之后写出） | `iteration`（RL 相 = iteration 号；预训练相 = 预训练步号）/ `stage` / `rank` / `phase`（相判别：`rl` 缺省 / `pretrain`，ADR-0009-γ）/ `modality` / `divergence_ema`（分叉值）/ `train_pairwise_acc` / `heldout_auc` | **按相分轨**：RL 相以 0-based iteration 号记账（保留号 < 恢复点，回退重执行重发）；预训练相不参与回退：全量保留（与 `pretrain` 事件同口径——预训练执行史没有对应的 checkpoint 可重放） |
+| `barrier_timeout_alert` | per-k barrier 软超时告警（async 执行序门面主线程，#217 §4：越过软阈值即发、继续等待，硬超时另走 fail-fast 中止） | `iteration` / `stage` / `k`（被优化训练步；非 k barrier = null）/ `elapsed_s`（已等待墙钟） | 以 0-based iteration 号记账：保留号 < 恢复点——墙钟时机事件随所属 iteration 回退，**显式接受史实蒸发**（重执行负载已变大概率不再超时，#222 论证；abort 证据链由进程日志承载） |
+| `weight_divergence_alert` | checkpoint 周期跨卡权重 bitwise 校验失配告警（async 执行序门面主线程，#217 §4：分叉是吸收态——告警 + abort + 从最近一致 checkpoint 重启，与 `overfit_alert`「报警不动作」哲学不同类） | `iteration` / `stage` / `elapsed_s`（校验窗口墙钟）；**无槽归因轴**（AND-allreduce 全卡一致失败，分叉不归因单卡，#222） | 以 0-based iteration 号记账：保留号 < 恢复点（同 `barrier_timeout_alert` 的墙钟时机事件口径，#222） |
 
+- **软超时事件的定名沿革**：骨架期（#231）的 `barrier_soft_timeout` 是 #222 收口前的临时落地（其 docstring 明记「随 #222 收口」）；#236 续训与事件契约期按 #222 决议定名 `barrier_timeout_alert`、字段对齐（`step_index` → `k`、`waited_s` → `elapsed_s`，`threshold_s` 阈值读数随收口移除）——新执行序当时无生产 run 落盘，类型判别值的改名是决议预定的定稿动作，事件契约「可扩不可改名」约束的是已发布类型面。其登记行随类型一并退役；旧行若存在于历史流即表外类型，按「宁可留痕不可误删」兜底全量保留。
+- **两档 flush（#222）**：iter 事件族缓冲到 iteration 边界、按 (iteration, slot) 排序后单点写（同一 iteration 的 N 条按槽号升序连续排列）；告警族（`barrier_timeout_alert` / `weight_divergence_alert` / `overfit_alert`）产生即写——软超时的运营价值 = 硬超时前的人工介入窗口，缓冲吃掉窗口；单写者下告警时序先于下一 iter 块、即写不破坏块内连续性。
 - **预训练事件排除在回退口径外的理由**：warm-start 执行史没有对应的 checkpoint 可重放，按任何边界删都是永久丢失——预训练收敛曲线断点、过线阈值的校准（`pretrain_pass_threshold` 定版）失去数据基础。
 - **曲线的读法**：`heldout_auc` 一律是「本步更新**前**」的快照（与在线期 iter 事件同口径：更新后测同一 fake 批会把 in-sample 拟合计入 AUC）。终止那两次测量（达标跨界测量 + 换批复测 / 步数耗尽后的补测）不进事件流——报告的 `final_heldout_auc` = 跨界测量与复测中的较小者（与落盘 checkpoint 同快照），离线画预训练收敛曲线时两端拼读。
 - **登记表 = 删除的准入名单**：回退只对表内口径为删除的轴做判定，表外（未登记 / 新增未声明）的事件类型一律保留——宁可留痕不可误删。
+- **事件流代际纯净性**：契约不加 `schema_version` 字段——兜底 = 续训 payload 的版本对账切断混流（v12 拒 v≤11 分片 → 旧 run 无法续训 → 同一 run 目录的 metrics.jsonl 不混代际；防「不 bump payload 却改事件语义」的变更无声破坏，#222）。早停 judge 的喂入按 iteration ≤ 当前里程碑前缀化过滤（判定纯函数化、不依赖落盘时序，#222）。
 - **同流混存的口径**：流的类型契约不假设一份流里有哪几型事件——当前 CLI 布局下 warm-start 与 RL 各在自己 run 目录（pretrain 写 `pretrain_report_json` 所在目录，train 另建 run 目录），两者分居两流；同流时（warm-start 历史并入 RL run 流）续训回退只重写恢复点之后的 RL 半截执行史，预训练事件**逐字**保留（真 `--resume` 回退路径的专属用例锁死）；预训练相 `overfit_alert` 告警（`phase="pretrain"`）与预训练事件同口径逐字保留——其步号轴与 RL 的 iteration 轴不同，按 RL 相口径记账会在恢复点 0 的边界上误删步号 0 的告警。
 
 

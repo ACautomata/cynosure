@@ -577,3 +577,23 @@ class TestResumeGuards:
         assert result.code == 2
         assert "格式版本" in result.stderr
         assert "v11" in result.stderr
+
+    def test_resume_rejects_async_v12_shard(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """async 执行序的 v12 分片（``version`` 键、``slots`` 拓扑、
+        per-槽嵌套 generators）被旧执行序 v11 版本对账显式拒绝——
+        「加厚期新 v12 分片被旧 resume 拒、旧 v11 分片被新 store 拒」
+        的另一半（#222：跨执行器拒绝由版本号承载）。v11 代码的
+        ``!= 11`` 对账天然拒绝 v12，此处锁行为防回归。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        legacy = dict(scenario.resume_state())
+        legacy.pop("format_version")
+        legacy["version"] = 12  # async nominal-v12 的版本键形态
+        legacy["slots"] = 1
+        legacy["rng"] = None
+        torch.save(legacy, scenario.run_dir / RESUME_STATE)
+        result = scenario.resume()
+        assert result.code == 2
+        assert "格式版本" in result.stderr
