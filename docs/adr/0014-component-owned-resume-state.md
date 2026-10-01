@@ -25,3 +25,31 @@
 - **退役面**：8 个转发 property、resume.py 全部穿透路径、三处手写 adopt 校验、旧版分片载入。
 - **核心收益**：组件重排不再动 resume（locality 落到组件自身）；trainer interface 由设计产生、不由消费者长出；v11 键组织获得组件自持的稳定锚。
 - **风险（记录在案）**：v11 落地与存量 run 的时点互斥（决策 5 检查项）；分片键自持后「全分片清单」的完整性从 resume 单点转移到「 trainer 聚合注册是否漏组件」——以注册时逐组件登记 + resume generation marker 对账把守。
+
+---
+
+## 尾部追加裁决（#222 结票，#236 实施；先例：#219 对 ADR-0008 的「尾部追加指针段」形态）
+
+本 ADR 起草于 async 执行模型迁移之前，两处字面裁决随迁移语境演进、
+以本段为权威口径：
+
+1. **「分片格式升 v11」（决策 4）的号位冲突 → 随 v-next 账单一并
+   递增**：v11 已由门控退役先行 PR（#228 / ADR-0017）占用
+   （`gating` 键删除）；本 ADR 的分片格式升版随 #218 贡献清单
+   （generators 嵌套、`rng` 键删除、`slots` 字段、分配表状态取消）
+   落 **nominal v12**（#236，`AsyncResumeStore`——单文件、主线程
+   直写、marker 与集合化拒绝整体退役）。「一次 bump 不拆」（#217）
+   的账单纪律不变；版本号是跨执行器拒绝的唯一承载（v12 分片被旧
+   v11 resume 拒、v11 分片被新 store 拒）。
+2. **聚合面「trainer → TrainingRuntime」平移再落门面**：#222 §1
+   按当时代码现实裁决 ResumeStore 挂 TrainingRuntime；#231 骨架期
+   后新执行序（async 门面）的装配与聚合层独立于 TrainingRuntime
+   （per-卡副本装配），「resume 只跨运行时聚合层一道 seam」在
+   新执行序的落点 = async 门面：``RunContinuation`` 持有
+   ``AsyncResumeStore`` + resume 单点声明 + checkpoint 节奏，分片
+   攒装/应用由门面编排。旧执行序（GranularGrpoTrainer +
+   train/resume.py 的 v11 ResumeStore）维持原形态至切换期删除——
+   8 个转发 property 删除面随旧执行序本体一并收口（#226 用户故事
+   17：加厚期 bugfix 对执行序本体不镜像）。「resume generation
+   marker 对守」的风险条目随之整体退役（单文件原子写下提交记录
+   冗余，marker 语义不复存在）。

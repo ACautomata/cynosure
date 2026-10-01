@@ -19,7 +19,7 @@
 
 from cynosure.train.artifacts import (
     REWIND_ACCOUNTING,
-    BarrierSoftTimeoutEvent,
+    BarrierTimeoutAlertEvent,
     BaselineManifest,
     IterEvent,
     ManifestEntry,
@@ -29,6 +29,7 @@ from cynosure.train.artifacts import (
     RewindAccounting,
     RunArtifacts,
     RunPaths,
+    WeightDivergenceAlertEvent,
 )
 from cynosure.train.earlystop import EarlyStopJudge, EarlyStopVerdict
 from cynosure.train.rewards import RewardCoordinator
@@ -54,7 +55,7 @@ from cynosure.train.trainer import (
 __all__ = [
     "REWIND_ACCOUNTING",
     "AmpContext",
-    "BarrierSoftTimeoutEvent",
+    "BarrierTimeoutAlertEvent",
     "BaselineManifest",
     "ConditionSampler",
     "CrossModalConditionSampler",
@@ -82,4 +83,5 @@ __all__ = [
     "TrainingDiagnostic",
     "TrainingLogProbPair",
     "TrainingRuntime",
+    "WeightDivergenceAlertEvent",
 ]

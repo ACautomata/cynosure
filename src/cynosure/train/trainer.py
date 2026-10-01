@@ -487,10 +487,12 @@ class GranularGrpoTrainer:
         started = time.monotonic()
         metrics: MilestoneMetrics = self.evaluation.milestone_metrics()
         if dist.rank == 0:
-            stage_events = [
-                event for event in self.artifacts.read_events()
-                if event.get("stage", 1) == self.stage_tag.stage
-            ]
+            # 前缀化喂入（#222 早停 judge 落口径）：判定纯函数化——
+            # 只消费 iteration ≤ 当前里程碑的事件，消除对落盘时序的
+            # 依赖（EarlyStopJudge.prefix_events 的调用点与单测面）
+            stage_events = EarlyStopJudge.prefix_events(
+                self.artifacts.read_events(), iteration, self.stage_tag.stage,
+            )
             verdict = EarlyStopJudge(self.config).judge(
                 stage_events, current_fid=metrics.fid,
             )
