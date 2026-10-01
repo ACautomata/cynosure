@@ -64,11 +64,14 @@ World-1 行为与分布式化前**逐位一致**（同代码路径、同 RNG 消
   与广播的调用次数由 rank0 判定驱动，全 rank 同一条执行序，复测确认步
   全 rank 一致跳过更新（确认/终止路径的集合对齐由此成立，#165 式挂死
   面不外露）；
-- **判别器更新 = 在线期同款 DDP**（决策 2）：经 ``TrainingRuntime.
-  assemble_rewards`` 装配缝自动生效——``ReplicatedDiscriminator.replicate``
-  梯度 allreduce（更新后各 rank 权重逐位一致）、``RankSlicedPool`` real
-  池条带（容量守卫 K×world_size 把门，装配期全 rank 一致拒绝）；有效
-  batch = K×N，config 字面不变，world_size 是唯一变量；
+- **判别器更新 = 在线期同款 DDP**（决策 2）：``TrainingRuntime.
+  assemble_rewards`` 装配缝 + 本 driver 自行 ``ReplicatedDiscriminator.
+  replicate``（#234 判别器链期 RL 构造点解耦退役后，torchrun 预训练
+  的留存构造点——梯度 allreduce（更新后各 rank 权重逐位一致）、
+  ``RankSlicedPool`` real 池条带（容量守卫 K×world_size 把门，
+  装配期全 rank 一致拒绝）；有效 batch = K×N，config 字面不变，
+  world_size 是唯一变量；单进程 world-1 下 replicate 恒等，行为与
+  退役前逐位一致）；
 - **冻结基座不 FSDP**（决策 6）：每 rank 完整副本，不注入 ``chunk_sync``
   （各 rank 同条件同尺寸，分块 cap 天然一致，无集合可绑定）；
 - **产物写者 rank0 门**（决策 8）：事件流（``metrics.jsonl``）、判别器
@@ -94,7 +97,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from cynosure.config import CynosureConfig
-from cynosure.distributed import DistributedContext
+from cynosure.distributed import DistributedContext, ReplicatedDiscriminator
 from cynosure.distributed.merge import EventMerger
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
@@ -175,6 +178,12 @@ class PretrainDriver:
             config, amp, streams, self._dist,
             sampler=sampler, conditions=self._policy.conditions,
         )
+        # DDP 副本语义的留存构造点（#234 判别器链期：RL 装配缝解耦退役
+        # 后，torchrun 预训练路径在本缝自行装配——梯度 allreduce、更新后
+        # 各 rank 权重逐位一致；ReplicatedDiscriminator 本体留存至
+        # pretrain driver 期收口删除，#226 用户故事 8。单进程 world-1
+        # 下 replicate 恒等返回，行为与退役前逐位一致）
+        ReplicatedDiscriminator.replicate(self._rewards.scorer, self._dist)
         # 量产 rollout（``RolloutPhase``）不装配：ADR-0012 决策 6 后预训练
         # 相 fake 全由装配原语重构产出（测量批 / 更新批两条入口），无
         # rollout 相的消费者——装配它只会让「fake 是否走了量产」留一条
@@ -310,9 +319,10 @@ class PretrainDriver:
                 # 对同批 real 的同源重构（专属 recon 流、先抽 s 后抽 ε、
                 # η=0 确定性 ODE 续跑）——与在线更新同一原语供批、判别器
                 # 任务两阶段同构（warm-start 权重不面临分布跳变）。分布式
-                # 下 DDP 自动装配（assemble_rewards 缝）：本 rank 的 K 条
-                # 配对批、梯度 allreduce，有效 batch = K×world_size。与本步
-                # 测量批同一原语的另一条入口（定序轮转 σ + 复位测量流）
+                # 下 DDP 由本 driver 装配（#234 解耦后的留存构造点）：本
+                # rank 的 K 条配对批、梯度 allreduce，有效 batch =
+                # K×world_size。与本步测量批同一原语的另一条入口（定序
+                # 轮转 σ + 复位测量流）
                 self._rewards.assembler.assemble(modality),
             )
             # 过拟合分叉观测（ADR-0009-γ）：与在线同一监控组件、同一

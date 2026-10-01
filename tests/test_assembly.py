@@ -38,6 +38,10 @@ MEASUREMENT_OFFSET = 10
 """测量流 seed 偏移的字面量钉子（刻意不 import 生产常量：本测钉的是
 偏移**值**——生产常量被误改时此处显式红，而非随改随过）。"""
 
+_UNSET: object = object()
+"""assembler 工厂的 real_sampler 缺省哨兵：显式 None 透传（供给语义
+装配），缺省才回落默认池采样器。"""
+
 
 def _expected_measurement_fakes(assembler, reals: torch.Tensor) -> torch.Tensor:
     """测量批的零速度 ODE 手工复算：重构 = 插值加噪（ODE 零贡献），
@@ -190,7 +194,7 @@ class AssemblyScenario:
         train_steps: tuple[int, ...] = TRAIN_STEPS,
         num_steps: int = NUM_STEPS,
         scale_factor: float = 1.0,
-        real_sampler=None,
+        real_sampler=_UNSET,
         conditions=None,
     ) -> ReconstructionAssembler:
         schedules = self.schedules(num_steps)
@@ -200,13 +204,12 @@ class AssemblyScenario:
             schedules,
         )
         pool = LatentManifest.load(self.pool_path, kind="real_pool")
+        if real_sampler is _UNSET:
+            real_sampler = RealPoolSampler(
+                pool, torch.Generator().manual_seed(real_seed),
+            )
         return ReconstructionAssembler(
-            real_sampler=(
-                real_sampler if real_sampler is not None
-                else RealPoolSampler(
-                    pool, torch.Generator().manual_seed(real_seed),
-                )
-            ),
+            real_sampler=real_sampler,
             sampler=sampler,
             schedules=schedules,
             conditions=conditions if conditions is not None else StubConditions(),
@@ -284,6 +287,58 @@ class TestPairBatchProperties:
             tuple(real.flatten().tolist()) for real in pair.reals
         }
         assert len(fingerprints) == scenario.K
+
+
+class TestReconstructAssigned:
+    """窗口任务供给入口（#220 决议 10/16，#234 判别器链期）：real 由
+    调用方给定（窗口起点全局无放回抽取的供给语义——real 侧是池数据不
+    是随机流），入口只做 fake 侧随机性（条件构造 + 先 s 后 ε + 同源
+    重构），real 侧零采样零校验。"""
+
+    def test_assigned_reals_produce_paired_batch(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        reals = torch.randn(2, *SHAPE)
+        pair = scenario.assembler().reconstruct_assigned(reals, CONDITION)
+        assert pair.reals is reals  # 同一对象：real 由调用方持有
+        assert pair.fakes.shape == reals.shape
+        assert pair.modality == CONDITION
+        assert not pair.fakes.requires_grad
+
+    def test_consumption_is_s_then_epsilon_without_real_sampling(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """供给入口的流消耗 = randint（s）+ randn（ε）恰一笔（n = 批维），
+        无 real 侧 randperm——「先 s 后 ε」次序契约的窗口任务粒度锚。"""
+        assembler = scenario.assembler(seed=11)
+        before = assembler.generator_state()
+        reals = torch.randn(3, *SHAPE)
+        assembler.reconstruct_assigned(reals, CONDITION)
+        replay = torch.Generator()
+        replay.set_state(before)
+        torch.randint(len(TRAIN_STEPS), (3,), generator=replay)
+        torch.randn((3, *SHAPE), generator=replay)
+        assert torch.equal(assembler.generator_state(), replay.get_state())
+
+    def test_assemble_without_real_sampler_rejected(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """供给语义装配（real_sampler=None）下旧 assemble 入口显式拒绝
+        ——半供给形态不静默可用。"""
+        assembler = scenario.assembler(real_sampler=None)
+        with pytest.raises(ValueError, match="real 侧采样器"):
+            assembler.assemble(CONDITION)
+
+    def test_reconstruct_assigned_works_without_real_sampler(
+        self, scenario: AssemblyScenario,
+    ) -> None:
+        """供给入口在 real_sampler=None 下可用（real 由调用方给定的
+        前提正是采样器缺席）。"""
+        reals = torch.randn(2, *SHAPE)
+        pair = scenario.assembler(real_sampler=None).reconstruct_assigned(
+            reals, CONDITION,
+        )
+        assert pair.fakes.shape == reals.shape
 
 
 class TestDeterministicReconstruction:

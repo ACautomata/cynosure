@@ -21,8 +21,12 @@ EventMerger）。trainer 只面对本 Facade 编排 iteration 循环，装配细
 - seed 的 rank 派生（各 rank 数据流独立；rank 0 恒等 = 单进程等价前提）；
 - 可训练网络 FSDP full-shard + 梯度检查点（PolicySharding，optimizer
   构建于分片后参数之上）；
-- 判别器 DDP 副本（ReplicatedDiscriminator）+ Real sample pool 切片
-  （RankSlicedPool；held-out 不切）；
+- 判别器 DDP 副本（ReplicatedDiscriminator——**RL 构造点已随 #234
+  判别器链期解耦退役**：本装配缝不再 DDP 化判别器，torchrun 预训练
+  driver 自行装配（pretrain 路径留存至 pretrain driver 期收口删除，
+  #226 用户故事 8）；旧 RL torchrun 路径在加厚窗口内各 rank 独立更新
+  判别器（数值分叉可接受——旧执行序随切换期删除））+ Real sample
+  pool 切片（RankSlicedPool；held-out 不切）；
 - 指标归并器（EventMerger，rank 0 顺序写出）。
 """
 
@@ -37,7 +41,6 @@ from cynosure.distributed import (
     EventMerger,
     PolicySharding,
     RankSlicedPool,
-    ReplicatedDiscriminator,
 )
 from cynosure.grpo import ClippedPolicyLoss, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
@@ -279,15 +282,22 @@ class TrainingRuntime:
         sampler: RolloutSampler | None = None,
         conditions: ConditionSampler | None = None,
     ) -> RewardCoordinator:
-        """判别器侧装配：网络构建 → DDP 副本升级（分布式）→ pool 切片
-        （real 侧；held-out 不切）→ 配对批装配原语 / Online update / AUC
-        协作者。
+        """判别器侧装配：网络构建 → pool 切片（real 侧；held-out 不切）
+        → 配对批装配原语 / Online update / AUC 协作者。
 
         公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
-        RankSlicedPool / ReplicatedDiscriminator 在单进程下恒等）共用
-        同一份装配代码——「无第二套判别器训练逻辑」在装配层同样成立。
+        RankSlicedPool 在单进程下恒等）共用同一份装配代码——「无第二
+        套判别器训练逻辑」在装配层同样成立。
         ``rng`` 收命名注册对象本体（TrainingRngStreams，#218 禁裸容器
         ——各协作者经它取各自的专属流）。
+
+        **DDP 解耦（#234 判别器链期）**：本缝不再构造 Replicated
+        Discriminator——RL 装配（新执行序门面与旧 trainer）的判别器
+        不经 DDP（新执行序梯度 allreduce SUM + 步末 u/v broadcast 的
+        全卡一致由执行序自身编排；旧执行序随切换期删除）；torchrun
+        预训练 driver 在调用本缝后自行 ``ReplicatedDiscriminator.
+        replicate``（pretrain 分布式更新语义的留存构造点，本体随
+        pretrain driver 期收口删除）。
 
         ``sampler`` + ``conditions``（policy 侧依赖，须成对提供）驱动
         判别器更新批装配原语（ADR-0012 唯一新缝）的组装——两阶段供给
@@ -323,7 +333,8 @@ class TrainingRuntime:
             )
         scorer = cls.assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
-        ReplicatedDiscriminator.replicate(scorer, dist)
+        # （#234：ReplicatedDiscriminator 的 RL 构造点解耦退役——本缝不再
+        # DDP 化判别器；torchrun 预训练 driver 自行装配，见模块 docstring）
         # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐条件容量
         # ≥ K×world_size——条带切片后每 rank 视图 ≥ K 的等价条件，判定放
         # 全量保失败路径全 rank 一致（RankSlicedPool 切片前校验同款理由）；
@@ -385,10 +396,10 @@ class TrainingRuntime:
         ``world_size`` = 守卫的需量倍数，按执行序的 real 侧数据访问形态
         取值：旧执行序条带切片（``entries[rank::world]``）下「每 rank 视图
         ≥ K」的等价条件 = K × world_size（判定放全量保失败路径全 rank
-        一致，ADR-0008 决策 4 / ADR-0008-03）；async 执行序全池直读、
-        每槽独立无放回采样 K 条（槽间独立抽取，判别器窗口的全局无放回
-        批语义随判别器链期定型，#232）——每槽供满的真实前提 = 全池
-        ≥ K，传 1。无放回采样语义不动，不引入有放回采样补洞。"""
+        一致，ADR-0008 决策 4 / ADR-0008-03）；async 执行序判别器链期
+        （#234）real 侧窗口起点全局无放回抽取——窗口单条件最大需求上界
+        = K × 卡数（#220 决议 9/10），需量倍数传卡数。无放回采样语义
+        不动，不引入有放回采样补洞。"""
         real_pool = LatentManifest.load(
             config.reward.real_pool_manifest, kind="real_pool",
         )
@@ -403,7 +414,7 @@ class TrainingRuntime:
     def assemble_pair_assembler(
         cls,
         config: CynosureConfig,
-        real_sampler: RealPoolSampler,
+        real_sampler: RealPoolSampler | None,
         sampler: RolloutSampler | None,
         conditions: ConditionSampler | None,
         generator: torch.Generator,
@@ -420,10 +431,17 @@ class TrainingRuntime:
         无源影像（ADR-0012 非目标，stage-2 到来时另行设计）——机制缝本
         票照常对组2 开放（机械链路可行），判别任务语义留待专项票。
 
-        两执行序共用：旧执行序经 ``assemble_rewards``（real 侧 = 本 rank
-        条带切片采样器）；async 执行序经执行门面的 per-槽装配（real 侧
-        = 全池直读采样器 + 槽 real_pool 流、重构流 = 槽 recon 流，
-        #218 五处消费面注入面零改动口径、#232 rollout 相重构任务）。"""
+        ``real_sampler`` 两态：旧执行序与预训练 driver = 本 rank 条带
+        切片采样器（经 ``assemble_rewards``，real 侧内部自采）；async
+        执行序（#234 判别器链期）= None 供给语义——real 由判别器窗口
+        起点全局无放回抽取（``WindowRealDraw``）经任务注入，装配原语
+        只承担 fake 构造（``reconstruct_assigned``）；两态共用同一
+        fake 构造核（ADR-0012 两阶段同原语的窗口化延伸）。
+
+        两执行序共用 fake 构造核：旧执行序/pretrain 经 ``assemble``
+        全批入口；async 执行序经 per-槽装配的消费（fake 侧 = 槽 recon
+        流，#218 五处消费面注入面零改动口径、#232 rollout 相重构任务）
+        与 ``reconstruct_assigned`` 供给入口。"""
         if (sampler is None) != (conditions is None):
             raise ValueError(
                 "配对批装配原语的 policy 侧依赖须成对提供：sampler 与 "

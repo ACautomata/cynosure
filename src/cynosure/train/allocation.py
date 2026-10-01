@@ -40,9 +40,41 @@ _GOLDEN = 0x9E3779B97F4A7C15
 _SEED_MASK = 0xFFFFFFFFFFFFFFFF
 """64 位混合的掩码（混合中间值全程无符号 64 位运算）。"""
 
-_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
+POSITIVE_INT64_MASK = 0x7FFFFFFFFFFFFFFF
 """torch.Generator.manual_seed 的正 int64 域掩码（混合产物超 int64 时
-截取低 63 位——同一 (seed, 轮号) 恒得同值，确定性不受影响）。"""
+截取低 63 位——同一 (seed, 轮号) 恒得同值，确定性不受影响）。分配表
+轮种子与窗口 real 抽取两消费方共享（#234 评审收敛：原两处同款私有
+常量合一）。"""
+
+_MIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
+_MIX_MULTIPLIER_2 = 0x94D049BB133111EB
+"""splitmix64 终混的两轮乘法常数。"""
+
+
+class SeedMixer:
+    """整数项序列的 splitmix64 终混种子派生（分配表轮种子 /
+    ``WindowRealDraw`` 窗口抽取种子 / ``BaselineManifest.noise_seed``
+    的同款机制单一实现，#234 评审收敛）。
+
+    混合结构：项序列求和入状态（外加金色比例常数）→ 三轮 xor-shift
+    × 乘法终混（全程 64 位无符号域）。加法交换律保证「项集合恒定则
+    同值」——各消费方以不同项结构调用（轮号 / 窗口号+条件摘要 /
+    stage+index），历史混合结果经本实现逐位保持。返回**全 64 位**
+    值——正 int64 域截取（torch ``Generator.manual_seed`` 域）是各
+    消费方的历史私有口径（分配表与窗口抽取截取、Baseline manifest
+    不截取），不在本实现内强加。不进 RNG 注册表（纯函数、无落盘
+    状态）。"""
+
+    @staticmethod
+    def mix(*terms: int) -> int:
+        """(terms...) 的终混种子（同项集合恒同值，与项次序无关）。"""
+        mixed = (_GOLDEN + sum(terms)) & _SEED_MASK
+        mixed ^= mixed >> 30
+        mixed = (mixed * _MIX_MULTIPLIER_1) & _SEED_MASK
+        mixed ^= mixed >> 27
+        mixed = (mixed * _MIX_MULTIPLIER_2) & _SEED_MASK
+        mixed ^= mixed >> 31
+        return mixed
 
 
 class AllocationTable:
@@ -110,15 +142,10 @@ class AllocationTable:
         return torch.randperm(len(self._conditions), generator=generator).tolist()
 
     def _round_seed(self, round_index: int) -> int:
-        """轮种子 = (seed, 轮号) 的 splitmix64 终混（与命名流线性偏移域
-        异构，撞位无语义）。"""
-        mixed = (self._seed + _GOLDEN + (round_index << 32)) & _SEED_MASK
-        mixed ^= mixed >> 30
-        mixed = (mixed * 0xBF58476D1CE4E5B9) & _SEED_MASK
-        mixed ^= mixed >> 27
-        mixed = (mixed * 0x94D049BB133111EB) & _SEED_MASK
-        mixed ^= mixed >> 31
-        return mixed & _MANUAL_SEED_MASK
+        """轮种子 = (seed, 轮号) 的 splitmix64 终混（``SeedMixer`` 单一
+        实现；与命名流偏移域异构，撞位无语义）——截取正 int64 域
+        （``Generator.manual_seed`` 域，共享 ``POSITIVE_INT64_MASK``）。"""
+        return SeedMixer.mix(self._seed, round_index << 32) & POSITIVE_INT64_MASK
 
     @staticmethod
     def assert_pair_symmetry(

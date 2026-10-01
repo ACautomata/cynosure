@@ -29,7 +29,7 @@ import torch
 
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.sampler import RealPoolSampler
-from cynosure.reward.scorer import LatentScorer
+from cynosure.reward.scorer import SCORE_CHUNK, ChunkedScorer, LatentScorer
 
 
 @dataclass(frozen=True)
@@ -94,13 +94,9 @@ class VolumeScoreClusters:
 class HeldOutAuc:
     """held-out 判别力监控信号（hacking 签名判定的输入）。"""
 
-    SCORE_CHUNK = 8
-    """打分前向的定块上界（3D 体数/块）：评估批量 = base 分区
-    （capacity//2 体，量产侧限 ``_BASE_BATCH`` 分块生成）或 fake 批，
-    一次性全量前向让激活显存随批量无界增长——训练开始前就可能耗尽
-    加速器。判别器归一化定死 GroupNorm（前向对 batch 维逐样本独立），
-    分块前向与全批逐位等价；AUC 是分数上的 rank 统计，分数级拼接
-    不改变口径。"""
+    SCORE_CHUNK = SCORE_CHUNK
+    """打分前向的定块上界（实现 = ``ChunkedScorer`` 单一来源——类常量
+    保留为历史消费面的兼容别名，本类内部经 ``self._chunked`` 消费）。"""
 
     def __init__(
         self,
@@ -116,16 +112,12 @@ class HeldOutAuc:
             )
         self._manifest = heldout_manifest
         self._scorer = scorer
+        self._chunked = ChunkedScorer(scorer)
         self._real_sampler = RealPoolSampler(heldout_manifest, generator, device)
 
     def _chunked_logits(self, latents: torch.Tensor) -> torch.Tensor:
         """分块打分前向（``SCORE_CHUNK`` 定块，分数级拼接）。"""
-        return torch.cat([
-            self._scorer.patch_logits(
-                latents[start:start + self.SCORE_CHUNK],
-            )
-            for start in range(0, latents.shape[0], self.SCORE_CHUNK)
-        ]).flatten()
+        return self._chunked.scores(latents)
 
     def _pool_size(self, modality: str | None) -> int:
         """该条件的 held-out 条目数（按条件过滤；None = 全池）。"""
