@@ -32,7 +32,7 @@ from cynosure.config import CynosureConfig
 from cynosure.eval.decode import VolumeDecoder
 from cynosure.eval.features import SliceFeatureExtractor
 from cynosure.eval.frechet import BootstrapKernelMmd, FrechetDistance
-from cynosure.eval.sampling import EntrySample, ManifestLatentSampler
+from cynosure.eval.sampling import EntryLatentSampler, EntrySample
 from cynosure.eval.volumes import (
     OrthoPlane,
     ReferenceVolumes,
@@ -116,7 +116,7 @@ class MilestoneEvaluator:
         self,
         config: CynosureConfig,
         stage: int,
-        latent_sampler: ManifestLatentSampler,
+        latent_sampler: EntryLatentSampler,
         decoder: VolumeDecoder,
         extractor: SliceFeatureExtractor,
         reals: ReferenceVolumes,

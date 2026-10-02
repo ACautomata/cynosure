@@ -256,6 +256,10 @@ _Avoid_: L1
 按里程碑间隔（默认每 50 iteration）在 train 循环内触发的解码评测——VAE 解码**监控子样本**（Baseline manifest 条目前缀 K，`milestone_eval_samples`，同 seed 同条件 → 跨里程碑可比）到像素域算 FID/KID（按目标条件分层宏平均），结果以 `milestone` 事件写入训练指标流，事件携带监控成本读数（总墙钟 + decode/fid 相位分解，#111 监控账的成本行来源；「卡时」读数措辞随 #222 §4 退役——实现恒为 time.monotonic 墙钟，协程数 > 卡数时字面卡时为假）。解码只发生在 Baseline / 里程碑 / 重采三条评测路径，不进逐 iteration 训练循环（iter 事件账无 decode 行项）。参照影像库按域分派：BraTS = 病例目录布局、病例×序列矩阵取体；MR-RATE = 平铺影像树、参照卷集锁 real pool train split 且轮转**按目标条件过滤**（一卷一条件，跨条件取卷即跨域比较，#124）。解码前向冻结为 fp16 autocast 口径（官方 NV-Generate-CTMR utils_infer 同款；不得换 bf16——与官方口径输出差 ~6.8e-02；生产 config `norm_float16=true` 下纯 fp32 前向对 fp32 conv 抛 dtype 错，无条件包 autocast、不分设备分支），出口统一上浮 fp32 供指标/落盘消费。
 _Avoid_: 定期评测、周期评测
 
+**Evaluation sampling forward（评测三路径采样前向）**:
+Baseline / 里程碑 / 重采三路径共用的 policy latent 采样段（manifest 条目 → Anchor 终点，`EntryLatentSampler` 缝）。async 执行序（#237，#217 评测三路径口径）：条目按槽分派到绑卡线程、per-entry `noise_seed` 独立 generator（按槽分派逐位安全——分派只影响墙钟不影响数值）、**异形 latent 逐条传卡 0 + 按 entry index 字典保序重组**（异形不可 cat）；解码 / FID / 特征提取在卡 0 主线程单点不动（KID bootstrap 独立 generator 的单点执行随之保留）。评测全程零消耗训练 RNG 流与进程全局 RNG——逐位重放锚不受 `milestone_interval` 影响。
+_Avoid_: 评测路径的全 rank FSDP 集合前向（旧执行序语义，随切换期删除）
+
 **Monitoring subsample（监控子样本）**:
 监控/评测路径专属的 decode 样本面：Baseline/重采 = N_baseline 全量 manifest 条目；里程碑 = 条目前缀 K（`milestone_eval_samples`，小样本相对信号，只服务于跨里程碑 plateau 比较）。decode 从不为训练主循环发生——主循环全程 latent 域（维护者裁决，#111 两本账口径），监控成本（decode+FID 卡时）只在里程碑事件上读数。
 _Avoid_: 评测集（评估集是数据侧互斥分区的概念，样本面是 run 内 manifest 条目）

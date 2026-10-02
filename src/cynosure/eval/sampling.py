@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -29,6 +29,21 @@ if TYPE_CHECKING:
 
 PHASE_BASELINE = "baseline"
 PHASE_RESAMPLE = "resample"
+
+
+class EntryLatentSampler(Protocol):
+    """manifest 条目的 policy latent 采样前向缝（#237 评测顺迁：三路径
+    共用同一缝、执行序可替换）——Baseline / 重采 / 里程碑评测的采样段
+    都经 ``sample`` 取 ``EntrySample`` 序，解码及下游度量不进本缝。
+
+    两个实现：``ManifestLatentSampler``（同步逐条，旧执行序全 rank 集合
+    前向语境）与 async 执行序的槽分派实现（manifest 条目按槽分派到绑卡
+    线程、异形 latent 逐条传卡 0 汇聚——#217 评测三路径顺迁口径）。"""
+
+    def sample(self, entries: list[ManifestEntry]) -> list[EntrySample]:
+        """逐条目解析条件、按 per-entry noise_seed 独立 generator 采样
+        Anchor 终点（同条目必得同 latent——与分派位置无关）。"""
+        ...
 
 
 @dataclass(frozen=True)
@@ -97,7 +112,7 @@ class ManifestVolumeSampler:
         self,
         stage: int,
         manifest: "BaselineManifest",
-        latent_sampler: ManifestLatentSampler,
+        latent_sampler: EntryLatentSampler,
         decoder: VolumeDecoder,
         paths: "RunPaths",
         decode_batch_size: int,
