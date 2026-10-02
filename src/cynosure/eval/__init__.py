@@ -34,7 +34,11 @@ from cynosure.eval.features import (
     StubSliceFeatureExtractor,
 )
 from cynosure.eval.milestone import MilestoneEvaluator, MilestoneMetrics
-from cynosure.eval.sampling import ManifestLatentSampler, ManifestVolumeSampler
+from cynosure.eval.sampling import (
+    EntryLatentSampler,
+    ManifestLatentSampler,
+    ManifestVolumeSampler,
+)
 from cynosure.eval.volumes import (
     MrReferenceVolumeStore,
     RealVolumeStore,
@@ -51,6 +55,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "EntryConditionResolver",
+    "EntryLatentSampler",
     "EvaluationPhase",
     "LatentDecoder",
     "ManifestEvaluation",
@@ -114,16 +119,32 @@ class ManifestEvaluation:
         decoder: VolumeDecoder | None = None,
         extractor: SliceFeatureExtractor | None = None,
         write_enabled: bool = True,
+        latent_sampler: EntryLatentSampler | None = None,
+        vocabulary: ConditionVocabulary | None = None,
+        pool: LatentManifest | None = None,
     ) -> "ManifestEvaluation":
         """按 config 装配评测相（manifest 由调用方从 run 目录装载注入；
         数值口径随训练循环的 AmpContext 单点传入；decoder/extractor 可
-        注入替身：fixture stub、测试计数解码器；缺省按 fixture/生产分派）。"""
-        pool = cls._load_pool(config)
+        注入替身：fixture stub、测试计数解码器；缺省按 fixture/生产分派）。
+
+        ``latent_sampler``：条目采样前向的执行序注入点（#237 评测顺迁，
+        ``EntryLatentSampler`` 结构化协议）——缺省 = 同步逐条实现
+        （``ManifestLatentSampler``，旧执行序全 rank 集合前向语境）；
+        async 执行序门面注入槽分派实现（条目按槽分派到绑卡线程、异形
+        latent 逐条传卡 0 汇聚），解码与下游度量的装配与本编排零改动。
+
+        ``vocabulary`` / ``pool``：条件词汇表与 real sample pool 的注入
+        点（#237 评审：async 门面与训练装配共享同一份装载，生产不双读
+        pool manifest）——缺省自装载（旧执行序与既有测试调用方兼容）。"""
+        pool = pool if pool is not None else cls._load_pool(config)
         # 条件词汇表自装载（eval 不 import train——train.trainer 依赖
         # 本包，经 train.runtime 装配会成环；与 GroupPolicy 同口径的
         # 两域内联分派）：rollout 条件解析与逐条目 latent 形状的共同
         # 取数面（#129 形状按条件贯通）
-        vocabulary = cls._assemble_vocabulary(config)
+        vocabulary = (
+            vocabulary if vocabulary is not None
+            else cls._assemble_vocabulary(config)
+        )
         # 监控相（里程碑解码评测）的装配前提：本 run 是否存在里程碑
         # 触发点——不触发里程碑的 run 不消费监控相，其样本面与参照库的
         # 装配要求随之不适用（#123：把监控相的资源/配置前置强加给不
@@ -146,7 +167,10 @@ class ManifestEvaluation:
                 "增大评测样本面或显式声明 fixture_mode"
             )
         resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
-        latent_sampler = ManifestLatentSampler(sampler, resolver, amp, vocabulary)
+        latent = (
+            latent_sampler if latent_sampler is not None
+            else ManifestLatentSampler(sampler, resolver, amp, vocabulary)
+        )
         resolved_decoder = decoder if decoder is not None else cls._build_decoder(
             config, amp.device,
         )
@@ -158,7 +182,7 @@ class ManifestEvaluation:
             MilestoneEvaluator(
                 config,
                 stage,
-                latent_sampler,
+                latent,
                 resolved_decoder,
                 extractor if extractor is not None
                 else cls._build_extractor(config, amp.device),
@@ -171,7 +195,7 @@ class ManifestEvaluation:
         volume_sampler = ManifestVolumeSampler(
             stage,
             manifest,
-            latent_sampler,
+            latent,
             resolved_decoder,
             artifacts.paths,
             decode_batch_size=config.schedule.decode_batch_size,

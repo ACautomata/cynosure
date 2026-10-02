@@ -93,7 +93,19 @@ alert / weight_divergence_alert / overfit_alert）产生即写。软超时
 事件随本票按 #222 收口定名（骨架期 barrier_soft_timeout 临时类型
 退役：barrier_timeout_alert、字段 iteration/k/elapsed_s）。
 
-**不含**（各进加厚期，#226）：评测路径、pretrain driver、
+评测顺迁期增量（#237，加厚 5/6，#217 评测三路径结票口径）：**评测
+三路径（Baseline 采样 / 里程碑解码评测 / RL 后重采）进本门面**——
+采样前向走新执行器（``SlotDispatchLatentSampler``：manifest 条目按
+槽分派到绑卡线程、per-entry noise_seed 独立 generator 按槽分派逐位
+安全）；**汇聚缝 = 异形 latent 逐条传卡 0 + 按 entry index 字典保序
+重组**（异形不可 cat）；解码 / FID / 特征提取不动（``ManifestEvaluation``
+三路径编排经 ``EntryLatentSampler`` 缝注入新实现后零改动，KID
+bootstrap 独立 generator 的主线程单点执行随之保留）；里程碑评测顺迁
+——decode / fid 相位面保持既有口径（``MilestoneEvent.phase_seconds``
+契约不收缩），早停判定喂入前缀化过滤（``EarlyStopJudge.prefix_events``，
+#222 既裁口径；单进程单写者无 rank 广播面）。
+
+**不含**（各进加厚期，#226）：pretrain driver、
 生产入口（本门面仅被 fixture 测试驱动，#226 决策 1 生产入口单口径）。
 """
 
@@ -114,6 +126,7 @@ from cynosure.distributed.process import (
     DistributedContext,
     PG_TIMEOUT_MINUTES_ENV,
 )
+from cynosure.eval import EvaluationPhase, ManifestEvaluation
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.pretrain.artifacts import PretrainReport
@@ -127,13 +140,16 @@ from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import (
     POLICY_CHECKPOINT_TEMPLATE,
     BarrierTimeoutAlertEvent,
+    BaselineManifest,
     DiscConditionReading,
     DiscUpdateDetail,
     IterEvent,
+    MilestoneEvent,
     OverfitAlertEvent,
     RunArtifacts,
     WeightDivergenceAlertEvent,
 )
+from cynosure.train.async_eval import SlotDispatchLatentSampler
 from cynosure.train.async_resume import (
     ASYNC_RESUME_FORMAT_VERSION,
     AsyncResumeStore,
@@ -148,6 +164,7 @@ from cynosure.train.discriminator import (
     WindowRealDraw,
     WindowTask,
 )
+from cynosure.train.earlystop import EarlyStopJudge
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rollout import IterationRollout, RolloutPhase, StepRollout
 from cynosure.train.rng import (
@@ -738,6 +755,9 @@ class RunContinuation:
     """续训与 checkpoint 节奏的编排协作者（#236 续训与事件契约期）：
 
     - 持有 v12 ``AsyncResumeStore``（分片存取的校验单点）；
+    - 持有槽 RNG 注册表（快照/恢复的流状态源——``generators`` 段与
+      ``seeds`` 段的取数面、恢复的流回填目标，#237 评审归并：流状态
+      的持有者随续训协作者走）；
     - **resume 单点声明**（装配与 run 执行共用同一开关，旧 trainer
       口径平移——无双点声明可错位）：build(resume=True) 驱动占位装配
       （判别器不消费任何 checkpoint 工件），run() 经本类声明从分片
@@ -745,16 +765,28 @@ class RunContinuation:
     - checkpoint 周期判定（收尾兜底由门面按 last_checkpoint 前向
       推进口径裁决，旧 trainer 同口径）。
 
-    分片的具体攒装（收集各卡权威状态）与恢复应用（下发各卡、流状态
-    回填）由门面承担——它持有 cards 与注册表；本类不触碰门面内部
-    结构（「ResumeStore 挂运行时聚合层」裁决在新执行序的落点：
-    #231 骨架期后新执行序的聚合层 = 本门面，store 与其节奏编排收为
-    门面单一协作者，#222 §1 / ADR-0014 平移口径）。
+    分片的具体攒装（收集各卡权威状态）与恢复应用（下发各卡）由门面
+    承担——它持有 cards；本类不触碰门面内部结构（「ResumeStore 挂
+    运行时聚合层」裁决在新执行序的落点：#231 骨架期后新执行序的聚合
+    层 = 本门面，store 与其节奏编排收为门面单一协作者，#222 §1 /
+    ADR-0014 平移口径）。
     """
 
-    def __init__(self, artifacts: RunArtifacts, *, resume: bool) -> None:
+    def __init__(
+        self,
+        artifacts: RunArtifacts,
+        rng: SlotRngRegistry,
+        *,
+        resume: bool,
+    ) -> None:
         self._store = AsyncResumeStore(artifacts)
+        self._rng = rng
         self._resume = resume
+
+    @property
+    def rng(self) -> SlotRngRegistry:
+        """槽 RNG 注册表（流状态快照/回填的取数面）。"""
+        return self._rng
 
     @property
     def resume_assembled(self) -> bool:
@@ -772,6 +804,82 @@ class RunContinuation:
         return completed % interval == 0
 
 
+class EvaluationRounds:
+    """评测三路径的回合编排（#237 评测顺迁期）：Baseline 采样 / 里程碑
+    解码评测回合 / RL 后重采的相位与簿记单点——评测采样前各卡 eval 相
+    位（三条评测路径与 rollout 同为 eval 相，旧 trainer 评测前显式
+    ``eval_phase`` 口径平移）、里程碑回合的解码评测 → ``milestone``
+    事件写入训练指标流 → 早停判定。主循环只按节奏点调用，评测编排不
+    进训练主循环体（#237 评审：门面属性数收拢 + 编排收出主循环）。"""
+
+    def __init__(
+        self,
+        evaluation: EvaluationPhase,
+        artifacts: RunArtifacts,
+        cards: "list[CardWorker]",
+        judge: EarlyStopJudge,
+    ) -> None:
+        self.evaluation = evaluation
+        self.artifacts = artifacts
+        self._cards = cards
+        self._judge = judge
+
+    def baseline(self) -> None:
+        """训练启动期的 Baseline 采样（eval 相位 → 冻结初始 policy
+        冻结只采一次）。"""
+        self._set_policy_eval()
+        self.evaluation.sample_baseline()
+
+    def resample(self) -> None:
+        """RL 后的同 manifest 重采（eval 相位 → 最终 policy）。"""
+        self._set_policy_eval()
+        self.evaluation.resample()
+
+    def milestone(self, iteration: int) -> bool:
+        """里程碑解码评测回合 → ``milestone`` 事件入训练指标流 → 早停
+        判定。返回是否早停。
+
+        评测采样前向走新执行器（``SlotDispatchLatentSampler`` 条目按槽
+        分派），解码 / FID / 特征提取在主线程单点执行不动——decode/fid
+        相位打点随 ``MilestoneMetrics.phase_seconds`` 透传，事件契约
+        （``MilestoneEvent.phase_seconds`` 面）不收缩。早停判定喂入前缀
+        化过滤（#222：只消费 iteration ≤ 当前里程碑的本 stage 事件，判定
+        纯函数化）；单进程单写者，无旧执行序的 rank 0 判定 + 广播面。
+        ``elapsed_s`` 是本方法侧的全区间口径（覆盖采样 + 解码 + FID +
+        簿记），与旧执行序同口径。"""
+        self._set_policy_eval()
+        started = time.monotonic()
+        metrics = self.evaluation.milestone_metrics()
+        stage_events = EarlyStopJudge.prefix_events(
+            self.artifacts.read_events(), iteration, _STAGE_TAG,
+        )
+        verdict = self._judge.judge(stage_events, current_fid=metrics.fid)
+        criteria = dict(metrics.summary())
+        criteria["plateau_stalled"] = float(verdict.plateau_stalled)
+        criteria["hacking_signature"] = float(verdict.hacking_signature)
+        self.artifacts.append_event(MilestoneEvent(
+            iteration=iteration,
+            stage=_STAGE_TAG,
+            fid=metrics.fid,
+            kid=metrics.kid,
+            ssim=metrics.ssim,
+            mae=metrics.mae,
+            psnr=metrics.psnr,
+            criteria_summary=criteria,
+            early_stop=verdict.stop,
+            early_stop_reason=verdict.reason,
+            elapsed_s=time.monotonic() - started,
+            phase_seconds=metrics.phase_seconds,
+        ))
+        return verdict.stop
+
+    def _set_policy_eval(self) -> None:
+        """评测采样前的 eval 相位（各卡；主线程直接调用纯 Python 相位
+        状态，先例 = 逐 iteration 的 eval_phase/train_phase 编排）。"""
+        for card in self._cards:
+            card.replica.policy.eval_phase()
+
+
 class AsyncTrainingExecutor:
     """async 执行序门面：静态分配表轮 + per-槽协程骨架 + 逐 k barrier
     收集-同步 + 事件发射 + fail-fast/超时口径的单点编排（#231 骨架期
@@ -782,24 +890,29 @@ class AsyncTrainingExecutor:
         config: CynosureConfig,
         artifacts: RunArtifacts,
         allocation: AllocationTable,
-        rng: SlotRngRegistry,
         cards: list[CardWorker],
         collect_reduce: PerKCollectReduce,
         timeout: BarrierTimeoutPolicy,
         window_run: DiscriminatorWindowRun,
         overfit: OverfitMonitor,
         continuation: RunContinuation,
+        evaluation_rounds: EvaluationRounds,
     ) -> None:
         self.config = config
         self.artifacts = artifacts
         self.allocation = allocation
-        self.rng = rng
         self.cards = cards
         self._collect_reduce = collect_reduce
         self._timeout = timeout
         self._window_run = window_run
         self._overfit = overfit
         self._continuation = continuation
+        self.evaluation_rounds = evaluation_rounds
+
+    @property
+    def rng(self) -> SlotRngRegistry:
+        """槽 RNG 注册表（续训协作者持有；测试锚与恢复面的取数别名）。"""
+        return self._continuation.rng
 
     @property
     def window(self) -> DiscriminatorWindow:
@@ -823,6 +936,7 @@ class AsyncTrainingExecutor:
         owner_check: bool = False,
         timeout: BarrierTimeoutPolicy | None = None,
         resume: bool = False,
+        evaluation: EvaluationPhase | None = None,
     ) -> "AsyncTrainingExecutor":
         """config 驱动装配：设备发现（卡数）→ 条件轴（条件分布
         ``targets()``，集合知识归条件分布自身）→ 分配表 + 槽注册表 →
@@ -928,11 +1042,38 @@ class AsyncTrainingExecutor:
                     bound_slots,
                 ),
             ))
+        # 评测相装配（#237 评测顺迁）：采样前向走新执行器（条目按槽分派
+        # + 异形 latent 逐条传卡 0 汇聚），解码 / FID / 特征提取与
+        # MilestoneEvent.phase_seconds 打点在 ManifestEvaluation 三路径
+        # 编排内零改动；测试可注入替身（EvaluationPhase 同契约）。
+        # vocabulary / real pool / AmpContext 由上方装配单点装载、注入
+        # 两个评测消费面（评审：不双读 pool manifest、不重复装配词表
+        # 与数值口径；real pool 复用 assemble_real_pool 的守卫装载）。
+        amps = [
+            TrainingRuntime.amp_context(config, device) for device in devices
+        ]
+        manifest = BaselineManifest.load(run_artifacts.paths.manifest)
+        assembled_evaluation = (
+            evaluation if evaluation is not None
+            else ManifestEvaluation.build(
+                config,
+                run_artifacts,
+                replica.sampler,
+                _STAGE_TAG,
+                manifest,
+                amp=amps[0],
+                write_enabled=True,
+                vocabulary=vocabulary,
+                pool=real_pool,
+                latent_sampler=SlotDispatchLatentSampler.assemble(
+                    cards, slot_count, vocabulary, real_pool, amps,
+                ),
+            )
+        )
         return cls(
             config=config,
             artifacts=run_artifacts,
             allocation=allocation,
-            rng=rng,
             cards=cards,
             collect_reduce=PerKCollectReduce(),
             timeout=(
@@ -943,7 +1084,13 @@ class AsyncTrainingExecutor:
                 window, WindowRealDraw(real_pool), config.schedule.seed,
             ),
             overfit=overfit,
-            continuation=RunContinuation(run_artifacts, resume=resume),
+            continuation=RunContinuation(
+                run_artifacts, rng, resume=resume,
+            ),
+            evaluation_rounds=EvaluationRounds(
+                assembled_evaluation, run_artifacts, cards,
+                EarlyStopJudge(config),
+            ),
         )
 
     @staticmethod
@@ -1033,14 +1180,14 @@ class AsyncTrainingExecutor:
         )
 
     def run(self) -> int:
-        """训练主循环（#236 续训与事件契约期口径）：预热 → 绑卡线程
-        启动 → 逐 iteration（rollout 相 → 逐 k barrier → 事件发射）
-        → 线程收尾。返回完成的 iteration 数。续训（resume 单点声明
-        经 ``RunContinuation``：恢复 + checkpoint 周期/收尾兜底 +
-        v12 分片与产物落盘）与判别器链（#234）已进本门面；评测仍未
-        进（评测脚本独立消费产物工件）。启动序在收尾兜底的 ``try``
-        内：第 2..N 卡装配失败（``start`` 抛 ``TrainingAborted``）
-        时已启动的前序卡同样经 ``finally`` 收尾。"""
+        """训练主循环（#237 评测顺迁期口径）：预热 → 绑卡线程启动 →
+        逐 iteration（rollout 相 → 逐 k barrier → 事件发射）+ Baseline
+        采样 / 里程碑评测（早停判定）+ RL 后重采 + 线程收尾。返回完成
+        的 iteration 数。续训（resume 单点声明经 ``RunContinuation``：
+        恢复 + checkpoint 周期/收尾兜底 + v12 分片与产物落盘）、判别器
+        链（#234）与评测三路径（#237：采样前向走新执行器）已进本门面。
+        启动序在收尾兜底的 ``try`` 内：第 2..N 卡装配失败（``start`` 抛
+        ``TrainingAborted``）时已启动的前序卡同样经 ``finally`` 收尾。"""
         self._warmup()
         try:
             for card in self.cards:
@@ -1061,29 +1208,56 @@ class AsyncTrainingExecutor:
         self._collect_reduce.warmup([card.replica for card in self.cards])
 
     async def _run_iterations(self) -> int:
-        """训练主循环（骨架期口径 + rollout 期重构任务 + 判别器链 +
-        续训与 checkpoint 节奏，#236）：resume 装配时先恢复（契约
-        校验 → 下发各卡 → 流回填 → 指标流回退）→ 逐 iteration →
-        周期/收尾兜底 checkpoint（分片先、产物后）。返回完成的
-        iteration 数（config 口径累计完成数；恢复点已达标 = 无操作
-        续训报告恢复点本身）。"""
+        """训练主循环（#236 续训与事件契约期口径 + #237 评测三路径顺迁）：
+        resume 装配时先恢复（契约校验 → 下发各卡 → 流回填 → 指标流回退）
+        → Baseline 采样（非 resume；冻结只采一次）→ 逐 iteration → 周期
+        /里程碑强制 checkpoint（分片先、产物后）→ 里程碑解码评测 + 早停
+        判定（命中即停）→ RL 后重采（执行了训练才收官）。返回完成的
+        iteration 数（config 口径累计完成数；早停时小于 max_iterations；
+        恢复点已达标 = 无操作续训报告恢复点本身）。
+
+        评测路径（baseline / 里程碑 / 重采）的相位与簿记收在评测回合
+        编排协作者（``EvaluationRounds``），采样前向走新执行器（条目
+        按槽分派到绑卡线程，评测采样零消耗训练 RNG 流——逐位重放锚不受
+        milestone_interval 影响），解码 / FID / 特征提取与事件打点在主
+        线程单点（单进程单写者，无旧执行序的 rank 0 闸门与广播面）。"""
         start_iteration = 0
         if self._continuation.resume_assembled:
             start_iteration = await self._restore()
         completed = start_iteration
         last_checkpoint = start_iteration
         interval = self.config.schedule.checkpoint_interval
+        if not self._continuation.resume_assembled:
+            self.evaluation_rounds.baseline()
         for iteration in range(start_iteration, self.config.schedule.max_iterations):
             await self._run_iteration(iteration)
             completed = iteration + 1
-            if self._continuation.checkpoint_due(completed, interval):
+            milestone_due = (
+                completed % self.config.schedule.milestone_interval == 0
+            )
+            if milestone_due or self._continuation.checkpoint_due(
+                completed, interval,
+            ):
+                # checkpoint 周期之外，每个里程碑也强制落盘（config 契约：
+                # milestone 评测器与恢复路径的取数点，周期不覆盖时仍须
+                # 产出——旧 trainer 口径平移）
                 await self._checkpoint_at(completed)
                 last_checkpoint = completed
+            if milestone_due:
+                if self.evaluation_rounds.milestone(completed):
+                    # 早停：最终 policy 状态已随上面的里程碑 checkpoint
+                    # 落盘（评测不改权重，checkpoint 态即停时态）
+                    break
         if last_checkpoint < completed:
             # 收尾兜底只允许前向推进：恢复点已在目标之后（收缩
             # max_iterations 的续训 = 无操作）时不得把更后的训练态
             # 改写成更小的 iteration 标签（旧 trainer 口径平移）
             await self._checkpoint_at(completed)
+        if completed > start_iteration:
+            # RL 后重采（同 manifest 条目，差异唯一归因于 RL）：恢复点
+            # 已达标的无操作续训不重采（policy 未变，重采只因 RNG 流
+            # 位置不同而静默改写产物——旧 trainer 口径平移）
+            self.evaluation_rounds.resample()
         return completed
 
     async def _restore(self) -> int:
@@ -1095,7 +1269,7 @@ class AsyncTrainingExecutor:
         指标流回退（删除恢复点之后的半截事件，重执行重写）。
         返回恢复点 iteration。"""
         payload = self._continuation.store.restore(
-            self.config, slot_count=self.rng.slot_count,
+            self.config, slot_count=self._continuation.rng.slot_count,
         )
         iteration = payload["iteration"]
         await self._collect(
@@ -1106,9 +1280,9 @@ class AsyncTrainingExecutor:
         )
         self._assert_restored_lr(payload["lr"])
         saved_streams = payload["generators"]
-        for slot in range(self.rng.slot_count):
+        for slot in range(self._continuation.rng.slot_count):
             for stream in _STREAM_NAMES:
-                self.rng.restore_stream(
+                self._continuation.rng.restore_stream(
                     slot, stream, saved_streams[f"slot{slot}"][stream],
                 )
         self._overfit.adopt(payload["overfit"])
@@ -1207,7 +1381,7 @@ class AsyncTrainingExecutor:
         return {
             "version": ASYNC_RESUME_FORMAT_VERSION,
             "iteration": int(iteration),
-            "slots": self.rng.slot_count,
+            "slots": self._continuation.rng.slot_count,
             "policy_network": policy_state,
             "policy_optimizer": AsyncResumeStore.to_cpu_snapshot(
                 card0.policy.optimizer.state_dict(),
@@ -1224,10 +1398,10 @@ class AsyncTrainingExecutor:
             },
             "generators": {
                 f"slot{slot}": {
-                    stream: self.rng.stream_state(slot, stream)
+                    stream: self._continuation.rng.stream_state(slot, stream)
                     for stream in streams
                 }
-                for slot in range(self.rng.slot_count)
+                for slot in range(self._continuation.rng.slot_count)
             },
             "overfit": self._overfit.state(),
             "seeds": {
@@ -1236,7 +1410,7 @@ class AsyncTrainingExecutor:
                     SlotRngRegistry.slot_seed(
                         self.config.schedule.seed, slot,
                     )
-                    for slot in range(self.rng.slot_count)
+                    for slot in range(self._continuation.rng.slot_count)
                 ],
             },
         }
