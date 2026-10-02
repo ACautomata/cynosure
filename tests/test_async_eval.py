@@ -33,6 +33,7 @@ from cynosure.train.executor import AsyncTrainingExecutor
 from cynosure.train.runtime import TrainingRuntime
 from tests.conftest import RunTrajectory, CliSession
 from tests.test_async_executor import ExecutorScenario
+from tests.test_milestone_eval import StubEvaluation
 from tests.test_mr_train import CONDITIONS, MrTrainScenario
 
 
@@ -98,6 +99,55 @@ class TestAsyncEvaluationFixtureTier:
             assert entry["resample_sample"] is not None
             assert (run_dir / entry["baseline_sample"]).is_file()
             assert (run_dir / entry["resample_sample"]).is_file()
+
+    def test_evaluation_phase_injection_point(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """评测相注入替身（``EvaluationPhase`` 同契约）：``build`` 的
+        ``evaluation=`` 短路真实装配、替身原样进评测回合编排——与旧
+        执行序 trainer 的替身注入缝同形态，替身复用早停接线档的
+        ``StubEvaluation`` 同一契约面。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = self._milestone_config(scenario, seed=0)
+        stub = StubEvaluation(fids=[5.0])
+        executor = scenario.build(config, coroutines=1, evaluation=stub)
+        assert executor.evaluation_rounds.evaluation is stub
+
+    def test_resume_crosses_milestones_without_rebaseline(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """续训 × 评测交叉（旧 trainer 口径平移的断言钉面）：resume 恢复
+        后跳过 Baseline 采样（manifest 的 ``baseline_sample`` 保持首轮
+        产物——冻结只采一次的工件级幂等），恢复点之后命中的新里程碑
+        照常评测（新 ``milestone`` 事件入流、无重复 iteration），收官
+        重采（policy 已推进）照常填充。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = self._milestone_config(scenario, seed=0)
+        config.schedule.max_iterations = 1
+        scenario.build(config, coroutines=1).run()
+        manifest_before = json.loads(
+            (tmp_path / "run" / "manifest.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+        config.schedule.max_iterations = 2
+        completed = scenario.resume_build(config).run()
+        assert completed == 2
+        milestones = [
+            event for event in scenario.events()
+            if event["event"] == "milestone"
+        ]
+        assert [event["iteration"] for event in milestones] == [1, 2]
+        manifest_after = json.loads(
+            (tmp_path / "run" / "manifest.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+        for before, after in zip(
+            manifest_before["entries"], manifest_after["entries"],
+        ):
+            assert after["baseline_sample"] == before["baseline_sample"]
+            assert after["resample_sample"] is not None
 
     def test_slot_dispatch_bitwise_matches_sequential(
         self, cli: CliSession, tmp_path: Path,

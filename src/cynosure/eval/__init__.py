@@ -166,11 +166,13 @@ class ManifestEvaluation:
                 "轮转下 K 不足即永久漏尾部条件，早停判据对其失明——"
                 "增大评测样本面或显式声明 fixture_mode"
             )
-        resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
-        latent = (
-            latent_sampler if latent_sampler is not None
-            else ManifestLatentSampler(sampler, resolver, amp, vocabulary)
-        )
+        # 缺省分支才构造同步逐条采样核（条件解析器 + sampler 编排）；
+        # 执行序注入时本面不构造不消费的协作者（评审：死构造收进分支）
+        if latent_sampler is not None:
+            latent = latent_sampler
+        else:
+            resolver = EntryConditionResolver(vocabulary, amp.device, pool=pool)
+            latent = ManifestLatentSampler(sampler, resolver, amp, vocabulary)
         resolved_decoder = decoder if decoder is not None else cls._build_decoder(
             config, amp.device,
         )

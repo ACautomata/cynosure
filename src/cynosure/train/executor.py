@@ -820,7 +820,7 @@ class EvaluationRounds:
         judge: EarlyStopJudge,
     ) -> None:
         self.evaluation = evaluation
-        self.artifacts = artifacts
+        self._artifacts = artifacts
         self._cards = cards
         self._judge = judge
 
@@ -851,13 +851,13 @@ class EvaluationRounds:
         started = time.monotonic()
         metrics = self.evaluation.milestone_metrics()
         stage_events = EarlyStopJudge.prefix_events(
-            self.artifacts.read_events(), iteration, _STAGE_TAG,
+            self._artifacts.read_events(), iteration, _STAGE_TAG,
         )
         verdict = self._judge.judge(stage_events, current_fid=metrics.fid)
         criteria = dict(metrics.summary())
         criteria["plateau_stalled"] = float(verdict.plateau_stalled)
         criteria["hacking_signature"] = float(verdict.hacking_signature)
-        self.artifacts.append_event(MilestoneEvent(
+        self._artifacts.append_event(MilestoneEvent(
             iteration=iteration,
             stage=_STAGE_TAG,
             fid=metrics.fid,
@@ -1032,6 +1032,10 @@ class AsyncTrainingExecutor:
         ]
         overfit = OverfitMonitor(config.reward, conditions=vocabulary.names())
         cards = []
+        # 卡 0 副本引用先行捕获（评测缺省采样核的取数面）——for 循环
+        # 泄漏的循环变量在循环后指向末卡（评审：注入移除时缺省 sampler
+        # 会静默落在末卡设备而 amp 落卡 0，设备口径错位）
+        card0_replica = replicas[0]
         for replica in replicas:
             bound_slots = list(card_slots[replica.index])
             cards.append(CardWorker(
@@ -1058,7 +1062,7 @@ class AsyncTrainingExecutor:
             else ManifestEvaluation.build(
                 config,
                 run_artifacts,
-                replica.sampler,
+                card0_replica.sampler,
                 _STAGE_TAG,
                 manifest,
                 amp=amps[0],
