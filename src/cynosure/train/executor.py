@@ -1053,13 +1053,17 @@ class AsyncTrainingExecutor:
         # vocabulary / real pool / AmpContext 由上方装配单点装载、注入
         # 两个评测消费面（评审：不双读 pool manifest、不重复装配词表
         # 与数值口径；real pool 复用 assemble_real_pool 的守卫装载）。
-        amps = [
-            TrainingRuntime.amp_context(config, device) for device in devices
-        ]
-        manifest = BaselineManifest.load(run_artifacts.paths.manifest)
-        assembled_evaluation = (
-            evaluation if evaluation is not None
-            else ManifestEvaluation.build(
+        # 注入替身路径短路全部评测面装载（评审：死装载收进分支，与
+        # ManifestEvaluation 缺省分支同口径）。
+        if evaluation is not None:
+            assembled_evaluation = evaluation
+        else:
+            amps = [
+                TrainingRuntime.amp_context(config, device)
+                for device in devices
+            ]
+            manifest = BaselineManifest.load(run_artifacts.paths.manifest)
+            assembled_evaluation = ManifestEvaluation.build(
                 config,
                 run_artifacts,
                 card0_replica.sampler,
@@ -1073,7 +1077,6 @@ class AsyncTrainingExecutor:
                     cards, slot_count, vocabulary, real_pool, amps,
                 ),
             )
-        )
         return cls(
             config=config,
             artifacts=run_artifacts,
