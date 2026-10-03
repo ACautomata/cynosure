@@ -72,9 +72,8 @@ Window``）：每窗口每卡恰 K 任务、逐 iter 发射 floor(K/L)（余数�
 train acc − 池化 AUC)、每条件一条、窗口内最后一次有效测量配窗口末
 train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
 明细（可扩不可改名）。ReplicatedDiscriminator 的 RL 构造点随本票
-解耦退役（本体留存至 pretrain driver 期删除，#226 用户故事 8）：
-RL 装配缝（``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器，
-预训练 driver 自行装配副本语义。
+解耦退役、本体已随 #238 pretrain driver 期收口删除：RL 装配缝
+（``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器。
 
 续训与事件契约期增量（#236，加厚 4/6，#222/#218 结票全口径）：
 **v12 单文件续训分片**——``AsyncResumeStore``（独立 nominal-v12

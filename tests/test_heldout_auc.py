@@ -677,8 +677,8 @@ class TestMeasurementSourceDecomposition:
     def test_empty_slice_load_rejected(
         self, scenario: UpdateScenario, tmp_path: Path,
     ) -> None:
-        """空切片显式拒绝（测量批的 real 源不得为空——与 measure_condition
-        / compute_volume_clusters 的非空守卫同语义家族）。"""
+        """空切片显式拒绝（测量批的 real 源不得为空——与
+        compute_volume_clusters / load_order 的非空守卫同语义家族）。"""
         manifest = self._manifest(tmp_path)
         auc = self._auc(scenario, manifest)
         order = auc.condition_order("t2w")

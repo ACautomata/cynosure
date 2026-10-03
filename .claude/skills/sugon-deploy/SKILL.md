@@ -94,30 +94,35 @@ sugon-bootstrap 的 pitfalls 排查——装任何 ML 依赖后都要回验这�
 
 前置链：`prepare`（构建 real sample pool / held-out / channel stats）→
 `pretrain`（判别器 warm-start，产出 `pretrain_report_json`）→ `train`。
-已有产物的环节跳过。`pretrain` 与 `train` 同走 torchrun（ADR-0016：
-pretrain 测量批按卷分片到各 rank + rank0 gate 单点判定 + 判别器 DDP；
-单进程与 torchrun 同一代码路径，World-1 退化路径保留）。
+已有产物的环节跳过。**pretrain 以单进程多卡执行**（ADR-0018：主控 +
+每卡绑卡线程，测量批按卡轴分片扇出、gate inline 主控、跨卡梯度
+allreduce——torchrun 多进程拓扑退役，RANK env 守卫恢复）；train 仍走
+torchrun（旧执行序，切换期前）。
 
 实例无作业调度器，长跑进 tmux：
 
 ```bash
 ssh sugon
 tmux new -s <run名>
-# pretrain：torchrun 启动，nproc = 实例 DCU 卡数（8 卡实例 = 8，
-# 同步 config deployment.nproc_per_node——prepare 容量守卫按 K×nproc 把门）
-CYNOSURE_PG_TIMEOUT_MIN=40 torchrun --nproc_per_node=8 -m cynosure.cli pretrain \
+# pretrain：单进程启动（进程内多卡由设备发现承担；卡集裁剪经
+# CUDA_VISIBLE_DEVICES/DCU 等价面，全卡 = 实例 DCU 卡数——prepare 容量
+# 守卫按 K×卡数把门）
+CYNOSURE_PG_TIMEOUT_MIN=40 python -m cynosure.cli pretrain \
   --config /root/private_data/cynosure/runs/<run>/config.json \
   --run-dir /root/private_data/cynosure/runs/<run>/pretrain_run
 ```
 
-- `CYNOSURE_PG_TIMEOUT_MIN=40`：同实例其他任务会间歇饿死 RCCL 端点，
-  watchdog 调到 40 分钟（`src/cynosure/distributed/process.py`）；
-- `--run-dir` 必须显式给：分布式启动（检测到 RANK）硬性要求（跨 rank
-  目录对齐，train 同款规则），且须与 config `reward.pretrain_report_json`
-  声明一致——声明值精确为 `<run>/pretrain_run/pretrain_report.json`
-  （文件名由 `PretrainRun.layout` 钉死），train 按声明路径装载，
-  分叉即 usage error 拒绝；
-- train 段同款（`--run-dir` 给 run 目录本身，metrics 落
+- `CYNOSURE_PG_TIMEOUT_MIN=40`：pretrain 侧该变量已随单进程化失去
+  进程组 watchdog 语义（保留无害）；train 侧仍是 RCCL watchdog 调 40
+  分钟（`src/cynosure/distributed/process.py`）；
+- **拒绝 torchrun 启动 pretrain**（检测到 RANK 即 usage error，ADR-0018
+  历史回环）：进程内多卡由设备发现承担，多进程拓扑不再受支持；
+- `--run-dir` 建议显式给（缺省 = config `reward.pretrain_report_json`
+  所在目录），且须与 config 声明一致——声明值精确为
+  `<run>/pretrain_run/pretrain_report.json`（文件名由
+  `PretrainRun.layout` 钉死），train 按声明路径装载，分叉即
+  usage error 拒绝；
+- train 段仍走 torchrun（`--run-dir` 给 run 目录本身，metrics 落
   `<run>/metrics.jsonl`；nproc 沿 orchestration.md 主路径口径）：
 
 ```bash

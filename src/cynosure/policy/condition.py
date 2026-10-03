@@ -96,6 +96,25 @@ class RolloutCondition:
                 f"{self.source_label.shape[0]}"
             )
 
+    def to(self, device: torch.device) -> "RolloutCondition":
+        """条件张量位（label/spacing/源位）迁移到 ``device`` 的副本：
+        主控单点构造的测量条件分派到各卡执行时，前向消费端要求条件与
+        latent 同设备——张量位逐张 ``to``、name 原样（副本共享底层存储
+        语义随 ``Tensor.to``：同设备返回原张量，跨设备新张量）。"""
+        return RolloutCondition(
+            label=self.label.to(device),
+            spacing=self.spacing.to(device),
+            source_latent=(
+                None if self.source_latent is None
+                else self.source_latent.to(device)
+            ),
+            source_label=(
+                None if self.source_label is None
+                else self.source_label.to(device)
+            ),
+            name=self.name,
+        )
+
     def name_or_raise(self) -> str:
         """条件键（sigma 日程与 latent 形状解析的贯通键，#129）：缺失
         即显式拒绝——逐条件贯通后无名条件无从按条件解析形状（

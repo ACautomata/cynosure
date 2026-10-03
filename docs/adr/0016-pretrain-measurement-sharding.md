@@ -1,8 +1,8 @@
 # 预训练编排：torchrun 测量批分片 + rank0 gate，判别器 DDP 同在线
 
-ADR-0003 把 RL 主循环定在 torchrun + FSDP 的编排上；判别器预训练（ADR-0007/0008）因「多 rank 各自预训练会分叉判别器」保持单进程 World-1 退化路径，CLI 层以 RANK env 显式拒绝 torchrun 启动。ADR-0012 落地后的生产数据重跑（#174）给出成本结构实测：预训练每步 = **测量批**（该条件全量 held-out 512 卷的冻结基座同源重构，逐卷平均 ~21.5 次 UNet 前向、事件流 `reconstruction_forwards=11032`）+ 判别器更新（K=8 配对批，毫秒级）——99% 的墙钟在测量批重构；MR-RATE 各平面尺寸极差（t1w/coronal ≈ 8× t1w/axial）下 coronal 单步 71 分钟，`pretrain_max_steps=100` 的最坏走满是 2 天以上。判别器 warm-start 是一次性成本、后续全部 RL iter 复用，墙钟压缩 = 把唯一的大头并行掉。**决定：预训练执行面 torchrun 化——测量批按卷分片到 N rank 独立重构与打分，分数 gather 到 rank0 做全局 recon-AUC 与 gate 判定（`broadcast_flag` 分发步进决策）；判别器走与在线期同款的 DDP 数据并行；冻结基座不 FSDP（每 rank 完整副本）；World-1 退化路径保持，单进程行为与现行逐位一致。**判别器机制面（fake 构造、gate 判据语义）零改动——本 ADR 是执行面变更，不是 ADR-0012 的修订。
+**Status**: superseded by [ADR-0018](0018-pretrain-async-driver.md)（#238 pretrain driver 期：执行模型单进程多卡化——torchrun 多进程拓扑、rank0 广播/gather 协议、DDP 判别器与 EventMerger 归并整体退役；RANK env 守卫历史回环恢复。测量批分片的并行边界与容量守卫语义由 ADR-0018 决策 2/4 承接）
 
-**Status**: accepted
+ADR-0003 把 RL 主循环定在 torchrun + FSDP 的编排上；判别器预训练（ADR-0007/0008）因「多 rank 各自预训练会分叉判别器」保持单进程 World-1 退化路径，CLI 层以 RANK env 显式拒绝 torchrun 启动。ADR-0012 落地后的生产数据重跑（#174）给出成本结构实测：预训练每步 = **测量批**（该条件全量 held-out 512 卷的冻结基座同源重构，逐卷平均 ~21.5 次 UNet 前向、事件流 `reconstruction_forwards=11032`）+ 判别器更新（K=8 配对批，毫秒级）——99% 的墙钟在测量批重构；MR-RATE 各平面尺寸极差（t1w/coronal ≈ 8× t1w/axial）下 coronal 单步 71 分钟，`pretrain_max_steps=100` 的最坏走满是 2 天以上。判别器 warm-start 是一次性成本、后续全部 RL iter 复用，墙钟压缩 = 把唯一的大头并行掉。**决定：预训练执行面 torchrun 化——测量批按卷分片到 N rank 独立重构与打分，分数 gather 到 rank0 做全局 recon-AUC 与 gate 判定（`broadcast_flag` 分发步进决策）；判别器走与在线期同款的 DDP 数据并行；冻结基座不 FSDP（每 rank 完整副本）；World-1 退化路径保持，单进程行为与现行逐位一致。**判别器机制面（fake 构造、gate 判据语义）零改动——本 ADR 是执行面变更，不是 ADR-0012 的修订。
 
 ## Decision
 

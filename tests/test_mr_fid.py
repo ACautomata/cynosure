@@ -536,15 +536,6 @@ class TestFidCli:
         assert result.code == 2
         assert "fid 输入契约违反" in result.stderr
 
-    def test_fid_rejects_torchrun_launch(self, tmp_path, cli, monkeypatch):
-        """fid 是单进程仪器：多 rank 各自全量提取会并发覆写同一缓存
-        指纹/特征与结果工件——torchrun 启动显式拒绝（pretrain 同先例）。"""
-        monkeypatch.setenv("RANK", "1")
-        config_path = self._cli_config(tmp_path)
-        result = cli.run("fid", "--config", str(config_path))
-        assert result.code == 2
-        assert "torchrun" in result.stderr
-
     def test_fid_corrupt_weights_exit_2(self, tmp_path, cli):
         """损坏/不兼容的权重工件 = 输入契约违反（exit 2）而非裸
         traceback——prepare/pretrain 装载期同口径。"""

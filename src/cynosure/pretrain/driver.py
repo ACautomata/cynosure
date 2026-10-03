@@ -1,271 +1,576 @@
 """判别器 warm-start 预训练 driver（ADR-0007：预训练 + 继续在线更新；
-ADR-0008 决策 3：per-condition 步进与终止；ADR-0016：torchrun 测量批
-分片 + rank0 gate）。
+ADR-0008 决策 3：per-condition 步进与终止；**ADR-0018：单进程多卡
+async 化**，#221 结票全口径——本模块 docstring 即该口径的落位说明）。
 
 密集步进循环：每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态
-均匀轮转，确定性不耗 RNG）→ 该条件的过线测量批 = 装配原语对
-**全量 held-out 卷**的冻结基座同源重构（``ReconstructionAssembler.
-measure_condition``：定序轮转 σ + 复位测量流 ⇒ 同输入同输出、可复算）
-→ 以更新前快照测该条件 recon-AUC（real = held-out real 原始、fake = 其
-重构体，逐样本配对；更新后测同一测量批会把 in-sample 拟合计入 AUC）
-→ 支撑度规则判定过线（``SupportRule.passes``：该条件 held-out 卷数
-< 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008 决策 6 / #85）→
-首测过线换新批复测确认：两次独立测量都过线该条件确认过线（单批贴线
-越过被非确定性拒绝），报告值取两次较小者，确认步不更新（无更新即无
-事件）→ 未确认则以**同一装配原语**产出的配对批（real + 冻结基座同源
-重构 fake，ADR-0012）走在线期同款 ``OnlineUpdate.step`` 更新一步
-（两阶段构造同构、warm-start 权重不面临分布跳变；测量批与更新批同一
-原语的两条入口：前者定序、后者抽样，见 ``reward.assembly`` 模块
-docstring）。每个更新步同时消费与在线**同一**过拟合
-分叉监控组件、同一 config knobs（ADR-0009-γ：共享装配缝挂进
-``RewardCoordinator`` 的 ``OverfitMonitor``——train 侧干净域复算准确率
-与本步更新前 recon-AUC 合成分叉观测，per-condition EMA 自下而上
-越线落预训练相 ``overfit_alert`` 事件（``phase="pretrain"``，EXEMPT
-记账——预训练执行史全量保留）；只报警不动作，确认步不更新不观测）——
-per-condition 分叉监控在预训练棘轮终止之前即暴露稀疏
-模态（MRA）记忆化。已确认过线的条件不再复测（棘轮：复测确认
-已拦住单批噪声）。终止 =
-全部条件最近一次确认过线即停；``pretrain_max_steps`` 耗尽 → 过线条件 =
-已确认者，未确认条件逐个对落盘权重补测（报告值与 checkpoint 同快照）。
-过线条件为空同样落盘全部产物——报告与 checkpoint 是诊断产物，不丢
-（warm-start 装载无门槛判定，ADR-0017）。
+均匀轮转，确定性不耗 RNG）→ 该条件的过线测量批 = 装配原语对全量
+held-out 卷的冻结基座同源重构（定序轮转 σ + 复位测量模板 ⇒ 同输入同
+输出、可复算）→ 以更新前快照测该条件 recon-AUC（real = held-out real
+原始、fake = 其重构体，逐样本配对；更新后测同一测量批会把 in-sample
+拟合计入 AUC）→ 支撑度规则判定过线（``SupportRule.passes``：该条件
+held-out 卷数 < 界用 bootstrap CI 下界、≥ 界用点估计——ADR-0008
+决策 6 / #85）→ 首测过线换新批复测确认：两次独立测量都过线该条件
+确认过线（单批贴线越过被非确定性拒绝），报告值取两次较小者，确认步
+不更新（无更新即无事件）→ 未确认则以**同一装配原语**产出的配对批
+（real + 冻结基座同源重构 fake，ADR-0012）走在线期同构的判别器单步
+更新（两阶段构造同构、warm-start 权重不面临分布跳变）。每个更新步
+同时消费与在线**同一**过拟合分叉监控组件、同一 config knobs
+（ADR-0009-γ：``OverfitMonitor`` 每卡实例——本地 train acc 与全局
+recon-AUC 合成分叉观测，per-condition EMA 自下而上越线落预训练相
+``overfit_alert`` 事件（``phase="pretrain"``，EXEMPT 记账——预训练
+执行史全量保留）；只报警不动作，确认步不更新不观测）——per-condition
+分叉监控在预训练棘轮终止之前即暴露稀疏模态（MRA）记忆化。已确认过线
+的条件不再复测（棘轮：复测确认已拦住单批噪声）。终止 = 全部条件最近
+一次确认过线即停；``pretrain_max_steps`` 耗尽 → 过线条件 = 已确认者，
+未确认条件逐个对落盘权重补测（报告值与 checkpoint 同快照）。过线条件
+为空同样落盘全部产物——报告与 checkpoint 是诊断产物，不丢（warm-start
+装载无门槛判定，ADR-0017）。
 
-**预训练相不产 rollout**（ADR-0012 决策 6）：量产 rollout（num_steps 步
-全 ODE）整体退出本执行路径——fake 侧只剩「全量 held-out 卷的重构」
-（测量批，σ 定序轮转）与「更新批的重构」（σ 逐样本抽自被优化步）两条，
-均经装配原语；事件流的 ``reconstruction_forwards`` / ``measurement_volumes``
-是本口径的读数面。判据口径的两阶段差异记录在案（ADR-0012 决策 5）：
-预训练判据是 recon-AUC（判别器训练任务的 out-of-sample 泛化力）、在线
-运行口径是 rollout-AUC（对打分对象的分辨力），**不可跨阶段比较绝对值**
+**预训练相不产 rollout**（ADR-0012 决策 6）：量产 rollout 整体退出本
+执行路径——fake 侧只剩「全量 held-out 卷的重构」（测量批，σ 定序
+轮转）与「更新批的重构」（σ 逐样本抽自被优化步）两条，均经装配原语；
+事件流的 ``reconstruction_forwards`` / ``measurement_volumes`` 是本
+口径的读数面。判据口径的两阶段差异记录在案（ADR-0012 决策 5）：预训练
+判据是 recon-AUC（判别器训练任务的 out-of-sample 泛化力）、在线运行
+口径是 rollout-AUC（对打分对象的分辨力），**不可跨阶段比较绝对值**
 ——准入体检 vs 在岗考核。
 
-单进程与 torchrun 同一条代码路径（ADR-0016 决策 3）：``DistributedContext``
-无 torchrun 环境时 bootstrap 为 world-1 恒等（不初始化进程组、集合通信
-与广播原样返回传入值），driver 的 rank0 判定/分发退化为本地判定——
-World-1 行为与分布式化前**逐位一致**（同代码路径、同 RNG 消耗序）。
-分布式下（``torchrun --nproc_per_node=N``）：
+**执行形态（ADR-0018，取代 ADR-0016 的 torchrun 多进程拓扑）**：单进程
+多卡，步进循环 resident **主控（编排层）**，每卡一条静态绑卡执行线程
+（``PretrainCardWorker``，#217 门面形态——任务粒度 = 每卡每相一个单元
+任务直交绑卡线程；预训练无分配表、无 k 循环、无协程语义面，任务载体
+不承载任何决策）。单步序：**排列抽取（主控单点）** → 测量扇出（每卡
+一片）→ join → 卡序 plain 拼接卷级分数聚类 → pooled AUC（CPU）→
+SupportRule / 复测确认 / 棘轮 / steps_completed 判定 **inline 主控**
+（单进程无集合可对齐，``broadcast_object``/``broadcast_flag``/
+object-gather 退役——四态语义保留为编排控制值）→ 更新扇出（每卡
+K 对装配 + 本地前向反向）→ join → 判别器步（逐对等权 loss 的跨卡
+梯度 SUM allreduce（M1 形态，主控单线程驱动多卡）→ 各卡 AdamW →
+步末 u/v broadcast（卡 0 权威，与在线协议统一））→ 事件主控直写 +
+告警卡序追加。
 
-- **测量批按卷切片**（决策 1/4）：全量索引排列照旧经 ``heldout_auc``
-  命名流抽出（各 rank 本地流同步推进——复测换批的消耗序逐 rank 对齐；
-  rank0 的派生 seed = seed 恒等，其排列与单进程逐位同序），rank0 的
-  排列经 ``broadcast_object`` 镜像到全 rank；每 rank 只 ``load_order``
-  本地连续段（测量批不整批驻留，#174 OOM 修复原则延伸到加载侧），
-  切片的 σ 轮转按全量位次偏移、ε 走测量流前缀消耗（
-  ``measure_condition(volume_offset=...)``——切片与整批逐位同位，
-  gather 拼回的全量测量与单卡 rank0 全量测量数值等价）；
-- **gate 控制流 rank0 单点**（决策 5）：每 rank 本地切片打分 → 逐卷
-  分数 object-gather 到 rank0（分数先落 CPU：对象集合的 pickle 不携带
-  跨 rank 设备语义，且 AUC 秩统计是 CPU 工作负载）→ rank0 重组全量
-  ``VolumeScoreClusters``（卷级归属保留、连续段按 rank 序拼接还原全量
-  排列序）重算全局 recon-AUC（Mann-Whitney estimand 不变）→
-  ``SupportRule`` 判定、复测确认、过线棘轮、``steps_completed`` 计数
-  rank0 单点 → ``broadcast_object`` 分发步进四态（更新/复测/确认/终止，
-  world-1 下广播恒等 = 本地判定）。控制流单点 = 集合序列单点：gather
-  与广播的调用次数由 rank0 判定驱动，全 rank 同一条执行序，复测确认步
-  全 rank 一致跳过更新（确认/终止路径的集合对齐由此成立，#165 式挂死
-  面不外露）；
-- **判别器更新 = 在线期同款 DDP**（决策 2）：``TrainingRuntime.
-  assemble_rewards`` 装配缝 + 本 driver 自行 ``ReplicatedDiscriminator.
-  replicate``（#234 判别器链期 RL 构造点解耦退役后，torchrun 预训练
-  的留存构造点——梯度 allreduce（更新后各 rank 权重逐位一致）、
-  ``RankSlicedPool`` real 池条带（容量守卫 K×world_size 把门，
-  装配期全 rank 一致拒绝）；有效 batch = K×N，config 字面不变，
-  world_size 是唯一变量；单进程 world-1 下 replicate 恒等，行为与
-  退役前逐位一致）；
-- **冻结基座不 FSDP**（决策 6）：每 rank 完整副本，不注入 ``chunk_sync``
-  （各 rank 同条件同尺寸，分块 cap 天然一致，无集合可绑定）；
-- **产物写者 rank0 门**（决策 8）：事件流（``metrics.jsonl``）、判别器
-  checkpoint、预训练报告全部 rank0 落盘（``PretrainRun`` 单进程唯一
-  写者契约由调用方 rank 门满足）；``OverfitMonitor`` 保持 rank 本地状态
-  （ADR-0009 决策 4/5：per-rank 离散本身是诊断信号，不跨 rank 平均），
-  各 rank 以广播下发的全局 AUC 合成观测，越线告警经 train 侧同一
-  ``EventMerger`` 归并（``PretrainRun`` 经 ``EventSink`` 协议充当写
-  者面）：各 rank 告警清单 gather 到 rank0、仅 rank0 按源 rank 序
-  append（``rank`` 字段归因观测 rank，归并序 = (步, rank)——步内
-  pretrain 事件先于告警由 rank0 先直写 pretrain、后归并告警的写出段
-  保证）。
+**随机面（#221 决议 13 消费清单）**：held-out 排列 = ``seed+3`` 主控
+单点直派（``RealPoolSampler.permutation`` 一次 randperm，每步单点抽
+全量排列 → ``ShardPlan`` 切片分派——各 rank 本地流同步抽 +
+``broadcast_object`` 镜像退役）；测量模板 = ``seed+19`` 主控显式直锚
+（复位一次 → 条件构造一次 → 按卡序逐段抽 ε；``volume_offset`` 前缀
+消耗退役——分段 ≡ 全量的顺序流等价性由行宽 ≡ 0 (mod 16) 的装配期
+断言与 #198 平移锚守护）；SupportRule bootstrap = ``seed+7`` 单点；
+冷启动判别器 = ``seed+6``（``assemble_scorer`` 既有口径）；更新批
+recon 流 = **卡轴**派生 ``seed + 卡×10⁶ + 9``（卡 0 恒等 = 现行 rank0
+recon 数值；每卡 σ 位与 ε 独立、「先 s 后 ε」次序契约保持——accepted
+drift：卡 ≥1 的 σ/ε 进迁移轨迹对照验收）；real 侧 = 主控对全池全局
+无放回抽 K×卡数再切片（``seed+1`` 单点直派——``RankSlicedPool`` 条带
+切片退役，抽取空间条带→全池、抽取者各卡→主控，同为 accepted drift）；
+rollout 流恒零消费死条目（``TrainingRngStreams`` per-卡实例的四流中
+仅 recon 有消费者）。恒等面（排列 +3 / 模板 +19 / SupportRule +7 /
+冷启动 +6 / 卡 0 recon +9）与 drift 面（real 抽取空间与抽取者、
+卡 ≥1 σ/ε）的对照表见 ADR-0018。
 
-判别器侧装配经 ``TrainingRuntime.assemble_rewards``（配对批装配原语同缝
-组装）、采样封装经 ``TrainingRuntime.assemble_sampler``、policy 侧经
-``GroupPolicy.build``（组1/组2 的采样场与条件分布按 config 分派）——
-与在线期同一份装配与同一条执行路径，仅 config 不同。
+**产物契约零改动（决议 17/18）**：checkpoint = 判别器步末**卡 0 副本
+直写**（确定性 allreduce + u/v broadcast 保证全卡逐位一致，含
+``_u``/``_v`` buffer；``loadable_state_dict`` 键集/格式不变；不设
+checkpoint 周期 bitwise 守卫 = 显式裁决——run 短风险低）；``Pretrain
+Report`` 字段集与 provenance 指纹面不变；``PretrainEvent`` 字段不动
+（``reconstruction_forwards`` / ``measurement_volumes`` = 全量 σ 列表
+推算与全量排列长度——分段求和的加法结合恒等）；train 侧消费面
+（``load_discriminator`` + 组别绑定守卫 + 报告白名单）零改动。
+告警轴 (步, rank) → (步, 卡) 的迁移对象仅 ``OverfitAlertEvent``
+（``rank`` 字段归因观测卡；``OverfitMonitor`` 每卡实例——本地
+train acc + 全局 AUC 的卡轴诊断保持，per-卡离散本身是诊断信号）；
+EventMerger 归并与写者门退役——主控是唯一写者，步内 pretrain 事件
+先直写、告警后按卡序追加（写出序 = 步序 + 步内 pretrain 先于告警）。
+
+复现承诺（决议 19）：#218 决议 0 双口径（生产统计等价 / 测试进程
+逐位）+ **同 config 同卡数重放逐位**；跨卡数重跑 = 新 run（预训练无
+payload、天然无拒绝面——与 RL 跨拓扑显式拒绝的差异见 ADR-0018）。
+
+判别器侧装配复用 ``TrainingRuntime`` 公开装配缝（scorer 冷启动 / 配对
+批装配原语 / real pool 守卫装载 / schedules / 数值口径）——「无第二套
+判别器训练逻辑」在装配层同样成立；判别器步相位编排复用 #234 的
+``DiscriminatorPhase``（先全桶 eval 后全桶 train、逐对等权加权
+backward、跨卡 SUM allreduce、步末 u/v broadcast）——预训练每步单条件
+单桶，逐对等权 ≡ 现行 patch 级 mean（每对 patch 数恒等，决议 3）。
 """
 
+import copy
+import queue
+import threading
 import time
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
 
 import torch
 
 from cynosure.config import CynosureConfig
-from cynosure.distributed import DistributedContext, ReplicatedDiscriminator
-from cynosure.distributed.merge import EventMerger
+from cynosure.conditions import ConditionVocabulary
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.numerics import AMP_DTYPES, AmpContext
+from cynosure.policy.schedules import ConditionSchedules
 from cynosure.pretrain.artifacts import (
     PretrainProvenance,
     PretrainReport,
     PretrainRun,
 )
-from cynosure.reward.assembly import PairBatch
-from cynosure.reward.auc import VolumeScoreClusters
+from cynosure.pretrain.measurement import MeasurementTemplate
+from cynosure.pretrain.sharding import ShardPlan
+from cynosure.reward.artifacts import LatentManifest, PoolEntry
+from cynosure.reward.assembly import ReconstructionAssembler
+from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
+from cynosure.reward.overfit import OverfitMonitor
+from cynosure.reward.sampler import RealPoolSampler
+from cynosure.reward.scorer import LatentScorer
 from cynosure.reward.support import SupportRule
+from cynosure.reward.update import OnlineUpdate, UpdateReport
 from cynosure.train.artifacts import OverfitAlertEvent, PretrainEvent
+from cynosure.train.discriminator import DiscriminatorBucket, DiscriminatorPhase
 from cynosure.train.policy import GroupPolicy
-from cynosure.train.rewards import RewardCoordinator
-from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.rng import SLOT_SEED_STRIDE, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+
+_WORKER_JOIN_TIMEOUT_S = 10.0
+"""绑卡线程收尾的 join 上限（秒）：卡死线程放行给进程退出兜底
+（daemon 线程——预训练卡任务无进程组集合操作，挂死面只剩 CUDA op
+本身的极端故障，口径与 async 门面一致）。"""
 
 
-_DECISION_UPDATE = "update"
-_DECISION_REMEASURE = "remeasure"
-_DECISION_CONFIRM = "confirm"
-_DECISION_HALT = "halt"
-"""gate 步进四态（ADR-0016 决策 5 的广播协议值）：rank0 判定的分发面，
-world-1 下 ``broadcast_object`` 恒等 = 本地判定。``update`` = 本步更新；
-``remeasure`` = 首测过线、换批复测；``confirm`` = 复测确认过线、
-跳过更新；``halt`` = 末个条件确认、全体终止。消息体 = (态, AUC)：更新/
-复测态携带首测值（更新步事件与分叉观测的全局 recon-AUC 记账面），
-确认/终止态携带 ``min(首测, 复测)`` 的保守报告值。"""
+@dataclass(frozen=True)
+class PretrainCardRig:
+    """单卡的预训练组件组（绑卡线程装配、单线程消费）：冻结基座
+    policy 副本 + 判别器 scorer 副本 + 配对批装配原语（卡轴 recon 流）
+    + 判别器步相位编排 + 数值口径 + 两侧 manifest 的加载面。"""
+
+    policy: GroupPolicy
+    scorer: LatentScorer
+    assembler: ReconstructionAssembler
+    disc_phase: DiscriminatorPhase
+    amp: AmpContext
+    real_pool: LatentManifest
+    heldout: LatentManifest
+
+
+class PretrainCardWorker:
+    """每卡预训练执行线程（#217 门面的直交提交形态）：静态绑卡
+    （current device 线程局部语义），组件装配在本线程完成（卡轴
+    recon 流的 owner = 绑卡线程），任务经 ``submit`` 直交、``Future``
+    回传（异常自动传播——主控 join 即 fail-fast 面）。"""
+
+    def __init__(
+        self,
+        index: int,
+        device: torch.device,
+        build_rig: Callable[[], PretrainCardRig],
+    ) -> None:
+        self.index = index
+        self.device = device
+        self._rig: PretrainCardRig | None = None
+        self._started = False
+        self._build_rig = build_rig
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._serve,
+            daemon=True,
+            name=f"cynosure-pretrain-card-{index}",
+        )
+
+    def _serve(self) -> None:
+        """线程本体：任务队列常驻（(动作, Future) 序对逐个执行——
+        单线程串行即绑卡语义）；``None`` 哨兵 = 收尾。"""
+        while True:
+            task = self._queue.get()
+            if task is None:
+                return
+            action, future = task
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(action())
+            except BaseException as error:
+                future.set_exception(error)
+
+    def start(self) -> None:
+        """启动线程并等待组件装配就绪（装配失败在此原样抛出，不留
+        半装配线程；幂等——先行探针式 start（rig 取数面）后接 ``run``
+        的正式 start 不重复启动）。"""
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+        self.submit(self._assemble).result()
+
+    def _assemble(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+        rig = self._build_rig()
+        rig.policy.eval_phase()  # 冻结基座的推理相（重构是 policy 前向）
+        # 打分/监控前向恒 eval（判别器相位由 disc_phase 编排）
+        rig.scorer.eval()
+        self._rig = rig
+
+    def submit(self, action: Callable, /, *args) -> Future:
+        """单元任务直交绑卡线程（``Future`` 回传：``result()`` 即主控
+        的 join 与 fail-fast 面）。"""
+        future: Future = Future()
+        self._queue.put((lambda: action(*args), future))
+        return future
+
+    def stop(self) -> None:
+        """线程收尾：哨兵停转 + 限时 join（卡死线程放行给进程退出
+        兜底，见 ``_WORKER_JOIN_TIMEOUT_S`` 口径）。"""
+        if self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join(_WORKER_JOIN_TIMEOUT_S)
+
+    @property
+    def conditions(self):
+        """本卡条件分布（主控测量模板的条件构造消费面——穿模板流，
+        抽取消耗传入的 generator、不触碰实例自有流）。"""
+        return self._require_rig().policy.conditions
+
+    @property
+    def disc_phase(self) -> DiscriminatorPhase:
+        """本卡判别器步相位编排（主控跨卡集合段的取数面）。"""
+        return self._require_rig().disc_phase
+
+    def measure_segment(
+        self,
+        entries: Sequence[PoolEntry],
+        sigmas: Sequence[float],
+        noise: torch.Tensor,
+        condition: RolloutCondition,
+    ) -> VolumeScoreClusters:
+        """测量相的本卡段：real 连续段上卡 → 冻结基座同源重构
+        （主控给定的定序 σ 与模板流 ε——本段零随机消耗）→ 本卡判别器
+        副本打分的卷级分数聚类（CPU 形态回传——跨线程传递不带设备
+        语义，秩统计是 CPU 工作负载）。"""
+        rig = self._require_rig()
+        reals = self._load(rig.heldout, entries)
+        with torch.no_grad(), torch.autocast(
+            rig.amp.device_type, dtype=rig.amp.dtype,
+        ):
+            fakes = rig.assembler.reconstruct(
+                reals, condition.to(self.device), list(sigmas),
+                noise.to(self.device),
+            )
+        clusters = HeldOutAuc.volume_clusters(reals, fakes, rig.scorer)
+        return VolumeScoreClusters(
+            real_volume_scores=tuple(
+                volume.cpu() for volume in clusters.real_volume_scores
+            ),
+            fake_scores=clusters.fake_scores.cpu(),
+        )
+
+    def update_segment(
+        self, entries: Sequence[PoolEntry], modality: str,
+    ) -> UpdateReport:
+        """更新相的本卡段：主控全局无放回抽取的本卡 K 对 real 上卡 →
+        配对批装配原语（卡轴 recon 流：先 s 后 ε、同源重构）→ 单条件
+        单桶的判别器步相位段（先 eval 复算 train acc 后 train 加权
+        backward——梯度落本卡 .grad，跨卡 SUM 由主控编排）。"""
+        rig = self._require_rig()
+        reals = self._load(rig.real_pool, entries)
+        pair = rig.assembler.reconstruct_assigned(reals, modality)
+        bucket = DiscriminatorBucket(
+            condition=modality, reals=pair.reals, fakes=pair.fakes,
+        )
+        return rig.disc_phase.accumulate([bucket])
+
+    def disc_step(self) -> None:
+        """判别器步收尾（主控跨卡梯度 SUM 之后）：本卡 optimizer.step
+        + eval 相恢复。"""
+        self._require_rig().disc_phase.step()
+
+    def export_discriminator(self) -> dict:
+        """本卡判别器的可装载 state_dict（checkpoint 直写的取数面——
+        卡 0 副本直写；确定性 allreduce + u/v broadcast 后全卡逐位
+        一致，取卡 0 即全局口径）。"""
+        return NetworkAssembler.loadable_state_dict(
+            self._require_rig().scorer.discriminator,
+        )
+
+    def _load(
+        self, manifest: LatentManifest, entries: Sequence[PoolEntry],
+    ) -> torch.Tensor:
+        """按条目序列加载 latent 批上本卡（逐条目懒加载 + stack + 设备
+        迁移，零随机性——切片加载与整批对应切片逐位一致，#198 锚）。"""
+        return torch.stack([
+            manifest.load_latent(entry) for entry in entries
+        ]).to(self.device)
+
+    def _require_rig(self) -> PretrainCardRig:
+        if self._rig is None:
+            raise RuntimeError(
+                f"卡 {self.index} 的组件未装配（start 前提交任务）"
+            )
+        return self._rig
+
+
+class MeasurementSources:
+    """预训练测量批与 real 侧的数据来源面（主控单点）：held-out
+    全量排列（``seed+3`` 单点直派）、real 侧全局无放回抽取（``seed+1``
+    单点直派、全池直读）、逐条件形状与卷数查询、装配期守卫。
+
+    两条流都是注册表外的**主控单实例**（预训练不参与续训——流不进
+    ``TrainingRngStreams`` 注册表；排列流消耗序 = 每次测量一次
+    randperm，与现行 rank0 的 ``HeldOutAuc.condition_order`` 逐位恒等）。
+    """
+
+    def __init__(
+        self,
+        seed: int,
+        heldout: LatentManifest,
+        real_pool: LatentManifest,
+    ) -> None:
+        self._heldout = heldout
+        self._order_sampler = RealPoolSampler(
+            heldout, torch.Generator().manual_seed(seed + 3),
+        )
+        self._real_sampler = RealPoolSampler(
+            real_pool, torch.Generator().manual_seed(seed + 1),
+        )
+
+    def assert_conditions_ready(
+        self, targets: Sequence[str], cards: int,
+    ) -> None:
+        """轮转条件集守卫：每条件 held-out ≥ 卡数（#221 决议 8——现行
+        world-1/distributed 两态守卫统一换名，单卡即 ≥ 1 的既有非空
+        守卫）：测量批按卷切片到各卡，每卡至少 1 卷——缺卡的条件在
+        装配期显式拒绝，而非首步测量时才炸。"""
+        starved = [
+            target for target in targets
+            if self.volume_count(target) < cards
+        ]
+        if starved:
+            raise ValueError(
+                f"held-out real 不足以支撑 {cards}-路测量批切片"
+                f"（每条件每卡至少 1 卷，不足条件: {starved}）——"
+                "切片后某卡测量段为空，全局 AUC 缺该卡分数即不完整"
+            )
+
+    def draw_order(self, modality: str) -> tuple[PoolEntry, ...]:
+        """该条件 held-out 全量卷的索引排列（测量批来源两步分解的第一
+        步，#198 缝）：主控单点一次 randperm——复测换批 = 本流推进，
+        新排列语义与数值保持。"""
+        return self._order_sampler.permutation(modality=modality)
+
+    def draw_reals(self, modality: str, count: int) -> tuple[PoolEntry, ...]:
+        """该条件 real 侧的全局无放回抽取（#221 决议 12：主控对全池
+        抽 K×卡数 → ``ShardPlan`` 切片到卡——跨卡无重复的条带互斥语义
+        保持，抽取空间条带→全池为 accepted drift）。"""
+        return self._real_sampler.permutation(modality=modality)[:count]
+
+    def shape_of(self, modality: str) -> tuple[int, ...]:
+        """该条件单卷 latent 形状（``LatentManifest.shape_of`` 的两态
+        解析——``assert_condition_shapes`` 已保证多条件域表覆盖全条件）。"""
+        return self._heldout.shape_of(modality)
+
+    def volume_count(self, modality: str) -> int:
+        """该条件 held-out 卷数（装配守卫与报告留痕的查询面）。"""
+        return self._heldout.modalities.get(modality, 0)
 
 
 class PretrainDriver:
-    """判别器 warm-start 预训练编排：装配（world-1 恒等退化 ↔ torchrun
-    多 rank 同一路径）→ 密集步进（rank0 gate 单点 + 四态分发）→ 产物
-    落盘（判别器 checkpoint + 预训练报告，rank0 唯一写者）。"""
+    """判别器 warm-start 预训练编排（单进程多卡主控）：装配（每卡副本
+    + 绑卡线程）→ 密集步进（主控单点测量/gate inline/扇出-join）→
+    产物落盘（判别器 checkpoint + 预训练报告，主控唯一写者）。"""
 
     def __init__(
         self,
         config: CynosureConfig,
         run: PretrainRun,
-        device: torch.device | None = None,
-        dist_context: DistributedContext | None = None,
+        sources: MeasurementSources,
+        support: SupportRule,
+        schedules: ConditionSchedules,
+        vocabulary: ConditionVocabulary,
+        cards: list[PretrainCardWorker],
     ) -> None:
         self._config = config
         self._run = run
-        reward = config.reward
-        # 单进程与 torchrun 同一条装配序（ADR-0016 决策 3）：无 torchrun
-        # 环境下 bootstrap 为 world-1 恒等（不初始化进程组），集合通信与
-        # 广播原语退化——与 train 同一条装配序；CLI 层装配进程组后经
-        # ``dist_context`` 注入（run 目录 init 的广播裁决先于 driver 构造）
-        self._dist = (
-            dist_context
-            if dist_context is not None
-            else DistributedContext.bootstrap()
+        self._sources = sources
+        self._support = support
+        self._schedules = schedules
+        self._cards = cards
+        self._template: MeasurementTemplate | None = None
+        # 过拟合分叉监控（ADR-0009-γ）每卡实例：本地 train acc + 全局
+        # AUC 的合成分叉观测、per-condition EMA 账轴 = 词汇表条件集
+        self._overfit: list[OverfitMonitor] = [
+            OverfitMonitor(config.reward, conditions=vocabulary.names())
+            for _ in cards
+        ]
+
+    @classmethod
+    def build(
+        cls,
+        config: CynosureConfig,
+        run: PretrainRun,
+        *,
+        devices: list[torch.device] | None = None,
+    ) -> "PretrainDriver":
+        """config 驱动装配：设备发现（卡数）→ 数据面守卫装载（real 池
+        容量 ≥ K×卡数、held-out 逐条件形状契约、行宽 ≡ 0 (mod 16)、
+        每条件 held-out ≥ 卡数）→ 判别器冷启动原型（``seed+6``，逐位
+        复制到各卡）→ 每卡绑卡线程。"""
+        devices = (
+            list(devices) if devices is not None else cls.execution_devices()
         )
-        amp = AmpContext(
-            device=device if device is not None else self._dist.local_device(),
-            dtype=AMP_DTYPES[config.policy.amp_dtype],
+        if not devices:
+            raise ValueError("设备集不得为空（缺省 = 本进程可见计算设备）")
+        vocabulary = TrainingRuntime.assemble_vocabulary(config)
+        # real 侧装载与守卫（共用装配缝）：全池直读、主控全局抽取——
+        # 需量倍数 = 卡数（每步每卡 K 对，最大需求上界 = K×卡数，
+        # #221 决议 8「容量守卫 ≥ K×卡数零改动」）
+        real_pool = TrainingRuntime.assemble_real_pool(
+            config, vocabulary, world_size=len(devices),
         )
-        streams = TrainingRngStreams(
-            self._dist.derive_seed(config.schedule.seed),
-            # 与 train runtime 同一 seeding 规则（数据侧逐 rank 派生、
-            # recon 用 shared）——rank 0 恒等偏移 = 分布式下 rank0 的全部
-            # 数据流与单进程逐位同序（重放锚）
-            shared_seed=config.schedule.seed,
+        heldout = LatentManifest.load(
+            config.reward.heldout_real_manifest, kind="heldout_real",
         )
-        self._policy = GroupPolicy.build(
-            config, streams.rollout, amp.device,
-        )
-        # 采样封装先行装配（判别器侧配对批装配原语与其共享同一实例——
-        # 确定性 ODE 续跑 kernel、日程表与分块调度单点）
-        sampler = TrainingRuntime.assemble_sampler(
-            config, self._policy.field, device=amp.device,
-        )
-        self._rewards = TrainingRuntime.assemble_rewards(
-            config, amp, streams, self._dist,
-            sampler=sampler, conditions=self._policy.conditions,
-        )
-        # DDP 副本语义的留存构造点（#234 判别器链期：RL 装配缝解耦退役
-        # 后，torchrun 预训练路径在本缝自行装配——梯度 allreduce、更新后
-        # 各 rank 权重逐位一致；ReplicatedDiscriminator 本体留存至
-        # pretrain driver 期收口删除，#226 用户故事 8。单进程 world-1
-        # 下 replicate 恒等返回，行为与退役前逐位一致）
-        ReplicatedDiscriminator.replicate(self._rewards.scorer, self._dist)
-        # 量产 rollout（``RolloutPhase``）不装配：ADR-0012 决策 6 后预训练
-        # 相 fake 全由装配原语重构产出（测量批 / 更新批两条入口），无
-        # rollout 相的消费者——装配它只会让「fake 是否走了量产」留一条
-        # 静默可用的旧路（base_partition 流已随 ADR-0012 退役，#173）。
-        #
-        # 过线判定原语（ADR-0008-04 消费 ADR-0008-02/#85 的支撑度规则）：
-        # bootstrap 的随机性独立派生（seed+7——命名流注册表之外，预训练
-        # 不参与续训、判定可复现性由 seed 纯函数保证；进注册表反而令续训
-        # 状态清单失配）。判定只在 rank0 发生（分布式下非 0 rank 的流
-        # 不消费——广播镜像 rank0 的决定，ADR-0016 决策 5）
-        self._support = SupportRule(
-            threshold=reward.pretrain_pass_threshold,
-            support_bound=reward.gate_support_min_volumes,
+        heldout.assert_condition_shapes(vocabulary)
+        # 顺序流等价性的装配期不变式（#221 决议 6）：行宽非 16 倍数 =
+        # 词表/manifest 工件异常，fail-fast
+        heldout.assert_measurement_row_width()
+        sources = MeasurementSources(config.schedule.seed, heldout, real_pool)
+        targets = vocabulary.names()
+        sources.assert_conditions_ready(targets, len(devices))
+        # 冷启动原型（seed+6 fork_rng，跨卡 deepcopy 逐位一致）；判别器
+        # optimizer 每卡独立（DiscriminatorPhase 编排其 step）
+        scorer_prototype = TrainingRuntime.assemble_scorer(config, None)
+        total_pairs = config.reward.disc_batch_size_k * len(devices)
+        amp_dtype = AMP_DTYPES[config.policy.amp_dtype]
+        cards = [
+            PretrainCardWorker(
+                index,
+                device,
+                cls._card_rig_factory(
+                    config, index, device, scorer_prototype,
+                    real_pool, heldout, total_pairs, amp_dtype,
+                ),
+            )
+            for index, device in enumerate(devices)
+        ]
+        support = SupportRule(
+            threshold=config.reward.pretrain_pass_threshold,
+            support_bound=config.reward.gate_support_min_volumes,
+            # bootstrap 的随机性独立派生（seed+7——命名流注册表之外，
+            # 预训练不参与续训、判定可复现性由 seed 纯函数保证）
             generator=torch.Generator().manual_seed(
-                self._dist.derive_seed(config.schedule.seed + 7),
+                config.schedule.seed + 7,
             ),
         )
-        # 轮转条件集守卫：每条件 held-out 非空（per-condition AUC 归因的
-        # 前提——缺条目的条件在装配期显式拒绝，而非首步测量时才炸）；
-        # 分布式下收紧为 ≥ world_size（测量批按卷切片到各 rank，每 rank
-        # 至少 1 卷——与 RankSlicedPool 的切片前全量校验同理由：失败路径
-        # 全 rank 一致，manifest 查询无通信、各 rank 同判定）
-        minimum_volumes = self._dist.world_size if self._dist.distributed else 1
-        starved = [
-            target
-            for target in self._policy.conditions.targets()
-            if self._rewards.auc.condition_volume_count(target) < minimum_volumes
-        ]
-        if starved:
-            if not self._dist.distributed:
-                raise ValueError(
-                    f"held-out real 缺条件 {starved} 的条目（per-condition 步进"
-                    "要求轮转条件集每条件 held-out 非空——AUC 测量按条件归因"
-                    f"无米下锅；heldout_real_manifest={reward.heldout_real_manifest}）"
-                )
-            raise ValueError(
-                f"held-out real 不足以支撑 {self._dist.world_size}-路测量批"
-                f"切片（每条件每 rank 至少 1 卷，不足条件: {starved}；"
-                f"heldout_real_manifest={reward.heldout_real_manifest}）："
-                "切片后某 rank 测量批为空——gather 的全局 AUC 缺该 rank "
-                "分数即不完整"
+        return cls(
+            config, run, sources, support,
+            TrainingRuntime.assemble_schedules(config), vocabulary, cards,
+        )
+
+    @staticmethod
+    def execution_devices() -> list[torch.device]:
+        """本进程的计算设备发现（卡轴）：CUDA 栈可用 = 逐卡设备清单
+        （``CUDA_VISIBLE_DEVICES`` 天然承担卡集裁剪）；否则 CPU 单卡
+        （fixture 口径——单设备上分片/扇出/重放全可测）。"""
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return [
+                torch.device("cuda", index)
+                for index in range(torch.cuda.device_count())
+            ]
+        return [torch.device("cpu")]
+
+    @staticmethod
+    def _card_rig_factory(
+        config: CynosureConfig,
+        index: int,
+        device: torch.device,
+        scorer_prototype: LatentScorer,
+        real_pool: LatentManifest,
+        heldout: LatentManifest,
+        total_pairs: int,
+        amp_dtype,
+    ) -> Callable[[], PretrainCardRig]:
+        """本卡组件装配的闭包工厂（绑卡线程执行）：冻结基座 policy +
+        判别器副本（原型 deepcopy 迁卡——单点装载、逐位复制）+ 卡轴
+        recon 流的装配原语（``seed + 卡×10⁶ + 9``——卡 0 恒等 = 现行
+        rank0 recon 数值；real_sampler=None 供给语义，real 由主控全局
+        抽取经任务注入）+ 判别器步相位编排。"""
+        def build_rig() -> PretrainCardRig:
+            amp = AmpContext(device=device, dtype=amp_dtype)
+            # 条件分布主流在新执行序无消费（测量条件穿模板流、更新批
+            # 条件穿卡轴 recon 流）——注入独立一次性 generator 仅满足
+            # 装配签名（async 门面同款口径）
+            policy = GroupPolicy.build(
+                config,
+                torch.Generator().manual_seed(config.schedule.seed),
+                device,
             )
-        # 预训练相告警的归并器（ADR-0016 决策 8）：train 侧同一实现
-        # （EventMerger），``PretrainRun`` 经 EventSink 协议充当写者面
-        # ——归并序（gather → rank0 → 源 rank 序 append）一处实现，
-        # 两条指标流（train 的 metrics.jsonl / 预训练的 metrics.jsonl）
-        # 共用，world-1 下 gather 恒等退化为直写
-        self._merger = EventMerger(self._dist, run)
+            scorer = copy.deepcopy(scorer_prototype).to(device)
+            # per-卡注册表实例：仅 recon 流有消费者（rollout/real_pool/
+            # heldout 三流是预训练消费清单里的恒零消费死条目，#221
+            # 决议 13——实例在场、消耗为零）
+            streams = TrainingRngStreams(
+                config.schedule.seed + index * SLOT_SEED_STRIDE,
+            )
+            assembler = TrainingRuntime.assemble_pair_assembler(
+                config,
+                real_sampler=None,
+                sampler=TrainingRuntime.assemble_sampler(
+                    config, policy.field, device=device,
+                ),
+                conditions=policy.conditions,
+                generator=streams.recon,
+                amp=amp,
+            )
+            disc_phase = DiscriminatorPhase(
+                scorer,
+                OnlineUpdate.assemble_optimizer(scorer, config.reward),
+                total_pairs,
+            )
+            return PretrainCardRig(
+                policy=policy,
+                scorer=scorer,
+                assembler=assembler,
+                disc_phase=disc_phase,
+                amp=amp,
+                real_pool=real_pool,
+                heldout=heldout,
+            )
 
-    @property
-    def policy(self) -> GroupPolicy:
-        """本组 policy 侧装配（冻结 base；组1/组2 的采样场与条件分布）。"""
-        return self._policy
+        return build_rig
 
-    @property
-    def rewards(self) -> RewardCoordinator:
-        """判别器侧协作者组（Online update 原语 / held-out AUC / 过拟合分叉监控）。"""
-        return self._rewards
-
-    def run(self) -> PretrainReport | None:
+    def run(self) -> PretrainReport:
         """密集步进至全部轮转条件过线（ADR-0008 决策 3 的 per-condition
-        终止语义）或步数上限，产出判别器 checkpoint 与预训练报告（产物
-        rank0 唯一写者；非 0 rank 返回 None——报告与 checkpoint 无多写者
-        消费者，CLI 层只 rank0 打印）。
+        终止语义）或步数上限，产出判别器 checkpoint 与预训练报告（主控
+        唯一写者）。每步条件 = 轮转条件集的 ``targets[step % n]``，以
+        该条件全量 held-out 卷的冻结基座同源重构作测量批（按卷切片到
+        各卡、主控卡序拼接全局分数，见 ``_measurement``）。"""
+        for card in self._cards:
+            if card.device.type == "cuda":
+                # CUDA 上下文主控单线程逐卡预热（多线程首触并行 lazy
+                # init 的竞争面消除，async 门面同款口径）
+                torch.zeros(1, device=card.device)
+                torch.cuda.synchronize(card.device)
+        try:
+            for card in self._cards:
+                card.start()
+            targets = self._cards[0].conditions.targets()
+            # 测量模板（seed+19 主控直锚）在此装配：条件构造消费卡 0 的
+            # 条件分布（穿模板流——抽取消耗传入 generator，不触碰实例
+            # 自有流；构造必须等绑卡线程装配完成）
+            self._template = MeasurementTemplate(
+                self._config.schedule.seed,
+                self._schedules,
+                self._cards[0].conditions,
+                sorted(self._config.policy.train_step_indices_m),
+            )
+            return self._step_loop(targets)
+        finally:
+            for card in self._cards:
+                card.stop()
 
-        每步条件 = 轮转条件集的 ``targets[step % n]``（目标模态均匀轮转），
-        以该条件**全量 held-out 卷**的冻结基座同源重构作测量批（分布式
-        下按卷切片到各 rank、rank0 重组全局分数，见 ``_measurement``；
-        recon-AUC 的 fake 侧）、real 同条件同批配对、AUC 归因该条件；首测
-        过线（``SupportRule.passes``，rank0 单点判定 + 四态广播）换新批复
-        测确认——两次独立测量都过线才确认（producer 侧成功判据对单批
-        测量噪声鲁棒，train 侧按独立采样的重算不再与非确定性拒绝耦合），
-        报告值取两次较小者。已确认过线的条件不再复测（棘轮：复测确认
-        已拦住单批噪声）；
-        ``pretrain_max_steps`` 耗尽 → 过线条件 = 已确认者、未确认条件对
-        落盘权重补测（补测循环全 rank 走同一目标序列——gather 的集合
-        对齐由「reported 全 rank 一致」保证）。过线条件为空仍落盘全部产物
-        （诊断产物不丢；warm-start 装载无门槛判定，ADR-0017）。"""
+    def _step_loop(self, targets: Sequence[str]) -> PretrainReport:
+        """步进循环体（四态 inline 主控）：更新 / 复测 / 确认 / 终止
+        的密集步进 + 耗尽补测 + 产物落盘。"""
         reward = self._config.reward
-        targets = self._policy.conditions.targets()
-        self._policy.eval_phase()  # 冻结 base 的推理相（重构是 policy 前向）
-        self._rewards.discriminator.eval()  # 打分/监控前向恒 eval（见 RewardCoordinator）
         confirmed: dict[str, float] = {}
         volumes: dict[str, int] = {}
         steps_completed = 0
@@ -273,288 +578,176 @@ class PretrainDriver:
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
             modality = targets[step % len(targets)]
-            batch, clusters, forwards = self._measurement(modality)
-            if self._dist.rank == 0:
-                # 支撑度判定的卷数留痕（rank0 的全局口径：分布式下 =
-                # 全量卷数，聚合于 ``_measurement`` 的 gather 重组）
-                assert clusters is not None  # rank0 恒拿到全局聚类
-                volumes[modality] = clusters.volume_count
-            # 过线首测判定（rank0 单点分布式 / 本地 world-1 恒等），
-            # broadcast_object 在 world-1 下原样返回传入值——控制流全
-            # rank 同一条，集合序列（gather/广播的调用次数）随之对齐
-            decision = self._first_decision(modality, confirmed, clusters)
-            decision = self._dist.broadcast_object(decision)
-            if decision[0] == _DECISION_REMEASURE:
+            clusters, forwards = self._measurement(modality)
+            volumes[modality] = clusters.volume_count
+            # 首测判定（主控 inline 四态：更新/复测/确认/终止，即下方
+            # if/continue/break 控制流——单进程无分发面）：更新前快照
+            # （本步判别器权重）的 recon-AUC
+            auc = clusters.pooled_auc()
+            if modality not in confirmed and self._support.passes(
+                auc, clusters,
+            ):
                 # 复测（同条件换批测量）：判别器权重同刻，变化的随机面
-                # 只有一处——held-out 全量卷的抽取序（各 rank 本地
-                # heldout_auc 流同步推进 → 新排列；广播镜像保证全 rank
-                # 同批）。重构 ε 经批次起手复位 + 前缀消耗逐位同位（
-                # ``measure_condition(volume_offset=...)``）：重排列把每卷
-                # 配到的 (σ, ε) 槽位换掉，≥2 卷条件下两次读数是不同样本；
-                # 单卷条件排列平凡、复测与首测同读数（确认退化——小池由
-                # 数据侧池规模与支撑度界兜底，不以本相为抗噪防线）。复测
-                # 只读 AUC——配对批不留存（与首测批同一释放口径，见下）
-                first_auc = decision[1]
-                _, confirm_clusters, _ = self._measurement(modality)
-                decision = self._confirm_decision(
-                    modality, confirmed, targets, confirm_clusters, first_auc,
-                )
-                decision = self._dist.broadcast_object(decision)
-                if decision[0] in (_DECISION_CONFIRM, _DECISION_HALT):
-                    confirmed[modality] = decision[1]  # 保守口径：两次取小
-                    del batch  # 确认/终止步不更新：测量批到此释放
-                    if decision[0] == _DECISION_HALT:
-                        all_conditions_passed = True  # 全部条件过线：终止
+                # 只有一处——排列流单点推进 → 新排列；测量模板同起手
+                # 复位（ε 逐位同输出现行语义不变）。重构 ε 把每卷配到
+                # 的 (σ, ε) 槽位换掉，≥2 卷条件下两次读数是不同样本；
+                # 单卷条件排列平凡、复测与首测同读数（确认退化——小池
+                # 由数据侧池规模与支撑度界兜底，不以本相为抗噪防线）。
+                # 复测只读 AUC——配对批不留存（与首测批同一释放口径）
+                first_auc = auc
+                confirm_clusters, _ = self._measurement(modality)
+                confirm_auc = confirm_clusters.pooled_auc()
+                if self._support.passes(confirm_auc, confirm_clusters):
+                    confirmed[modality] = min(first_auc, confirm_auc)
+                    if len(confirmed) == len(targets):
+                        all_conditions_passed = True  # 末个条件：终止
                         break
                     continue  # 本条件已确认：本步不更新（无更新即无事件）
+                # 复测掉线：本步事件/告警的 AUC 记账仍为首测值（``auc``
+                # 未被改写）——复测读数只作确认判定，不入账
             # 测量批到此消费完毕（AUC 已归因、卷数已留痕 volumes）——
-            # 配对张量不进更新步（#174 生产重跑 OOM 修复：全量 held-out
-            # 测量批在大尺寸条件下数十 GiB 驻留，与更新批装配叠加是
-            # 64 GiB 卡的 OOM 峰值；分布式下每 rank 只驻留本地切片、释放
-            # 更早；事件面的 measurement_volumes 走 volumes 留痕，同值）
-            del batch
-            auc = decision[1]  # 更新步的 heldout_auc（全局口径）
-            update = self._rewards.update_step(
-                # 更新批 = 装配原语的配对批（ADR-0012）：fake = 冻结基座
-                # 对同批 real 的同源重构（专属 recon 流、先抽 s 后抽 ε、
-                # η=0 确定性 ODE 续跑）——与在线更新同一原语供批、判别器
-                # 任务两阶段同构（warm-start 权重不面临分布跳变）。分布式
-                # 下 DDP 由本 driver 装配（#234 解耦后的留存构造点）：本
-                # rank 的 K 条配对批、梯度 allreduce，有效 batch =
-                # K×world_size。与本步测量批同一原语的另一条入口（定序
-                # 轮转 σ + 复位测量流）
-                self._rewards.assembler.assemble(modality),
-            )
-            # 过拟合分叉观测（ADR-0009-γ）：与在线同一监控组件、同一
-            # knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor，
-            # 阈值/跨度同源于 config.reward.overfit_*）——train 侧干净域
-            # 复算准确率（随更新报告上行）与本步更新前 recon-AUC 合成
-            # 分叉观测，per-condition EMA 越线即落预训练相告警（确认步
-            # 不更新不观测；报警不动作，人工裁决——口径同在线。两侧估计
-            # 量同为 Mann-Whitney pairwise 占比、同为干净域，只差 in/out
-            # of sample 平面与 fake 来源）。OverfitMonitor 保持 rank 本地
-            # 状态（ADR-0016 决策 8：per-rank 离散本身是诊断信号，不跨
-            # rank 平均）——全 rank 以广播下发的全局 AUC 合成观测，越线
-            # 告警经 gather 归并落 rank0 事件流（train 侧 EventMerger
-            # 本体，归并调用见下）
-            reading = self._rewards.overfit.observe(
-                modality,
-                train_pairwise_acc=update.train_pairwise_acc,
-                heldout_auc=auc,
-            )
-            if self._dist.rank == 0:
-                self._run.append_event(PretrainEvent(
-                    step=step,
-                    modality=modality,
-                    loss_discriminator=update.loss_discriminator,
-                    heldout_auc=auc,
-                    # 重构成本读数（#171 AC5 的成本口径落点）：测量批重构的
-                    # 前向次数（逐卷定序 σ 的续跑步数之和）与测量批规模——
-                    # 30 步全 ODE 量产路径已不在本执行路径，这两项让「没有
-                    # 量产」在事件流上可核对（口径见模块 docstring）。分布式
-                    # 下两者都是全局口径（各 rank 本地读数经 gather 求和/
-                    # 卷数聚合），语义与单进程逐字一致
-                    reconstruction_forwards=forwards,
-                    measurement_volumes=volumes[modality],
-                    lr=reward.disc_lr,
-                    elapsed_s=time.monotonic() - started,
-                ))
-            # 预训练相告警的 rank 归并（ADR-0016 决策 8）：train 侧
-            # EventMerger 本体（EventSink 协议下 PretrainRun 为写者面）
-            # ——OverfitMonitor 保持 rank 本地状态（per-rank 离散是诊断
-            # 信号，不跨 rank 平均），各 rank 的越线读数各自构造告警、
-            # gather 到 rank0、仅 rank0 按源 rank 序 append（归并序 =
-            # (步, rank)，清单内序保持）。rank0 已先直写本步 pretrain
-            # 事件，归并段只追加告警——写出序 = 步序 + 步内 pretrain
-            # 先于告警（与在线侧「iter 后随告警」同构）。更新步全 rank
-            # 每步恰一次 emit 内 gather（决策已广播、分支一致），确认/
-            # 终止步不进本段——集合序列逐 rank 对齐
+            # 测量段张量在各卡瞬态驻留、join 后即释放，不进更新步
+            # （#174 OOM 修复：全量 held-out 测量批在大尺寸条件下数十
+            # GiB 驻留的峰值面，在分段扇出形态下结构性消失）
+            per_card_reports = self._update(modality)
+            # 过拟合分叉观测（ADR-0009-γ）：每卡实例、本地 train acc +
+            # 全局 AUC（卡轴诊断保持——per-卡离散本身是诊断信号）；
+            # 越线告警主控按卡序追加（确认步不更新不观测）
             alerts = []
-            if reading.alerted:
-                # ``phase="pretrain"`` 是回退记账的 EXEMPT 分轨轴——
-                # 预训练执行史全量保留（预训练相的 ``iteration`` 记本
-                # 步步号）；``rank`` 归因观测 rank（分叉按 rank 独立
-                # 计算落盘的归因轴，ADR-0009 决策 4）
-                alerts.append(OverfitAlertEvent(
-                    iteration=step,
-                    phase="pretrain",
-                    rank=self._dist.rank,
-                    modality=modality,
-                    divergence_ema=reading.divergence,
-                    train_pairwise_acc=update.train_pairwise_acc,
+            for card_index, monitor in enumerate(self._overfit):
+                train_acc = per_card_reports[
+                    card_index
+                ].conditions[0].train_pairwise_acc
+                reading = monitor.observe(
+                    modality,
+                    train_pairwise_acc=train_acc,
                     heldout_auc=auc,
-                ))
-            self._merger.emit(alerts)
+                )
+                if reading.alerted:
+                    # ``phase="pretrain"`` 是回退记账的 EXEMPT 分轨轴
+                    # （预训练执行史全量保留；``iteration`` 记本步步号）；
+                    # ``rank`` 归因观测卡（分叉按卡独立计算落盘的归因轴，
+                    # ADR-0009 决策 4 的卡轴迁移）
+                    alerts.append(OverfitAlertEvent(
+                        iteration=step,
+                        phase="pretrain",
+                        rank=card_index,
+                        modality=modality,
+                        divergence_ema=reading.divergence,
+                        train_pairwise_acc=train_acc,
+                        heldout_auc=auc,
+                    ))
+            global_loss = sum(
+                report.loss_discriminator for report in per_card_reports
+            )
+            self._run.append_event(PretrainEvent(
+                step=step,
+                modality=modality,
+                loss_discriminator=global_loss,
+                heldout_auc=auc,
+                # 重构成本读数（#171 AC5 的成本口径落点）：测量批重构的
+                # 前向次数（全量 σ 列表推算——分段求和与全量求和的加法
+                # 结合恒等）与测量批规模——「没有量产」在事件流上可核对
+                reconstruction_forwards=forwards,
+                measurement_volumes=volumes[modality],
+                lr=reward.disc_lr,
+                elapsed_s=time.monotonic() - started,
+            ))
+            for alert in alerts:
+                # 卡序追加（步内 pretrain 事件先于告警的写出序口径不变）
+                self._run.append_event(alert)
             steps_completed += 1  # 更新步计数（确认步占步号但不更新不事件）
         reported = dict(confirmed)
         if not all_conditions_passed:
-            # 步数上限耗尽：未确认条件逐个对落盘权重补测（循环内最后一次
-            # 测得值属于更新前的上一份权重，与 checkpoint 不同快照；
-            # 已确认条件的报告值 = 确认时的两次较小者，保留不覆盖）。补测
-            # 的测量/gather 全 rank 一致参与（reported 由广播驱动的
-            # confirmed 全 rank 一致 → 目标序列全 rank 相同 → 集合序列
-            # 对齐）；只有 rank0 的读数进报告
+            # 步数上限耗尽：未确认条件逐个对落盘权重补测（循环内最后
+            # 一次测得值属于更新前的上一份权重，与 checkpoint 不同快照；
+            # 已确认条件的报告值 = 确认时的两次较小者，保留不覆盖）
             for target in targets:
                 if target not in reported:
-                    _, clusters, _ = self._measurement(target)
-                    if self._dist.rank == 0:
-                        assert clusters is not None
-                        reported[target] = clusters.pooled_auc()
-                        volumes[target] = clusters.volume_count
-        if self._dist.rank != 0:
-            return None  # 产物 rank0 唯一写者：非 0 rank 无报告消费者
+                    clusters, _ = self._measurement(target)
+                    reported[target] = clusters.pooled_auc()
+                    volumes[target] = clusters.volume_count
         return self._finalize(
             steps_completed, reported, list(confirmed),
             all_conditions_passed, volumes,
         )
 
-    def _first_decision(
-        self,
-        modality: str,
-        confirmed: dict[str, float],
-        clusters: VolumeScoreClusters | None,
-    ) -> tuple[str, float]:
-        """首测判定（rank0 单点）：未确认且过线 → 复测；否则 → 更新。
-        非 0 rank 的 ``clusters`` 为 None（本地切片分数已在 gather 后由
-        rank0 消费），返回占位（``broadcast_object`` 覆盖，值无关紧要）。
-        world-1 下广播恒等，本方法即全部判定。"""
-        if self._dist.rank != 0:
-            return (_DECISION_UPDATE, 0.0)
-        assert clusters is not None
-        auc = clusters.pooled_auc()  # 更新前快照（本步判别器权重）
-        if modality not in confirmed and self._support.passes(auc, clusters):
-            return (_DECISION_REMEASURE, auc)
-        return (_DECISION_UPDATE, auc)
-
-    def _confirm_decision(
-        self,
-        modality: str,
-        confirmed: dict[str, float],
-        targets: "Sequence[str]",
-        confirm_clusters: VolumeScoreClusters | None,
-        first_auc: float,
-    ) -> tuple[str, float]:
-        """复测判定（rank0 单点）：复测亦过线 → 确认（报告值 = 两次较小）
-        或终止（最后一个条件确认完毕）；未过线 → 更新（首测值记账）。
-        确认/终止态全 rank 一致跳过更新——复测确认步的集合对齐由四态
-        广播的单点语义保证。"""
-        if self._dist.rank != 0:
-            return (_DECISION_UPDATE, first_auc)
-        assert confirm_clusters is not None
-        confirm_auc = confirm_clusters.pooled_auc()
-        if self._support.passes(confirm_auc, confirm_clusters):
-            value = min(first_auc, confirm_auc)
-            if len(confirmed) + 1 == len(targets):
-                return (_DECISION_HALT, value)
-            return (_DECISION_CONFIRM, value)
-        return (_DECISION_UPDATE, first_auc)
-
     def _measurement(
         self, modality: str,
-    ) -> tuple[PairBatch, VolumeScoreClusters | None, int]:
+    ) -> tuple[VolumeScoreClusters, int]:
         """单条件测量批 → 卷级分数聚类（过线测量/复测/补测共用入口）。
 
-        测量批 = 该条件**全量 held-out 卷**的冻结基座同源重构（装配原语
-        ``measure_condition``：定序轮转 σ + 复位测量流 ⇒ 逐次测量逐位同
-        输出）；real 侧**就是这批重构的源**（同一次索引排列抽取的逐样本
-        配对）——recon-AUC 的判别目标因此只剩重构伪影（ADR-0012 决策 5）。
-        与更新批同条件归因（ADR-0008-03 条件归因口径），条件轴与本步
-        更新的条件轴一致。
-
-        随机流：held-out 全量卷的抽取消耗 ``heldout_auc`` 命名流（卷内
-        顺序不影响读数——AUC 是集合级秩统计），重构的 ε 走装配原语的
-        复位测量流（不碰 recon 流）。预训练不参与续训，两处消耗都由
-        seed 纯函数确定 ⇒ 同 seed 同 world_size 重跑逐位可复算。
-
-        World-1（``distributed=False``）：全量路径——排列抽出即全量加载，
-        行为与分布式化前逐位一致。分布式：各 rank 本地 heldout_auc 流
-        同步推进抽排列（消耗序对齐，复测换批 = 流推进的语义逐 rank 同
-        构），rank0 的排列经 ``broadcast_object`` 镜像（rank0 派生 seed
-        恒等 ⇒ 与单进程逐位同序）；每 rank 只 load 本地连续段切片（
-        ``volume_offset`` 把 σ 轮转与 ε 前缀消耗对齐到全量位次——切片
-        行与整批对应行逐位一致）；本地切片打分后逐卷分数 object-gather
-        到 rank0（分数先落 CPU：对象集合的 pickle 不携带跨 rank 设备
-        语义，且秩统计是 CPU 工作负载），rank0 按 rank 序重组全量聚类
-        （卷级归属保留、连续段拼接还原全量排列序），全局前向次数 =
-        各 rank 本地读数之和。返回：rank0 = (批, 全局聚类, 全局前向数)，
-        非 0 rank = (本地批, None, 0)——聚类已被 rank0 消费，占位仅为
-        类型对齐。
+        主控单点：排列抽取（seed+3 流一次 randperm）→ ``ShardPlan``
+        卡轴连续段切片 → 测量模板复位抽取（seed+19 直锚：条件构造
+        一次 → 全量 σ 定序轮转列表 → 按卡序逐段 ε）→ 测量扇出（每卡
+        一段：real 切片加载 + 冻结基座同源重构 + 本卡打分）→ join →
+        卡序 plain 拼接聚类（卷级归属保留、连续段拼接还原全量排列序）。
+        返回 (全局聚类, 全局前向数)。随机流：held-out 全量卷的抽取消耗
+        主控排列流（卷内顺序不影响读数——AUC 是集合级秩统计）、重构
+        的 ε 走复位测量模板（不碰 recon 流）——预训练不参与续训，两处
+        消耗都由 seed 纯函数确定 ⇒ 同 seed 同卡数重跑逐位可复算。
         """
-        assembler = self._rewards.assembler
-        if assembler is None:
-            raise ValueError(
-                "配对批装配原语未装配（RewardCoordinator.assembler=None）："
-                "预训练测量批与更新批同源于它（ADR-0012）"
-            )
-        auc = self._rewards.auc
-        if not self._dist.distributed:
-            # real 侧先抽一次（该条件全量 held-out 卷）：同一批张量既作
-            # AUC 的 real 侧、又作重构的源——逐样本配对由构造保证
-            reals = auc.condition_latents(modality)
-            batch = assembler.measure_condition(reals, modality)
-            clusters = auc.compute_volume_clusters(
-                batch.reals, batch.fakes,
-            )
-            return batch, clusters, assembler.measurement_forward_count(
-                reals, modality,
-            )
-        # 分布式：同排列（rank0 抽取 + 广播镜像）、切加载（每 rank 本地段）
-        order = auc.condition_order(modality)
-        order = self._dist.broadcast_object(
-            order if self._dist.rank == 0 else None,
+        assert self._template is not None
+        order = self._sources.draw_order(modality)
+        plan = ShardPlan.split(len(order), len(self._cards))
+        draw = self._template.draw(
+            modality, self._sources.shape_of(modality), plan,
         )
-        start, stop = self._shard_bounds(len(order))
-        reals = auc.load_order(order[start:stop])  # 只 load/驻留本 rank 段
-        batch = assembler.measure_condition(
-            reals, modality, volume_offset=start,
-        )
-        clusters = auc.compute_volume_clusters(batch.reals, batch.fakes)
-        forwards = assembler.measurement_forward_count(
-            reals, modality, volume_offset=start,
-        )
-        # 分数落 CPU 再 gather：对象集合经 pickle 传输，CUDA 设备号不随
-        # 对象迁移（生产 NCCL 下跨 rank 反序列化会指向不存在的源设备）；
-        # AUC/bootstrap 的秩统计与重采样本来就工作在 CPU 负载面上
-        gathered = self._dist.gather([
-            VolumeScoreClusters(
-                real_volume_scores=tuple(
-                    volume.cpu() for volume in clusters.real_volume_scores
-                ),
-                fake_scores=clusters.fake_scores.cpu(),
-            ),
-            forwards,
-        ])
-        if self._dist.rank != 0:
-            return batch, None, 0
-        rank_clusters = [submission[0] for submission in gathered]
+        futures = [
+            card.submit(
+                card.measure_segment,
+                order[start:stop],
+                draw.sigmas_of(card_index, plan),
+                draw.noises[card_index],
+                draw.condition,
+            )
+            for card_index, (card, (start, stop)) in enumerate(
+                zip(self._cards, plan.bounds),
+            )
+        ]
+        per_card = [future.result() for future in futures]
         global_clusters = VolumeScoreClusters(
             real_volume_scores=tuple(
                 volume
-                for rank in range(self._dist.world_size)
-                for volume in rank_clusters[rank].real_volume_scores
+                for segment in per_card
+                for volume in segment.real_volume_scores
             ),
-            fake_scores=torch.cat([
-                rank_clusters[rank].fake_scores
-                for rank in range(self._dist.world_size)
-            ]),
+            fake_scores=torch.cat(
+                [segment.fake_scores for segment in per_card],
+            ),
         )
-        return (
-            batch,
-            global_clusters,
-            sum(submission[1] for submission in gathered),
+        return global_clusters, self._template.forward_count(
+            modality, draw.sigmas,
         )
 
-    def _shard_bounds(self, total: int) -> tuple[int, int]:
-        """全量测量批按 rank 均分的连续段边界（前余均分：排位 < 余数的
-        rank 多领一卷）。连续段（非条带）使 gather 后的 rank 序拼接
-        **还原全量排列序**——「切片合并还原全量」是全局 AUC 的卷级
-        归属前提；末段 rank 的切片可能为空（total < world_size 的防御
-        已由装配期每条件 ≥ world_size 守卫把住，此处恒有 start < stop）。"""
-        world = self._dist.world_size
-        base, remainder = divmod(total, world)
-        start = self._dist.rank * base + min(self._dist.rank, remainder)
-        stop = start + base + (1 if self._dist.rank < remainder else 0)
-        return start, stop
+    def _update(self, modality: str) -> list[UpdateReport]:
+        """更新步：主控全局无放回抽 K×卡数 → ``ShardPlan`` 切片（K×D
+        切 D 段 = base K rem 0，每卡恰 K）→ 更新扇出（每卡 K 对装配 +
+        本地前向反向）→ join → 跨卡梯度 SUM allreduce（M1 形态，与
+        在线判别器步同 communicator 语义）→ 各卡 AdamW → 步末 u/v
+        broadcast（卡 0 权威）。返回逐卡报告（事件的全局 loss =
+        逐对等权加权值的跨卡求和 ≡ 全局逐对 patch mean——每对 patch
+        数恒等，决议 3；观测面取各卡本地 train acc）。"""
+        card_count = len(self._cards)
+        total = self._config.reward.disc_batch_size_k * card_count
+        entries = self._sources.draw_reals(modality, total)
+        plan = ShardPlan.split(total, card_count)
+        futures = [
+            card.submit(
+                card.update_segment, entries[start:stop], modality,
+            )
+            for card, (start, stop) in zip(self._cards, plan.bounds)
+        ]
+        reports = [future.result() for future in futures]
+        DiscriminatorPhase.reduce_gradients(
+            [card.disc_phase for card in self._cards]
+        )
+        for card in self._cards:
+            card.submit(card.disc_step).result()
+        DiscriminatorPhase.synchronize_spectral(
+            [card.disc_phase for card in self._cards]
+        )
+        return reports
 
     def _finalize(
         self,
@@ -564,17 +757,14 @@ class PretrainDriver:
         all_conditions_passed: bool,
         condition_volumes: dict[str, int],
     ) -> PretrainReport:
-        """产物落盘（rank0 唯一写者）：判别器 checkpoint（可装载
-        state_dict，与训练期产物 checkpoint 同构）+ 预训练报告（kind
-        标识 + per-condition recon-AUC + 过线条件清单 + 支撑度卷数 + 数据
-        口径指纹，含 checkpoint 内容指纹——报告的过线判定与实测值只对
-        落盘这份权重负责，装载面按指纹对照，
-        ``load_discriminator``）。过线条件为空同样落盘——报告与
-        checkpoint 是失败预训练的诊断产物，不丢。"""
-        torch.save(
-            NetworkAssembler.loadable_state_dict(self._rewards.discriminator),
-            self._run.paths.discriminator_ckpt,
-        )
+        """产物落盘（主控唯一写者）：判别器 checkpoint（卡 0 副本直写，
+        可装载 state_dict 与训练期产物同构）+ 预训练报告（字段集与
+        provenance 指纹面不变——决议 17/18）。过线条件为空同样落盘
+        ——报告与 checkpoint 是失败预训练的诊断产物，不丢。"""
+        discriminator_state = self._cards[0].submit(
+            self._cards[0].export_discriminator,
+        ).result()
+        torch.save(discriminator_state, self._run.paths.discriminator_ckpt)
         discriminator_relative = (
             self._run.paths.discriminator_ckpt.relative_to(
                 self._run.paths.root,

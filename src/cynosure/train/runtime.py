@@ -7,9 +7,9 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 注册对象，归本聚合层持有；装配缝与续训状态枚举一律经它取流，无裸
 dict 第二载体，#218/#230）、数值口径（AmpContext，定义在
 policy/numerics——train 与 eval 共用的 import 环安全位，此处
-re-export 保持既有消费面）与分布式运行时（DistributedContext +
-EventMerger）。trainer 只面对本 Facade 编排 iteration 循环，装配细节
-（含分布式包装）不进循环代码路径。
+re-export 保持既有消费面）与分布式运行时（DistributedContext）。
+trainer 只面对本 Facade 编排 iteration 循环，装配细节（含分布式包装）
+不进循环代码路径。
 
 聚合面口径（ADR-0014 平移先行，#230）：本 Facade 是续训聚合层——
 长寿命协作者由本层持有注册；「任务无自持状态」档为空（任务是协程跑
@@ -21,13 +21,10 @@ EventMerger）。trainer 只面对本 Facade 编排 iteration 循环，装配细
 - seed 的 rank 派生（各 rank 数据流独立；rank 0 恒等 = 单进程等价前提）；
 - 可训练网络 FSDP full-shard + 梯度检查点（PolicySharding，optimizer
   构建于分片后参数之上）；
-- 判别器 DDP 副本（ReplicatedDiscriminator——**RL 构造点已随 #234
-  判别器链期解耦退役**：本装配缝不再 DDP 化判别器，torchrun 预训练
-  driver 自行装配（pretrain 路径留存至 pretrain driver 期收口删除，
-  #226 用户故事 8）；旧 RL torchrun 路径在加厚窗口内各 rank 独立更新
-  判别器（数值分叉可接受——旧执行序随切换期删除））+ Real sample
-  pool 切片（RankSlicedPool；held-out 不切）；
-- 指标归并器（EventMerger，rank 0 顺序写出）。
+- 判别器不再 DDP 化（ReplicatedDiscriminator 已随 #238 pretrain driver
+  期收口删除——#234 解耦 RL 构造点后无任何构造点残留；旧 RL torchrun
+  路径在衰减窗口内各 rank 独立更新判别器，数值分叉可接受——旧执行序
+  随切换期删除）+ Real sample pool 切片（RankSlicedPool；held-out 不切）。
 """
 
 from collections.abc import Callable
@@ -38,7 +35,6 @@ from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.distributed import (
     DistributedContext,
-    EventMerger,
     PolicySharding,
     RankSlicedPool,
 )
@@ -87,7 +83,6 @@ class TrainingRuntime:
         rng: TrainingRngStreams,
         amp: AmpContext,
         dist: DistributedContext,
-        merger: EventMerger,
     ) -> None:
         self.config = config
         self.policy = policy
@@ -97,7 +92,6 @@ class TrainingRuntime:
         self.rng = rng
         self.amp = amp
         self.dist = dist
-        self.merger = merger
 
     @classmethod
     def build(
@@ -188,7 +182,6 @@ class TrainingRuntime:
             rng=streams,
             amp=amp,
             dist=dist,
-            merger=EventMerger(dist, run_artifacts),
         )
 
     @classmethod
@@ -285,19 +278,15 @@ class TrainingRuntime:
         """判别器侧装配：网络构建 → pool 切片（real 侧；held-out 不切）
         → 配对批装配原语 / Online update / AUC 协作者。
 
-        公开装配缝：train 运行时与预训练 driver（world-1 退化语境——
-        RankSlicedPool 在单进程下恒等）共用同一份装配代码——「无第二
-        套判别器训练逻辑」在装配层同样成立。
+        公开装配缝：**旧执行序 trainer 的装配缝**（新执行序门面经
+        小装配缝自行组装、预训练 driver 经 ``PretrainDriver.build``
+        组装）——「无第二套判别器训练逻辑」在装配层同样成立。
         ``rng`` 收命名注册对象本体（TrainingRngStreams，#218 禁裸容器
         ——各协作者经它取各自的专属流）。
 
-        **DDP 解耦（#234 判别器链期）**：本缝不再构造 Replicated
-        Discriminator——RL 装配（新执行序门面与旧 trainer）的判别器
-        不经 DDP（新执行序梯度 allreduce SUM + 步末 u/v broadcast 的
-        全卡一致由执行序自身编排；旧执行序随切换期删除）；torchrun
-        预训练 driver 在调用本缝后自行 ``ReplicatedDiscriminator.
-        replicate``（pretrain 分布式更新语义的留存构造点，本体随
-        pretrain driver 期收口删除）。
+        **判别器无 DDP**（#234 解耦 + #238 本体删除）：Replicated
+        Discriminator 已退役——新执行序梯度 allreduce SUM + 步末
+        u/v broadcast 的全卡一致由执行序自身编排。
 
         ``sampler`` + ``conditions``（policy 侧依赖，须成对提供）驱动
         判别器更新批装配原语（ADR-0012 唯一新缝）的组装——两阶段供给
@@ -333,8 +322,6 @@ class TrainingRuntime:
             )
         scorer = cls.assemble_scorer(config, report, resume=resume)
         scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
-        # （#234：ReplicatedDiscriminator 的 RL 构造点解耦退役——本缝不再
-        # DDP 化判别器；torchrun 预训练 driver 自行装配，见模块 docstring）
         # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐条件容量
         # ≥ K×world_size——条带切片后每 rank 视图 ≥ K 的等价条件，判定放
         # 全量保失败路径全 rank 一致（RankSlicedPool 切片前校验同款理由）；

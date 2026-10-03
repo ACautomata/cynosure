@@ -9,7 +9,8 @@ spec #15 执行序（单进程与 torchrun 多进程同一条路径，world-1 �
          当前 policy 对同批 real 的同源重构，DDP 梯度 allreduce）随步做
          train 侧干净域复算与 per-condition 分叉观测（ADR-0009-β，越线
          落 overfit_alert 事件、只报警不动作）
-      3. iter 事件归并（EventMerger：rank 0 顺序写出）→ dist.barrier()
+      3. iter 事件直写（单事件追加面；EventMerger 归并随 #238 退役
+         ——单进程衰减窗口口径）→ dist.barrier()
     定期：续训状态全清单落盘（per-rank 文件）+ 产物 checkpoint
     （rank 0 独写，契约文件名不变）
     train 启动时：Baseline manifest
@@ -439,7 +440,10 @@ class GranularGrpoTrainer:
             if alert_event is not None:
                 # 告警排本 rank iter 事件之后（归并序 = iter 后随同 rank 告警）
                 events.append(alert_event)
-            self.runtime.merger.emit(events)
+            # 事件直写（world-1 与归并器逐事件追加逐位同形——EventMerger
+            # 随 #238 退役，衰减窗口内单进程直写）
+            for event in events:
+                self.artifacts.append_event(event)
             completed = iteration + 1
             milestone_due = completed % self.config.schedule.milestone_interval == 0
             if (
