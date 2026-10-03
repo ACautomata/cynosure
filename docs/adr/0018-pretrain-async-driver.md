@@ -40,7 +40,7 @@ ADR-0016 把判别器预训练执行面 torchrun 化（测量批按卷分片到 
 
 10. **torchrun 守卫历史回环**：CLI pretrain 恢复 ADR-0016 决策 3 恰好退役的 RANK env 拒绝守卫（执行模型已单进程多卡化，进程内多卡由设备发现承担）；`fid`/`fid-floor`/`base-smoke` 的 `_reject_torchrun` 泛化守卫随 RANK 注入源死化一并退役。
 
-11. **第三批删除面收口**（#238）：`ReplicatedDiscriminator` 本体（含 `distributed` 导出与 `RewardScorer.adopt_distributed`/DDP 解包）、`EventMerger` 本体（旧 trainer 归并点降级为单事件直写——衰减窗口内单进程语义与 world-1 恒等逐位同形）、`_reject_torchrun` 死守卫、torchrun slow 档测试退役（CPU fixture 档与 gauss 多卡档接替）。`DistributedContext`/`PolicySharding`/`RankSlicedPool` 为旧执行序 trainer 的衰减窗口保留面（切换期第二步整删）。
+11. **第三批删除面收口**（#238）：`ReplicatedDiscriminator` 本体（含 `distributed` 导出与 `RewardScorer.adopt_distributed`/DDP 解包）、`EventMerger` 本体（旧 trainer 归并点降级为 rank 0 单点直写——world-1 下与归并器逐事件追加逐位同形；**显式 drift**：衰减窗口内 torchrun 多进程重跑 train 时仅 rank 0 事件落盘（gather 归并基建已删，文件完好性优先于全 rank 事件覆盖）——窗口由切换期第二步整删收口）、`_reject_torchrun` 死守卫、torchrun slow 档测试退役（CPU fixture 档与 gauss 多卡档接替）。`DistributedContext`/`PolicySharding`/`RankSlicedPool` 为旧执行序 trainer 的衰减窗口保留面（切换期第二步整删）。
 
 ## #220 决议修订记档（#221 决议 5 移交）
 

@@ -101,7 +101,7 @@ class MeasurementTemplate:
         ``plan`` = 卡轴分片计划（ε 按其卡序逐段生成）。
         """
         cursor = self._schedules.cursor(modality)
-        self._assert_indices_within_schedule(cursor, modality)
+        cursor.assert_reconstruction_candidates(self._step_indices, modality)
         candidates = [
             cursor.sigma_level(step) for step in self._step_indices
         ]
@@ -131,39 +131,7 @@ class MeasurementTemplate:
         求和与全量求和的加法结合恒等）。"""
         cursor = self._schedules.cursor(modality)
         return sum(
-            cursor.num_steps - 1 - self._start_index(cursor, sigma)
+            cursor.num_steps - 1 - cursor.continue_start_index(sigma)
             for sigma in sigmas
         )
 
-    def _start_index(
-        self, cursor, sigma: float,
-    ) -> int:
-        """σ 水平 → 续跑起点下标（``ReconstructionAssembler`` 同款口径：
-        σ = s_k 的样本位于第 k−1 步输出位置、从第 k 步积分）。"""
-        for step in range(cursor.num_steps):
-            if cursor.sigma_level(step) == sigma:
-                if step == 0:
-                    raise ValueError(
-                        f"sigma={sigma} 是最噪端（日程下标 0，s≈1 奇异点）"
-                        "——不在重构候选（被优化步集合 M 排除下标 0，"
-                        "ADR-0012 决策 2）"
-                    )
-                return step - 1
-        raise ValueError(
-            f"sigma={sigma!r} 不是该条件的日程点（重构起点无从定位；"
-            "候选 = 被优化步的 sigma 日程点）"
-        )
-
-    def _assert_indices_within_schedule(self, cursor, name: str) -> None:
-        """被优化步集合在该条件日程的**中段**（装配原语同款守卫——
-        测量面独立构造，候选越界在首次测量即显式暴露）。"""
-        overflow = [
-            step for step in self._step_indices
-            if step >= cursor.num_steps - 1
-        ]
-        if overflow:
-            raise ValueError(
-                f"被优化步 {overflow} 越界条件 {name} 的重构候选"
-                f"（num_steps={cursor.num_steps}：合法候选为 1..num_steps−2"
-                "，首位的 s≈1 奇异端与末位的零续跑空间都排除）"
-            )

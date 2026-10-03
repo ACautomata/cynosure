@@ -65,10 +65,10 @@ spec）**、单点 float64 midrank）取代 per-rank 轴——分叉 = EMA(逐�
 acc − 池化 AUC)（#220 决议 13，per-rank 离散诊断对象结构性消失；多卡同条件
 多桶时 train acc 按桶对数加权聚合为条件级单值、每条件每步恰一次观测——决议 14
 未明文的多卡聚合形态，#234 补记）。
-``ReplicatedDiscriminator`` 的 **RL 构造点随本票解耦退役**（本体留存至
-pretrain driver 期删除）：旧 RL torchrun 路径各 rank 独立更新判别器（跨
-rank 一致性断言随退役移除），torchrun **预训练**路径仍 DDP（driver 自行
-装配，语义不受影响）。
+``ReplicatedDiscriminator`` 的 **RL 构造点随本票解耦退役**（本体已随 #238
+第三批删除面删除）：旧 RL torchrun 路径各 rank 独立更新判别器（跨
+rank 一致性断言随退役移除）；**预训练**路径已单进程多卡化（ADR-0018，
+torchrun 启动显式拒绝）。
 
 ## 降级预案（ticket 问题④）
 

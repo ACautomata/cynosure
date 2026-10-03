@@ -97,7 +97,9 @@ sugon-bootstrap 的 pitfalls 排查——装任何 ML 依赖后都要回验这�
 已有产物的环节跳过。**pretrain 以单进程多卡执行**（ADR-0018：主控 +
 每卡绑卡线程，测量批按卡轴分片扇出、gate inline 主控、跨卡梯度
 allreduce——torchrun 多进程拓扑退役，RANK env 守卫恢复）；train 仍走
-torchrun（旧执行序，切换期前）。
+torchrun（旧执行序，切换期前）。衰减窗口内 train 多进程的 metrics 流 =
+rank 0 单点直写（EventMerger 归并已随 #238 退役，非 rank 0 事件不落盘——
+ADR-0018 决策 11 显式 drift）。
 
 实例无作业调度器，长跑进 tmux：
 
@@ -154,12 +156,11 @@ ssh sugon 'tail -f /root/private_data/cynosure/runs/<run>/metrics.jsonl'        
 指标契约只有 `metrics.jsonl`（JSONL 事件流，拒 NaN/Inf）；项目不接
 wandb/tensorboard，监控与出图都从它出发。
 
-**读数口径（ADR-0016）**：单卡 run 与多卡 run 的预训练读数**不可横向
-比较逐位值**——测量批分块边界与判别器有效 batch（K×world_size）随
-world_size 变化；重放锚是「同 config + 同 world_size 重跑逐位一致」，
-跨 world_size 只保统计等价（卷积算法随 batch shape 的 ~1e-12 量级
-尾差）。对比实验的「同机制」判断锚在机制语义（ADR-0012）而非执行面
-数值。
+**读数口径（ADR-0018）**：预训练重放锚 = 「同 config + 同卡数重跑逐位
+一致」（分片边界由卡数决定、随之固定）；**跨卡数重跑 = 新 run**——
+读数不可横向比较逐位值（判别器有效 batch K×卡数随卡数变化），无
+payload 拒绝面（预训练不参与续训）。对比实验的「同机制」判断锚在
+机制语义（ADR-0012）而非执行面数值。
 
 ### 7. 收尾
 
@@ -169,7 +170,7 @@ world_size 变化；重放锚是「同 config + 同 world_size 重跑逐位一�
 ## 参考
 
 - 启动编排、M0 门槛与 T11 实测结论：`docs/spec/orchestration.md`
-- 决策记录：`docs/adr/0003`（torchrun+FSDP）、`0005`（SothisAI 迁移）、`0007`（pretrain warm-start）、`0016`（pretrain torchrun 化：测量批分片 + rank0 gate + 判别器 DDP）
+- 决策记录：`docs/adr/0003`（torchrun+FSDP）、`0005`（SothisAI 迁移）、`0007`（pretrain warm-start）、`0018`（pretrain 单进程多卡 async 化：测量模板直锚 + 卡轴分片 + gate inline 主控）、`0016`（pretrain torchrun 化——已 superseded by 0018）
 - config 全字段：`src/cynosure/config.py`
 - 集群级故障排查（双 source 失效、numpy 顶坏 torch、pip 超时、sourcefind wheel）：
   sugon-bootstrap 的故障排查表与 `references/dcu-pitfalls.md`

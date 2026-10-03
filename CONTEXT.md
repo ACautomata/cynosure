@@ -207,7 +207,7 @@ torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写�
 _Avoid_: 进程号、节点（node 是机器，rank 是进程）、把 pretrain 说成多进程
 
 **World size（进程组规模）**:
-参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。词条随 ADR-0016 退役（同 rank 词条口径）；async 执行序的拓扑对账字段 = `slots`（协程数，卡数不进对账，#218/#222），payload 无 world_size 键。
+参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。词条随 ADR-0018 退役（同 rank 词条口径）；async 执行序的拓扑对账字段 = `slots`（协程数，卡数不进对账，#218/#222），payload 无 world_size 键。
 
 **FSDP full-shard（全分片）**:
 可训练网络的参数/梯度/优化器状态按 rank 切分、前向按需重组的数据并行方式；梯度 allreduce 保证各 rank 权重同步（ADR-0003：同构 rank、无角色划分）。

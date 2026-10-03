@@ -520,7 +520,9 @@ class RunPaths:
 
 class RunArtifacts:
     """run 目录与产物工件契约：config 快照 + metrics.jsonl + manifest +
-    checkpoint 目录，落 ``$HOME``（多 rank 下指标由 rank 0 归并写出）。"""
+    checkpoint 目录，落 ``$HOME``（多 rank 下指标由 rank 0 直写——
+    EventMerger 归并随 #238 退役，非 rank 0 事件不落盘，ADR-0018
+    决策 11 显式 drift）。"""
 
     def __init__(self, paths: RunPaths) -> None:
         self.paths = paths

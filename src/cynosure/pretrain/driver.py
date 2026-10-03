@@ -100,6 +100,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -129,6 +130,9 @@ from cynosure.train.discriminator import DiscriminatorBucket, DiscriminatorPhase
 from cynosure.train.policy import GroupPolicy
 from cynosure.train.rng import SLOT_SEED_STRIDE, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
+
+if TYPE_CHECKING:
+    from cynosure.train.rollout import ConditionSampler
 
 
 _WORKER_JOIN_TIMEOUT_S = 10.0
@@ -225,7 +229,7 @@ class PretrainCardWorker:
             self._thread.join(_WORKER_JOIN_TIMEOUT_S)
 
     @property
-    def conditions(self):
+    def conditions(self) -> "ConditionSampler":
         """本卡条件分布（主控测量模板的条件构造消费面——穿模板流，
         抽取消耗传入的 generator、不触碰实例自有流）。"""
         return self._require_rig().policy.conditions

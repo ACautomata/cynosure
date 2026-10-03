@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 
 from cynosure.policy.condition import RolloutCondition
-from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import ConditionSchedules
@@ -158,7 +157,9 @@ class ReconstructionAssembler:
         )
         steps = [self._step_indices[i] for i in position.tolist()]
         cursor = self._schedules.cursor(condition.name_or_raise())
-        self._assert_indices_within_schedule(cursor, condition.name_or_raise())
+        cursor.assert_reconstruction_candidates(
+            self._step_indices, condition.name_or_raise(),
+        )
         sigmas = [cursor.sigma_level(step) for step in steps]
         noise = torch.randn(
             reals.shape, generator=self._generator,
@@ -200,7 +201,7 @@ class ReconstructionAssembler:
         """该条件重构候选噪声水平的导出面（被优化步的 sigma 日程点，
         按日程位升序）——s 抽样与日程同源的镜像口径（测试与诊断消费）。"""
         cursor = self._schedules.cursor(modality)
-        self._assert_indices_within_schedule(cursor, modality)
+        cursor.assert_reconstruction_candidates(self._step_indices, modality)
         return tuple(cursor.sigma_level(step) for step in self._step_indices)
 
     def reconstruct(
@@ -252,50 +253,8 @@ class ReconstructionAssembler:
             noised = working * (1.0 - level) + noise[rows] * level
             terminal = self._sampler.continue_to_terminal(
                 noised,
-                self._start_index(cursor, sigma),
+                cursor.continue_start_index(sigma),
                 condition,
             )
             reconstructed[rows] = terminal / self._scale_factor
         return reconstructed
-
-    def _start_index(
-        self, cursor: "TrajectoryCursor", sigma: float,
-    ) -> int:
-        """σ 水平 → ``continue_to_terminal`` 的起点下标：σ = s_k 的样本
-        位于第 k 步的输入位置（即第 k−1 步的输出位置），续跑从第 k 步
-        开始积分。s = 0（σ=0 终点之后）走调用方短路、不进本方法；
-        日程点外的 σ 与最噪端 s≈1（下标 0，M 排除）显式拒绝。"""
-        for step in range(cursor.num_steps):
-            if cursor.sigma_level(step) == sigma:
-                if step == 0:
-                    raise ValueError(
-                        f"sigma={sigma} 是最噪端（日程下标 0，s≈1 奇异点）"
-                        "——不在重构候选（被优化步集合 M 排除下标 0，"
-                        "ADR-0012 决策 2）"
-                    )
-                return step - 1
-        raise ValueError(
-            f"sigma={sigma!r} 不是该条件的日程点（重构起点无从定位；"
-            "候选 = 被优化步的 sigma 日程点）"
-        )
-
-    def _assert_indices_within_schedule(self, cursor, name: str) -> None:
-        """被优化步集合在该条件日程的**中段**（末位亦是非法候选）——
-        小锚日程下 M 截尾在装配期显式暴露（可读报错点名条件与越界位），
-        而非 ``sigma_level`` 越界的 IndexError 或首步测量才炸。
-
-        末位被排除与 config 的 ``train_step_indices_m`` 校验同源
-        （``max(M) ≤ num_steps − 2``）：末位之后无续跑空间，重构会退化为
-        透传（fake ≡ real），而测量面**没有** ``reconstruct`` 的 s=0 短路
-        ——它是判别器要学的「生成伪影」的零内容批次，静默进入测量会把
-        上岗判据污染成 chance 带上的噪声。"""
-        overflow = [
-            step for step in self._step_indices
-            if step >= cursor.num_steps - 1
-        ]
-        if overflow:
-            raise ValueError(
-                f"被优化步 {overflow} 越界条件 {name} 的重构候选"
-                f"（num_steps={cursor.num_steps}：合法候选为 1..num_steps−2"
-                "，首位的 s≈1 奇异端与末位的零续跑空间都排除）"
-            )
