@@ -16,12 +16,13 @@ ADR-0012 的新流）由 rank 无关的 shared seed 派生——其 s 抽样的�
 偏移布局权威（#218 §5 单点化）：本模块注释是流 seed 偏移的唯一权威
 登记处——数据侧 +0（rollout）/ +1（real_pool）/ +3（heldout_auc）/
 +9（recon，shared 轴或槽轴见下）；+2/+4/+5/+8 为退役流空置偏移、
-**不回收再用**（含 v10 退役流的「历史占位不回收」口径，assembly.py
-的 MEASUREMENT_STREAM_OFFSET 描述为历史占位）；注册表之外：+6 =
-冷启动判别器初始化的全局 fork seed（跨卡一致，不经派生）、+7 =
-预训练 SupportRule 的 bootstrap 流、+19 = 预训练测量模板（宿主随
-#221）。async 执行序（#231 骨架期）的槽轴派生见 ``SlotRngRegistry``
-（线性步长 = 旧 rank 步长的沿用，槽 0 恒等）。
+**不回收再用**（含 v10 退役流的「历史占位不回收」口径）；注册表之外：
++6 = 冷启动判别器初始化的全局 fork seed（跨卡一致，不经派生）、+7 =
+预训练 SupportRule 的 bootstrap 流、+19 = 预训练测量模板（ADR-0018 起
+宿主 = ``MeasurementTemplate`` 主控显式直锚）。async 执行序（#231
+骨架期）的槽轴派生见 ``SlotRngRegistry``（线性步长 = 旧 rank 步长的
+沿用，槽 0 恒等）；预训练卡轴 recon 流同公式以卡号派生（#221 决议
+11——卡 0 恒等 = 现行 rank0 recon 数值）。
 
 历史（ADR-0012 退役，#173）：``disc_noise``（训练期噪声注入）、
 ``disc_update``（回放抽样）、``fake_shuffle``（fake 全批置换）、

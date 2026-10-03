@@ -4,7 +4,7 @@
 fail-fast 面）、checkpoint 容器形态分派（上游训练容器 / 裸 state_dict /
 MetaTensor 元数据的严格反序列化）、``BaseSmokeRunner`` 的读数契约
 （定点前向逐位复现、参数量对账、scale factor 来源分派）与 base-smoke
-子命令（exit 码 / 报告落盘 / torchrun 拒绝）。真实基座发布件（HF
+子命令（exit 码 / 报告落盘）。真实基座发布件（HF
 ``nvidia/NV-Generate-MR-Brain``）的装载自检由 gpu+slow 标记的测试承担
 ——smoke config 路径经环境变量注入，缺省跳过（集群侧产出）。
 """
@@ -635,16 +635,6 @@ class TestBaseSmokeCli:
         result = cli.run("base-smoke", "--config", str(tmp_path / "absent.json"))
         assert result.code == 2
         assert "不存在" in result.stderr
-
-    def test_torchrun_is_rejected(
-        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("RANK", "3")
-        result = cli.run(
-            "base-smoke", "--config", str(tmp_path / "whatever.json"),
-        )
-        assert result.code == 2
-        assert "拒绝 torchrun" in result.stderr
 
 
 @pytest.mark.gpu  # 生产尺寸 encode/decode 的网络大计算：GPU 口径

@@ -19,7 +19,6 @@ per-condition 步进（ADR-0008-04）分两层锁：**轮转与归因**在端到
 
 import copy
 import json
-import weakref
 from pathlib import Path
 
 import pytest
@@ -30,17 +29,23 @@ from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
+from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.pretrain import (
     PretrainProvenance,
     PretrainReport,
     PretrainRun,
 )
-from cynosure.pretrain.driver import PretrainDriver
+from cynosure.pretrain.driver import MeasurementSources, PretrainDriver
+from cynosure.pretrain.measurement import MeasurementTemplate
+from cynosure.pretrain.sharding import ShardPlan
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.assembly import PairBatch
 from cynosure.reward.overfit import OverfitMonitor
-from cynosure.reward.update import OnlineUpdate
+from cynosure.reward.update import (
+    ConditionUpdateDetail,
+    OnlineUpdate,
+    UpdateReport,
+)
 from cynosure.train import (
     REWIND_ACCOUNTING,
     AmpContext,
@@ -753,21 +758,20 @@ class TestPretrainCliGuards:
         assert result.code == 2
         assert "已存在" in result.stderr
 
-    def test_torchrun_env_requires_explicit_run_dir(
+    def test_torchrun_launch_rejected(
         self, scenario: PretrainScenario, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """ADR-0016 决策 3：pretrain 的 RANK 拒绝守卫退役（单进程与
-        torchrun 同一条代码路径）——分布式启动面改由「显式 --run-dir」
-        把守（跨 rank 目录对齐，train 同款）；RANK env 下缺省 run 目录
-        即拒绝，不再言「单进程执行」。多 rank 真跑由 2 卡 slow 档端到端
-        覆盖（tests/test_pretrain_distributed.py）。"""
+        """ADR-0018 历史回环：ADR-0016 决策 3 退役的 RANK env 拒绝守卫
+        随 pretrain driver 单进程多卡化恢复——torchrun 启动显式拒绝
+        （执行模型已单进程多卡化，进程内多卡由设备发现承担）；拒绝在
+        run 目录预占之前（usage 错误不落任何工件）。"""
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "2")
         result = scenario.pretrain()
         assert result.code == 2
-        assert "--run-dir" in result.stderr
-        assert "单进程" not in result.stderr
+        assert "拒绝 torchrun" in result.stderr
+        assert not scenario.run_dir.exists()
 
     def test_explicit_run_dir_override(
         self, scenario: PretrainScenario, tmp_path: Path,
@@ -828,60 +832,84 @@ class TestPretrainCliGuards:
 
 
 class TestPretrainDriverAssembly:
+    def _started_driver(self, config: CynosureConfig, run: PretrainRun):
+        """装配并启动绑卡线程的 driver（组件装配发生在卡线程——rig
+        面的断言须在 start 之后取数；调用方负责 stop）。"""
+        driver = PretrainDriver.build(config, run, devices=[torch.device("cpu")])
+        for card in driver._cards:
+            if card.device.type == "cuda":
+                torch.zeros(1, device=card.device)
+                torch.cuda.synchronize(card.device)
+        for card in driver._cards:
+            card.start()
+        return driver
+
     def test_reuses_online_update_with_explicit_weight_decay(
         self, scenario: PretrainScenario,
     ) -> None:
-        """AC：driver 复用在线期同款单步更新原语（OnlineUpdate 实例，
-        无第二套判别器训练逻辑）；weight_decay 显式配置且与 policy 同值。"""
+        """AC：driver 复用在线期同款判别器优化器装配
+        （``OnlineUpdate.assemble_optimizer``，无第二套判别器训练逻辑）；
+        weight_decay 显式配置且与 policy 同值。"""
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        assert isinstance(driver.rewards.update, OnlineUpdate)
-        decay = driver.rewards.update.optimizer.param_groups[0]["weight_decay"]
-        assert decay == pytest.approx(config.reward.disc_weight_decay)
-        assert decay == pytest.approx(config.policy.policy_weight_decay)
+        driver = self._started_driver(config, run)
+        try:
+            optimizer = driver._cards[0].disc_phase.optimizer
+            assert isinstance(optimizer, torch.optim.AdamW)
+            decay = optimizer.param_groups[0]["weight_decay"]
+            assert decay == pytest.approx(config.reward.disc_weight_decay)
+            assert decay == pytest.approx(config.policy.policy_weight_decay)
+        finally:
+            for card in driver._cards:
+                card.stop()
 
     def test_consumes_same_overfit_monitor_via_shared_assembly(
         self, scenario: PretrainScenario,
     ) -> None:
-        """AC（ADR-0009-γ，issue #106 验收 1）：预训练 driver 每步消费与
-        在线同一监控组件、同一 config knobs——分叉监控器经共享装配缝
-        （``TrainingRuntime.assemble_rewards``）挂进 ``RewardCoordinator``，
-        两阶段同一组件类、knobs 同源于 ``config.reward.overfit_*``；
-        与在线装配逐位一致（同一调用、同一入参，产物 knobs 无分歧）。
+        """AC（ADR-0009-γ，issue #106 验收 1）：预训练每步消费与在线
+        同一监控组件类、同一 config knobs——``OverfitMonitor`` 每卡实例
+        （#221 决议 15：卡轴诊断保持），knobs 同源于
+        ``config.reward.overfit_*``；与在线装配（同缝构造的监控器）逐位
+        一致（同一调用、同一入参，产物 knobs 无分歧）。
         """
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "overfit_assembly_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        assert isinstance(driver.rewards.overfit, OverfitMonitor)
-        assert driver.rewards.overfit._threshold == pytest.approx(
-            config.reward.overfit_alert_divergence
-        )
-        assert driver.rewards.overfit._span == config.reward.overfit_ema_span
-        # 在线装配同缝重放：产物监控器 knobs 与预训练侧逐位一致
-        dist = DistributedContext.bootstrap()
-        amp = AmpContext(
-            device=torch.device("cpu"),
-            dtype=AMP_DTYPES[config.policy.amp_dtype],
-        )
-        streams = TrainingRngStreams(
-            dist.derive_seed(config.schedule.seed),
-            shared_seed=config.schedule.seed,  # 生产装配位同款（数据侧
-            # 逐 rank 派生、recon 用 shared）——同缝重放保持镜像逐字
-        )
-        policy = GroupPolicy.build(config, streams.rollout, amp.device)
-        sampler = TrainingRuntime.assemble_sampler(
-            config, policy.field, device=amp.device,
-        )
-        online = TrainingRuntime.assemble_rewards(
-            config, amp, streams, dist,
-            sampler=sampler, conditions=policy.conditions,
-        )
-        assert isinstance(online.overfit, OverfitMonitor)
-        assert online.overfit._threshold == driver.rewards.overfit._threshold
-        assert online.overfit._span == driver.rewards.overfit._span
+        driver = self._started_driver(config, run)
+        try:
+            for monitor in driver._overfit:
+                assert isinstance(monitor, OverfitMonitor)
+                assert monitor._threshold == pytest.approx(
+                    config.reward.overfit_alert_divergence
+                )
+                assert monitor._span == config.reward.overfit_ema_span
+            # 在线装配同缝重放：产物监控器 knobs 与预训练侧逐位一致
+            dist = DistributedContext.bootstrap()
+            amp = AmpContext(
+                device=torch.device("cpu"),
+                dtype=AMP_DTYPES[config.policy.amp_dtype],
+            )
+            streams = TrainingRngStreams(
+                dist.derive_seed(config.schedule.seed),
+                shared_seed=config.schedule.seed,  # 生产装配位同款
+            )
+            policy = GroupPolicy.build(config, streams.rollout, amp.device)
+            sampler = TrainingRuntime.assemble_sampler(
+                config, policy.field, device=amp.device,
+            )
+            online = TrainingRuntime.assemble_rewards(
+                config, amp, streams, dist,
+                sampler=sampler, conditions=policy.conditions,
+            )
+            assert isinstance(online.overfit, OverfitMonitor)
+            assert online.overfit._threshold == (
+                driver._overfit[0]._threshold
+            )
+            assert online.overfit._span == driver._overfit[0]._span
+        finally:
+            for card in driver._cards:
+                card.stop()
 
     def test_cross_modal_conditions_from_controlnet_path(
         self, scenario: PretrainScenario,
@@ -895,39 +923,51 @@ class TestPretrainDriverAssembly:
         )
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        assert isinstance(driver.policy.conditions, CrossModalConditionSampler)
-        assert driver.rewards.assembler is not None
+        driver = self._started_driver(config, run)
+        try:
+            assert isinstance(
+                driver._cards[0].conditions, CrossModalConditionSampler,
+            )
+            assert driver._cards[0]._rig.assembler is not None
+        finally:
+            for card in driver._cards:
+                card.stop()
 
     @pytest.mark.slow  # 满步数轮转 × 每步真实装配原语重构（fixture 网络 ODE 续跑）
     def test_rotation_steps_round_robin(
         self, scenario: PretrainScenario,
     ) -> None:
         """AC：per-condition 均匀轮转——每步条件 = 轮转条件集的
-        ``step % n``，update_step 穿同一步条件（确定性轮转不耗 RNG；
-        ADR-0008 决策 3 的调度形态）——替身按步记录条件，步数上限内
-        每步一步更新、条件按轮转序循环。"""
+        ``step % n``，更新扇出穿同一步条件（确定性轮转不耗 RNG；
+        ADR-0008 决策 3 的调度形态）——更新面替身按步记录条件，步数
+        上限内每步一步更新、条件按轮转序循环。"""
         scenario.write_config(reward={
             "pretrain_pass_threshold": 0.99,  # 不可达：跑满上限，逐步观测
             "pretrain_max_steps": 6,
         })
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "assembly_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        recording = RecordingUpdate(driver.rewards.discriminator)
-        driver.rewards.update = recording
+        driver = self._started_driver(config, run)
+        recorded: list[str] = []
+        original = driver._update
+
+        def recording_update(modality: str):
+            recorded.append(modality)
+            return original(modality)
+
+        driver._update = recording_update
         report = driver.run()
         assert report.steps_completed == 6
-        assert recording.modalities == [
+        assert recorded == [
             MODALITIES[step % len(MODALITIES)] for step in range(6)
         ]
 
     def test_rejects_real_pool_below_batch_capacity(
         self, scenario: PretrainScenario,
     ) -> None:
-        """ADR-0008-03 装配守卫：逐 (全池, 模态) real 容量 < K → fail-fast
-        可读报错（driver 经 assemble_rewards 与 train 同一条装配缝——
-        守卫先于任何 rollout/更新执行）。"""
+        """ADR-0008-03 装配守卫：逐 (全池, 模态) real 容量 < K×卡数
+        → fail-fast 可读报错（driver 经 ``assemble_real_pool`` 与 train
+        同一条装配缝——守卫先于任何测量/更新执行）。"""
         small_pool = scenario.tmp_path / "starved_pool.json"
         small_pool.write_text(json.dumps({
             "kind": "real_pool",
@@ -950,16 +990,16 @@ class TestPretrainDriverAssembly:
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "capacity_run")
         with pytest.raises(ValueError, match="容量不足") as exc_info:
-            PretrainDriver(config, run, device=torch.device("cpu"))
+            PretrainDriver.build(config, run)
         message = str(exc_info.value)
         assert "disc_batch_size_k" in message  # 可读：点名条件、可用量与 knob
 
-    def test_rejects_rotation_target_without_heldout(
+    def test_rejects_rotation_target_below_card_count(
         self, scenario: PretrainScenario,
     ) -> None:
-        """ADR-0008-04 装配守卫：轮转条件集某条件的 held-out 无条目 →
-        fail-fast（per-condition AUC 归因无米下锅；首步 rollout 之前
-        拒绝，报错点名缺条目的条件）。"""
+        """#221 决议 8 装配守卫（现行两态守卫统一换名）：轮转条件集某
+        条件的 held-out < 卡数（单卡即无条目）→ fail-fast（测量批切片
+        后某卡测量段为空；首步测量之前拒绝，报错点名不足的条件）。"""
         starved_heldout = scenario.tmp_path / "starved_heldout.json"
         starved_heldout.write_text(json.dumps({
             "kind": "heldout_real",
@@ -984,7 +1024,7 @@ class TestPretrainDriverAssembly:
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "starved_run")
         with pytest.raises(ValueError, match="t2f") as exc_info:
-            PretrainDriver(config, run, device=torch.device("cpu"))
+            PretrainDriver.build(config, run)
         assert "held-out" in str(exc_info.value)
 
 
@@ -995,7 +1035,8 @@ class TestPretrainReconstructionFakeSupply:
 
     量产退役是**范围收窄**（RolloutPhase 从 driver 装配面消失、成本
     读数改口径），不是「换个名字继续跑」：本类断言 driver 上不存在
-    任何量产入口，且事件流自带「重构前向次数 < 量产步数」的成本证据。
+    任何量产入口，且测量面模板 / 更新面供给缝各就各位（#221 决议 5
+    的主控单点形态）。
     """
 
     def test_driver_has_no_rollout_phase_seam(
@@ -1007,42 +1048,50 @@ class TestPretrainReconstructionFakeSupply:
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "supply_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
+        driver = PretrainDriver.build(
+            config, run, devices=[torch.device("cpu")],
+        )
         for attribute in ("rollout", "_rollout", "_measurement_batch"):
             assert not hasattr(driver, attribute), attribute
-        # 配送面在场：测量与更新同源于装配原语（两阶段构造同构的前提）
-        assert driver.rewards.assembler is not None
-        assert callable(driver.rewards.assembler.measure_condition)
+        # 供给面在场：测量模板 + 卡轴装配原语（两阶段构造同构的前提）
+        assert driver._sources is not None
+        assert callable(driver._cards[0].update_segment)
+        assert callable(driver._cards[0].measure_segment)
 
-    def test_measurement_batch_is_full_heldout_reconstruction(
+    def test_measurement_draw_is_full_heldout_geometry(
         self, scenario: PretrainScenario,
     ) -> None:
-        """测量面：每步测量批 = 该条件**全量 held-out 卷**的冻结基座
-        重构（非批次量产）——卷数 = 该条件 held-out 条目数、real 与
-        fake 逐样本同形同源（批量量纲随 ADR-0012 量产退役消失，
-        ``pretrain_fake_batch`` 字段已删，schema 携带即拒）。"""
+        """测量面几何（#221 决议 5）：每步测量批 = 该条件**全量
+        held-out 卷**的冻结基座重构——全量 σ 列表长度 = 该条件 held-out
+        条目数、ε 段形状随分片计划对齐（批量量纲随 ADR-0012 量产退役
+        消失，``pretrain_fake_batch`` 字段已删，schema 携带即拒）。"""
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
         )
         assert heldout.modalities["t1n"] == 2
-        run = PretrainRun.init(config, scenario.tmp_path / "measure_run")
-        driver = PretrainDriver(config, run, device=torch.device("cpu"))
-        target = driver.policy.conditions.targets()[0]
-        reals = driver.rewards.auc.condition_latents(target)
-        batch = driver.rewards.assembler.measure_condition(reals, target)
-        assert batch.reals.shape[0] == 2  # 该条件全量卷，非 pretrain_fake_batch
-        assert batch.fakes.shape == batch.reals.shape
-        assert batch.reals is reals  # 逐样本配对的同一批张量
-        assert not torch.equal(batch.fakes, batch.reals)  # 冻结基座重构在场
-        # 成本读数与测量批的规模同源（同入参、同定序轮转）：逐卷余量
-        # 之和（MONAI 实际日程步数），严格小于量产的「每卷全 ODE」上界
-        cursor = TrainingRuntime.assemble_schedules(config).cursor(target)
-        forwards = driver.rewards.assembler.measurement_forward_count(
-            reals, target,
+        sources = MeasurementSources(config.schedule.seed, heldout, heldout)
+        template = MeasurementTemplate(
+            config.schedule.seed,
+            TrainingRuntime.assemble_schedules(config),
+            StubConditionsForTargets([modality for modality in MODALITIES]),
+            sorted(config.policy.train_step_indices_m),
         )
-        assert 0 < forwards < batch.reals.shape[0] * cursor.num_steps
+        order = sources.draw_order("t1n")
+        plan = ShardPlan.split(len(order), 2)
+        draw = template.draw("t1n", sources.shape_of("t1n"), plan)
+        assert len(draw.sigmas) == 2  # 该条件全量卷，非 pretrain_fake_batch
+        assert sum(stop - start for start, stop in plan.bounds) == 2
+        assert all(
+            noise.shape == (stop - start, *sources.shape_of("t1n"))
+            for noise, (start, stop) in zip(draw.noises, plan.bounds)
+        )
+        # 成本读数与测量批的规模同源（全量 σ 列表推算）：严格小于量产
+        # 的「每卷全 ODE」上界
+        cursor = TrainingRuntime.assemble_schedules(config).cursor("t1n")
+        forwards = template.forward_count("t1n", draw.sigmas)
+        assert 0 < forwards < len(draw.sigmas) * cursor.num_steps
 
     def test_report_carries_recon_criterion_and_support_volumes(
         self, scenario: PretrainScenario,
@@ -1070,36 +1119,30 @@ class TestPretrainReconstructionFakeSupply:
         assert payload["auc_criterion"] == "recon_auc"
         assert payload["condition_volumes"] == report.condition_volumes
 
-    def test_pretrain_events_carry_reconstruction_cost_readout(
-        self, scenario: PretrainScenario,
-    ) -> None:
-        """事件面（#171 AC5）：每步 pretrain 事件带重构成本读数——
-        前向次数 = 测量批逐卷余量之和（严格小于「每卷全 ODE」的
-        ``num_steps`` 上界）、卷数 = 该条件 held-out 全量卷；量产
-        rollout 退出执行路径后再无该量级的固定开销。"""
-        scenario.write_config(reward={
-            "pretrain_pass_threshold": 0.99,  # 不可达：走满步数上限
-            "pretrain_max_steps": 4,
-        })
-        assert scenario.pretrain().code == 0
-        events = [
-            event for event in scenario.events()
-            if event["event"] == "pretrain"
-        ]
-        assert len(events) == 4
-        config = scenario.config()
-        cursor = TrainingRuntime.assemble_schedules(config).cursor(MODALITIES[0])
-        for event in events:
-            assert event["measurement_volumes"] == 2  # 每条件 held-out 2 卷
-            assert 0 < event["reconstruction_forwards"] < (
-                event["measurement_volumes"] * cursor.num_steps
-            )
+
+class StubConditionsForTargets:
+    """按给定条件集的固定构造替身（targets 查询 + 不耗 RNG 的条件构造
+    ——测量模板几何用例的 conditions 注入）。"""
+
+    def __init__(self, names: list[str]) -> None:
+        self._names = tuple(names)
+
+    def sample_target(self, target, generator=None):
+        return RolloutCondition(
+            label=torch.tensor([29]), spacing=SPACING, name=target,
+        )
+
+    def targets(self):
+        return self._names
 
 
-SCRIPTED_SHAPE = (4, 4, 16, 16, 8)
-"""替身批形状共此一源：ScriptedAuc 测量批与 ScriptedAssembler 更新批
-同形（driver 的测量批与更新批同经装配 seam，形状分叉只会在运行断言
-炸——常量共享让两处不可能漂移）。"""
+SPACING = torch.tensor([[100.0, 100.0, 100.0]])
+
+
+"""替身观测面（终止状态机用例）：ScriptedClusters 承载按条件脚本的
+AUC 数值与卷数（driver._measurement 注入面的返回形态）、ScriptedSupport
+承载判定脚本——主控测量/更新 seam 整体替换（#221 决议 1 inline 主控的
+注入缝 = 主控方法本身）。"""
 
 
 class ScriptedClusters:
@@ -1118,62 +1161,37 @@ class ScriptedClusters:
         return self._point_estimate
 
 
-class ScriptedAuc:
-    """HeldOutAuc 替身：按条件脚本返回点估计（记录测量次序供断言）；
-    容量查询恒充足（守卫路径由真实 manifest 用例覆盖）。
+class ScriptedAucFace:
+    """主控测量 seam 的替身载体：按条件脚本返回聚类（数值 = 脚本值、
+    卷数 = 4）并记录测量次序——``driver._measurement`` 注入面的返回
+    形态（主控拿聚类做 pooled_auc/支撑度判定/卷数留痕）。"""
 
-    ``condition_latents`` 与 ``compute_volume_clusters`` 的配对语义照搬
-    真实实现（real 侧由调用方给出、与 fake 同量同形）——条件归因不在
-    聚类 seam 的入参里（生产签名无 modality 位），由测量流「先取
-    real 侧」的 ``condition_latents`` 调用带出。状态机用例只换测量面的
-    **数值来源**，不绕开配对契约。"""
+    def __init__(
+        self, values: dict[str, float], measurements: list[str],
+    ) -> None:
+        self._values = values
+        self.measurements = measurements
 
-    def __init__(self, values: dict[str, float]) -> None:
-        self.values = values
-        self.measurements: list[str] = []
-        self.paired: list[bool] = []
-        self._measuring: str | None = None
-
-    def condition_latents(self, modality: str) -> torch.Tensor:
-        self._measuring = modality  # 测量流先取 real 侧：条件归因随之而来
-        return torch.zeros(SCRIPTED_SHAPE)
-
-    def compute_volume_clusters(self, latents, fake_latents):
-        assert latents.shape == fake_latents.shape  # 同源配对的逐样本对齐
-        assert self._measuring is not None  # 生产 seam 无 modality 位
-        modality = self._measuring
-        self.measurements.append(modality)
-        self.paired.append(True)
-        return ScriptedClusters(
-            modality, self.values[modality], latents.shape[0],
-        )
-
-    def condition_volume_count(self, modality) -> int:
-        return 4
+    def __call__(self, modality: str) -> ScriptedClusters:
+        return ScriptedClusters(modality, self._values[modality], 4)
 
 
-class ScriptedAssembler:
-    """ReconstructionAssembler 替身（旋转状态机用例的装配 seam）：测量批
-    real/fake 同量同形、值可辨识（fake = −real，同源配对的可观测面）；
-    成本读数恒 1。更新批同经本替身（ADR-0012 后 driver 的测量与更新是
-    同一装配原语的两条入口，替换必须同时覆盖）——RecordingUpdate 不做
-    真实前向，形状仅走 ``UpdateReport`` 的 batch_size 记账（4 卷 ×
-    BraTS latent 形状，与 ScriptedAuc 替身批同约定）。"""
-
-    def assemble(self, modality: str) -> PairBatch:
-        return PairBatch(
-            reals=torch.zeros(SCRIPTED_SHAPE),
-            fakes=torch.zeros(SCRIPTED_SHAPE),
-            modality=modality,
-        )
-
-    def measure_condition(self, reals: torch.Tensor, modality: str):
-        return PairBatch(reals=reals, fakes=-reals, modality=modality)
-
-    def measurement_forward_count(
-        self, reals: torch.Tensor, modality: str,
-    ) -> int:
-        return 1
+def _scripted_report(modality: str, k: int = 4) -> UpdateReport:
+    """更新 seam 的替身报告（单条件单桶、train acc 恒 0.5——分叉观测
+    的 γ 用例口径：0.5 − held-out 0.4 = 0.1 ≥ 阈值）。"""
+    return UpdateReport(
+        conditions=(ConditionUpdateDetail(
+            condition=modality,
+            loss_discriminator=1.0,
+            loss_real_term=0.5,
+            loss_fake_term=0.5,
+            pair_count=k,
+            train_pairwise_acc=0.5,
+        ),),
+        batch_size=k,
+        global_batch_size=k,
+        loss_discriminator=1.0,
+    )
 
 
 class ScriptedSupport:
@@ -1192,19 +1210,21 @@ class ScriptedSupport:
 
 
 class TestPretrainRotationStateMachine:
-    """终止状态机替身用例（ADR-0008-04 决策 3 的判定语义）：测量
-    （ScriptedAuc）/ 支撑度判定（ScriptedSupport）/ 更新（RecordingUpdate）
-    四 seam 换脚本替身（测量 / 配对批装配 / 支撑度 / 更新），确认棘轮、
-    部分过线、复测掉线、耗尽补测的语义逐项驱动。事件落盘走真实路径。"""
+    """终止状态机替身用例（ADR-0008-04 决策 3 的判定语义）：主控三 seam
+    （测量 / 支撑度判定 / 更新）换脚本替身，确认棘轮、部分过线、复测
+    掉线、耗尽补测的语义逐项驱动。事件落盘走真实路径。"""
 
     @pytest.fixture
     def scripted(self, scenario: PretrainScenario):
-        """替身驱动的 driver 工厂：config 定死不可达门槛，三 seam 注入；
-        ``reward_overrides`` 供 γ 用例覆写分叉 knobs（不牵动其余用例）。"""
+        """替身驱动的 driver 工厂：config 定死不可达门槛，主控 seam 注入
+        （测量 = ``driver._measurement``、判定 = ``driver._support``、
+        更新 = ``driver._update``——#221 决议 1 的 inline 主控让三 seam
+        收敛为主控方法本身）；``reward_overrides`` 供 γ 用例覆写分叉
+        knobs（不牵动其余用例）。"""
         def factory(
             values: dict[str, float], plan: dict[str, list[bool]],
             max_steps: int = 8, reward_overrides: dict | None = None,
-        ) -> tuple[PretrainDriver, ScriptedAuc, ScriptedSupport, RecordingUpdate]:
+        ) -> tuple[PretrainDriver, ScriptedAucFace, ScriptedSupport, list[str]]:
             scenario.write_config(reward={
                 "pretrain_pass_threshold": 0.99,
                 "pretrain_max_steps": max_steps,
@@ -1212,15 +1232,26 @@ class TestPretrainRotationStateMachine:
             })
             config = scenario.config()
             run = PretrainRun.init(config, scenario.tmp_path / "state_run")
-            driver = PretrainDriver(config, run, device=torch.device("cpu"))
-            recording = RecordingUpdate(driver.rewards.discriminator)
-            auc = ScriptedAuc(values)
+            driver = PretrainDriver.build(
+                config, run, devices=[torch.device("cpu")],
+            )
+            measurements: list[str] = []
+            updates: list[str] = []
             support = ScriptedSupport(plan)
-            driver.rewards.update = recording
-            driver.rewards.auc = auc
-            driver.rewards.assembler = ScriptedAssembler()
+            face = ScriptedAucFace(values, measurements)
+
+            def fake_measurement(modality: str):
+                measurements.append(modality)
+                return face(modality), 1  # forwards 占位（成本读数不涉本组断言）
+
+            def fake_update(modality: str):
+                updates.append(modality)
+                return [_scripted_report(modality)]
+
+            driver._measurement = fake_measurement
+            driver._update = fake_update
             driver._support = support
-            return driver, auc, support, recording
+            return driver, face, support, updates
         return factory
 
     def test_all_conditions_confirmed_stops_early(
@@ -1230,16 +1261,16 @@ class TestPretrainRotationStateMachine:
         换批复测确认 → 棘轮入列；全部过线终止，零更新零事件。"""
         values = {modality: 0.8 for modality in MODALITIES}
         plan = {modality: [True] for modality in MODALITIES}
-        driver, auc, support, recording = scripted(values, plan)
+        driver, face, support, updates = scripted(values, plan)
         report = driver.run()
         assert report.all_conditions_passed is True
         assert report.steps_completed == 0
         assert report.conditions_passed == list(MODALITIES)
         assert report.condition_auc == {modality: 0.8 for modality in MODALITIES}
-        assert recording.received == []  # 确认步不更新
+        assert updates == []  # 确认步不更新
         assert driver._run.read_events() == []  # 无更新即无事件
         # 测量次序：每条件「首测 + 复测」成对、按轮转序推进
-        assert auc.measurements == [
+        assert face.measurements == [
             modality
             for modality in MODALITIES
             for _ in range(2)
@@ -1259,7 +1290,7 @@ class TestPretrainRotationStateMachine:
         plan = {
             "t1n": [True], "t1c": [False], "t2w": [False], "t2f": [False],
         }
-        driver, auc, support, recording = scripted(values, plan, max_steps=8)
+        driver, face, support, updates = scripted(values, plan, max_steps=8)
         report = driver.run()
         assert report.all_conditions_passed is False
         assert report.conditions_passed == ["t1n"]
@@ -1270,14 +1301,14 @@ class TestPretrainRotationStateMachine:
         assert report.condition_auc["t2f"] == pytest.approx(0.4)
         # 测量：step0 测 t1n（首测+复测）；steps 1-7 更新步各一次首测
         # （t1n 已确认的轮转步只测不判）；耗尽补测 t1c/t2w/t2f 各一次
-        assert auc.measurements == [
+        assert face.measurements == [
             "t1n", "t1n",                       # step0：首测 + 复测
             "t1c", "t2w", "t2f", "t1n",         # 轮转 steps 1-4
             "t1c", "t2w", "t2f",                # 轮转 steps 5-7
             "t1c", "t2w", "t2f",                # 耗尽补测（t1n 已确认不补）
         ]
         # 已确认条件照常参与轮转更新
-        assert recording.modalities == [
+        assert updates == [
             MODALITIES[step % len(MODALITIES)] for step in range(1, 8)
         ]
 
@@ -1292,7 +1323,7 @@ class TestPretrainRotationStateMachine:
             "t1n": [True, False],  # 首测过、复测掉
             "t1c": [False], "t2w": [False], "t2f": [False],
         }
-        driver, auc, support, recording = scripted(values, plan, max_steps=4)
+        driver, face, support, updates = scripted(values, plan, max_steps=4)
         report = driver.run()
         assert report.all_conditions_passed is False
         assert report.conditions_passed == []
@@ -1314,7 +1345,7 @@ class TestPretrainRotationStateMachine:
         事件之后（与在线侧「iter 后随告警」同构的归并序）。"""
         values = {modality: 0.4 for modality in MODALITIES}
         plan = {modality: [False] for modality in MODALITIES}
-        driver, auc, support, recording = scripted(
+        driver, face, support, updates = scripted(
             values, plan, max_steps=4,
             reward_overrides={"overfit_alert_divergence": 0.01},
         )
@@ -1342,49 +1373,6 @@ class TestPretrainRotationStateMachine:
             event["heldout_auc"] == pytest.approx(0.4)
             for event in events if event["event"] == "pretrain"
         )
-
-    def test_measurement_batch_released_before_update_step(
-        self, scripted,
-    ) -> None:
-        """更新步执行时测量批已出作用域（#174 生产重跑 OOM 修复）：测量
-        批 = 该条件全量 held-out 卷的配对批（生产口径 512 卷/条件，t1w/
-        coronal 尺寸下单批数十 GiB 级驻留）——AUC 归因完成后事件面只剩
-        卷数（volumes 留痕），配对张量不留到更新步（测量批驻留 + 更新批
-        装配叠加是 64 GiB 卡上的 OOM 峰值）。"""
-        values = {modality: 0.4 for modality in MODALITIES}
-        plan = {modality: [False] for modality in MODALITIES}
-        driver, auc, support, recording = scripted(values, plan, max_steps=2)
-        assembler = driver.rewards.assembler
-        refs: list[weakref.ReferenceType] = []
-
-        class MeasuringRefs:
-            """测量 seam 包装：对每步测量批挂弱引用（释放时机的观测面）。"""
-
-            def measure_condition(self, reals, modality):
-                batch = assembler.measure_condition(reals, modality)
-                refs.append(weakref.ref(batch))
-                return batch
-
-            def assemble(self, modality):
-                return assembler.assemble(modality)
-
-            def measurement_forward_count(self, reals, modality):
-                return assembler.measurement_forward_count(reals, modality)
-
-        driver.rewards.assembler = MeasuringRefs()
-        alive_at_update: list[list[bool]] = []
-        update_step = driver.rewards.update_step
-
-        def spying_update_step(pair_batch):
-            alive_at_update.append([ref() is not None for ref in refs])
-            return update_step(pair_batch)
-
-        driver.rewards.update_step = spying_update_step
-        report = driver.run()
-        assert report.steps_completed == 2
-        assert len(recording.received) == 2  # 每步都走更新（不可达门槛）
-        # 每个更新步执行时：此前所有测量批（含本步）都不再存活
-        assert alive_at_update == [[False], [False, False]]
 
 
 class TestOverfitAlertEventContract:
@@ -1517,3 +1505,217 @@ class TestOverfitAlertEventContract:
             (event["event"], event.get("phase"))
             for event in artifacts.read_events()
         ] == [("overfit_alert", "pretrain")]
+
+
+class TestPretrainReproduction:
+    """复现双口径锚（#221 决议 19/20，ADR-0018）：
+
+    - **恒等面五条读数**：排列 seed+3 / 测量模板 seed+19 / SupportRule
+      seed+7 / 冷启动判别器 seed+6 / 卡 0 recon seed+9——随机面的流
+      派生数值与现行口径逐位恒等（对照表的机器面）；drift 面卡 ≥1 的
+      recon 流卡轴派生（seed+卡×10⁶+9）同测试锁（决议 20）；
+    - **CPU fixture 重放逐位**（双口径层 2）：同 config 同卡数两 run
+      ——事件流逐字段一致 + 报告与 checkpoint 指纹一致（测试进程逐位
+      口径）；生产统计等价口径由 gauss 多卡档承载。
+    """
+
+    def _started(
+        self, config: CynosureConfig, run: PretrainRun,
+        devices: list[torch.device] | None = None,
+    ):
+        driver = PretrainDriver.build(config, run, devices=devices)
+        for card in driver._cards:
+            card.start()
+        return driver
+
+    def test_identity_face_five_stream_anchors(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """恒等面五条读数 + drift 面（#221 决议 20 对照表的机器面）：
+        流派生数值 = seed + 既有偏移登记（train/rng 偏移布局权威），
+        断言读取 driver 实例装配出的真实 generator——派生公式或基址
+        选择被误改时此处显式红。双卡 CPU driver 承载（threshold 0.01
+        = 首测过线复测确认的零更新路径，不触 multicard 更新守卫；
+        K=2 过 real 容量守卫 K×卡数 ≤ 池深）。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.01,
+            "disc_batch_size_k": 2,
+        })
+        config = scenario.config()
+        seed = config.schedule.seed
+        run = PretrainRun.init(config, scenario.tmp_path / "identity_run")
+        driver = self._started(config, run, devices=[
+            torch.device("cpu"), torch.device("cpu"),
+        ])
+        try:
+            # 排列流 seed+3（主控单点直派——恒等面第 1 条）
+            assert driver._sources._order_sampler._generator.initial_seed() == seed + 3
+            # real 侧 seed+1（drift 面的抽取者单点，流位本身不 drift）
+            assert driver._sources._real_sampler._generator.initial_seed() == seed + 1
+            # SupportRule seed+7（恒等面第 3 条）
+            assert driver._support._generator.initial_seed() == seed + 7
+            # 冷启动 seed+6（恒等面第 4 条）：卡 0 判别器与 fresh 冷启动逐位
+            fresh = TrainingRuntime.assemble_scorer(config, None)
+            reference = NetworkAssembler.loadable_state_dict(fresh.discriminator)
+            card0 = NetworkAssembler.loadable_state_dict(
+                driver._cards[0]._require_rig().scorer.discriminator,
+            )
+            assert set(card0) == set(reference)
+            assert all(
+                torch.equal(card0[key], reference[key]) for key in reference
+            )
+            # 卡 0 recon seed+9（恒等面第 5 条：基址 = seed+0×10⁶ 的
+            # 恒等特例——读 rig 装配出的真实流，非派生公式复读）
+            assert driver._cards[0]._require_rig().assembler._generator.initial_seed() == seed + 9
+            # 卡 ≥1 recon = seed+卡×10⁶+9（drift 面：卡轴派生）
+            assert driver._cards[1]._require_rig().assembler._generator.initial_seed() == seed + 1_000_000 + 9
+            # 测量模板 seed+19（恒等面第 2 条）：run 装配的模板复位态
+            # = 显式直锚（config.schedule.seed → 模板构造的 driver
+            # 传递面；模板值契约由 test_pretrain_measurement 锁）
+            driver.run()
+            assert driver._template is not None
+            assert torch.equal(
+                driver._template._template_state,
+                torch.Generator().manual_seed(seed + 19).get_state(),
+            )
+        finally:
+            for card in driver._cards:
+                card.stop()
+
+    def test_same_seed_replay_is_bitwise_identical(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """CPU fixture 重放逐位（#221 决议 19 同 config 同卡数重放）：
+        同 seed 两 run——pretrain 事件流除 elapsed 墙钟外逐字段一致
+        （步号/条件/AUC/loss/forwards/volumes/lr 数值面逐项对照，墙钟
+        读数天然非确定）、报告逐字段一致、checkpoint 内容指纹一致。
+        步数显式 3（生产默认 2000 是满走面上限，重放锚只需覆盖四态
+        路径的密集步进段——满步数轮转的形态由轮转状态机替身用例驱动）。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 3,
+        })
+        config = scenario.config()
+        reports = []
+        metric_lines = []
+        ckpt_digests = []
+        for index in range(2):
+            run = PretrainRun.init(
+                config, scenario.tmp_path / f"replay_run_{index}",
+            )
+            driver = self._started(config, run)
+            try:
+                reports.append(driver.run())
+            finally:
+                for card in driver._cards:
+                    card.stop()
+            metrics = run.paths.metrics.read_text(encoding="utf-8")
+            metric_lines.append([
+                json.loads(line) for line in metrics.splitlines() if line
+            ])
+            ckpt_digests.append(PretrainProvenance.digest(
+                run.paths.discriminator_ckpt,
+            ))
+        first, second = reports
+        assert first.condition_auc == second.condition_auc
+        assert first.conditions_passed == second.conditions_passed
+        assert first.steps_completed == second.steps_completed
+        assert first.all_conditions_passed == second.all_conditions_passed
+        for events_a, events_b in zip(*metric_lines):
+            for field in (
+                "event", "step", "modality", "heldout_auc",
+                "loss_discriminator",
+                "reconstruction_forwards", "measurement_volumes", "lr",
+            ):
+                assert events_a[field] == events_b[field], field
+        assert ckpt_digests[0] == ckpt_digests[1]
+
+
+@pytest.mark.gpu  # 多卡 e2e：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）
+@pytest.mark.slow
+class TestPretrainMultiCardGauss:
+    """gauss 多卡档（#221 决议 19 三层锚的层 3 + #221 决议 1 扇出面）：
+    多卡端到端 + 跨卡判别器逐位一致（确定性 allreduce + u/v broadcast +
+    同步 step 的结构性保证）+ 同 seed 重放（生产统计等价口径的数值面
+    对照）。CPU 环境自动跳过（conftest 执行环境分派）。"""
+
+    def _devices(self) -> list[torch.device] | None:
+        if not (torch.cuda.is_available() and torch.cuda.device_count() >= 2):
+            return None
+        return [
+            torch.device("cuda", index)
+            for index in range(min(torch.cuda.device_count(), 4))
+        ]
+
+    def test_multicard_run_bitwise_consistent_discriminators(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """多卡密集步进：跨卡判别器 state_dict 逐位一致（含 spectral
+        buffer）；事件流 = (步, 条件) 完备序、告警 rank 字段 = 卡号且
+        按卡序排列。"""
+        devices = self._devices()
+        if devices is None:
+            pytest.skip("多卡档：需要 ≥2 CUDA 设备")
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.99})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "multicard_run")
+        driver = PretrainDriver.build(config, run, devices=devices)
+        try:
+            report = driver.run()
+        finally:
+            for card in driver._cards:
+                card.stop()
+        assert report.steps_completed == config.reward.pretrain_max_steps
+        reference = NetworkAssembler.loadable_state_dict(
+            driver._cards[0]._require_rig().scorer.discriminator,
+        )
+        for card in driver._cards[1:]:
+            other = NetworkAssembler.loadable_state_dict(
+                card._require_rig().scorer.discriminator,
+            )
+            assert set(other) == set(reference)
+            assert all(
+                torch.equal(reference[key], other[key]) for key in reference
+            ), card.index
+        events = run.read_events()
+        pretrain_events = [
+            event for event in events if event["event"] == "pretrain"
+        ]
+        assert [event["step"] for event in pretrain_events] == list(
+            range(report.steps_completed),
+        )
+        alerts = [
+            event for event in events if event["event"] == "overfit_alert"
+        ]
+        for index, alert in enumerate(alerts):
+            assert alert["phase"] == "pretrain"
+            assert 0 <= alert["rank"] < len(devices)  # 卡轴归因
+
+    def test_multicard_seed_replay_tracks_bitwise(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """同 config 同卡数重放逐位（#221 决议 19；多卡数值面）：两 run
+        的 per-condition AUC 与步数一致、checkpoint 内容指纹一致。"""
+        devices = self._devices()
+        if devices is None:
+            pytest.skip("多卡档：需要 ≥2 CUDA 设备")
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.99})
+        config = scenario.config()
+        digests = []
+        reports = []
+        for index in range(2):
+            run = PretrainRun.init(
+                config, scenario.tmp_path / f"multicard_replay_{index}",
+            )
+            driver = PretrainDriver.build(config, run, devices=devices)
+            try:
+                reports.append(driver.run())
+            finally:
+                for card in driver._cards:
+                    card.stop()
+            digests.append(PretrainProvenance.digest(
+                run.paths.discriminator_ckpt,
+            ))
+        assert reports[0].condition_auc == reports[1].condition_auc
+        assert reports[0].steps_completed == reports[1].steps_completed
+        assert digests[0] == digests[1]

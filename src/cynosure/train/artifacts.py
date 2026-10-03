@@ -240,7 +240,8 @@ class PretrainEvent(BaseModel):
     """本步测量批重构消耗的 policy 前向次数（#171 AC5 的成本口径读数：
     批量量产的 num_steps 步全 ODE 路径已退役，本读数让「每卷重构前向 =
     num_steps − 起始步位、恒严格小于全 ODE 步数」在事件流上可核对——
-    与装配原语的 ``measurement_forward_count`` 同源推算，非平行复刻）。
+    与测量模板的 σ 序列推算同源（ADR-0018 起宿主 =
+    ``MeasurementTemplate.forward_count``），非平行复刻）。
     None = 本步未测量（当前执行路径每步都测，留 None 供旧事件与未来
     分支）。"""
     measurement_volumes: int | None = None
@@ -519,7 +520,9 @@ class RunPaths:
 
 class RunArtifacts:
     """run 目录与产物工件契约：config 快照 + metrics.jsonl + manifest +
-    checkpoint 目录，落 ``$HOME``（多 rank 下指标由 rank 0 归并写出）。"""
+    checkpoint 目录，落 ``$HOME``（多 rank 下指标由 rank 0 直写——
+    EventMerger 归并随 #238 退役，非 rank 0 事件不落盘，ADR-0018
+    决策 11 显式 drift）。"""
 
     def __init__(self, paths: RunPaths) -> None:
         self.paths = paths

@@ -39,11 +39,10 @@ CFG 组合场、组2 裸条件单前向（condition 经 ``ConditionSampler`` 产
 
 - ``assemble``（**更新批**）：s 逐样本均匀抽自被优化步日程点（ADR-0012
   决策 2）、ε 同流 —— 训练分布；
-- ``measure_condition``（**gate 测量批**，ADR-0012 决策 5 的 recon-AUC
-  构造面）：s 按候选步点**定序轮转**、ε 走**批次起手复位**的测量流 ——
-  同输入逐位同输出。测量是上岗判据的原料（报告值与白名单都由它出），
-  不许随「此前抽了多少次」漂移：逐条件读全量 held-out 卷打分，逐次测量
-  与 run 配置无关地可比、可复算。
+- gate 测量批（ADR-0012 决策 5 的 recon-AUC 构造面）已随 #221 决议 5
+  迁出本原语：主控单点复位测量模板（``cynosure.pretrain.measurement``
+  ——seed+19 显式直锚 + 按卡序逐段抽 ε），本原语只承担更新批与
+  供给入口的重构核。
 """
 
 from dataclasses import dataclass
@@ -52,7 +51,6 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 
 from cynosure.policy.condition import RolloutCondition
-from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import ConditionSchedules
@@ -60,16 +58,6 @@ from cynosure.reward.sampler import RealSampling
 
 if TYPE_CHECKING:
     from cynosure.train.rollout import ConditionSampler
-
-
-MEASUREMENT_STREAM_OFFSET = 10
-"""测量流（gate 测量批的 ε 与条件构造）相对**重构流**的 seed 偏移。
-绝对位置按基底分轴：``TrainingRngStreams`` 注册表八条流占 rank 轴
-seed+0..+5、+8 与 shared 轴 +9（recon；+6/+7 为注册表外的派生用途
-——冷启动判别器 fork 与 ``PretrainDriver`` 的 SupportRule bootstrap），
-测量流 = 重构流 seed + 10 = **shared_seed+19**——shared 轴上越过
-recon 位，不占任何注册表流位（不进 ``named()``：测量不参与续训状态
-清单），与 rank 轴的 +6/+7 派生不同轴、无撞位可言。"""
 
 
 @dataclass(frozen=True)
@@ -127,17 +115,6 @@ class ReconstructionAssembler:
         self._batch_size_k = batch_size_k
         self._scale_factor = latent_scale_factor
         self._generator = generator
-        # 测量流 + 复位模板（measure_condition 的确定性来源）：模板只取
-        # 状态、永不被推进——逐次测量复位到同一个起手点，测量输入因此
-        # 与「本 run 此前测量过几次」无关。与 recon 流同为 shared seed
-        # 派生（recon = shared_seed+9，本流 = +10 → shared_seed+19，
-        # 越过 recon 位、不占注册表），跨 rank 一致但互不交叉；
-        # 不进 TrainingRngStreams 注册表——测量不参与续训状态清单。
-        self._measurement_template = (
-            torch.Generator()
-            .manual_seed(generator.initial_seed() + MEASUREMENT_STREAM_OFFSET)
-            .get_state()
-        )
         self._amp = amp
 
     def assemble(self, modality: str) -> PairBatch:
@@ -180,7 +157,9 @@ class ReconstructionAssembler:
         )
         steps = [self._step_indices[i] for i in position.tolist()]
         cursor = self._schedules.cursor(condition.name_or_raise())
-        self._assert_indices_within_schedule(cursor, condition.name_or_raise())
+        cursor.assert_reconstruction_candidates(
+            self._step_indices, condition.name_or_raise(),
+        )
         sigmas = [cursor.sigma_level(step) for step in steps]
         noise = torch.randn(
             reals.shape, generator=self._generator,
@@ -191,126 +170,6 @@ class ReconstructionAssembler:
         """本原语持有流（recon 流）的只读观测面（消耗序锚取数口；
         ``SlotRngRegistry.stream_state`` 同款：读状态不消耗、不推进）。"""
         return self._generator.get_state()
-
-    def measure_condition(
-        self,
-        reals: torch.Tensor,
-        modality: str,
-        volume_offset: int = 0,
-    ) -> PairBatch:
-        """该条件 **gate 测量批**的装配（ADR-0012 决策 5 的 recon-AUC
-        构造面）：调用方给出的 real 卷 → 定序轮转 σ → 同源重构 →
-        配对批。返回的 ``reals`` 与入参**同一个张量**——AUC 的 real 侧
-        与 fake 侧因此逐样本配对，判别目标只剩重构伪影。
-
-        ``reals`` = 该条件**全量** held-out 卷（``HeldOutAuc.
-        condition_latents`` 的返回值），量由调用方持有：real 侧既作
-        AUC 的 real、又作重构的源，两次各自自抽会让同源配对在测量层
-        悄悄失效。
-
-        与 ``assemble`` 的两处差别都在「测量的可复算性」上：
-
-        - **s 定序轮转**：第 i 枚卷取候选步点的第 ``i % |M|`` 位——全员
-          覆盖候选噪声带，且同输入恒同输出（逐样本抽 s 会让报告值随
-          「本 run 此前抽了几次」漂移，上岗判据不可复算）；
-        - **ε 走批次起手复位的测量流**：不消耗 recon 流（续训分片的流
-          位置不被测量次数搅动），也不漂移 policy 主流。
-
-        ``volume_offset``（ADR-0016 决策 4 的分布式切片语义）：本地批
-        首卷在**全量**测量批中的位次——分布式预训练把全量卷按序切片到
-        各 rank，本地第 j 卷即全量第 ``offset + j`` 卷。偏移进入两个
-        面且只进这两个面：σ 轮转按全量位次取候选第 ``(offset + j) %
-        |M|`` 位；测量流先做**前缀消耗**（生成并丢弃 offset 行的 ε，
-        torch CPU generator 的顺序流性质，#198 的前缀锚）再生的本地
-        ε 与整批 ε 的对应行**同位逐位一致**——gather 拼回的全量测量批
-        与单卡 rank0 全量测量逐位等价（多卡 gate 报告值对单卡可复算）。
-        缺省 0 = 全量批自身（World-1 路径行为逐位不变）。"""
-        if volume_offset < 0:
-            raise ValueError(
-                f"volume_offset 是本地批首卷在全量测量批中的位次，"
-                f"不得为负，得到 {volume_offset}"
-            )
-        if reals.shape[0] < 1:
-            raise ValueError("测量批需要非空 real 卷（重构的源）")
-        sigmas = self._round_robin_sigmas(
-            modality, reals.shape[0], volume_offset,
-        )
-        # 批次起手复位（一次，不逐卷复位）：本批的条件构造与 ε 从这里
-        # 同一起手点顺序展开——同输入的逐次测量逐位同输出
-        measurement = torch.Generator()
-        measurement.set_state(self._measurement_template)
-        condition = self._resolve_condition(modality, measurement)
-        if volume_offset:
-            # 前缀消耗：跳过排在本切片之前的各 rank 的 ε 行（复位流的
-            # 顺序位）——消耗序与整批同构（整批 = 条件构造 → 一次全量
-            # randn；切片 = 条件构造 → 丢弃 offset 行 → 本地 randn），
-            # 生成值因此与整批对应行逐位一致（#198 的前缀消耗锚）
-            torch.randn(
-                (volume_offset, *reals.shape[1:]), generator=measurement,
-            )
-        noise = torch.randn(reals.shape, generator=measurement).to(reals.device)
-        return self._build(reals, condition, modality, sigmas, noise)
-
-    def _round_robin_sigmas(
-        self,
-        modality: str,
-        count: int,
-        volume_offset: int = 0,
-    ) -> list[float]:
-        """定序轮转的逐卷噪声水平：第 i 枚卷取候选步点的第
-        ``(volume_offset + i) % |M|`` 位（候选 = 被优化步的 sigma 日程
-        点，按日程位升序——与 ``candidate_sigmas`` 同源）。
-        ``measure_condition`` 与 ``measurement_forward_count`` 共享本定序
-        ——成本读数与实际测量批同源推算，不是平行复刻。
-
-        ``volume_offset`` = 本地批在全量测量批中的起始位次（分布式
-        rank 切片的轮转偏移）：整批的第 k 枚卷取第 ``k % |M|`` 位，
-        切片因此按全量位次而非本地序轮转（缺省 0 = 整批自身）。"""
-        cursor = self._schedules.cursor(modality)
-        self._assert_indices_within_schedule(cursor, modality)
-        candidates = [cursor.sigma_level(step) for step in self._step_indices]
-        return [
-            candidates[(volume_offset + index) % len(candidates)]
-            for index in range(count)
-        ]
-
-    def measurement_forward_count(
-        self,
-        reals: torch.Tensor,
-        modality: str,
-        volume_offset: int = 0,
-    ) -> int:
-        """该测量批（``reals`` 同上 ``measure_condition`` 的入参）重构的
-        policy 前向次数（定序轮转下的确定值）——#171 AC5 成本口径的读数
-        面：**无全 ODE 量产**在事件流上可核对。逐卷步数 = 日程步数 − 起点
-        下标（见 ``_start_index``），恒严格小于 ``num_steps``：候选档位
-        取自被优化步（{2..15} 类中段日程点），起点下标 ≥ 0。
-
-        量纲随入参卷数（测量批的规模由调用方持有的 real 决定——装配原
-        语的 real 侧采样器≠调用方的 real 来源时，按采样器规模读会得到
-        与真实测量批无关的数）。``volume_offset`` 与
-        ``measure_condition`` 同语义（分布式切片的成本分段读数：各 rank
-        本地和 gather 求和 = 全量批的定序读数——求和合法的前提由
-        ``_round_robin_sigmas`` 的偏移轮转保证）。"""
-        if volume_offset < 0:
-            raise ValueError(
-                f"volume_offset 是本地批首卷在全量测量批中的位次，"
-                f"不得为负，得到 {volume_offset}"
-            )
-        cursor = self._schedules.cursor(modality)
-        sigmas = self._round_robin_sigmas(
-            modality, reals.shape[0], volume_offset,
-        )
-        return sum(self._remaining_steps(cursor, sigma) for sigma in sigmas)
-
-    def _remaining_steps(
-        self, cursor: TrajectoryCursor, sigma: float,
-    ) -> int:
-        """该 σ 档位的续跑步数（= 日程步数 − 1 − 起点下标，
-        ``_start_index`` 的镜像口径）。候选档位经
-        ``_assert_indices_within_schedule`` 钉在中段（1..num_steps−2），
-        零步档位在装配期即不可达，本方法只处理正步数。"""
-        return cursor.num_steps - 1 - self._start_index(cursor, sigma)
 
     def _resolve_condition(
         self, modality: str, generator: torch.Generator,
@@ -342,7 +201,7 @@ class ReconstructionAssembler:
         """该条件重构候选噪声水平的导出面（被优化步的 sigma 日程点，
         按日程位升序）——s 抽样与日程同源的镜像口径（测试与诊断消费）。"""
         cursor = self._schedules.cursor(modality)
-        self._assert_indices_within_schedule(cursor, modality)
+        cursor.assert_reconstruction_candidates(self._step_indices, modality)
         return tuple(cursor.sigma_level(step) for step in self._step_indices)
 
     def reconstruct(
@@ -394,50 +253,8 @@ class ReconstructionAssembler:
             noised = working * (1.0 - level) + noise[rows] * level
             terminal = self._sampler.continue_to_terminal(
                 noised,
-                self._start_index(cursor, sigma),
+                cursor.continue_start_index(sigma),
                 condition,
             )
             reconstructed[rows] = terminal / self._scale_factor
         return reconstructed
-
-    def _start_index(
-        self, cursor: "TrajectoryCursor", sigma: float,
-    ) -> int:
-        """σ 水平 → ``continue_to_terminal`` 的起点下标：σ = s_k 的样本
-        位于第 k 步的输入位置（即第 k−1 步的输出位置），续跑从第 k 步
-        开始积分。s = 0（σ=0 终点之后）走调用方短路、不进本方法；
-        日程点外的 σ 与最噪端 s≈1（下标 0，M 排除）显式拒绝。"""
-        for step in range(cursor.num_steps):
-            if cursor.sigma_level(step) == sigma:
-                if step == 0:
-                    raise ValueError(
-                        f"sigma={sigma} 是最噪端（日程下标 0，s≈1 奇异点）"
-                        "——不在重构候选（被优化步集合 M 排除下标 0，"
-                        "ADR-0012 决策 2）"
-                    )
-                return step - 1
-        raise ValueError(
-            f"sigma={sigma!r} 不是该条件的日程点（重构起点无从定位；"
-            "候选 = 被优化步的 sigma 日程点）"
-        )
-
-    def _assert_indices_within_schedule(self, cursor, name: str) -> None:
-        """被优化步集合在该条件日程的**中段**（末位亦是非法候选）——
-        小锚日程下 M 截尾在装配期显式暴露（可读报错点名条件与越界位），
-        而非 ``sigma_level`` 越界的 IndexError 或首步测量才炸。
-
-        末位被排除与 config 的 ``train_step_indices_m`` 校验同源
-        （``max(M) ≤ num_steps − 2``）：末位之后无续跑空间，重构会退化为
-        透传（fake ≡ real），而测量面**没有** ``reconstruct`` 的 s=0 短路
-        ——它是判别器要学的「生成伪影」的零内容批次，静默进入测量会把
-        上岗判据污染成 chance 带上的噪声。"""
-        overflow = [
-            step for step in self._step_indices
-            if step >= cursor.num_steps - 1
-        ]
-        if overflow:
-            raise ValueError(
-                f"被优化步 {overflow} 越界条件 {name} 的重构候选"
-                f"（num_steps={cursor.num_steps}：合法候选为 1..num_steps−2"
-                "，首位的 s≈1 奇异端与末位的零续跑空间都排除）"
-            )
