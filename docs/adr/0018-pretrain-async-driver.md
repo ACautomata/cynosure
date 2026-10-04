@@ -36,7 +36,7 @@ ADR-0016 把判别器预训练执行面 torchrun 化（测量批按卷分片到 
 
 8. **产物契约零改动**（#221 决议 17/18）。checkpoint = 判别器步末**卡 0 副本直写**（确定性 allreduce + u/v broadcast 保证全卡逐位一致，含 `_u`/`_v` buffer；`loadable_state_dict` 键集/格式不变；不设 checkpoint 周期 bitwise 守卫 = 显式裁决——run 短风险低）；PretrainReport 字段集与 provenance 指纹面不变；PretrainEvent 字段不动（reconstruction_forwards / measurement_volumes = 全量 σ 列表推算与全量排列长度，分段求和的加法结合恒等）；train 侧消费面（load_discriminator + 组别绑定守卫）零改动。告警轴 (步, rank) → (步, 卡) 的迁移对象**仅 OverfitAlertEvent**（rank 字段归因观测卡；OverfitMonitor 每卡实例——本地 train acc + 全局 AUC 的卡轴诊断保持）；PretrainEvent 本无 rank 字段。
 
-9. **复现承诺口径**（取代 ADR-0016 决策 7）：#218 决议 0 双口径（生产统计等价 / 测试进程逐位）+ **同 config 同卡数重放逐位**；跨卡数重跑 = 新 run（预训练无 payload、天然无拒绝面——与 RL 跨拓扑显式拒绝的差异记一句）。复现锚 = #218 三层锚形态套预训练（派生公式单元锚 + CPU fixture 重放逐位 + gauss `--run-slow` 多卡档）。
+9. **复现承诺口径**（取代 ADR-0016 决策 7）：#218 决议 0 双口径（生产统计等价 / 测试进程逐位）+ **同 config 同卡数重放逐位**；跨卡数重跑 = 新 run（预训练无 payload、天然无拒绝面——与 RL 跨拓扑显式拒绝的差异记一句）。复现锚 = #218 三层锚形态套预训练（派生公式单元锚 + CPU fixture 重放逐位 + gauss `--run-slow` 多卡档）。**accepted drift（实施期记档，CPU 层）**：CPU 库层非确定（内存对齐 → MKL 微内核分派）的位噪声 ~1e-9 不可在 torch 用户侧根除（单线程/mkldnn off/manual_seed 均压不净）——CPU 重放锚的 checkpoint 对照为张量级容差（allclose atol 1e-7），事件流与报告逐字段严格一致不变；「逐位」的文件字节 sha256 由 gauss CUDA 档独占（cudnn 确定性模式由测试环境钉死）。
 
 10. **torchrun 守卫历史回环**：CLI pretrain 恢复 ADR-0016 决策 3 恰好退役的 RANK env 拒绝守卫（执行模型已单进程多卡化，进程内多卡由设备发现承担）；`fid`/`fid-floor`/`base-smoke` 的 `_reject_torchrun` 泛化守卫随 RANK 注入源死化一并退役。
 

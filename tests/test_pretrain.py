@@ -19,6 +19,7 @@ per-condition 步进（ADR-0008-04）分两层锁：**轮转与归因**在端到
 
 import copy
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -532,6 +533,13 @@ class PretrainScenario:
         # 报告路径 = run 目录内的契约名（run 目录缺省随它派生）
         self.config_dict["reward"].update({
             "pretrain_report_json": str(self.run_dir / "pretrain_report.json"),
+            # 容量守卫按 K×卡数把门（#238）：测试进程经 conftest 裁到
+            # 2 卡（held-out val 2 卷/条件的天花板）——K=4 在 CPU 单卡
+            # 与 2 卡 gauss 全口径过线（4×2=8 ≤ real 14）。K=4 不用更低
+            # 值：批 shape 2/3 是 CPU 卷积归约位漂的更强观测面（容差化
+            # 后只影响重放对照的位漂幅度，ADR-0018 决策 9；K=4 观测史
+            # 位漂最小）
+            "disc_batch_size_k": 4,
         })
 
     def write_config(
@@ -690,6 +698,9 @@ class TestPretrainEndToEnd:
             "pretrain_pass_threshold": 0.99,
             "pretrain_max_steps": 12,
             "disc_lr": 2e-4,
+            # 学习生效断言（rises ≥ 1）需要每步足够的配对批信号：显式
+            # 锚 K=4（场景默认同值；单卡 CPU 下 4 对/步）
+            "disc_batch_size_k": 4,
         })
         result = scenario.pretrain()
         assert result.code == 0, result.stderr
@@ -983,10 +994,15 @@ class TestPretrainDriverAssembly:
                     "spacing": [100.0, 100.0, 100.0],
                 }
                 for modality in ("t1n", "t1c", "t2w", "t2f")
-                for index in range(3)  # 每模态 3 条 < K=4
+                for index in range(3)  # 每模态 3 条 < K×卡数
             ],
         }), encoding="utf-8")
-        scenario.write_config(reward={"real_pool_manifest": str(small_pool)})
+        scenario.write_config(reward={
+            "real_pool_manifest": str(small_pool),
+            # 守卫边界测试显式锚 K=4（场景默认同值，锚定断言语义不随
+            # 场景默认演进漂移）：每模态 3 条 < K×卡数（测试进程 2 卡）
+            "disc_batch_size_k": 4,
+        })
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "capacity_run")
         with pytest.raises(ValueError, match="容量不足") as exc_info:
@@ -1514,9 +1530,11 @@ class TestPretrainReproduction:
       seed+7 / 冷启动判别器 seed+6 / 卡 0 recon seed+9——随机面的流
       派生数值与现行口径逐位恒等（对照表的机器面）；drift 面卡 ≥1 的
       recon 流卡轴派生（seed+卡×10⁶+9）同测试锁（决议 20）；
-    - **CPU fixture 重放逐位**（双口径层 2）：同 config 同卡数两 run
-      ——事件流逐字段一致 + 报告与 checkpoint 指纹一致（测试进程逐位
-      口径）；生产统计等价口径由 gauss 多卡档承载。
+    - **CPU fixture 重放**（双口径层 2）：同 config 同卡数两 run——
+      事件流与报告逐字段严格一致 + checkpoint 张量级容差一致（CPU 库
+      层位噪声 ~1e-9 的容差口径，ADR-0018 决策 9 accepted drift；
+      逐位字节 sha256 由 gauss CUDA 档独占）；生产统计等价口径由
+      gauss 多卡档承载。
     """
 
     def _started(
@@ -1582,13 +1600,16 @@ class TestPretrainReproduction:
             for card in driver._cards:
                 card.stop()
 
-    def test_same_seed_replay_is_bitwise_identical(
+    def test_same_seed_replay_is_reproducible(
         self, scenario: PretrainScenario,
+        deterministic_cpu_replay: None,
+        checkpoint_parity: Callable[[dict, dict], None],
     ) -> None:
         """CPU fixture 重放逐位（#221 决议 19 同 config 同卡数重放）：
         同 seed 两 run——pretrain 事件流除 elapsed 墙钟外逐字段一致
         （步号/条件/AUC/loss/forwards/volumes/lr 数值面逐项对照，墙钟
-        读数天然非确定）、报告逐字段一致、checkpoint 内容指纹一致。
+        读数天然非确定）、报告逐字段一致、checkpoint 容差一致
+        （``checkpoint_parity``，ADR-0018 决策 9）。
         步数显式 3（生产默认 2000 是满走面上限，重放锚只需覆盖四态
         路径的密集步进段——满步数轮转的形态由轮转状态机替身用例驱动）。"""
         scenario.write_config(reward={
@@ -1598,8 +1619,12 @@ class TestPretrainReproduction:
         config = scenario.config()
         reports = []
         metric_lines = []
-        ckpt_digests = []
+        ckpts = []
         for index in range(2):
+            # 全局 RNG 每run 重置：spectral norm 的 u 向量惰性初始化
+            # 消耗全局 RNG（非注册流）——同进程双 run 间状态漂移会让
+            # u 落点微差、权重演化位漂破坏重放锚
+            torch.manual_seed(config.schedule.seed)
             run = PretrainRun.init(
                 config, scenario.tmp_path / f"replay_run_{index}",
             )
@@ -1613,8 +1638,9 @@ class TestPretrainReproduction:
             metric_lines.append([
                 json.loads(line) for line in metrics.splitlines() if line
             ])
-            ckpt_digests.append(PretrainProvenance.digest(
+            ckpts.append(torch.load(
                 run.paths.discriminator_ckpt,
+                map_location="cpu", weights_only=True,
             ))
         first, second = reports
         assert first.condition_auc == second.condition_auc
@@ -1628,7 +1654,7 @@ class TestPretrainReproduction:
                 "reconstruction_forwards", "measurement_volumes", "lr",
             ):
                 assert events_a[field] == events_b[field], field
-        assert ckpt_digests[0] == ckpt_digests[1]
+        checkpoint_parity(ckpts[0], ckpts[1])
 
 
 @pytest.mark.gpu  # 多卡 e2e：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）
@@ -1652,11 +1678,17 @@ class TestPretrainMultiCardGauss:
     ) -> None:
         """多卡密集步进：跨卡判别器 state_dict 逐位一致（含 spectral
         buffer）；事件流 = (步, 条件) 完备序、告警 rank 字段 = 卡号且
-        按卡序排列。"""
+        按卡序排列。步数显式 40：0.99 阈值下过线步数远低于默认上限
+        2000（单卡 CPU 实测 239 步提前终止；2 卡 CUDA 判别力更强、
+        过线只会更早——「走满上限」断言需要一个观测上不可达的步数
+        预算，gauss 实测 40 步内未达线且有密集步进段）。"""
         devices = self._devices()
         if devices is None:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备")
-        scenario.write_config(reward={"pretrain_pass_threshold": 0.99})
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 40,
+        })
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "multicard_run")
         driver = PretrainDriver.build(config, run, devices=devices)
@@ -1666,16 +1698,19 @@ class TestPretrainMultiCardGauss:
             for card in driver._cards:
                 card.stop()
         assert report.steps_completed == config.reward.pretrain_max_steps
-        reference = NetworkAssembler.loadable_state_dict(
+        state = NetworkAssembler.loadable_state_dict(
             driver._cards[0]._require_rig().scorer.discriminator,
         )
+        reference = {key: value.cpu() for key, value in state.items()}
         for card in driver._cards[1:]:
             other = NetworkAssembler.loadable_state_dict(
                 card._require_rig().scorer.discriminator,
             )
             assert set(other) == set(reference)
+            # torch.equal 不跨设备——各卡副本先归位 CPU 再逐位对照
             assert all(
-                torch.equal(reference[key], other[key]) for key in reference
+                torch.equal(reference[key], other[key].cpu())
+                for key in reference
             ), card.index
         events = run.read_events()
         pretrain_events = [
@@ -1695,11 +1730,18 @@ class TestPretrainMultiCardGauss:
         self, scenario: PretrainScenario,
     ) -> None:
         """同 config 同卡数重放逐位（#221 决议 19；多卡数值面）：两 run
-        的 per-condition AUC 与步数一致、checkpoint 内容指纹一致。"""
+        的 per-condition AUC 与步数一致、checkpoint 内容指纹一致。步数
+        显式 40（同 bitwise_consistent 的不可达预算口径）。两 run 间不
+        重置全局 RNG（CPU 档双 run 前的 torch.manual_seed 重置未在此
+        复写）：CUDA 档两 run digest 逐位一致由 gauss 实测背书——全局
+        RNG 与设备流的消耗位置和 CPU 档不同，若未来 flaky 再对齐重置。"""
         devices = self._devices()
         if devices is None:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备")
-        scenario.write_config(reward={"pretrain_pass_threshold": 0.99})
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 40,
+        })
         config = scenario.config()
         digests = []
         reports = []
