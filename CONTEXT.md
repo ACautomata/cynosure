@@ -203,18 +203,18 @@ _Avoid_: 分辨率、尺度（尺度另有所指，见 多尺度判别器）
 ### 分布式执行
 
 **Rank（进程秩）**:
-torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0016 退役：pretrain 留 torchrun 期间保留本语义，async 执行序落地后删除——记账/归并/事件归因全轴收敛到「槽」（iter 事件的 rank 字段语义已重定义为槽号，字段名随事件契约「可扩不可改名」保留）。
-_Avoid_: 进程号、节点（node 是机器，rank 是进程）
+torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0018 退役：pretrain 已单进程多卡化（RANK env 守卫历史回环恢复）、记账/归并/事件归因全轴收敛到「槽」或「卡」（iter 事件的 rank 字段语义 = 槽号、预训练告警的 rank 字段语义 = 卡号——字段名随事件契约「可扩不可改名」保留）；语义仅存旧执行序 trainer 的衰减窗口（切换期删除）。
+_Avoid_: 进程号、节点（node 是机器，rank 是进程）、把 pretrain 说成多进程
 
 **World size（进程组规模）**:
-参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。词条随 ADR-0016 退役（同 rank 词条口径）；async 执行序的拓扑对账字段 = `slots`（协程数，卡数不进对账，#218/#222），payload 无 world_size 键。
+参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。词条随 ADR-0018 退役（同 rank 词条口径）；async 执行序的拓扑对账字段 = `slots`（协程数，卡数不进对账，#218/#222），payload 无 world_size 键。
 
 **FSDP full-shard（全分片）**:
 可训练网络的参数/梯度/优化器状态按 rank 切分、前向按需重组的数据并行方式；梯度 allreduce 保证各 rank 权重同步（ADR-0003：同构 rank、无角色划分）。
 
-**DDP replica（判别器完整副本）**:
-判别器不参与分片的分布式口径：每 rank 完整副本 + 标准 DDP 梯度 allreduce；各 rank 用本 rank fake + Real sample pool 切片更新。
-_Avoid_: 判别器分片
+**每卡判别器副本（per-card discriminator replica）**:
+判别器不参与分片的执行口径：每卡完整副本（deepcopy 逐位复制），跨卡一致性由「同初始化 + 确定性梯度 allreduce SUM + 同步 optimizer.step + 步末 u/v broadcast」结构性承载——DDP wrapper 已随 #238 删除（#234 解耦 RL 构造点后无构造点残留）；归约编排 = 主控单点（M1 形态，RL 侧 DiscriminatorPhase / 预训练同构）。
+_Avoid_: 判别器分片、DDP（本仓已无 wrapper）、各卡独立更新判别器
 
 **Rank-sliced pool（真实样本库切片）**:
 Real sample pool 按**活动条件集**分层的条带切片（每条件 entries[rank::world]），各 rank 判别器 real 侧只见本切片；条件集经装配注入（#129：BraTS = 四序列、MR-RATE = 词表条件集，代码内不设四序列副本）；held-out real 不切（out-of-sample 监控保持全量）。
@@ -224,7 +224,7 @@ Real sample pool 按**活动条件集**分层的条带切片（每条件 entries
 _Avoid_: 把 marker 当 async 序的机制（新执行序无此概念，跨执行器拒绝由版本对账承载）、混代际分片恢复（旧执行序的显式拒绝面）。
 
 **Metric merge（指标归并）**:
-iter 事件写出的排序轴承诺——同一 iteration 的 N 条按调度槽号升序连续排列，无重复、无丢失、顺序稳定。async 执行序 = 单点写者（门面主线程）两档 flush：iter 族缓冲到 iteration 边界、按 (iteration, slot) 排序后单点写；告警族（barrier_timeout_alert / weight_divergence_alert / overfit_alert）产生即写。旧执行序（torchrun，留存至 pretrain 驱动器退役）= 各 rank gather 到 rank 0、按 (iteration, rank) 稳定序写出（EventMerger 本体两执行序共用，pretrain 相消费不变）。
+iter 事件写出的排序轴承诺——同一 iteration 的 N 条按调度槽号升序连续排列，无重复、无丢失、顺序稳定。async 执行序 = 单点写者（门面主线程）两档 flush：iter 族缓冲到 iteration 边界、按 (iteration, slot) 排序后单点写；告警族（barrier_timeout_alert / weight_divergence_alert / overfit_alert）产生即写。预训练相（ADR-0018）= 主控唯一写者：步内 pretrain 事件先直写、告警后按卡序追加（写出序 = 步序 + 步内 pretrain 先于告警）。EventMerger 本体已随 #238 删除（旧执行序衰减窗口内单事件直写——world-1 与归并器逐事件追加逐位同形）。
 
 **World-1 degeneration（world-1 恒等退化）**:
 单进程 = world size 1 的退化实现：不初始化进程组、集合通信原语恒等（barrier/gather 直接返回），训练循环对单进程/分布式走同一条执行序。
@@ -241,6 +241,10 @@ _Avoid_: 动态负载分派、条件 i.i.d. 随机采样（退役口径）、分
 **逐 k 收集-同步（per-k collect-reduce）**:
 更新相的跨卡同步点：各卡并发 forward+backward 本卡例子的第 k 步（梯度本卡累积）→ 主线程单点串行 allreduce（SUM，loss 侧已除全 iteration 例子数）→ wait → 各卡一次 optimizer.step；k 间严格串行（Granular-GRPO 逐 k 顺序 step）。
 _Avoid_: 异步梯度累积、allreduce 与下一 k forward 重叠（缓行）、NCCL AVG op（未实证）
+
+**主控单点测量模板（measurement template）**:
+预训练测量批的随机面原语（#221 决议 5/9，ADR-0018）：主控持 ``seed+19`` 显式直锚的复位模板，每次测量复位 → 条件构造一次 → 按卡序逐卡抽本地 ε 行直接交任务——``volume_offset`` 前缀消耗与「各 rank 本地流 + broadcast 镜像」退役；分段抽 ≡ 全量对应行由行宽 ≡ 0 (mod 16) 的装配期断言 + #198 平移锚守护（顺序流性质是受锚不变式、非结构性事实）。
+_Avoid_: 把顺序流等价当结构性事实、测量模板进续训注册表（测量不参与续训）、随卡派生模板 seed
 
 ### 实验设计与验收
 

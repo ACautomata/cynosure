@@ -22,6 +22,7 @@ latent 张量本体不经 JSON：每条目一个 ``torch.save`` 文件，manifes
 """
 
 import json
+from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -232,6 +233,51 @@ class LatentManifest(BaseModel):
                 + "——形状的权威是本域条件词汇表（fake 侧同源），"
                 "同名异形会让判别器把两套影像空间的样本拼进同一批；"
                 "请按当前词表重建 manifest 后入训"
+            )
+
+    def shape_of(self, modality: str) -> tuple[int, ...]:
+        """该条件单卷 latent 形状（两态解析：逐条件表优先、单域全局
+        ``latent_shape`` 兜底——``load_latent`` 的对账同源）。"""
+        if self.condition_latent_shapes is not None:
+            return self.condition_latent_shapes[modality]
+        return tuple(self.latent_shape)
+
+    def assert_measurement_row_width(self) -> None:
+        """每条件测量批行宽（latent numel）≡ 0 (mod 16) 的装配期断言
+        （#221 决议 6）：预训练测量批的按卡分段抽 ε ≡ 全量对应行，由
+        float32 ``randn`` 的 16 元素块 Box-Muller 顺序流性质承载——
+        该性质当且仅当行宽 ≡ 0 (mod 16) 成立（同时保证 fallback 路径
+        不可达）。现行安全靠数据巧合（测试行宽 8192、生产 4 通道×偶³
+        latent），本断言把巧合升为机器不变式：违者 fail-fast。形状
+        来源与 ``load_latent`` 同款两态（逐条件表 / 全局）。
+
+        行宽不是 16 的倍数 = 词表/manifest 工件异常（网格尺寸或通道
+        数非预期），而非测量机制缺陷——修工件，勿改机制。"""
+        if self.condition_latent_shapes is not None:
+            offenders = [
+                (name, shape)
+                for name, shape in self.condition_latent_shapes.items()
+                if prod(shape) % 16 != 0
+            ]
+            detail = "；".join(
+                f"{name}（shape {list(shape)}，numel {prod(shape)}）"
+                for name, shape in offenders
+            )
+        else:
+            shape = self.latent_shape
+            offenders = [] if prod(shape) % 16 == 0 else [(None, shape)]
+            detail = (
+                f"全局 shape {list(shape)}，numel {prod(shape)}"
+                if offenders else ""
+            )
+        if offenders:
+            raise ValueError(
+                f"{self.kind} 工件的测量批行宽（latent numel）非 16 的"
+                f"倍数: {detail}——按卡分段抽 ε 与全量抽 ε 的逐位等价"
+                "（float32 randn 16 元素块 Box-Muller 顺序流性质）以行宽"
+                " ≡ 0 (mod 16) 为前提，违者测量不可复算。这是词表/manifest"
+                " 工件异常（网格尺寸/通道数非预期），非测量机制缺陷："
+                "请核对条件词汇表与 manifest 重建口径"
             )
 
     def load_latent(self, entry: PoolEntry) -> torch.Tensor:

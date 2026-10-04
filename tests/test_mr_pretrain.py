@@ -19,6 +19,7 @@ BraTS 线与既有 MR prepare 测试零改动。（原第 4 面「白名单空 �
 随 ADR-0017 门控链退役删除——train 侧无上岗门槛。）"""
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,11 @@ import torch
 from cynosure.config import CynosureConfig
 from cynosure.fixtures import Fixture
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
-from tests.conftest import CliSession, SyntheticMrRateDataset
+from tests.conftest import (
+    CliSession,
+    SPARSE_POOL_DISC_K,
+    SyntheticMrRateDataset,
+)
 
 
 CONDITIONS = ["t1w/axial", "flair/axial"]
@@ -84,6 +89,9 @@ class MrPretrainScenario:
         pretrain_config.reward.pretrain_report_json = str(
             self._run_dir / "pretrain_report.json",
         )
+        # 容量守卫按 K×卡数把门（#238）：MR 稀疏条件池 4 条/条件，
+        # 口径单点见 conftest.SPARSE_POOL_DISC_K
+        pretrain_config.reward.disc_batch_size_k = SPARSE_POOL_DISC_K
         pretrain_config_path = self._work_dir / "pretrain_config.json"
         pretrain_config_path.write_text(
             pretrain_config.model_dump_json(indent=2), encoding="utf-8",
@@ -164,15 +172,17 @@ class TestMrPretrainEndToEnd:
         scorer = report.load_discriminator(config)
         assert scorer is not None
 
-    def test_dense_steps_rotate_conditions_and_replay_bitwise(
+    def test_dense_steps_rotate_conditions_and_replay(
         self, cli: CliSession, tmp_path: Path,
+        deterministic_cpu_replay: None,
+        checkpoint_parity: Callable[[dict, dict], None],
     ) -> None:
         """AC：密集步进路径——per-condition 轮转落事件流（modality 字段
         轮转、字段齐备）；更新批 = 装配原语的配对批（重构构造走专属
         recon 流、先抽 s 后抽 ε，ADR-0012）在 MR 线 pretrain 路径确定性
-        重放：同 seed 同 config 双 run 判别器 checkpoint 逐位一致
-        （σ_max 对照锚随注入退役——更新前向恒干净域，σ_max 不再有
-        更新链路消费面）。"""
+        重放：同 seed 同 config 双 run 判别器 checkpoint 容差一致
+        （``checkpoint_parity``，ADR-0018 决策 9；σ_max 对照锚随注入
+        退役——更新前向恒干净域，σ_max 不再有更新链路消费面）。"""
         common = {
             "pretrain_pass_threshold": 0.99,  # 不可达：走满步数上限（真训练态）
             "pretrain_max_steps": 4,
@@ -186,10 +196,14 @@ class TestMrPretrainEndToEnd:
         first = MrPretrainScenario(
             cli, tmp_path / "first", fixtures_dir=shared_fixtures,
         )
+        # 全局 RNG 每 run 重置（spectral u 惰性初始化消耗全局流——同
+        # 进程双 run 间状态漂移会破坏重放逐位锚）
+        torch.manual_seed(0)
         first.run(reward_overrides=common)
         second = MrPretrainScenario(
             cli, tmp_path / "second", fixtures_dir=shared_fixtures,
         )
+        torch.manual_seed(0)
         second.run(reward_overrides=common)
         events = first.events()
         # 轮转条件序（目标模态均匀轮转，确定性不耗 RNG）
@@ -211,11 +225,8 @@ class TestMrPretrainEndToEnd:
             second.run_dir_path() / "checkpoints" / "pretrain_discriminator.pt",
             map_location="cpu", weights_only=True,
         )
-        assert first_state.keys() == second_state.keys()
-        assert all(
-            torch.equal(first_state[key], second_state[key])
-            for key in first_state
-        )
+        # checkpoint 对照口径单点见 conftest.checkpoint_parity
+        checkpoint_parity(first_state, second_state)
 
     def test_report_guard_rejects_vocabulary_drift(
         self, cli: CliSession, tmp_path: Path,

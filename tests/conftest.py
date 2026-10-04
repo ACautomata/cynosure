@@ -17,6 +17,21 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import pytest
+
+# 测试进程的多卡口径裁到 2 卡（须在 ``import torch`` 之前——CUDA 运行
+# 时初始化后环境变量不再生效）：#238 起 pretrain 容量守卫按 K×卡数、
+# 轮转守卫按「每条件 held-out ≥ 卡数」把门，BraTS fixture（real 14、
+# held-out val 2 条/条件）只能承载 ≤2 卡——多卡机器上 4 卡设备发现会
+# 让全部 pretrain e2e 在装配期拒绝。2 卡口径下守卫全过线（建库
+# K=4：4×2=8 ≤ real 14；held-out：2 ≥ 2），多卡语义（跨卡
+# SUM/broadcast、分片扇出）照常覆盖；
+# 多卡 gauss 档（TestPretrainMultiCardGauss）取 min(device_count, 4)=2
+# 卡跑。``setdefault`` 尊重外部显式配置，但显式放宽卡数只对不触
+# pretrain 容量/轮转守卫的测试有意义——BraTS fixture 的 held-out 天花板
+# 封死 pretrain e2e 的 >2 卡口径（held-out 2 < 4 装配期即拒）。CPU
+# 环境无 CUDA，设置无副作用。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+
 import torch
 
 from cynosure.cli import CynosureCli
@@ -57,6 +72,54 @@ enforce_deterministic_kernels()
 # 线程数不影响逐位结果。spawn 出的训练 worker 是独立进程，不继承
 # 此限制。
 torch.set_num_threads(4)
+
+
+@pytest.fixture
+def deterministic_cpu_replay():
+    """CPU 重放逐位锚的确定性环境（测试进程逐位口径，#221 决议 19）：
+    单线程归约（多线程卷积 wgrad 归约树随调度漂移，4 线程实测 ~2e-9
+    位差）+ mkldnn 朴素实现（oneDNN JIT 的批 shape 敏感路径单线程下
+    仍有偶发位漂）。重放/逐位对照类测试显式消费。mkldnn 开关走公开
+    property ``torch.backends.mkldnn.enabled``（``flags()`` 是
+    contextmanager，裸调用不生效）。"""
+    threads = torch.get_num_threads()
+    mkldnn_enabled = torch.backends.mkldnn.enabled
+    torch.set_num_threads(1)
+    torch.backends.mkldnn.enabled = False
+    yield
+    torch.backends.mkldnn.enabled = mkldnn_enabled
+    torch.set_num_threads(threads)
+
+
+# MR 稀疏条件池（4 条/条件）的 pretrain 批容量口径（#238 容量守卫按
+# K×卡数把门）：2 卡需 K≤2；CPU（单设备）用 3——K≤2 的批 shape 是
+# CPU 卷积归约位漂的更强观测面，容差化（ADR-0018 决策 9）后只影响
+# 重放对照的位漂幅度、不影响正确性，CPU 侧仍取 3 留余量。
+SPARSE_POOL_DISC_K = 2 if torch.cuda.is_available() else 3
+
+
+@pytest.fixture
+def checkpoint_parity():
+    """checkpoint 同源重放对照（ADR-0018 决策 9 accepted drift）：
+    浮点张量 allclose(rtol=0, atol=1e-7)——CPU 库层非确定（内存对齐
+    → MKL 微内核分派）的位噪声 ~1e-9 不可在 torch 用户侧根除，容差
+    承载复算语义；非浮点张量逐位 equal；键集合严格一致。事件流/报告
+    的逐字段严格一致由各测试另行断言；逐位文件字节 sha256 由 gauss
+    CUDA 档（cudnn 确定性模式）独占。"""
+
+    def assert_parity(first: dict, second: dict) -> None:
+        assert set(first) == set(second)
+        for key in first:
+            expected = first[key]
+            actual = second[key]
+            if expected.is_floating_point():
+                assert torch.allclose(
+                    expected, actual, rtol=0.0, atol=1e-7,
+                ), key
+            else:
+                assert torch.equal(expected, actual), key
+
+    return assert_parity
 
 
 class SceneCache:
@@ -593,6 +656,11 @@ class FixtureArtifactLibrary:
             # 只对组3 有语义：预训练 job 是单阶段组别 config，不携带
             job.experiment.stage1_run_dir = None
             job.experiment.stage2_pretrain_report_json = None
+            # 容量守卫按 K×卡数把门（#238）：K 沿用 config 默认（4）
+            # 或调用方 reward 覆写、不在此钉值（无条件钉值会静默覆盖
+            # 调用方锚定语义，如 test_async_eval 多卡档锚 K=2 的窗口
+            # 容量守卫）。2 卡口径全过线：4×2=8 ≤ real 14、held-out
+            # 2 ≥ 2
             job.reward.pretrain_report_json = str(
                 run_dir / "pretrain_report.json",
             )

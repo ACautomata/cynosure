@@ -168,15 +168,15 @@ class HeldOutAuc:
         构造原料，ADR-0012 决策 5）：无放回抽满该条件池——卷数是支撑度
         规则的判定输入，采样子集会让「卷数」一栏与池不一致，故不设下
         采样。同一调用的返回值既是判别器 real 侧、也是重构 fake 侧的
-        源（``ReconstructionAssembler.measure_condition`` 与
-        ``compute_volume_clusters`` 逐样本配对，AUC 的判别目标只剩重构
-        伪影）。
+        源（``compute_volume_clusters`` 逐样本配对，AUC 的判别目标只剩
+        重构伪影）。
 
         抽取消耗本对象的持有流（``heldout_auc`` 命名流）——预训练每步
         逐条件调用，抽取次序随轮转序确定；**卷内顺序**不影响读数
         （``auc_from_scores`` 是集合级秩统计）。实现 = 两步分解面的全量
-        特例（``load_order(condition_order(·))``，ADR-0016 决策 4）：
-        单进程全量路径行为不变，分解面为分布式测量批分片铺路。"""
+        特例（``load_order(condition_order(·))``）：全量路径行为不变；
+        ADR-0018 起预训练主控持同 seed 排列流单点直派（逐位恒等的等价
+        形态），分段加载见 ``load_order``。"""
         return self.load_order(self.condition_order(modality))
 
     def compute(
@@ -226,6 +226,19 @@ class HeldOutAuc:
         保证同形）。打分前向同样在 no_grad 下进行、同样 SCORE_CHUNK
         定块；iter 事件的单标量消费路径不经本方法。
         """
+        return self.volume_clusters(latents, fake_latents, self._scorer)
+
+    @staticmethod
+    def volume_clusters(
+        latents: torch.Tensor,
+        fake_latents: torch.Tensor,
+        scorer: LatentScorer,
+    ) -> VolumeScoreClusters:
+        """卷级分数聚类的**打分段**（#221 决议 10：预训练测量批的打分
+        各卡本地——判别器副本对本地段，排列消耗只在主控单点）：零
+        随机性、零流消耗的纯打分面，绑定打分前向的 scorer 注入而非
+        ``HeldOutAuc`` 实例（实例持排列流，卡任务不该触碰）。分段
+        断言与定块口径同 ``compute_volume_clusters``。"""
         if latents.shape[0] < 1:
             raise ValueError("held-out AUC 卷级聚类需要非空 real 批")
         if fake_latents.shape[0] < 1:
@@ -236,9 +249,10 @@ class HeldOutAuc:
                 f"{tuple(fake_latents.shape)} 不符（同源配对的逐样本对齐"
                 "前提——两侧须同量同形）"
             )
+        chunked = ChunkedScorer(scorer)
         with torch.no_grad():
-            real_scores = self._chunked_logits(latents)
-            fake_scores = self._chunked_logits(fake_latents)
+            real_scores = chunked.scores(latents)
+            fake_scores = chunked.scores(fake_latents)
         patches = real_scores.numel() // latents.shape[0]
         per_volume = real_scores.reshape(latents.shape[0], patches)
         return VolumeScoreClusters(

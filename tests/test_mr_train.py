@@ -29,7 +29,11 @@ from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.train.runtime import TrainingRuntime
 from cynosure.train.trainer import PhaseTimer
-from tests.conftest import CliSession, SyntheticMrRateDataset
+from tests.conftest import (
+    CliSession,
+    SPARSE_POOL_DISC_K,
+    SyntheticMrRateDataset,
+)
 
 CONDITIONS = ["t1w/axial", "flair/axial"]
 """夹具词表的两条件（t1w/axial [4,16,16,8]、flair/axial [4,8,8,16]）——
@@ -84,6 +88,12 @@ class MrTrainScenario:
         prepared.reward.pretrain_report_json = str(
             self._pretrain_dir / "pretrain_report.json",
         )
+        # 容量守卫按 K×卡数把门（#238）：pretrain 与 train 共用本
+        # config（use 落盘 train config），K 口径单点见
+        # conftest.SPARSE_POOL_DISC_K——MR real 池 4 条/条件，train
+        # 侧同守卫口径在 2 卡下需 K≤2（4 ≤ 4；K=3 即 6>4 装配期
+        # 拒），在线判别器批随之缩小（CPU 3、CUDA 2）
+        prepared.reward.disc_batch_size_k = SPARSE_POOL_DISC_K
         path = self._work_dir / "pretrain_config.json"
         path.write_text(prepared.model_dump_json(indent=2), encoding="utf-8")
         result = self._cli.run("pretrain", "--config", str(path))

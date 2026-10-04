@@ -322,14 +322,3 @@ class TestFidFloorCli:
         assert result.code == 2
         assert "fid-floor 输入契约违反" in result.stderr
 
-    def test_fid_floor_rejects_torchrun_launch(self, tmp_path, cli, monkeypatch):
-        """fid-floor 是单进程工具：多 rank 各自半分会并发覆写同一冻结
-        工件——torchrun 启动显式拒绝（pretrain 同先例）。"""
-        monkeypatch.setenv("RANK", "1")
-        manifest = _write_manifest(tmp_path / "eval_manifest.csv", _MANIFEST_ROWS)
-        result = cli.run(
-            "fid-floor", "--manifest", str(manifest),
-            "--output-dir", str(tmp_path / "floor"),
-        )
-        assert result.code == 2
-        assert "torchrun" in result.stderr
