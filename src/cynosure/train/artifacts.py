@@ -25,8 +25,8 @@ _SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
 """组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
 
 POLICY_CHECKPOINT_TEMPLATE = "policy_iter{iteration}.pt"
-"""policy checkpoint 文件名模板（契约布局的一部分：组3 stage-1 的复用
-查找 ``SequentialTrainer._locate_stage1_product`` 按同一形态解析）。"""
+"""policy checkpoint 文件名模板（契约布局的一部分：stage-1 产物按此
+形态被下游 run 复用装载）。"""
 
 
 class DiscConditionReading(BaseModel):
@@ -514,15 +514,12 @@ class RunPaths:
     """Baseline 与 RL 后重采的解码像素体目录（评测材料，契约布局成员）。"""
     trajectory_diagnostic: Path
     """轨迹诊断工件（fixture 诊断开关 --dump-trajectory 产出；诊断未跑则无此文件）。"""
-    training_diagnostic: Path
-    """训练诊断工件（--dump-trajectory 时的训练侧 log-prob 对；未开启则无此文件）。"""
 
 
 class RunArtifacts:
     """run 目录与产物工件契约：config 快照 + metrics.jsonl + manifest +
-    checkpoint 目录，落 ``$HOME``（多 rank 下指标由 rank 0 直写——
-    EventMerger 归并随 #238 退役，非 rank 0 事件不落盘，ADR-0018
-    决策 11 显式 drift）。"""
+    checkpoint 目录，落 ``$HOME``（单进程单写者，iter 族按
+    (iteration, slot) 排序后单点写——async 执行序事件契约）。"""
 
     def __init__(self, paths: RunPaths) -> None:
         self.paths = paths
@@ -532,11 +529,8 @@ class RunArtifacts:
         """创建 run 目录并落盘契约最小集工件；run 目录已存在则拒绝
         （每次运行一个 run 目录的隔离契约，续训须显式复用并经续训入口）。
 
-        只应由协调方（CLI：进程组 rendezvous 之后的 rank 0）在新 run
-        启动时调用一次，成败经广播裁决同步各 rank——文件存在性无法区分
-        「rank 0 本轮新建」与「上轮遗留」，历史上「非 0 rank 轮询等待
-        config 快照出现」的握手在预存目录下会让非 0 rank 误判 rank 0
-        成功、径自进入 rendezvous 挂死。
+        只应由 CLI 在新 run 启动时调用一次（单进程执行序，无旧执行序的
+        rank 0 协调与广播裁决面）。
         """
         paths = cls.layout(root)
         if paths.config_snapshot.exists():
@@ -564,7 +558,6 @@ class RunArtifacts:
             checkpoints=root / "checkpoints",
             samples=root / "samples",
             trajectory_diagnostic=root / "trajectory.json",
-            training_diagnostic=root / "training.json",
         )
 
     @classmethod

@@ -108,7 +108,7 @@ class ExecutorScenario:
         """门面装配（run 目录初始化 + build；不启动线程）。fixture 档
         钉单 CPU 设备——CPU fixture 档的语义就是单设备上的多协程机器面
         （设备集裁剪的生产口径 = ``CUDA_VISIBLE_DEVICES``；测试显式传
-        设备，与 ``GranularGrpoTrainer`` 的 device 注入同惯例）。"""
+        设备，CLI 生产入口走设备发现缺省）。"""
         kwargs.setdefault("devices", [torch.device("cpu")])
         artifacts = RunArtifacts.init(config, self._tmp_path / run_name)
         return AsyncTrainingExecutor.build(config, artifacts, **kwargs)

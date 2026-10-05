@@ -39,6 +39,7 @@ from cynosure.config import CynosureConfig, DEFAULT_CROSS_MODAL_PAIRS, MODALITIE
 from cynosure.fixtures import Fixture
 from cynosure.reward.assembly import PairBatch
 from cynosure.reward.update import ConditionUpdateDetail, UpdateReport
+from cynosure.train.executor import AsyncTrainingExecutor
 
 
 def enforce_deterministic_kernels() -> None:
@@ -96,6 +97,23 @@ def deterministic_cpu_replay():
 # CPU 卷积归约位漂的更强观测面，容差化（ADR-0018 决策 9）后只影响
 # 重放对照的位漂幅度、不影响正确性，CPU 侧仍取 3 留余量。
 SPARSE_POOL_DISC_K = 2 if torch.cuda.is_available() else 3
+
+
+def execution_slot_count() -> int:
+    """本进程训练执行序的调度槽数（= 设备发现卡数，缺省拓扑）：CLI e2e
+    断言的槽自适应基数——每 iteration 每调度槽恰一条 iter 事件，本机
+    CPU 单卡 1 槽、gauss 双卡（conftest 裁剪）2 槽。"""
+    return len(AsyncTrainingExecutor.execution_devices())
+
+
+def slot_tiled(iterations) -> list[int]:
+    """iteration 序列按调度槽平铺（事件流按 (iteration, slot) 归并序：
+    同 iteration 的逐槽事件连续排列）。"""
+    return [
+        iteration
+        for iteration in iterations
+        for _ in range(execution_slot_count())
+    ]
 
 
 @pytest.fixture

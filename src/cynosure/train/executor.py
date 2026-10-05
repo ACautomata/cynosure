@@ -24,8 +24,8 @@
   #231 字面「abort communicator + 进程级退出」的落位记档：torch 无
   communicator abort API 面，abort 的等效语义 = 本卡线程收尾 + 跨卡
   互等由 barrier 硬超时（``BarrierTimeoutPolicy``）有界化；进程级
-  退出由入口层承载（``TrainingAborted`` 抛给调用方，骨架期无 CLI
-  装配、生产入口票面明确不含，#226 决策 1）。
+  退出由入口层承载（``TrainingAborted`` 抛给调用方；骨架期无 CLI
+  装配，生产入口装配随 #240 切换期第一步补齐，#226 决策 1）。
 - **barrier 软/硬超时**（#217 §4）：软超时 → ``barrier_timeout_alert``
   告警事件（#222 两档 flush 告警族即写）后继续等待；硬超时 → fail-fast。
   ``CYNOSURE_PG_TIMEOUT_MIN`` 变量沿用、**语义换绑** per-k barrier 硬
@@ -76,9 +76,10 @@ train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
 （``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器。
 
 续训与事件契约期增量（#236，加厚 4/6，#222/#218 结票全口径）：
-**v12 单文件续训分片**——``AsyncResumeStore``（独立 nominal-v12
-常量，旧 v11 分片被新 store 拒、新 v12 分片被旧 resume 拒 = 版本
-对账承载跨执行器拒绝）、marker/集合化拒绝整体退役（单进程
+**v12 单文件续训分片**——``AsyncResumeStore``（nominal-v12 常量，
+#226 切换期第一步收口为全仓唯一版本口径：旧执行序 v11 store 已随
+切换期删除，v12 读写闭环、非 v12 代际分片拒载）、marker/集合化拒绝
+整体退役（单进程
 fail-fast）、拓扑守卫只对账 slots（卡数不进对账）、generators
 per-(槽×流) 嵌套、seeds 记录性字段、全局 RNG/world_size/ema 预留槽
 删除；checkpoint 节奏（周期 + 收尾兜底）**同写者顺序定死**——跨卡
@@ -104,8 +105,13 @@ bootstrap 独立 generator 的主线程单点执行随之保留）；里程碑�
 契约不收缩），早停判定喂入前缀化过滤（``EarlyStopJudge.prefix_events``，
 #222 既裁口径；单进程单写者无 rank 广播面）。
 
-**不含**（各进加厚期，#226）：pretrain driver、
-生产入口（本门面仅被 fixture 测试驱动，#226 决策 1 生产入口单口径）。
+切换期第一步增量（#240，#226 决策 16）：**生产入口改指本门面**——
+CLI train 单口径（torchrun 拒绝 + 组3 序贯拒绝），v12 单常量全局收口
+（旧执行序 v11 store 随其唯一消费者 trainer 退役删除），fixture 测试
+驱动之外本门面获得生产消费者。
+
+原骨架期「不含」段的历史记档（各随加厚期补齐，#226）：pretrain
+driver（#238 ADR-0018 独立门面）、生产入口（本票补齐）。
 """
 
 import asyncio
@@ -176,8 +182,8 @@ from cynosure.train.runtime import TrainingRuntime
 _T = TypeVar("_T")
 
 _STAGE_TAG = 1
-"""骨架期事件的阶段号（单阶段组缺省；组3 StageTag 机制属 trainer 面，
-本门面 fixture 薄切片不承载序贯）。"""
+"""事件流的阶段号（单阶段执行序常量；组3 序贯编排属旧执行序，
+已随切换期退役——两阶段由两次独立 run 衔接）。"""
 
 _STREAM_NAMES: tuple[str, ...] = (
     TrainingRngStreams.ROLLOUT,
@@ -950,6 +956,14 @@ class AsyncTrainingExecutor:
                 "async 门面是单进程执行序：检测到 torchrun 注入的 RANK "
                 "环境——进程内多卡由设备发现承担、不经 torchrun（多进程"
                 "入口属旧执行序）"
+            )
+        if config.policy.sde_eta <= 0.0:
+            # η=0 对照属纯诊断路径（trajectory.json 仍随 --dump-trajectory
+            # 产出）：训练循环需要 η>0 才存在 policy gradient
+            raise ValueError(
+                "η=0 是确定性步、无高斯密度可求（log-prob 仅在扰动步有意义）:"
+                "训练循环需要 η>0 才存在 policy gradient；η=0 对照属纯诊断路径"
+                "（trajectory.json 仍随 --dump-trajectory 产出）",
             )
         devices = (
             list(devices) if devices is not None else cls.execution_devices()

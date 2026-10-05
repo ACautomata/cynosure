@@ -28,9 +28,10 @@ from cynosure.eval import ManifestEvaluation
 from cynosure.eval.decode import LatentDecoder
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.numerics import AmpContext
-from cynosure.reward.overfit import DivergenceReading
-from cynosure.train import BaselineManifest, GranularGrpoTrainer, RunArtifacts
-from tests.conftest import CliSession
+from cynosure.reward.overfit import DivergenceReading, OverfitMonitor
+from cynosure.train import BaselineManifest, RunArtifacts
+from cynosure.train.executor import AsyncTrainingExecutor
+from tests.conftest import CliSession, execution_slot_count as slot_count
 from tests.test_mr_train import CONDITIONS, PHASES, MrTrainScenario
 
 pytestmark = pytest.mark.gpu  # MR fixture 全链路（prepare 预编码 + 训练轮次）
@@ -93,7 +94,7 @@ class TestMilestoneDualTrack:
         assert [
             event["event"] for event in events
             if event["event"] != "overfit_alert"
-        ] == ["iter", "iter", "milestone"]
+        ] == ["iter"] * (2 * slot_count()) + ["milestone"]
         milestone = next(
             event for event in events if event["event"] == "milestone"
         )
@@ -151,8 +152,10 @@ class TestDecodeOnlyInMonitoringSamples:
             amp=AmpContext(torch.device("cpu"), torch.bfloat16),
             decoder=counter,
         )
-        trainer = GranularGrpoTrainer(config, artifacts, evaluation=evaluation)
-        assert trainer.run() == 3
+        executor = AsyncTrainingExecutor.build(
+            config, artifacts, evaluation=evaluation,
+        )
+        assert executor.run() == 3
         # baseline 4 条目（条件轮转 t1w→flair→t1w→flair）单块分两组，
         # 组序 = 条目首次出现序（ManifestVolumeSampler 的 dict 插入序，
         # 每条件 2 条 → 批维 2）；里程碑评测的组序 = 条件名字典序
@@ -180,62 +183,49 @@ class TestDecodeOnlyInMonitoringSamples:
         )
 
 
-class AlertingMonitor:
-    """测试仪器：恒越线分叉监控替身（``OverfitMonitor`` 的观测面契约：
-    ``observe`` 返回越线读数、``state``/``adopt`` 与续训分片对接）。
-
-    越线判定的数值语义（上升沿、阈值对照、per-condition EMA 递推）已由
-    ``test_overfit`` 单元与 #105 在线侧打穿覆盖；本替身的存在理由是
-    **确定性**——fixture 判别器的分号方向不受控（随机初始化下 train 侧
-    与 held-out 的干净域差在 ±0.1 内波动），自然越线不能作为 MR 线接线
-    测试的前置。"""
-
-    def observe(
-        self, modality: str, *, train_pairwise_acc: float, heldout_auc: float,
-    ) -> DivergenceReading:
-        return DivergenceReading(divergence=0.9, alerted=True)
-
-    def state(self) -> dict:
-        return {"ema": {}}
-
-    def adopt(self, state: dict) -> None:
-        self._adopted = state
-
-
 class TestOverfitAlertSubscribable:
     """AC：overfit_alert 事件在 MR 线可触发、可订阅。"""
 
     def test_alert_fires_into_stream_with_full_elements(
         self, cli: CliSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """越线观测（替身注入）经 trainer 落成 overfit_alert 事件：随
-        iter 事件同归并序写出（告警排本 iter 之后）、按事件类型可从
+        """越线观测（恒越线替身注入）经执行序落成 overfit_alert 事件：
+        随 iter 族块之后即写（两档 flush 的告警族）、按事件类型可从
         指标流过滤订阅，要素齐备——modality 为 MR 生成条件名（per-condition
-        归因轴）、phase="rl"（RL 相按 iteration 轴记账）、rank、分叉值与
-        两侧原始量均有限。"""
+        归因轴）、phase="rl"（RL 相按 iteration 轴记账）、rank=0（主线程
+        写出口径）、分叉值与两侧原始量均有限。"""
         scenario = MrTrainScenario(cli, tmp_path)
         prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared), max_iterations=2)
         config = ConfigLoader.load(scenario.config_path())
         artifacts = RunArtifacts.init(config, scenario.run_dir())
-        trainer = GranularGrpoTrainer(config, artifacts)
-        trainer.rewards.overfit = AlertingMonitor()
-        assert trainer.run() == 2
+
+        def always_alert(
+            self: OverfitMonitor, modality: str, *,
+            train_pairwise_acc: float, heldout_auc: float,
+        ) -> DivergenceReading:
+            return DivergenceReading(divergence=0.9, alerted=True)
+
+        monkeypatch.setattr(OverfitMonitor, "observe", always_alert)
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        assert executor.run() == 2
         events = scenario.events()
         alerts = [
             event for event in events if event["event"] == "overfit_alert"
         ]
-        # 每 iteration 一次判别器步（N_d=1）→ 逐条件观测恒越线：
-        # 2 iter 两条件各一条告警
-        assert len(alerts) == 2
-        assert [
-            (event["iteration"], event["modality"])
-            for event in alerts
-        ] == [(0, CONDITIONS[0]), (1, CONDITIONS[1])]
-        # 归并序：告警排本 rank 对应 iter 事件之后（同 rank 单流交错）
-        assert [event["event"] for event in events] == [
-            "iter", "overfit_alert", "iter", "overfit_alert",
-        ]
+        # 每 iteration 一次判别器步（N_d=1）→ 本 iter 活跃条件恒越线：
+        # 每 iteration 每活跃条件恰一条告警（槽数 ≥ 条件数时两条件每
+        # iter 都活跃；单槽时轮转逐 iter 覆盖——2 iter 全条件各一遇）
+        assert len(alerts) == 2 * slot_count()
+        assert {event["iteration"] for event in alerts} == {0, 1}
+        assert {event["modality"] for event in alerts} == set(CONDITIONS)
+        # 归并序：告警族排本 iteration 的 iter 族块之后（两档 flush）
+        stream = [event["event"] for event in events]
+        assert stream == (
+            ["iter"] * slot_count()
+            + ["overfit_alert"] * slot_count()
+        ) * 2
         for alert in alerts:
             assert alert["phase"] == "rl"
             assert alert["rank"] == 0

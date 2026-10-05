@@ -203,7 +203,7 @@ _Avoid_: 分辨率、尺度（尺度另有所指，见 多尺度判别器）
 ### 分布式执行
 
 **Rank（进程秩）**:
-torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0018 退役：pretrain 已单进程多卡化（RANK env 守卫历史回环恢复）、记账/归并/事件归因全轴收敛到「槽」或「卡」（iter 事件的 rank 字段语义 = 槽号、预训练告警的 rank 字段语义 = 卡号——字段名随事件契约「可扩不可改名」保留）；语义仅存旧执行序 trainer 的衰减窗口（切换期删除）。
+torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0018 退役：pretrain 已单进程多卡化（RANK env 守卫历史回环恢复）、记账/归并/事件归因全轴收敛到「槽」或「卡」（iter 事件的 rank 字段语义 = 槽号、预训练告警的 rank 字段语义 = 卡号——字段名随事件契约「可扩不可改名」保留）；旧执行序 trainer 已随 #226 切换期第一步删除，残余（DistributedContext 控制面）待切换期第二步清尾。
 _Avoid_: 进程号、节点（node 是机器，rank 是进程）、把 pretrain 说成多进程
 
 **World size（进程组规模）**:
@@ -220,7 +220,7 @@ _Avoid_: 判别器分片、DDP（本仓已无 wrapper）、各卡独立更新判
 Real sample pool 按**活动条件集**分层的条带切片（每条件 entries[rank::world]），各 rank 判别器 real 侧只见本切片；条件集经装配注入（#129：BraTS = 四序列、MR-RATE = 词表条件集，代码内不设四序列副本）；held-out real 不切（out-of-sample 监控保持全量）。
 
 **Resume generation marker（续训代际标记）**:
-全部 rank 分片均已持久化到同一 iteration 的提交记录（resume_generation.json，save 的 barrier 之后由 rank 0 写出）；恢复对账标记代际、混代际分片（保存中途崩溃现场）显式拒绝——各 rank 必须从同一 iteration 继续。词条随 #236 async 执行序退役：新执行序单文件分片 tmp + os.replace 原子写（写成功即一致、崩溃留旧代际完整可用），marker 提交语义冗余、整体退役；旧执行序（v11 ResumeStore）维持原形态至切换期删除（ADR-0014 尾部裁决），期间本语义在 torchrun 生产路径仍活跃。
+全部 rank 分片均已持久化到同一 iteration 的提交记录（resume_generation.json，save 的 barrier 之后由 rank 0 写出）；恢复对账标记代际、混代际分片（保存中途崩溃现场）显式拒绝——各 rank 必须从同一 iteration 继续。词条随 #236 async 执行序退役：新执行序单文件分片 tmp + os.replace 原子写（写成功即一致、崩溃留旧代际完整可用），marker 提交语义冗余、整体退役；旧执行序（v11 ResumeStore）已随 #226 切换期第一步删除，本语义在仓内无任何存活实现。
 _Avoid_: 把 marker 当 async 序的机制（新执行序无此概念，跨执行器拒绝由版本对账承载）、混代际分片恢复（旧执行序的显式拒绝面）。
 
 **Metric merge（指标归并）**:
@@ -231,7 +231,7 @@ iter 事件写出的排序轴承诺——同一 iteration 的 N 条按调度槽�
 _Avoid_: 单机模式（单机也可多进程）
 
 **分片自持（Component-owned resume state）**:
-续训分片的读写知识归各协作者自身（ADR-0014；尾部追加裁决段 = 号位与聚合面的权威口径）：聚合面两度平移——#230 落 TrainingRuntime（RNG 注册对象归聚合层、无 generators 裸容器），#236 随 async 门面落 RunContinuation（新执行序独立于 TrainingRuntime 装配：v12 单文件 `AsyncResumeStore` + resume 单点声明 + checkpoint 节奏，攒装/恢复应用由门面编排）；旧执行序 v11 ResumeStore 维持原形态至切换期删除（8 个转发 property 删除面随旧执行序本体一并收口，#226 用户故事 17）：协作者实现 `state()` / `adopt()` 小接口（overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 TrainingRuntime 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分档：长寿命协作者自持；「任务化组件自持」档为空——任务是协程跑的短寿命对象，无状态长于其上（RNG 状态在注册表、分叉 EMA 在 OverfitMonitor、spectral norm buffer 在权重侧、分配表位置纯函数重导出），`state()` / `adopt()` 只落长寿命协作者。分片格式变更循升版拒旧先例（v10 清单退役、v11 门控状态退役、v12 async nominal 账单——跨执行器拒绝由版本号承载，legacy 拒载），不写迁移读取。
+续训分片的读写知识归各协作者自身（ADR-0014；尾部追加裁决段 = 号位与聚合面的权威口径）：聚合面两度平移——#230 落 TrainingRuntime（RNG 注册对象归聚合层、无 generators 裸容器），#236 随 async 门面落 RunContinuation（新执行序独立于 TrainingRuntime 装配：v12 单文件 `AsyncResumeStore` + resume 单点声明 + checkpoint 节奏，攒装/恢复应用由门面编排）；旧执行序 v11 ResumeStore 已随 #226 切换期第一步删除（v12 单常量收口——`ASYNC_RESUME_FORMAT_VERSION` 是续训分片契约的唯一版本单点，非 v12 代际分片拒载）：协作者实现 `state()` / `adopt()` 小接口（overfit 既有雏形命名），分片键由组件自持声明，resume 只跨 TrainingRuntime 一道 seam、不再穿透组件树（旧形态：`trainer.rewards.update.optimizer` 三跳 + 8 个转发 property）；`adopt` 的 dict 形态校验为共享 helper 单点。分档：长寿命协作者自持；「任务化组件自持」档为空——任务是协程跑的短寿命对象，无状态长于其上（RNG 状态在注册表、分叉 EMA 在 OverfitMonitor、spectral norm buffer 在权重侧、分配表位置纯函数重导出），`state()` / `adopt()` 只落长寿命协作者。分片格式变更循升版拒旧先例（v10 清单退役、v11 门控状态退役、v12 async nominal 账单——跨执行器拒绝由版本号承载，legacy 拒载），不写迁移读取。
 _Avoid_: resume 穿透属性链（本词条落地后即违例）、转发 property（interface 由消费者需求长出）、迁移读取（先例是升版拒旧）、为短寿命任务建注册面（任务无自持状态档如实为空）
 
 **静态分配表（static allocation table）**:

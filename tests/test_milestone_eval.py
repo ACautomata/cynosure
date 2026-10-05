@@ -30,11 +30,15 @@ from cynosure.policy.numerics import AmpContext
 from cynosure.reward.artifacts import LatentManifest
 from cynosure.train import (
     BaselineManifest,
-    GranularGrpoTrainer,
     ManifestEntry,
     RunArtifacts,
 )
-from tests.conftest import MINIMAL_CONFIG_DICT, CliSession
+from cynosure.train.executor import AsyncTrainingExecutor
+from tests.conftest import (
+    MINIMAL_CONFIG_DICT,
+    CliSession,
+    execution_slot_count as slot_count,
+)
 from tests.test_train_loop import TrainingLoopScenario
 
 # 整文件大轮次：里程碑像素域解码评测（VAE decode + FID/KID/SSIM 批量
@@ -67,11 +71,12 @@ class TestMilestoneEventStream:
         assert result.code == 0, result.stderr
         events = scenario.events()
         # overfit_alert 合法插入流中（小 real 池上判别器记忆化、分叉越线
-        # 即告警）：按类型过滤后对照交错序，milestone 按类型选取
+        # 即告警）：按类型过滤后对照交错序（每槽一条 iter 事件 + 单写者
+        # 一条 milestone 事件），milestone 按类型选取
         assert [
             event["event"] for event in events
             if event["event"] != "overfit_alert"
-        ] == ["iter", "milestone"]
+        ] == ["iter"] * slot_count() + ["milestone"]
         milestone = next(
             event for event in events if event["event"] == "milestone"
         )
@@ -391,8 +396,10 @@ class TestDecodeOnlyInEvaluationPaths:
             amp=AmpContext(torch.device("cpu"), torch.bfloat16),
             decoder=counter,
         )
-        trainer = GranularGrpoTrainer(config, artifacts, evaluation=evaluation)
-        assert trainer.run() == 3
+        executor = AsyncTrainingExecutor.build(
+            config, artifacts, evaluation=evaluation,
+        )
+        assert executor.run() == 3
         # baseline 4 批 + 里程碑 2 批 + 重采 4 批，全部单条目条件组
         assert counter.calls == [(1, 4, 16, 16, 8)] * 10
 
@@ -888,16 +895,16 @@ class TestEarlyStopWiring:
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         stub = StubEvaluation(fids=[5.0] * 6)
-        trainer = GranularGrpoTrainer(config, artifacts, evaluation=stub)
-        assert trainer.run() == 4  # 里程碑 1 立基准，2/3/4 连续 plateau → 停
+        executor = AsyncTrainingExecutor.build(config, artifacts, evaluation=stub)
+        assert executor.run() == 4  # 里程碑 1 立基准，2/3/4 连续 plateau → 停
         assert stub.baseline_called and stub.resample_called
         events = artifacts.read_events()
-        # 每 iteration 先落 iter 事件、里程碑再落 milestone 事件：交错
-        # 流（overfit_alert 合法插入，过滤后对照）
+        # 每 iteration 先落 iter 事件（每槽一条）、里程碑再落 milestone
+        # 事件：交错流（overfit_alert 合法插入，过滤后对照）
         assert [
             event["event"] for event in events
             if event["event"] != "overfit_alert"
-        ] == ["iter", "milestone"] * 4
+        ] == (["iter"] * slot_count() + ["milestone"]) * 4
         final_milestone = next(
             event for event in reversed(events)
             if event["event"] == "milestone"
@@ -923,8 +930,8 @@ class TestEarlyStopWiring:
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
         stub = StubEvaluation(fids=[10.0, 5.0, 2.0])  # 持续显著改善
-        trainer = GranularGrpoTrainer(config, artifacts, evaluation=stub)
-        assert trainer.run() == 3  # 跑满，不早停
+        executor = AsyncTrainingExecutor.build(config, artifacts, evaluation=stub)
+        assert executor.run() == 3  # 跑满，不早停
         events = artifacts.read_events()
         final_milestone = next(
             event for event in reversed(events)

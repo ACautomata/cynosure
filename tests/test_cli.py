@@ -137,38 +137,29 @@ class TestTrainCommand:
 
 
 class TestDistributedEntryGuard:
-    """torchrun 环境的 CLI 守卫（T09 分布式交付后）：非 0 rank 不再被
-    rank 守卫拦截——全部 rank 走同一训练循环（FSDP/DDP 梯度聚合、rank 0
-    归并落盘在 TrainingRuntime 装配），仅默认 run 目录仍被拒绝（按进程
-    时间戳生成，多 rank 下无法对齐、会静默分裂 run）。"""
+    """torchrun 环境的 CLI 守卫（#226 切换期第一步）：train 以单进程多卡
+    执行（async 执行序，进程内多卡由设备发现承担）——torchrun 多进程
+    拓扑属已退役的旧执行序，显式拒绝在 run 目录预占之前（usage 错误
+    不落任何工件，与 pretrain 的 RANK 拒绝同口径）。"""
 
-    def test_nonzero_rank_enters_training_assembly(
+    @pytest.mark.parametrize("rank", ["0", "1"])
+    def test_torchrun_start_rejected_regardless_of_rank(
         self, cli: CliSession, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch, rank: str,
     ) -> None:
-        """torchrun 环境进入训练装配（无 rank 守卫）：world=1 形态（
-        ``torchrun --nproc_per_node=1`` 的真实 env）下进程组自洽初始化，
-        生产 config 在装配期因工件缺失得到训练契约错误——走到该错误证明
-        CLI 未按 rank 拦截。多 rank 全 rank 同构执行由 test_distributed
-        的 spawn 契约真实验证（单测无跨进程 rendezvous）。"""
-        monkeypatch.setenv("RANK", "0")
-        monkeypatch.setenv("WORLD_SIZE", "1")
-        monkeypatch.setenv("LOCAL_RANK", "0")
+        """torchrun 环境（任意 rank）整体拒绝：新旧执行序无运行时开关，
+        生产入口单口径（#226 决策 1「不留双口径」）。"""
+        monkeypatch.setenv("RANK", rank)
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("LOCAL_RANK", rank)
         monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
         monkeypatch.setenv("MASTER_PORT", "29781")
-        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
-        assert "训练输入契约违反" in result.stderr
-
-    def test_rank0_passes_guard_into_training(
-        self, cli: CliSession, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """rank 0 通过守卫进入训练装配（生产 config 在装配期因工件缺失
-        得到训练契约错误——走到该错误证明守卫未拦截；失败后未产出工件
-        的 run 目录已被回滚）。"""
-        monkeypatch.setenv("RANK", "0")
-        result = cli.train(cli.write_config(tmp_path), run_dir=tmp_path / "run")
-        assert "训练输入契约违反" in result.stderr
+        run_dir = tmp_path / "run"
+        result = cli.train(cli.write_config(tmp_path), run_dir=run_dir)
+        assert result.code == 2
+        assert "拒绝 torchrun 启动" in result.stderr
+        assert "RANK" in result.stderr
+        assert not run_dir.exists()  # 拒绝在 run 目录预占之前
 
 
 class TestEvalCommand:
@@ -264,16 +255,6 @@ class TestDistributedRunDir:
         (run_root / "config.json").write_text("{}", encoding="utf-8")
         with pytest.raises(FileExistsError):
             RunArtifacts.init(config, run_root)
-
-    def test_train_under_torchrun_requires_explicit_run_dir(
-        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """默认 run 目录按进程时间戳生成、无法跨 rank 对齐：torchrun 下
-        （rank 0）也必须显式 --run-dir（非 0 rank 已被单进程守卫更早拒绝）。"""
-        monkeypatch.setenv("RANK", "0")
-        result = cli.train(cli.write_config(tmp_path))
-        assert result.code == 2
-        assert "--run-dir" in result.stderr
 
 
 class TestMetricsStream:
