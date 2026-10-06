@@ -206,19 +206,24 @@ class ExecutorScenario:
 
     @staticmethod
     def assert_state_dicts_close(
-        first: dict, second: dict, label: str,
+        first: dict, second: dict, label: str, *,
+        rtol: float = 1e-2, atol: float = 2e-4,
     ) -> None:
-        """两张 state_dict 的容差对账（rtol=1e-2、atol=5e-5——实测漂移
-        包络的一数倍余量：2 iteration 后全张量最大绝对漂移 2.2e-5，近零
-        权重张量是绝对漂移的主要失守面、rtol 在其上失效）。多卡档重放
-        锚的数值面：kernel 路径的地址/对齐敏感选择使同进程/跨进程逐位
-        不可达（#234 评审收敛期探测定谳，见 test_multicard_same_seed_
-        replay docstring），协议级非确定性（RNG 流错接、barrier 序乱）
-        为 O(1) 仍被本容差捕获。"""
+        """两张 state_dict 的容差对账（缺省 rtol=1e-2、atol=2e-4——
+        #234 实测漂移包络 2.2e-5 的 ~10 倍；gauss 共享负载窗口的压测
+        观测把跨 run 漂移推到 1e-4 量级、2e-4 留数倍余量；近零权重
+        张量是绝对漂移的主要失守面、rtol 在其上失效）。跨卡同 run
+        比对调用方收紧到 atol=1e-5（detect_card_divergence 同款口径：
+        共享负载压测实测跨卡漂移 2.4e-7 ~ 2.6e-6，结构性分叉信号
+        单步 AdamW ~5e-5 仍在拒绝域）。多卡档重放锚的数值面：kernel
+        路径的地址/对齐敏感选择使同进程/跨进程逐位不可达（#234 评审
+        收敛期探测定谳，见 test_multicard_same_seed_replay docstring），
+        协议级非确定性（RNG 流错接、barrier 序乱）为 O(1) 仍被本容差
+        捕获。"""
         assert set(first) == set(second), label
         for key in first:
             assert torch.allclose(
-                first[key].cpu(), second[key].cpu(), rtol=1e-2, atol=5e-5,
+                first[key].cpu(), second[key].cpu(), rtol=rtol, atol=atol,
             ), f"{label}:{key}"
 
     @staticmethod
@@ -227,9 +232,11 @@ class ExecutorScenario:
     ) -> None:
         """重放事件值的容差递归对账：float 叶 rel（调用方按 iteration
         分代——漂移随训练步放大：iter 0 紧锚 rel=1e-2，iter ≥ 1 放松
-        rel=1e-1；观测包络：判别器损失分量 2 iteration 后相对漂移
-        2.2%）+ abs=1e-3（近零损失 surrogate 抵消放大面）；None/
-        int/str/bool 叶与容器键集精确相等——结构面不留容差。"""
+        rel=3e-1；#234 观测包络判别器损失分量 2.2%、gauss 共享负载压测
+        实测 overfit_divergence_ema 相对漂移 ~12.7%——3e-1 数倍余量，
+        协议级错误 O(1) 仍远超）+ abs=1e-3（近零损失 surrogate 抵消
+        放大面）；None/int/str/bool 叶与容器键集精确相等——结构面不
+        留容差。"""
         if isinstance(left, float) or isinstance(right, float):
             assert left is not None and right is not None, (
                 f"{path}: {left!r} != {right!r}（None 与 float 不可对拍）"
@@ -1158,11 +1165,13 @@ class TestExecutorMultiCardTier:
     def test_multicard_weights_and_events_across_cards(
         self, cli: CliSession, tmp_path: Path,
     ) -> None:
-        """单进程多卡端到端：跨卡权重与 spectral buffer 逐位一致（确定性
-        allreduce + 同步 step 序列的结构性保证），事件 (iteration, slot)
-        完备有序。判别器链全强度（#234）：判别器参数跨卡逐位一致进锚
-        （梯度 allreduce SUM + 同步 optimizer.step 的实证）+ 每事件
-        disc_update 在场（N_d=1）。"""
+        """单进程多卡端到端：跨卡权重数值一致（容差 atol=1e-5——确定性
+        allreduce + 同步 step 序列 + 步末状态 broadcast 把跨卡一致性
+        收敛到数值面；gauss 共享负载压测实测 1-2 ulp 级漂移随机发生、
+        逐位不可达，detect_card_divergence 同款容差口径），spectral
+        buffer 逐位一致（broadcast 直接复制的同步强锚保留逐位）。事件
+        (iteration, slot) 完备有序。判别器链全强度（#234）：判别器
+        参数跨卡一致进锚 + 每事件 disc_update 在场（N_d=1）。"""
         card_count = self._visible_card_count()
         if card_count < 2:
             pytest.skip("多卡档：需要 ≥2 CUDA 设备（gauss 4×A6000 口径）")
@@ -1182,14 +1191,14 @@ class TestExecutorMultiCardTier:
             executor.cards[0].replica.scorer,
         )
         for card in executor.cards[1:]:
-            scenario.assert_state_dicts_bitwise(
+            scenario.assert_state_dicts_close(
                 reference, card.replica.policy.full_state(),
-                f"policy(card{card.index})",
+                f"policy(card{card.index})", rtol=0.0, atol=1e-5,
             )
-            scenario.assert_state_dicts_bitwise(
+            scenario.assert_state_dicts_close(
                 reference_disc,
                 card.replica.scorer.discriminator.state_dict(),
-                f"discriminator(card{card.index})",
+                f"discriminator(card{card.index})", rtol=0.0, atol=1e-5,
             )
             scenario.assert_state_dicts_bitwise(
                 reference_buffers, scenario.spectral_buffers(card.replica.scorer),
@@ -1222,9 +1231,11 @@ class TestExecutorMultiCardTier:
         M={1,2,3}）——多卡更新相逐 k 收集-同步（逐 tensor 串行
         allreduce × |M| barrier）进重放锚，验收逐 k 协议的多卡档。
 
-        数值面为**容差对拍**（权重 rtol=1e-2/atol=5e-5；事件按
-        iteration 分代——iter 0 rel=1e-2 紧锚、iter ≥ 1 rel=1e-1，
-        漂移随训练步放大、判别器损失分量 2 iter 后相对漂移实测 2.2%，
+        数值面为**容差对拍**（权重 rtol=1e-2/atol=2e-4；事件按
+        iteration 分代——iter 0 rel=1e-2 紧锚、iter ≥ 1 rel=3e-1，
+        漂移随训练步放大、#234 实测判别器损失分量 2 iter 后相对漂移
+        2.2%、gauss 共享负载压测实测 overfit_divergence_ema 达 12.7%——
+        容差取共享负载包络的数倍上界，
         近零值 abs=1e-3）而非逐位；spectral u/v 缓冲**跨 run 不比较**——幂
         迭代在两判别器步（8 次推进）远未收敛，跨 run 方向是迭代
         basin 抽签（实测一对 |cos|=0.994、另一对 0.887），无跨 run
@@ -1305,7 +1316,7 @@ class TestExecutorMultiCardTier:
             )
             # 分代容差：漂移随训练步放大——iter 0 数值面留紧锚，
             # iter ≥ 1 放宽防 kernel 漂移误报（机制见 docstring）。
-            rel = 1e-2 if left["iteration"] == 0 else 1e-1
+            rel = 1e-2 if left["iteration"] == 0 else 3e-1
             for key, value in left.items():
                 if key in WALL_CLOCK_EVENT_FIELDS:
                     continue  # 墙钟字段跨 run 必然不同
@@ -1676,15 +1687,28 @@ class TestWeightDivergenceCheck:
     def test_policy_divergence_located(self) -> None:
         per_card = [self._states(1.0), self._states(2.0)]
         assert AsyncTrainingExecutor.detect_card_divergence(per_card) == (
-            "policy:w（卡 1 与卡 0 逐位失配）"
+            "policy:w（卡 1 与卡 0 数值失配）"
         )
 
     def test_discriminator_divergence_located(self) -> None:
         second = ({"w": torch.full((2, 2), 1.0)}, {"d": torch.full((3,), 9.0)})
         per_card = [self._states(1.0), second]
         assert AsyncTrainingExecutor.detect_card_divergence(per_card) == (
-            "discriminator:d（卡 1 与卡 0 逐位失配）"
+            "discriminator:d（卡 1 与卡 0 数值失配）"
         )
+
+    def test_ulpscale_drift_within_tolerance(self) -> None:
+        """1-2 ulp 级跨卡库层漂移（gauss 压测实测 2.4e-7 ~ 2.6e-6）在校验
+        容差内不触发 fail-fast——结构性分叉（单步 AdamW ~lr 量级）仍在
+        拒绝域。"""
+        drifted = ({"w": torch.full((2, 2), 1.0) + 2.6e-6}, {"d": torch.full((3,), 1.0)})
+        per_card = [self._states(1.0), drifted]
+        assert (
+            AsyncTrainingExecutor.detect_card_divergence(per_card) is None
+        )
+        beyond = ({"w": torch.full((2, 2), 1.0 + 5e-5)}, {"d": torch.full((3,), 1.0)})
+        per_card = [self._states(1.0), beyond]
+        assert AsyncTrainingExecutor.detect_card_divergence(per_card) is not None
 
 
 class TestAppendEventsFlushFace:

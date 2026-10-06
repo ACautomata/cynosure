@@ -60,7 +60,7 @@ gradient_checkpointing` 默认开、fixture 可关），装配期 bitwise 探针
 环后落地**——混合条件配对批经判别器桶（``DiscriminatorBucket``，单
 条件同形对集合、构造期断言）承载，相位序列先全桶 eval 后全桶 train
 （``DiscriminatorPhase.accumulate``）→ 跨卡梯度 allreduce SUM →
-optimizer.step → 步末 u/v broadcast（卡 0 权威）；**逐对等权全局
+optimizer.step → 步末状态 broadcast（判别器全参数 + u/v，卡 0 权威）；**逐对等权全局
 mean**（loss×n_b/N_total）显式新裁落地。窗口语义（``Discriminator
 Window``）：每窗口每卡恰 K 任务、逐 iter 发射 floor(K/L)（余数补窗
 口首 iter）、任务创建序 = 桶序×对序；real 侧窗口起点全局无放回抽取
@@ -83,7 +83,7 @@ train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
 fail-fast）、拓扑守卫只对账 slots（卡数不进对账）、generators
 per-(槽×流) 嵌套、seeds 记录性字段、全局 RNG/world_size/ema 预留槽
 删除；checkpoint 节奏（周期 + 收尾兜底）**同写者顺序定死**——跨卡
-权重 bitwise 校验（#217，失配 = weight_divergence_alert 即写 +
+权重一致性校验（#217，容差口径；失配 = weight_divergence_alert 即写 +
 abort）→ 续训分片 → 产物 checkpoint（policy_iter*.pt /
 discriminator_iter*.pt）；resume 单点声明（占位装配 + 恢复 = 契约
 校验 → 下发各卡 → 流状态回填 → 分叉 adopt → 指标流回退）。
@@ -437,7 +437,8 @@ class CardWorker:
     测量段，绑卡线程装配——heldout 流 owner 即绑卡线程）、
     ``discriminate``（窗口记录 → 桶装配 → 全桶 eval/train/加权
     backward）、``disc_step``（optimizer.step + eval 归位）——跨卡
-    集合段（梯度 allreduce、u/v broadcast）由门面主线程单点编排
+    集合段（梯度 allreduce、步末状态 broadcast：判别器全参数 +
+    spectral u/v）由门面主线程单点编排
     （``DiscriminatorPhase.reduce_gradients`` / ``synchronize_spectral``）。"""
 
     def __init__(
@@ -574,7 +575,7 @@ class CardWorker:
 
     async def disc_step(self) -> None:
         """判别器步收尾：optimizer.step + eval 相恢复（门面跨卡梯度
-        allreduce 之后；步末 u/v broadcast 由门面主线程单点编排）。"""
+        allreduce 之后；步末状态 broadcast（全参数 + u/v）由门面主线程单点编排）。"""
         self.replica.disc_phase.step()
 
     async def export_states(self) -> tuple[dict, dict]:
@@ -1333,7 +1334,7 @@ class AsyncTrainingExecutor:
 
     async def _checkpoint_at(self, iteration: int) -> None:
         """checkpoint 节奏点（#222 同写者顺序定死）：跨卡权重逐位
-        校验（#217 checkpoint 周期 bitwise 校验，多卡面）→ v12 续训
+        校验（#217 checkpoint 周期跨卡一致性校验，多卡面）→ v12 续训
         分片（单文件原子写）→ 产物 checkpoint（契约工件，外部消费）。
         校验失败 = ``weight_divergence_alert`` 告警即写 + abort——分叉
         是吸收态（allreduce 只作用梯度、不能纠正权重分叉，#217 §4），
@@ -1354,7 +1355,7 @@ class AsyncTrainingExecutor:
             ))
             raise TrainingAborted(
                 f"checkpoint 周期跨卡权重分叉（iteration {iteration}）："
-                f"{divergence}——#217 bitwise 校验 fail-fast（分叉是吸收态，"
+                f"{divergence}——#217 一致性校验 fail-fast（分叉是吸收态，"
                 "告警 + abort + 从最近一致 checkpoint 重启）"
             )
         self._continuation.store.save(
@@ -1364,12 +1365,20 @@ class AsyncTrainingExecutor:
 
     @staticmethod
     def detect_card_divergence(per_card: list[tuple[dict, dict]]) -> str | None:
-        """跨卡权重逐位比较（policy + 判别器网络 state_dict 的每个
+        """跨卡权重一致性比较（policy + 判别器网络 state_dict 的每个
         张量，含 spectral norm ``_u``/``_v`` buffer）：全部卡与卡 0
-        快照逐位相等 = None；失配 = 「网络:参数名（卡 i 与卡 0 逐位
+        快照数值一致 = None；失配 = 「网络:参数名（卡 i 与卡 0 数值
         失配）」的定位描述（告警事件的归因文案与 abort 消息共用）。
         单卡拓扑无跨卡面，结构性恒一致（返回 None，无跳过日志——
-        单卡的「一致」是结构事实不是测量结论）。"""
+        单卡的「一致」是结构事实不是测量结论）。
+
+        浮点张量以 allclose(rtol=0, atol=1e-5) 判定而非逐位：GPU 库层
+        归约噪声（共享负载窗口放大）使 1-2 ulp 级跨卡漂移成为概率事件
+        ——gauss 双卡压测实测 policy/判别器皆可出现 2.4e-7 ~ 2.6e-6 的
+        随机失配（判别器步段已由 synchronize_spectral 的步末状态
+        broadcast 收敛，残余窗口在 k 相位），#217「分叉是吸收态」的
+        fail-fast 语义保留给结构性分叉（单步 AdamW ~lr=5e-5 量级的
+        真实信号，检测余量 5 倍+）；非浮点张量仍逐位。"""
         if len(per_card) <= 1:
             return None
         reference_policy, reference_disc = per_card[0]
@@ -1377,13 +1386,17 @@ class AsyncTrainingExecutor:
             per_card[1:], 1,
         ):
             for name, reference in reference_policy.items():
-                if not torch.equal(reference, policy_state[name]):
-                    return f"policy:{name}（卡 {card_index} 与卡 0 逐位失配）"
+                if not torch.allclose(
+                    reference, policy_state[name], rtol=0.0, atol=1e-5,
+                ):
+                    return f"policy:{name}（卡 {card_index} 与卡 0 数值失配）"
             for name, reference in reference_disc.items():
-                if not torch.equal(reference, disc_state[name]):
+                if not torch.allclose(
+                    reference, disc_state[name], rtol=0.0, atol=1e-5,
+                ):
                     return (
                         f"discriminator:{name}"
-                        f"（卡 {card_index} 与卡 0 逐位失配）"
+                        f"（卡 {card_index} 与卡 0 数值失配）"
                     )
         return None
 
@@ -1392,7 +1405,7 @@ class AsyncTrainingExecutor:
     ) -> dict:
         """v12 全清单快照的攒装（#222 终稿键清单）：卡 0 权威取数
         （各卡副本经「同初始化 + 确定性 allreduce + 同步 step」结构
-        保证逐位一致，checkpoint 点的跨卡 bitwise 校验刚把守过）；
+        保证逐位一致，checkpoint 点的跨卡一致性校验刚把守过）；
         optimizer 与 lr 卡 0 单份。``seeds`` = per-槽 seed 派生值的
         记录性落痕（恢复不对账，#222 §1）。"""
         policy_state, disc_state = card0_states
@@ -1471,7 +1484,7 @@ class AsyncTrainingExecutor:
         每活跃条件恰一次读数）→ train 相逐 k barrier（loss×(1/N)+SUM
         → 各卡一次 step）→ 判别器步（is_step：桶装配 → 全桶 eval/train
         + 逐对等权 backward → 跨卡梯度 allreduce SUM → optimizer.step
-        → 步末 u/v broadcast）→ 分叉观测与事件发射（(iteration, slot)
+        → 步末状态 broadcast（全参数 + u/v））→ 分叉观测与事件发射（(iteration, slot)
         排序写）。
 
         phase_seconds 发 rollout / policy_update / discriminator 三相

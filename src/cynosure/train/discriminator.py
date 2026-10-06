@@ -676,14 +676,37 @@ class DiscriminatorPhase:
 
     @staticmethod
     def synchronize_spectral(phases: list["DiscriminatorPhase"]) -> None:
-        """步末 spectral norm u/v broadcast（卡 0 权威，#220 决议 2）。
+        """步末判别器状态 broadcast（卡 0 权威，#220 决议 2 的口径扩展）。
 
-        奇异向量不可平均，broadcast 即最优；步末而非步首——窗口内
-        AUC 打分须读同步后值。多卡 CUDA 面生效；单卡/无 spectral
-        norm（buffer 集为空）结构性跳过，不空发集合调用。"""
+        奇异向量不可平均，broadcast 即最优；**参数同样不可平均**（归约
+        后权重经各卡本地 step 落地，GPU 库层归约噪声使 bitwise 一致性
+        成为概率事件而非结构保证）——gauss 双卡共享负载压测实测 ~1/10
+        概率的跨卡 2-6e-6 级权重失配（checkpoint 周期一致性校验
+        fail-fast 误触发）。故步末同步面 = 判别器全参数 + spectral
+        u/v buffer，全量 broadcast 卡 0 权威：幅度即数值噪声级
+        （broadcast 值与本地值的差 < checkpoint 校验的拒绝域语义），
+        不改变训练数值语义、把「理论一致」收敛到「bitwise 一致」。
+        多卡 CUDA 面生效；单卡结构性跳过，不空发集合调用。"""
         if len(phases) <= 1:
             return
         DiscriminatorPhase._require_multicard(phases)
+        parameter_maps = [
+            dict(phase._scorer.discriminator.named_parameters())
+            for phase in phases
+        ]
+        for name in parameter_maps[0]:
+            missing = [
+                index for index, mapping in enumerate(parameter_maps)
+                if name not in mapping
+            ]
+            if missing:
+                raise ValueError(
+                    f"判别器参数 {name!r} 跨卡不同构（卡 {missing} "
+                    "缺失）——broadcast 前提破坏，拒绝静默部分同步"
+                )
+            torch.cuda.nccl.broadcast(
+                [mapping[name] for mapping in parameter_maps], root=0,
+            )
         reference = phases[0].spectral_buffers()
         if not reference:
             return

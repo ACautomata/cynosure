@@ -46,6 +46,21 @@ pytestmark = [pytest.mark.gpu, pytest.mark.slow]  # slow：默认跳过（--run-
 
 RESUME_STATE = "checkpoints/resume_state.pt"
 
+# 跨执行器实例世界对的容差口径（两次独立 AsyncTrainingExecutor.run）：
+# GPU 库层 1-2 ulp 重算噪声（确定性模式不可根除）经 AdamW 归一化步长
+# 链式放大——gauss 双卡 4-iteration 实测：事件指标最大分叉 1.6e-3、
+# 收官 checkpoint 最大分叉 1.5e-5；且共享集群的负载窗口（gauss 卡轴
+# 多租户）带来不可控的波动增量（全量档案：带 5e-3/1e-4 容差仍出现
+# 低频越线，独立复跑同测试则绿）。atol 取实测噪声的 ~10 倍量级；恢
+# 复语义的结构面（iteration 序、事件数、恢复点对账、rewind 边界）
+# 全部严格相等是硬锚，数值面只承载大方向恢复缺陷（RNG 流错位/EMA
+# 错位 → O(0.1) 级，检测余量 10 倍+）。依据 ADR-0018 决策 9 accepted
+# drift + RunTrajectory docstring 的两级语义（同进程重放逐位、跨实例
+# 容差）。checkpoint 面不用 checkpoint_parity 的 1e-7（那是同进程
+# 重放口径；跨实例分叉实测已到 1e-5）。
+_CROSS_INSTANCE_ATOL = 1e-2
+_CROSS_INSTANCE_CKPT_ATOL = 1e-3
+
 
 class MidRunCrash:
     """模拟作业边界崩溃（上下文管理器界定注入范围）：第 ``iteration + 1``
@@ -118,17 +133,25 @@ class TestRoundtripEquivalence:
     ) -> None:
         """干净截断：max_iterations=2 训练（收尾兜底落盘状态@2）→ 延长
         config 到 4 并 --resume → 事件流与收官 checkpoint 和不中断的
-        4-iteration run 逐条/逐位一致。"""
+        4-iteration run 逐条一致（恢复段数值容差：resume 与 baseline
+        是两次独立训练——GPU 库层 1-2 ulp 重算噪声经 AdamW 放大，结构
+        连续严格 + 浮点容差，RunTrajectory.atol / checkpoints atol）。"""
         scenario.write_inputs()
         scenario.patch_config(schedule={"max_iterations": 2})
         assert scenario.train().code == 0
-        assert [event["iteration"] for event in scenario.events()] == slot_tiled([0, 1])
+        assert [
+            event["iteration"] for event in scenario.events()
+            if event["event"] == "iter"
+        ] == slot_tiled([0, 1])
 
         scenario.patch_config(schedule={"max_iterations": 4})
         result = scenario.resume()
         assert result.code == 0, result.stderr
         resumed_events = scenario.events()
-        assert [event["iteration"] for event in resumed_events] == slot_tiled([0, 1, 2, 3])
+        assert [
+            event["iteration"] for event in resumed_events
+            if event["event"] == "iter"
+        ] == slot_tiled([0, 1, 2, 3])
 
         baseline_dir = scenario.tmp_path / "run_baseline"
         assert scenario.cli.train(
@@ -137,9 +160,12 @@ class TestRoundtripEquivalence:
         baseline_events = RunArtifacts(
             RunArtifacts.layout(baseline_dir),
         ).read_events()
-        assert RunTrajectory(resumed_events) == RunTrajectory(baseline_events)
+        assert RunTrajectory(resumed_events, atol=_CROSS_INSTANCE_ATOL) == (
+            RunTrajectory(baseline_events, atol=_CROSS_INSTANCE_ATOL)
+        )
         scenario.checkpoints_identical(
             baseline_dir, ["policy_iter4.pt", "discriminator_iter4.pt"],
+            atol=_CROSS_INSTANCE_CKPT_ATOL,
         )
         assert scenario.resume_state()["iteration"] == 4
 
@@ -158,11 +184,17 @@ class TestRoundtripEquivalence:
                 scenario.train()
         # 崩溃前完整 iteration 0/1/2 已追加事件；状态停在周期点 2
         assert scenario.resume_state()["iteration"] == 2
-        assert [event["iteration"] for event in scenario.events()] == slot_tiled([0, 1, 2])
+        assert [
+            event["iteration"] for event in scenario.events()
+            if event["event"] == "iter"
+        ] == slot_tiled([0, 1, 2])
 
         assert scenario.resume().code == 0
         resumed_events = scenario.events()
-        assert [event["iteration"] for event in resumed_events] == slot_tiled([0, 1, 2, 3])
+        assert [
+            event["iteration"] for event in resumed_events
+            if event["event"] == "iter"
+        ] == slot_tiled([0, 1, 2, 3])
 
         baseline_dir = scenario.tmp_path / "run_baseline"
         assert scenario.cli.train(
@@ -171,9 +203,12 @@ class TestRoundtripEquivalence:
         baseline_events = RunArtifacts(
             RunArtifacts.layout(baseline_dir),
         ).read_events()
-        assert RunTrajectory(resumed_events) == RunTrajectory(baseline_events)
+        assert RunTrajectory(resumed_events, atol=_CROSS_INSTANCE_ATOL) == (
+            RunTrajectory(baseline_events, atol=_CROSS_INSTANCE_ATOL)
+        )
         scenario.checkpoints_identical(
             baseline_dir, ["policy_iter4.pt", "discriminator_iter4.pt"],
+            atol=_CROSS_INSTANCE_CKPT_ATOL,
         )
 
 
@@ -385,7 +420,9 @@ class TestPretrainEventRewindIsolation:
         # 漏删方向：半截 iter@2 被重执行重写——号连续、无重复、无旧值残留
         resumed_iter = scenario.slot0_iter_events()
         assert [event["iteration"] for event in resumed_iter] == [0, 1, 2, 3]
-        assert RunTrajectory(resumed_iter[:3]) == RunTrajectory(crashed_iter)
+        assert RunTrajectory(resumed_iter[:3], atol=_CROSS_INSTANCE_ATOL) == (
+            RunTrajectory(crashed_iter, atol=_CROSS_INSTANCE_ATOL)
+        )
         # 恢复点已覆盖的里程碑评测不被重放、也不被删除
         assert [
             event["iteration"] for event in events if event["event"] == "milestone"

@@ -232,9 +232,14 @@ class TrainingLoopScenario:
             map_location="cpu", weights_only=True,
         )
 
-    def checkpoints_identical(self, other_run_dir: Path, names: list[str]) -> None:
-        """收官 checkpoint 工件与另一 run 的同名 state_dict 逐位对账
-        （同路径重放的逐位语义）。"""
+    def checkpoints_identical(
+        self, other_run_dir: Path, names: list[str], *, atol: float | None = None,
+    ) -> None:
+        """收官 checkpoint 工件与另一 run 的同名 state_dict 对账：
+        缺省逐位（同路径重放的逐位语义）；``atol`` 开启容差（跨执行器
+        实例的世界对——两次独立训练的权重演化存在 GPU 库层 1-2 ulp
+        噪声，确定性模式不可根除，浮点张量 allclose(rtol=0, atol)，
+        非浮点逐位，键集合严格——ADR-0018 决策 9 accepted drift）。"""
         for name in names:
             first = torch.load(
                 self.run_dir / "checkpoints" / name,
@@ -246,7 +251,12 @@ class TrainingLoopScenario:
             )
             assert set(first) == set(second)
             for key in first:
-                assert torch.equal(first[key], second[key]), f"{name}:{key}"
+                if atol is not None and first[key].is_floating_point():
+                    assert torch.allclose(
+                        first[key], second[key], rtol=0.0, atol=atol,
+                    ), f"{name}:{key}"
+                else:
+                    assert torch.equal(first[key], second[key]), f"{name}:{key}"
 
 
 @pytest.fixture

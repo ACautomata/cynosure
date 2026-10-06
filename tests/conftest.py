@@ -213,15 +213,37 @@ WALL_CLOCK_EVENT_FIELDS = ("elapsed_s", "phase_seconds")
 ``threshold_s`` 两字段随类型收口退役）。"""
 
 
+def _tolerant_equal(first, second, atol: float) -> bool:
+    """嵌套事件结构的容差相等：dict 键集合 / list 长度 / 非浮点值严格，
+    浮点值逐个 abs 差 ≤ atol（ADR-0018 决策 9 accepted drift 的
+    事件面口径——结构连续严格、数值连续容差）。"""
+    if isinstance(first, dict) and isinstance(second, dict):
+        return set(first) == set(second) and all(
+            _tolerant_equal(first[key], second[key], atol)
+            for key in first
+        )
+    if isinstance(first, list) and isinstance(second, list):
+        return len(first) == len(second) and all(
+            _tolerant_equal(a, b, atol) for a, b in zip(first, second)
+        )
+    if isinstance(first, float) and isinstance(second, float):
+        return abs(first - second) <= atol
+    return first == second
+
+
 class RunTrajectory:
     """iter 事件流的轨迹可比面（值对象）：wall-clock 字段（``elapsed_s``
     与 ``phase_seconds``，见 ``WALL_CLOCK_EVENT_FIELDS``）不参与相等性
     ——跨作业对比的语义轴是事件序下的其余字段。同**进程**重放
-    （单进程续训 roundtrip）在此逐位断言；跨进程世界对的对比（分布式
-    续训 roundtrip 等）的观测前向存在 1-2 ulp 重算噪声，走
-    test_distributed.CrossPathEquivalence 的容差判定。"""
+    （单进程续训 roundtrip 的流回填/恢复对账）在此逐位断言；**跨执行器
+    实例**的世界对对比（截断/崩溃 resume 的恢复段 vs 独立 baseline——
+    两次 ``AsyncTrainingExecutor.run``）的观测前向存在 1-2 ulp 重算
+    噪声（GPU 库层非确定，确定性模式不可根除），经 AdamW 归一化步长
+    放大后事件指标可见 1e-3 级分叉——``atol`` 显式开启容差模式：
+    结构（事件序、键形、非浮点值）严格、浮点值容差（ADR-0018 决策 9
+    accepted drift 的事件面延伸）。"""
 
-    def __init__(self, events: list[dict]) -> None:
+    def __init__(self, events: list[dict], *, atol: float | None = None) -> None:
         self._events = [
             {
                 key: value for key, value in event.items()
@@ -229,9 +251,15 @@ class RunTrajectory:
             }
             for event in events
         ]
+        self._atol = atol
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, RunTrajectory) and self._events == other._events
+        if not isinstance(other, RunTrajectory):
+            return NotImplemented
+        if self._atol is not None or other._atol is not None:
+            atol = max(self._atol or 0.0, other._atol or 0.0)
+            return _tolerant_equal(self._events, other._events, atol)
+        return self._events == other._events
 
     def __repr__(self) -> str:
         return (
