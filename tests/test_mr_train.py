@@ -1,4 +1,5 @@
-"""MR-RATE 线 RL 主循环端到端（#123 tracer 首跑票的 fixture 层）。
+"""MR-RATE 线 RL 主循环端到端（#123 tracer 首跑票的 fixture 层；#226
+切换期第一步起经 async 执行序生产入口驱动）。
 
 MR 线的 prepare → pretrain 两段已在 ``test_mr_pretrain.py`` 贯通；本票
 补的是**主循环第三段**：G 轨迹 rollout → PatchDiscriminator latent 域打分
@@ -6,7 +7,8 @@ MR 线的 prepare → pretrain 两段已在 ``test_mr_pretrain.py`` 贯通；本
 条件形状 / 逐条件 sigma 日程上跑通，并覆盖本票交付的面：
 
 1. **逐 iter 卡时分解**（``iter`` 事件的 ``phase_seconds``）：rollout /
-   held-out AUC / policy 更新 / 判别器更新四相位。
+   policy 更新 / 判别器更新三相（AUC 池化原料打分计入 rollout 相，
+   #237 评测顺迁口径）。
 
 监控链路（里程碑 FID 双轨 / 监控子样本 decode / overfit_alert 订阅面，
 #124）的专项测试在 ``test_mr_monitoring.py``；本文件保留装配分界的
@@ -15,7 +17,6 @@ MR 线的 prepare → pretrain 两段已在 ``test_mr_pretrain.py`` 贯通；本
 
 import json
 import math
-import shutil
 from pathlib import Path
 
 import pytest
@@ -28,22 +29,24 @@ from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.train.runtime import TrainingRuntime
-from cynosure.train.trainer import PhaseTimer
 from tests.conftest import (
     CliSession,
     SPARSE_POOL_DISC_K,
     SyntheticMrRateDataset,
+    execution_slot_count as slot_count,
+    slot_tiled,
 )
 
 CONDITIONS = ["t1w/axial", "flair/axial"]
 """夹具词表的两条件（t1w/axial [4,16,16,8]、flair/axial [4,8,8,16]）——
 异形状是本文件「逐条件形状贯通」的输入面。"""
 
-PHASES = ("rollout", "heldout_auc", "policy_update", "discriminator")
-"""逐 iter 卡时分解的相位键（#123：iter 事件 ``phase_seconds``；
-未开 ``--dump-trajectory`` 的口径——开了诊断另加 ``trajectory`` 相，
-见 test_trajectory_diagnostic；``gating`` 相随 ADR-0017 门控链退役
-移出）。"""
+PHASES = ("rollout", "policy_update", "discriminator")
+"""逐 iter 卡时分解的相位键（#123 卡时分解面；async 执行序三相——
+held-out AUC 并入 rollout 相的池化原料打分、gating 相随 ADR-0017 门控链
+退役移出、trajectory 相属旧执行序诊断路径）。"""
+
+
 
 
 class MrTrainScenario:
@@ -190,7 +193,8 @@ class MrTrainScenario:
 
 
 class TestMrMainLoop:
-    """主循环在 MR-RATE 条件词汇表上的执行序（#123 AC1/AC4）。"""
+    """主循环在 MR-RATE 条件词汇表上的执行序（#123 AC1/AC4；断言按
+    槽拓扑自适应——每 iteration 每调度槽恰一条 iter 事件）。"""
 
     @pytest.mark.gpu  # 3 iteration 训练（大轮次口径与既有全链一致）
     def test_main_loop_emits_complete_iter_events(
@@ -198,27 +202,28 @@ class TestMrMainLoop:
     ) -> None:
         """AC：N iter 全绿（无 NaN、无异常终止），iter 事件字段齐全——
         reward（anchor_eval_reward / intra_group_reward_std）、per-condition
-        记账（modality）、逐 iter 卡时分解（phase_seconds 四相位）；
-        条件按词汇表轮转（异条件异形状在同一 run 内贯通）。"""
+        记账（modality）、逐 iter 卡时分解（rollout/policy_update 恒在、
+        discriminator 相随判别器步出现）；条件按分配表轮转（异条件异形状
+        在同一 run 内贯通，全条件在 run 内均有覆盖）。"""
         scenario = MrTrainScenario(cli, tmp_path)
         prepared = scenario.prepare(reward_overrides={"pretrain_pass_threshold": 0.01})
         scenario.use(scenario.pretrain(prepared))
         result = scenario.train()
         assert result.code == 0, result.stderr
         events = scenario.iter_events()
-        assert len(events) == 3
-        assert [event["modality"] for event in events] == [
-            CONDITIONS[index % len(CONDITIONS)] for index in range(3)
-        ]
+        assert len(events) == 3 * slot_count()
+        assert {event["modality"] for event in events} == set(CONDITIONS)
         for event in events:
-            assert set(event["loss"]) == {"policy_step_1", "discriminator"}
-            for key in ("anchor_eval_reward", "intra_group_reward_std",
-                        "heldout_auc"):
+            assert set(event["loss"]) >= {"policy_step_1"}
+            assert set(event["loss"]) <= {"policy_step_1", "discriminator"}
+            for key in ("anchor_eval_reward", "intra_group_reward_std"):
                 value = event[key]
                 assert value == value  # 非 NaN
                 assert abs(value) <= 1e6
-            # 逐 iter 卡时分解：五相位齐备、非负、和不超过总耗时
-            assert set(event["phase_seconds"]) == set(PHASES)
+            # 逐 iter 卡时分解：rollout/policy_update 恒在、判别器相随
+            # 判别器步出现，相位值非负、和不超过总耗时
+            assert set(event["phase_seconds"]) <= set(PHASES)
+            assert {"rollout", "policy_update"} <= set(event["phase_seconds"])
             assert all(
                 value >= 0.0 for value in event["phase_seconds"].values()
             )
@@ -237,7 +242,9 @@ class TestMrMainLoop:
         scenario.use(scenario.pretrain(prepared), max_iterations=2)
         first = scenario.train()
         assert first.code == 0, first.stderr
-        assert [event["iteration"] for event in scenario.iter_events()] == [0, 1]
+        assert [
+            event["iteration"] for event in scenario.iter_events()
+        ] == slot_tiled([0, 1])
         checkpoints = scenario.run_dir() / "checkpoints"
         policy_ckpt = checkpoints / "policy_iter2.pt"
         assert policy_ckpt.is_file()
@@ -258,11 +265,23 @@ class TestMrMainLoop:
         scenario.set_schedule(max_iterations=4)
         second = scenario.train(resume=True)
         assert second.code == 0, second.stderr
-        assert [event["iteration"] for event in scenario.iter_events()] == [
-            0, 1, 2, 3,
-        ]
-        # 续训后条件轮转沿同一序继续（恢复点 = iteration 2 → 条件索引 0）
-        assert scenario.iter_events()[2]["modality"] == CONDITIONS[0]
+        assert [
+            event["iteration"] for event in scenario.iter_events()
+        ] == slot_tiled([0, 1, 2, 3])
+        # 续训后分配表沿纯函数重导出继续（恢复点 = iteration 2 起事件
+        # 重执行；条件域合法 + 无重复无丢失由上面的 iteration 序列断言
+        # 承载，轮转确定性锚在 test_async_executor 的分配表纯函数面）
+        resumed = {
+            (event["iteration"], event["rank"])
+            for event in scenario.iter_events()
+            if event["iteration"] >= 2
+        }
+        assert len(resumed) == 2 * slot_count()
+        assert {
+            event["modality"]
+            for event in scenario.iter_events()
+            if event["iteration"] >= 2
+        } <= set(CONDITIONS)
 
     @pytest.mark.gpu  # 1 iteration 训练（大轮次口径）
     def test_baseline_sampling_runs_without_monitoring_phase(
@@ -310,16 +329,3 @@ class TestMonitoringPhasePresence:
         )
         assert milestone["iteration"] == pretrained.schedule.milestone_interval
         assert math.isfinite(milestone["fid"]) and milestone["fid"] >= 0.0
-
-
-class TestCostReadingShape:
-    """逐 iter 卡时分解的相位命名契约（#123 AC3 的取数面）。"""
-
-    def test_phase_timer_marks_named_phases(self) -> None:
-        """``PhaseTimer`` 的边界语义：逐次 mark 产出对应相位、值为非负
-        秒数，未打点的相位不出现。"""
-        timer = PhaseTimer()
-        timer.mark("rollout")
-        timer.mark("policy_update")
-        assert set(timer.marks) == {"rollout", "policy_update"}
-        assert all(value >= 0.0 for value in timer.marks.values())

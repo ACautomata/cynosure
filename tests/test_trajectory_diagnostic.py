@@ -18,6 +18,7 @@ from tests.conftest import (
     CliResult,
     CliSession,
     FixtureArtifactLibrary,
+    execution_slot_count as slot_count,
 )
 from tests.test_mr_train import PHASES
 
@@ -89,17 +90,17 @@ class TestDiagnosticArtifact:
     def test_consistency_diagnostics_have_their_own_phase(
         self, scenario: DiagnosticScenario,
     ) -> None:
-        """--dump-trajectory 的一致性诊断自占相位（PR #165 review）：
-        consistency_pairs 在 rollout 打点之后、held-out AUC 之前执行，
-        其 policy 前向与张量归本是诊断开销——记入 trajectory 相，不并入
-        heldout_auc（诊断运行的 AUC 卡时才不被诊断开销吹胀）；未开 dump
-        的 run 无该相位（五相位契约由 test_mr_train 的 PHASES 锚定）。"""
+        """--dump-trajectory 的诊断开销不进主循环相位账：async 执行序的
+        iter 事件只发 rollout/policy_update/discriminator 三相（#234 池化
+        语义），旧执行序的 trajectory 诊断相随 trainer 退役——诊断回路
+        （TrajectoryDiagnosticRunner）是训练循环之外的独立单进程路径，
+        主循环账不被诊断开销吹胀的诉求由「账面隔离」结构性承载。"""
         assert scenario.run().code == 0
         iter_events = scenario.iter_events()
-        assert len(iter_events) == 1
-        assert set(iter_events[0]["phase_seconds"]) == set(PHASES) | {
-            "trajectory",
-        }
+        assert len(iter_events) == slot_count()
+        for event in iter_events:
+            assert set(event["phase_seconds"]) <= set(PHASES)
+            assert "trajectory" not in event["phase_seconds"]
 
     def test_schedule_anchors_monai_actual_output(
         self, scenario: DiagnosticScenario,

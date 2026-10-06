@@ -559,6 +559,19 @@ class GrpoConfig(BaseModel):
             raise ValueError("KL 定死为 0（无 KL、无参考模型，EMA 锚为升级项）")
         return value
 
+    @field_validator("ema_anchor_enabled")
+    @classmethod
+    def _ema_anchor_is_undelivered(cls, value: bool) -> bool:
+        """EMA 锚是升级项（ADR-0001）且实现未交付：静默忽略会让续训
+        状态清单的 EMA 条件项失真——schema 级显式拒绝（拒绝单点随
+        #226 切换期上移到 config 装载）。"""
+        if value:
+            raise ValueError(
+                "参数 EMA 锚为升级项（ADR-0001），实现未交付："
+                "ema_anchor_enabled=true 显式拒绝"
+            )
+        return value
+
 
 class RewardConfig(BaseModel):
     """Reward model（reward-model 章 + ADR-0001）：latent 域在线 PatchDiscriminator。"""
@@ -976,9 +989,8 @@ class DeploymentConfig(BaseModel):
 
 class AsyncExecutionConfig(BaseModel):
     """async 执行模型 knobs（#217 调度单元契约）：单进程门面执行序的
-    拓扑可设面。既有执行序（单进程 world-1 / torchrun 多进程）不消费
-    本节——新执行序仅被 fixture 测试驱动（#226 决策 1：生产入口直到
-    切换期才改指）。"""
+    拓扑可设面（train 生产入口自切换期第一步 #240 起消费本节；
+    pretrain 的调度拓扑非 config 面）。"""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -1045,7 +1057,7 @@ class CynosureConfig(BaseModel):
     )
     execution: AsyncExecutionConfig = SpecField(
         "tunable", "async 执行模型（#217）",
-        "async 执行模型 knobs（调度槽数）；既有执行序不消费",
+        "async 执行模型 knobs（调度槽数）",
         default_factory=AsyncExecutionConfig,
     )
 

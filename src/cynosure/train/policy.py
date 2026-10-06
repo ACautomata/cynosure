@@ -2,9 +2,9 @@
 
 Policy = 被 RL 训练的扩散模型——模态标签阶段是 base UNet（全参更新），
 跨模态阶段是 ControlNet（base UNet 冻结）。本模块把「可训练网络 + 采样场
-+ 条件分布 + 优化器」收敛为单点装配：**训练循环的采样/更新语义**（trainer /
-rollout / updater）经本装配对组无感知；编排层的组间分流（序贯两阶段、
-诊断工件门槛）仍由 CLI / SequentialTrainer 按 experiment.group 处理。
++ 条件分布 + 优化器」收敛为单点装配：**训练循环的采样/更新语义**（执行序
+门面 / rollout / updater）经本装配对组无感知；编排层的组间分流（诊断工件
+门槛）由 CLI 按 experiment.group 处理。
 
 base 冻结经断言验证（issue #23 验收）：组2 装配期显式关闭 UNet 全部参数
 的 ``requires_grad`` 并复检——静默未冻结会让「仅训 ControlNet」退化为
@@ -68,8 +68,9 @@ class GroupPolicy:
         group = config.experiment.group
         if group == "sequential":
             raise ValueError(
-                "组3 的两阶段序贯由 SequentialTrainer 编排（单次训练循环"
-                "只面对一个可训练对象）"
+                "组3（sequential）的序贯两阶段编排属旧执行序，已随切换期"
+                "退役（单次训练循环只面对一个可训练对象——两阶段由两次"
+                "独立 run 衔接）"
             )
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),

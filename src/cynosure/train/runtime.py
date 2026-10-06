@@ -8,7 +8,7 @@ config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
 dict 第二载体，#218/#230）、数值口径（AmpContext，定义在
 policy/numerics——train 与 eval 共用的 import 环安全位，此处
 re-export 保持既有消费面）与分布式运行时（DistributedContext）。
-trainer 只面对本 Facade 编排 iteration 循环，装配细节（含分布式包装）
+执行序门面只面对本 Facade 的静态装配缝编排，装配细节（含分布式包装）
 不进循环代码路径。
 
 聚合面口径（ADR-0014 平移先行，#230）：本 Facade 是续训聚合层——
@@ -22,9 +22,13 @@ trainer 只面对本 Facade 编排 iteration 循环，装配细节（含分布�
 - 可训练网络 FSDP full-shard + 梯度检查点（PolicySharding，optimizer
   构建于分片后参数之上）；
 - 判别器不再 DDP 化（ReplicatedDiscriminator 已随 #238 pretrain driver
-  期收口删除——#234 解耦 RL 构造点后无任何构造点残留；旧 RL torchrun
-  路径在衰减窗口内各 rank 独立更新判别器，数值分叉可接受——旧执行序
-  随切换期删除）+ Real sample pool 切片（RankSlicedPool；held-out 不切）。
+  期收口删除——#234 解耦 RL 构造点后无任何构造点残留）+ Real sample
+  pool 切片（RankSlicedPool；held-out 不切）。
+
+``build`` 是旧执行序（torchrun 多进程 trainer）的装配入口，其唯一
+消费者已随 #226 切换期第一步退役——本方法现为零入口死代码，与
+DistributedContext 控制面残余一并待切换期第二步（#242 全删除面）
+删除；静态装配缝（``assemble_*``）为新执行序活跃消费面。
 """
 
 from collections.abc import Callable

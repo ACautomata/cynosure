@@ -171,7 +171,7 @@ class NetworkAssembler:
         物化有效权重的形态看似兼容（装载静默成功）实则**再归一化一次**
         （随机 u/v 起步的幂迭代估计）：消费面拿到的不再是保存的那一份
         判别函数，故不采用。无参数化模型逐键同一（``state_dict`` 直通）；
-        续训分片（``ResumeStore``）存的也是这一形态，两处同形。
+        续训分片（v12 ``AsyncResumeStore``）存的也是这一形态，两处同形。
         """
         return model.state_dict()
 

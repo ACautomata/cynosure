@@ -26,8 +26,8 @@ pairwise 准确率（随单步更新报告上行，更新原语 ``OnlineUpdate.s
   由编排方落 ``overfit_alert`` 事件——监控器不持白名单与 σ 的任何
   引用，不自动移出白名单、不自动调 σ（人工裁决）。
 
-per-condition EMA 状态经 ``state``/``adopt`` 与 ResumeStore 对接
-（续训分片的 ``overfit`` 键，恢复逐位复原——iter 事件的分叉 EMA 字段
+per-condition EMA 状态经 ``state``/``adopt`` 与续训分片对接
+（v12 分片的 ``overfit`` 键，恢复逐位复原——iter 事件的分叉 EMA 字段
 进逐位轨迹比对，状态不落盘即续训 roundtrip 失真）。
 """
 
@@ -109,7 +109,7 @@ class OverfitMonitor:
     预训练曲线校准后定版」）。
 
     监控器无集合通信（rank 轴已退役，见模块 docstring）；续训状态经
-    ``state``/``adopt`` 与 ResumeStore 对接（resume v6 的 ``overfit``
+    ``state``/``adopt`` 与 v12 续训分片对接（``overfit``
     键，恢复逐位复原）。
     """
 

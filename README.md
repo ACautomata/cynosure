@@ -12,7 +12,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 pytest                     # 本地测试入口（CLI seam + fixture + 静态零依赖检查；默认跳过 slow 大轮次）
-pytest --run-slow          # 全量（含 slow 大轮次：完整训练 / torchrun 多进程 / 像素域评测）
+pytest --run-slow          # 全量（含 slow 大轮次：完整训练 / 多卡 e2e / 像素域评测）
 ```
 
 CLI：
@@ -26,18 +26,18 @@ cynosure prepare --config config.json   # Real sample pool / held-out / 统计�
 三子命令共享同一 config schema（全量配置项 + 定死/tunable 状态标注，见
 `src/cynosure/config.py`）；config 校验失败时输出字段级错误并以退出码 2 拒绝。
 
-分布式训练（torchrun + FSDP full-shard，判别器 DDP 不分片）：
+train / pretrain 以**单进程多卡**执行（async 执行序，#217/#226：每卡完整
+副本 + 静态分配表 + 逐 k barrier 收集-同步；进程内多卡由设备发现承担）：
 
 ```bash
-torchrun --nproc_per_node=4 -m cynosure.cli train \
+CUDA_VISIBLE_DEVICES=0,1,2,3 cynosure train \
     --config config.json --run-dir /root/private_data/cynosure/runs/<run>
 ```
 
-- 分布式启动必须显式 `--run-dir`（默认目录按进程时间戳生成，多 rank
-  无法对齐）；产物 checkpoint 由 rank 0 独写、指标流由 rank 0 归并
-  （事件按 (iteration, rank) 顺序稳定）、续训状态每 rank 一个分片文件
-  （`checkpoints/resume_state_rank{R}.pt`）；
-- 单进程（无 torchrun 环境）与分布式走同一条训练循环；续训须以同一
-  world size 恢复（跨拓扑续训被拒绝）；
-- 本地 CPU fixture 多进程验证用 gloo 后端；DCU/RCCL 集群侧门槛见
-  实施 spec（issue #15）M0 清单。
+- torchrun 多进程启动显式拒绝（多进程拓扑属已退役的旧执行序）；
+  卡集裁剪经 `CUDA_VISIBLE_DEVICES`；
+- 调度槽数 = `execution.coroutines`（缺省 = 卡数）；
+- 续训 `--resume --run-dir <run>`：v12 单文件分片
+  （`checkpoints/resume_state.pt`），恢复须同协程数拓扑（卡数不进对账）；
+- 多卡语义的机器面锚（跨卡 allreduce / 重放逐位）由集群 `--run-slow`
+  全量覆盖，见 `docs/adr/0018`（pretrain driver 同款执行形态）。

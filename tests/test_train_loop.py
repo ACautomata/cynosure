@@ -1,13 +1,15 @@
 """单 iteration GRPO 循环全链路（ticket #21 验收标准聚合，tracer bullet）。
 
-fixture 下 CLI train 端到端：Rollout（Anchor → 单步 SDE 扰动 → 各 λ ODE
-续跑 → 判别器 raw logit 打分）→ MGAI advantage → 逐 k 独立梯度步 →
-判别器 Online update → iter 事件落盘 + checkpoint。
+fixture 下 CLI train 端到端（#226 切换期第一步起经 async 执行序生产
+入口驱动）：Rollout（Anchor → 单步 SDE 扰动 → 各 λ ODE 续跑 → 判别器
+raw logit 打分）→ MGAI advantage → 逐 k 独立梯度步 → 判别器 Online
+update → iter 事件落盘 + checkpoint。
 
 四条 AC 对应（原 AC 5「buffer base 分区自动生成」随 ADR-0012 量产退役
 移除，#173）：
 1. fixture 下单 iteration 全链路绿，产出可装载 checkpoint 与 iter 事件流；
-2. log-prob 一致性：Rollout 记录的 π_old 与更新时重算一致（诊断工件）；
+2. log-prob 一致性：Rollout 记录的 π_old 与更新时重算一致（组件级锚在
+   test_policy；训练侧诊断工件随旧执行序退役）；
 3. MGAI 顺序正确；G=12 下组内标准化非退化（组内 reward std 非零进事件）；
 4. 每个训练步 k 一次独立梯度步（loss 组件逐 k 记录）；
 """
@@ -50,13 +52,12 @@ from cynosure.reward.assembly import PairBatch
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
-    GranularGrpoTrainer,
     RewardCoordinator,
     RunArtifacts,
 )
-from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.executor import AsyncTrainingExecutor
+from cynosure.train.rng import SlotRngRegistry, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
-from cynosure.train.resume import RESUME_STATE_FORMAT_VERSION
 from cynosure.train.rollout import (
     CrossModalConditionSampler,
     ModalLabelConditionSampler,
@@ -70,6 +71,7 @@ from tests.conftest import (
     PretrainLightweightReward,
     RecordingScorer,
     RecordingUpdate,
+    execution_slot_count as slot_count,
 )
 
 
@@ -197,6 +199,14 @@ class TrainingLoopScenario:
     def events(self) -> list[dict]:
         return self.artifacts().read_events()
 
+    def slot0_iter_events(self) -> list[dict]:
+        """槽 0 的 iter 事件（槽自适应断言的取数面——槽 0 在任何调度
+        拓扑下都存在；overfit_alert 的 rank 也是 0，按事件类型过滤）。"""
+        return [
+            event for event in self.events()
+            if event["event"] == "iter" and event["rank"] == 0
+        ]
+
     def patch_config(self, **sections: dict) -> None:
         """按 section 覆写已写出的训练 config（JSON 补丁，写回原路径）。"""
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -215,16 +225,21 @@ class TrainingLoopScenario:
         return self.cli.run(*argv)
 
     def resume_state(self) -> dict:
-        """单进程续训状态分片的外部读取面（契约文件名字面：world-1 无
-        rank 后缀；多 rank 分片对账见 test_distributed.RankResumeShards）。"""
+        """v12 续训状态分片的外部读取面（契约文件名字面：单文件、无
+        per-rank 后缀；payload 契约见 test_async_resume）。"""
         return torch.load(
             self.run_dir / "checkpoints" / "resume_state.pt",
             map_location="cpu", weights_only=True,
         )
 
-    def checkpoints_identical(self, other_run_dir: Path, names: list[str]) -> None:
-        """收官 checkpoint 工件与另一 run 的同名 state_dict 逐位对账
-        （同路径重放的逐位语义）。"""
+    def checkpoints_identical(
+        self, other_run_dir: Path, names: list[str], *, atol: float | None = None,
+    ) -> None:
+        """收官 checkpoint 工件与另一 run 的同名 state_dict 对账：
+        缺省逐位（同路径重放的逐位语义）；``atol`` 开启容差（跨执行器
+        实例的世界对——两次独立训练的权重演化存在 GPU 库层 1-2 ulp
+        噪声，确定性模式不可根除，浮点张量 allclose(rtol=0, atol)，
+        非浮点逐位，键集合严格——ADR-0018 决策 9 accepted drift）。"""
         for name in names:
             first = torch.load(
                 self.run_dir / "checkpoints" / name,
@@ -236,7 +251,12 @@ class TrainingLoopScenario:
             )
             assert set(first) == set(second)
             for key in first:
-                assert torch.equal(first[key], second[key]), f"{name}:{key}"
+                if atol is not None and first[key].is_floating_point():
+                    assert torch.allclose(
+                        first[key], second[key], rtol=0.0, atol=atol,
+                    ), f"{name}:{key}"
+                else:
+                    assert torch.equal(first[key], second[key]), f"{name}:{key}"
 
 
 @pytest.fixture
@@ -255,26 +275,27 @@ class TestSingleIterationLoop:
         assert result.code == 0, result.stderr
         events = scenario.events()
         # overfit_alert 合法插入流中（小 real 池上判别器记忆化、分叉越线
-        # 即告警）：只对照 iter 事件
+        # 即告警）：只对照 iter 事件（每调度槽一条）
         assert [
             event["event"] for event in events if event["event"] == "iter"
-        ] == ["iter"]
+        ] == ["iter"] * slot_count()
 
     def test_iter_event_carries_health_metrics(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """iter 事件：Anchor eval reward、非退化组内 reward std（G=12）、
         held-out AUC、loss 组件（逐 k policy + discriminator）、lr、采样的
-        目标序列（per-sequence 健康监控的归因轴——条件分布每 iter 均匀采
-        一个序列，事件不记序列名时 reward/loss/AUC 无法归因，随机序列
-        变化会伪装成趋势）。"""
+        目标序列（per-sequence 健康监控的归因轴——分配表确定性映射条件到
+        槽，事件不记序列名时 reward/loss/AUC 无法归因）。"""
         scenario.write_inputs()
         assert scenario.train().code == 0
-        event = scenario.events()[0]
+        event = scenario.events()[0]  # (iteration, slot) 归并序首条 = slot 0
         assert event["iteration"] == 0
+        assert event["rank"] == 0  # 槽 0（归并序首条）
         assert event["modality"] in MODALITIES
         assert math.isfinite(event["anchor_eval_reward"])
         assert event["intra_group_reward_std"] > 0.0  # G=12 组内标准化非退化
+        assert event["heldout_auc"] is not None
         assert 0.0 < event["heldout_auc"] < 1.0
         assert "policy_step_1" in event["loss"]  # M={1} → 一次 policy 梯度步
         assert "discriminator" in event["loss"]
@@ -307,7 +328,7 @@ class TestSingleIterationLoop:
         scenario.patch_config(reward={"disc_update_interval_n_d": 2})
         result = scenario.train()
         assert result.code == 0, result.stderr
-        first, second = scenario.events()
+        first, second = scenario.slot0_iter_events()
         assert first["train_pairwise_acc"] is not None
         assert first["overfit_divergence_ema"] is not None
         assert second["train_pairwise_acc"] is None  # N_d 跳过：无判别器步
@@ -316,10 +337,13 @@ class TestSingleIterationLoop:
     def test_default_threshold_emits_no_overfit_alert(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """默认报警阈值下 fixture 单 iteration 无告警（健康判别器两侧同
-        估计量、分叉贴 0）——报警面的静默侧在循环层贯通（越线触发路径
-        由 test_overfit 的边界单测与事件契约测试收口）。"""
+        """报警阈值被消费（静默侧在循环层贯通）：抬到不可越的阈值后即使
+        fixture 判别器在小 real 池上天然记忆化（双卡池化几何下分叉可越过
+        默认 0.2——阈值校准属 MR-RATE 预训练曲线的暂定 knob）也无告警；
+        越线触发路径由 test_overfit 的边界单测、事件契约测试与
+        test_mr_monitoring 的注入面收口。"""
         scenario.write_inputs()
+        scenario.patch_config(reward={"overfit_alert_divergence": 0.99})
         assert scenario.train().code == 0
         assert [
             event for event in scenario.events()
@@ -338,7 +362,7 @@ class TestSingleIterationLoop:
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
         result = scenario.train()
         assert result.code == 0, result.stderr
-        first, second = scenario.events()
+        first, second = scenario.slot0_iter_events()
         assert "discriminator" in first["loss"]
         assert "discriminator" not in second["loss"]  # N_d 跳过
 
@@ -385,37 +409,35 @@ class TestSingleIterationLoop:
         一次**（随机 u/v 起步 + 15 次幂迭代）——前向随 ambient RNG 漂移，
         消费面拿到的不再是训练时那一份判别函数。
 
-        执行 device 跟随训练装配（GPU 可见即加速器、CPU 强制即 CPU）：
-        手动构造的 normalizer 按被测 latent 的 device 落位（生产装配由
-        trainer 单点 ``.to()`` 接管的同款语义，#95），GPU 可见环境不再被
-        normalize 的 device fail-fast 拦在断言层之前；state_dict 逐位对比
-        与前向对比都在 CPU 侧做——加速器上同权重不同实例的前向偏离实测
-        可超 1e-6 容差（conv kernel 的分块/归约随实例内存布局漂移，#95
-        集群复测非偶发），CPU 路径的 1 ulp 噪声底下这层容差才站得住。"""
+        训练态取卡 0 副本（执行序每卡完整副本、逐位一致——跨卡 bitwise
+        校验在 checkpoint 点把门）；state_dict 逐位对比与前向对比都在
+        CPU 侧做——加速器上同权重不同实例的前向偏离实测可超 1e-6 容差
+        （conv kernel 的分块/归约随实例内存布局漂移，#95 集群复测非偶发），
+        CPU 路径的 1 ulp 噪声底下这层容差才站得住。"""
         scenario.write_inputs()
         data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
         data["reward"]["spectral_norm_enabled"] = True
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        assert trainer.run() == 1
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        assert executor.run() == 1
         checkpoint = scenario.run_dir / "checkpoints" / "discriminator_iter1.pt"
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        live = trainer.rewards.discriminator
+        live = executor.cards[0].replica.scorer.discriminator
         # 保存面键形 = 训练态参数化状态（不是裸网络的物化有效权重）
         assert set(saved.keys()) == set(live.state_dict().keys())
         assert any(".parametrizations." in key for key in saved)
         live.eval()
-        device = trainer.device  # 训练装配设备（GPU 可见即加速器、CPU 强制即 cpu）
-        sample = torch.zeros(1, *config.latent_shape, device=device)
         # 测试构造按被测 latent 的 device 落位（#95）：normalize 的 device
         # fail-fast 契约要求统计量 buffer 与输入同源——手动构造的
-        # normalizer 与生产装配一样迁移到 latent 所在 device，GPU 可见环境
-        # 不再被契约拦截在真正的断言层之前。
+        # normalizer 迁移到判别器所在 device，GPU 可见环境不再被契约拦截
+        # 在真正的断言层之前。
+        live_device = next(live.parameters()).device
+        sample = torch.zeros(1, *config.latent_shape, device=live_device)
         normalizer = ChannelNormalizer(
             ChannelStats.load(config.reward.channel_stats_json),
-        ).to(device)
+        ).to(live_device)
         normalized = normalizer.normalize(sample)
         # 前向对比固定 CPU 执行路径（#95 集群实测）：加速器上同权重不同
         # 实例的前向偏离可超 1e-6 容差且非偶发，装载实例不迁移——断言层
@@ -485,35 +507,38 @@ class TestSingleIterationLoop:
         assert "policy_step_2" in event["loss"]
         assert "discriminator" in event["loss"]
 
-    def test_sequential_group_rejected_outside_sequential_trainer(
+    def test_sequential_group_rejected_at_production_entry(
         self, scenario: TrainingLoopScenario,
     ) -> None:
-        """组3 的两阶段序贯由 SequentialTrainer 编排：绕过 CLI 分派、直接
-        把 sequential config 塞进单阶段训练循环时显式拒绝（不静默只跑一段）。"""
+        """组3 序贯两阶段编排随旧执行序退役（SequentialTrainer 删除）：
+        生产入口对 sequential config 显式拒绝（新执行序为单阶段门面，
+        两阶段由两次独立 run 衔接——不静默只跑一段）。"""
         scenario.write_inputs(group="sequential")
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        with pytest.raises(ValueError, match="SequentialTrainer"):
-            GranularGrpoTrainer(config, artifacts)
+        result = scenario.train()
+        assert result.code == 2
+        assert "组3" in result.stderr
+        assert not scenario.run_dir.exists()  # 拒绝在 run 目录预占之前
 
     def test_only_unet_params_updated(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         """AC「组1：仅 UNet 参数被更新」：组1 的 policy = UNet 本体（无第二
-        个可训练对象）、全参 requires_grad，一次 iteration 后权重真实演化。"""
+        个可训练对象）、全参 requires_grad，一次 iteration 后权重真实演化
+        （执行序卡 0 副本观测面——跨卡副本逐位一致由 checkpoint 校验把门）。"""
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        assert trainer.policy.network is trainer.unet
-        assert all(p.requires_grad for p in trainer.unet.parameters())
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        policy = executor.cards[0].replica.policy
+        assert isinstance(policy.network, torch.nn.Module)
+        assert all(p.requires_grad for p in policy.unet.parameters())
         initial = {
-            name: value.clone() for name, value in trainer.unet.state_dict().items()
+            name: value.clone() for name, value in policy.unet.state_dict().items()
         }
-        assert trainer.run() == 1
+        assert executor.run() == 1
         assert any(
             not torch.equal(initial[name], value)
-            for name, value in trainer.unet.state_dict().items()
+            for name, value in policy.unet.state_dict().items()
         )
 
     def test_discriminator_cold_start_without_checkpoint(
@@ -584,12 +609,12 @@ class TestPolicyOptimizerConfig:
     ) -> None:
         """AdamW 显式带参考实现的 weight decay 1e-4（research/granular-grpo.md
         超参总表）——PyTorch 默认 1e-2 是 100× 过正则，会淹没 2e-6 的
-        policy 学习步。"""
+        policy 学习步（执行序卡 0 副本的 optimizer 装配面）。"""
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        (group,) = trainer.loop.updater.optimizer.param_groups
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        (group,) = executor.cards[0].replica.updater.optimizer.param_groups
         assert group["weight_decay"] == pytest.approx(
             config.policy.policy_weight_decay,
         )
@@ -597,26 +622,32 @@ class TestPolicyOptimizerConfig:
 
 
 class TestRngRegistryAggregation:
-    """RNG 注册对象归 TrainingRuntime 聚合层（#230 聚合先行，#218/#222
-    口径）：单一命名注册对象（TrainingRngStreams），无 ``generators`` 裸
-    容器第二载体——骨架期 per-槽实例化的载体前提。「任务无自持状态」档
-    为空：聚合层不为短寿命任务建注册面，注册清单即四条命名流。"""
+    """RNG 注册对象归执行序聚合层（#218 per-槽注册表，#226 切换期起经
+    生产入口装配）：单一注册对象（SlotRngRegistry），无 ``generators`` 裸
+    容器第二载体——per-(槽×流) 双轴注册，「任务无自持状态」档为空：
+    聚合层不为短寿命任务建注册面，注册清单即四条命名流 × 槽数。"""
 
-    def test_runtime_holds_registry_object_not_bare_dict(
+    def test_executor_holds_registry_object_not_bare_dict(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        runtime = GranularGrpoTrainer(config, artifacts).runtime
-        assert isinstance(runtime.rng, TrainingRngStreams)
-        assert not hasattr(runtime, "generators")
-        assert set(runtime.rng.named()) == {
-            TrainingRngStreams.ROLLOUT,
-            TrainingRngStreams.REAL_POOL,
-            TrainingRngStreams.HELDOUT_AUC,
-            TrainingRngStreams.RECON,
-        }
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        registry = executor.rng
+        assert isinstance(registry, SlotRngRegistry)
+        assert not hasattr(executor, "generators")
+        assert registry.slot_count == slot_count()
+        for slot in range(registry.slot_count):
+            for stream in (
+                TrainingRngStreams.ROLLOUT,
+                TrainingRngStreams.REAL_POOL,
+                TrainingRngStreams.HELDOUT_AUC,
+                TrainingRngStreams.RECON,
+            ):
+                assert isinstance(
+                    registry.get_stream(slot, stream), torch.Generator,
+                )
 
 
 class TestCrossModalLoop:
@@ -634,7 +665,7 @@ class TestCrossModalLoop:
         # 流里可能顺带有 overfit_alert——fixture 判别器在小 real 池上
         # 天然记忆化（ADR-0009-β 的监控面），其触发不属本测试锁定范围
         iter_events = [event for event in events if event["event"] == "iter"]
-        assert len(iter_events) == 1
+        assert len(iter_events) == slot_count()
         event = iter_events[0]
         assert event["modality"] in MODALITIES  # 目标序列归因轴（12 对的目标端）
         assert event["intra_group_reward_std"] > 0.0  # CFG=0 场的组内方差非退化
@@ -662,46 +693,31 @@ class TestCrossModalLoop:
     ) -> None:
         """AC「仅 ControlNet 参数被更新（base 冻结经断言验证）」：一次
         iteration 后 base UNet 全部参数逐位未动（无梯度、无优化器步），
-        ControlNet 有参数真实演化；冻结在装配期即被 requires_grad 断言。"""
+        ControlNet 有参数真实演化；冻结在装配期即被 requires_grad 断言
+        （执行序卡 0 副本观测面）。"""
         scenario.write_inputs(group="cross-modal")
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        policy = executor.cards[0].replica.policy
         initial_unet = {
-            name: value.clone() for name, value in trainer.unet.state_dict().items()
+            name: value.clone() for name, value in policy.unet.state_dict().items()
         }
         initial_controlnet = {
             name: value.clone()
-            for name, value in trainer.policy.network.state_dict().items()
+            for name, value in policy.network.state_dict().items()
         }
         assert not any(
-            p.requires_grad for p in trainer.unet.parameters()
+            p.requires_grad for p in policy.unet.parameters()
         )  # base 冻结：装配期断言的对外可观测面
-        assert all(p.requires_grad for p in trainer.policy.network.parameters())
-        assert trainer.run() == 1
-        for name, value in trainer.unet.state_dict().items():
+        assert all(p.requires_grad for p in policy.network.parameters())
+        assert executor.run() == 1
+        for name, value in policy.unet.state_dict().items():
             assert torch.equal(initial_unet[name], value), name
         assert any(
             not torch.equal(initial_controlnet[name], value)
-            for name, value in trainer.policy.network.state_dict().items()
+            for name, value in policy.network.state_dict().items()
         )
-
-    def test_cross_modal_logprob_pairs_survive_to_update_time(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """CFG=0 单前向场的 log-prob 一致性（测试面 #3 对组2 的延伸）：
-        rollout 记录的 π_old 与更新前重算逐位一致——残差注入路径在
-        rollout 与重算两侧同权重同口径。"""
-        scenario.write_inputs(group="cross-modal")
-        assert scenario.train(dump=True).code == 0
-        report = json.loads(
-            (scenario.run_dir / "training.json").read_text(encoding="utf-8"),
-        )
-        pairs = report["logprob_pairs"]
-        assert len(pairs) == 12  # |M| × G
-        for pair in pairs:
-            assert math.isfinite(pair["recorded"])
-            assert pair["recorded"] == pair["recomputed"]
 
 
 class TestCrossModalPairSampling:
@@ -968,21 +984,6 @@ class TestModalLabelTargetSampling:
         assert torch.equal(before, stream.get_state())
 
 
-class SequencedAuc:
-    """测试仪器：记录 held-out AUC 相对判别器更新的调用顺序
-    （每次调用时判别器 update 是否已执行过）。"""
-
-    def __init__(self, update: RecordingUpdate) -> None:
-        self._update = update
-        self.calls: list[bool] = []
-
-    def compute(
-        self, fake_latents: torch.Tensor, modality: str | None = None,
-    ) -> float:
-        self.calls.append(len(self._update.received) > 0)
-        return 0.5
-
-
 def _reward_config() -> RewardConfig:
     """判别器侧协作者装配的最小 RewardConfig（默认 knobs；纯单测用途）。"""
     return RewardConfig(
@@ -1040,100 +1041,41 @@ class TestDiscriminatorSideOrchestration:
         scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        assert trainer.run() == 1
-        assert trainer.rewards.discriminator.training is False
-        sample = torch.zeros(1, *config.latent_shape, device=trainer.device)
-        scorer = trainer.rewards.update.scorer
+        executor = AsyncTrainingExecutor.build(config, artifacts)
+        assert executor.run() == 1
+        scorer = executor.cards[0].replica.scorer
+        assert scorer.discriminator.training is False
+        sample = torch.zeros(
+            1, *config.latent_shape, device=next(scorer.parameters()).device,
+        )
         first = scorer.reward(sample)
         second = scorer.reward(sample)
         assert torch.allclose(first, second, rtol=0.0, atol=1e-6)  # eval 相打分幂等
 
-    def test_update_step_receives_iteration_condition(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """AC4：train 循环的 update_step 调用点穿本 iteration 条件——
-        替身记录到的条件与 iter 事件的 modality 归因轴一致（本 iteration
-        的 fake 批、回放过滤与 real 采样三侧条件的同源观测锁）。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        update = RecordingUpdate(trainer.rewards.discriminator)
-        trainer.rewards.update = update
-        assert trainer.run() == 1
-        event = scenario.events()[0]
-        assert update.modalities == [event["modality"]]
-
-    def test_heldout_auc_precedes_discriminator_update(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """held-out AUC 在判别器更新之前测得（与 anchor_eval_reward 同一
-        判别器快照）：update 之后测同一 fake 批会把 in-sample 拟合计入
-        AUC（当前批子集刚被训练过、分数被抬高），且与 rollout 相记录的
-        anchor reward 分属不同判别器快照——联合 hacking 签名（AUC 掉
-        而 eval-reward 升）失真。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        update = RecordingUpdate(trainer.rewards.discriminator)
-        auc = SequencedAuc(update)
-        trainer.rewards.update = update
-        trainer.rewards.auc = auc
-        assert trainer.run() == 1
-        assert update.received  # N_d=1 的首 iteration 应执行判别器更新
-        assert auc.calls == [False]  # AUC 先于判别器更新（同一快照）
-
 
 class TestDevicePlacement:
-    """设备放置（装配期单点选设备、协作者经注入对齐）。
+    """设备放置（执行序装配期设备发现、每卡完整副本同源落位）。
 
-    fixture 测试面是 CPU-only：本组断言锁「模型与张量同源于 trainer 的
-    设备」这一装配契约（accelerator 可用时的实际放置由 DCU 实例的
-    M0 门槛验证，fixture 无法覆盖 cuda 分支）。"""
+    fixture 测试面以 CPU 口径断言「副本网络与张量同源于执行序的设备
+    发现」这一装配契约（显式注入单 CPU 设备；accelerator 可用时的实际
+    放置由 DCU 实例的多卡档验证，fixture 无法覆盖 cuda 分支）。"""
 
-    def test_models_follow_trainer_device(
+    def test_models_follow_executor_device(
         self, scenario: TrainingLoopScenario,
     ) -> None:
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(
-            config, artifacts, device=torch.device("cpu"),
+        executor = AsyncTrainingExecutor.build(
+            config, artifacts, devices=[torch.device("cpu")],
         )
-        assert trainer.unet.parameters().__next__().device.type == "cpu"
+        replica = executor.cards[0].replica
         assert (
-            trainer.rewards.discriminator.parameters().__next__().device.type
-            == "cpu"
+            replica.policy.network.parameters().__next__().device.type == "cpu"
         )
-
-    def test_cold_start_discriminator_is_seeded_deterministically(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """冷启动判别器在 schedule.seed 的派生流下确定初始化：随机初始化
-        消耗全局 RNG，而 sampling generators 在装配序列更后才创建——同
-        config 的两次冷启动若依赖进程全局 RNG 状态，判别器初始权重不同，
-        初始 reward 与其后所有 policy update 都不可复现（seeded 实验
-        失效）。两次独立构造（不同进程内全局状态、同 seed）判别器权重
-        须逐位一致。"""
-        scenario.write_inputs()
-        data = json.loads(scenario.config_path.read_text(encoding="utf-8"))
-        data["artifacts"]["discriminator_ckpt"] = None
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        weights: list[list[torch.Tensor]] = []
-        for name in ("a", "b"):
-            config = ConfigLoader.load(scenario.config_path)
-            artifacts = RunArtifacts.init(
-                config, scenario.tmp_path / f"run_cold_{name}",
-            )
-            trainer = GranularGrpoTrainer(config, artifacts)
-            weights.append([
-                param.detach().clone()
-                for param in trainer.rewards.discriminator.parameters()
-            ])
-        for first, second in zip(weights[0], weights[1]):
-            assert torch.equal(first, second)
+        assert (
+            replica.scorer.parameters().__next__().device.type == "cpu"
+        )
 
     @pytest.mark.slow  # 集群实测 ~109s：同权重两次完整前向的 CPU 对照
     def test_scoring_inputs_carry_no_stray_cpu_tensors(
@@ -1141,119 +1083,22 @@ class TestDevicePlacement:
     ) -> None:
         """打分输入（rollout 终点、real 采样）与判别器同 device——CPU 上
         退化为同源性 sanity（cuda 分支由 CfgCombinedField 的 timesteps
-        device 对齐与 RealPoolSampler 的迁移保证）。"""
+        device 对齐与 RealPoolSampler 的迁移保证；执行序副本装配的
+        scorer 与输入天然同 device）。"""
         scenario.write_inputs()
         config = ConfigLoader.load(scenario.config_path)
         artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(
-            config, artifacts, device=torch.device("cpu"),
+        executor = AsyncTrainingExecutor.build(
+            config, artifacts, devices=[torch.device("cpu")],
         )
-        sample = torch.zeros(1, *config.latent_shape, device=trainer.device)
+        scorer = executor.cards[0].replica.scorer
+        sample = torch.zeros(
+            1, *config.latent_shape, device=next(scorer.parameters()).device,
+        )
         assert sample.device.type == "cpu"
-        assert trainer.rewards.update.scorer.reward(
-            sample,
-        ).device.type == "cpu"
+        assert scorer.reward(sample).device.type == "cpu"
 
 
-class TestLogProbConsistency:
-    """AC 2：Rollout 记录的 π_old 与更新时重算一致（测试面 #3，经
-    --dump-trajectory 诊断工件断言）。"""
-
-    def test_recorded_old_log_probs_survive_to_update_time(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        scenario.write_inputs()
-        result = scenario.train(dump=True)
-        assert result.code == 0, result.stderr
-        report = json.loads(
-            (scenario.run_dir / "training.json").read_text(encoding="utf-8"),
-        )
-        pairs = report["logprob_pairs"]
-        assert len(pairs) == 1 * 12  # |M| × G = 1 × 12 组对
-        assert {(pair["step_index"], pair["direction"]) for pair in pairs} == {
-            (1, direction) for direction in range(12)
-        }
-        for pair in pairs:
-            assert math.isfinite(pair["recorded"])
-            assert pair["recorded"] == pair["recomputed"]  # 同权重逐位一致
-
-    @pytest.mark.gpu  # |M|=2 的 5 步日程 × dump 重放（本机实测 78s）
-    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
-    def test_multi_step_pairs_cover_every_train_step(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """|M|=2（5 步日程 M={1,2}）：每个被优化训练步都有 |G| 组对。"""
-        scenario.write_inputs(num_steps=5, train_steps={1, 2})
-        assert scenario.train(dump=True).code == 0
-        report = json.loads(
-            (scenario.run_dir / "training.json").read_text(encoding="utf-8"),
-        )
-        pairs = report["logprob_pairs"]
-        assert len(pairs) == 2 * 12
-        assert {pair["step_index"] for pair in pairs} == {1, 2}
-        for pair in pairs:
-            assert pair["recorded"] == pair["recomputed"]
-
-
-class TestRewardDomainNormalization:
-    """rollout（policy 域）→ reward（real pool 存储域）的归位
-    （T12 探针定谳）：fake 在打分前除 latent_scale_factor——
-    real 按 data-preparation 契约存 encode 原始输出、policy 输出在
-    checkpoint scaled 域，判别器比较要求两侧同域。"""
-
-    @staticmethod
-    def _rollout_with_scale(
-        scenario: TrainingLoopScenario, scale: float, tag: str,
-    ) -> tuple:
-        # fixture 权重由 write_inputs 内的 manual_seed(7) 固定；两次构造的
-        # rollout 流可比性来自 TrainingRngStreams 全显式 CPU generator——
-        # scale 不进任何 RNG 消耗路径（reward 打分后置、无反馈分支）
-        scenario.write_inputs()
-        data = json.loads(
-            scenario.config_path.read_text(encoding="utf-8"),
-        )
-        data["policy"]["latent_scale_factor"] = scale
-        scenario.config_path.write_text(json.dumps(data), encoding="utf-8")
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.tmp_path / f"run_{tag}")
-        trainer = GranularGrpoTrainer(config, artifacts, device=torch.device("cpu"))
-        scored: list[torch.Tensor] = []
-        scorer = trainer.rewards.update.scorer
-        original_reward = scorer.reward
-
-        def recording_reward(latents: torch.Tensor) -> torch.Tensor:
-            scored.append(latents)
-            return original_reward(latents)
-
-        scorer.reward = recording_reward  # 打分输入记录（实例属性遮蔽 bound method）
-        record = trainer.loop.run_iteration()
-        return record, scored
-
-    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
-    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
-    def test_scored_fakes_match_new_fakes_domain(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """打分输入与 new_fakes 同值同序（同一归一域）：打分与
-        AUC fake 侧消费同一批归一后 latent，不出现跨域错配。"""
-        record, scored = self._rollout_with_scale(scenario, 2.0, "domain")
-        assert scored, "打分记录为空"
-        assert torch.equal(torch.cat(scored), record.new_fakes)
-
-    @pytest.mark.gpu  # 两次完整场景训练（scale 对比）
-    @pytest.mark.slow  # 默认跳过，--run-slow 全量时运行
-    def test_scale_only_affects_reward_side_not_rollout(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """scale 只作用在 reward 侧归一：rollout 采样流（条件/噪声/方向）
-        与 scale 无关——scale=2 的 new_fakes 恰为 scale=1 的 ÷2
-        （policy 域产出同、归一除法真实发生在 fake 上）。"""
-        neutral_record, _ = self._rollout_with_scale(scenario, 1.0, "neutral")
-        scaled_record, _ = self._rollout_with_scale(scenario, 2.0, "scaled")
-        assert neutral_record.modality == scaled_record.modality
-        assert torch.equal(
-            neutral_record.new_fakes, scaled_record.new_fakes * 2.0,
-        )
 
 
 class TestPairedBatchSupplyGuards:
@@ -1274,143 +1119,3 @@ class TestPairedBatchSupplyGuards:
         assert result.code == 0, result.stderr
 
 
-class TestOnPolicyReconstructionSupply:
-    """在线判别器更新的 on-policy 供批（ADR-0012，issue #172 AC）。
-
-    主循环口径：判别器更新批 = 装配原语用**当前 policy** 现做的同源
-    重构配对批——fake 随 policy 权重演化（同一 real 在 policy 更新前后
-    重构不同），rollout latent 不再进判别器更新批（此后只承担打分、
-    advantage 与在线 AUC——AUC 的 fake 侧 = rollout 终点，链路零改动由
-    既有测试回归）。重构前向是 policy 的推理前向：no_grad + autocast
-    口径、不产生评估相副作用（判别器的 spectral norm 幂迭代等推进属
-    更新步训练语义，装配前向不触）。"""
-
-    K = 2
-    """重构核直喂的批大小（``reconstruct`` 纯数学无 real 采样，任意正
-    K 合法——取小批压测试成本）。"""
-
-    def test_update_batch_comes_from_assembler(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """判别器更新批 = 装配原语的配对批：update 原样消费
-        ``assembler.assemble`` 的产出（同对象透传），条件标记与 iter
-        事件同源，fake ≠ real（σ>0 候选下重构非透传）。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        update = RecordingUpdate(trainer.rewards.discriminator)
-        trainer.rewards.update = update
-        assembler = trainer.rewards.assembler
-        assembled: list[PairBatch] = []
-        original_assemble = assembler.assemble
-
-        def recording_assemble(modality: str) -> PairBatch:
-            pair = original_assemble(modality)
-            assembled.append(pair)
-            return pair
-
-        assembler.assemble = recording_assemble  # type: ignore[method-assign]
-        assert trainer.run() == 1
-        assert len(assembled) == 1  # N_d=1：单 iteration 恰一步判别器更新
-        assert update.received[0] is assembled[0]
-        assert assembled[0].modality == scenario.events()[0]["modality"]
-        assert not torch.equal(assembled[0].fakes, assembled[0].reals)
-
-    def test_reconstruction_follows_policy_weights(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """fake 随 policy 权重演化（on-policy 的定义性观测）：同一批
-        real、同一 condition/s/ε 确定性输入（不经 recon 流抽签），一个
-        iteration 的逐 k policy 更新前后重构不同——装配原语的重构前向
-        持 policy 网络引用，权重演化即时反映进更新批的 fake 侧。"""
-        scenario.write_inputs()
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        assembler = trainer.rewards.assembler
-        modality = MODALITIES[0]
-        condition = trainer.policy.conditions.sample_target(modality)
-        sigmas = [assembler.candidate_sigmas(modality)[0]] * self.K
-        stream = torch.Generator().manual_seed(41)
-        # 确定性输入随 trainer 设备落位（生产路径 real 批在加速器上，
-        # CPU 常量的 device mismatch 在本机 CPU fixture 口径测不到）
-        reals = torch.randn(
-            self.K, *Fixture.LATENT_SHAPE, generator=stream,
-        ).to(trainer.device)
-        noise = torch.randn(
-            self.K, *Fixture.LATENT_SHAPE, generator=stream,
-        ).to(trainer.device)
-        # 对比唯一变量 = policy 权重：两次重构同处 eval 相（与 rollout/
-        # 重构同 inference 口径），s 与 ε 都是固定输入、不走 recon 流
-        trainer.policy.eval_phase()
-        before = assembler.reconstruct(reals, condition, sigmas, noise)
-        assert not torch.equal(before, reals)  # σ>0 重构非透传
-        assert trainer.run() == 1  # 逐 k policy 更新 + 判别器更新照常
-        after = assembler.reconstruct(reals, condition, sigmas, noise)
-        assert not torch.equal(after, before)
-
-    def test_reconstruction_forward_is_inference_only(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """额外前向的数值口径与副作用面（AC：no_grad + bf16、评估相零
-        副作用）：装配原语的重构前向在 no_grad + autocast(bf16) 下进行
-        （前向 hook 在 assemble 窗口内采样 grad/autocast 状态）；判别器
-        不进重构链路，装配前后 state_dict（参数 + spectral norm 幂迭代
-        的 parametrization buffer）逐位不动——相位敏感推进只属于更新步
-        的 train 相（RewardCoordinator.update_step）。SN 经 ``write_inputs``
-        的 reward 覆写进库键（预训练与训练同一 reward regime）——warm-start
-        产物即谱归一化形态，形态指纹守卫可过；幂迭代的 u/v buffer 存在，
-        零触碰断言才有对象。"""
-        scenario.write_inputs(reward={"spectral_norm_enabled": True})
-        config = ConfigLoader.load(scenario.config_path)
-        artifacts = RunArtifacts.init(config, scenario.run_dir)
-        trainer = GranularGrpoTrainer(config, artifacts)
-        assembler = trainer.rewards.assembler
-        device_type = trainer.amp.device_type
-        readings: list[tuple[bool, bool, torch.dtype]] = []
-        recording = False
-
-        def probe(
-            module: torch.nn.Module,
-            inputs: tuple[torch.Tensor, ...],
-            output: torch.Tensor,
-        ) -> None:
-            if recording:
-                readings.append((
-                    torch.is_grad_enabled(),
-                    torch.is_autocast_enabled(device_type),
-                    torch.get_autocast_dtype(device_type),
-                ))
-
-        hook = trainer.unet.register_forward_hook(probe)
-        original_assemble = assembler.assemble
-
-        def recording_assemble(modality: str) -> PairBatch:
-            nonlocal recording
-            recording = True
-            try:
-                return original_assemble(modality)
-            finally:
-                recording = False
-
-        assembler.assemble = recording_assemble  # type: ignore[method-assign]
-        # state_dict 面 = 参数 + buffer（spectral norm 幂迭代的 u/v 活在
-        # parametrization buffer——只快照 parameters() 会漏掉它）
-        snapshot = {
-            name: tensor.detach().clone()
-            for name, tensor in trainer.rewards.discriminator.state_dict(
-            ).items()
-        }
-        assembler.assemble(MODALITIES[0])
-        hook.remove()
-        assert readings  # 重构前向经过了 policy 网络
-        assert all(not grad for grad, _, _ in readings)  # no_grad 推理前向
-        assert all(autocast for _, autocast, _ in readings)  # autocast 开启
-        assert all(
-            dtype == torch.bfloat16 for _, _, dtype in readings
-        )  # amp_dtype 定死 bf16 的口径
-        after = trainer.rewards.discriminator.state_dict()
-        assert set(after) == set(snapshot)
-        for name, before in snapshot.items():
-            assert torch.equal(before, after[name]), name  # 判别器零触碰
