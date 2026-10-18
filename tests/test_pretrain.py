@@ -30,6 +30,7 @@ from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
+from cynosure.plots import MetricsPlotter
 from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.pretrain import (
@@ -756,6 +757,81 @@ class TestPretrainEndToEnd:
         report = scenario.report()
         assert report.group == "cross-modal"
         assert sorted(report.conditions_passed) == sorted(MODALITIES)
+
+
+class TestMetricPlotsOnCompletion:
+    """pretrain 正常收尾的自动绘图（#258）：CLI 进程内收尾读本 run 的
+    metrics.jsonl 绘图，产物落 run 目录 plots/（布局登记的附属产物位）；
+    绘图失败仅 stderr 告警、不改变命令退出码（预训练已成功，图是附属
+    产物）。"""
+
+    def test_layout_registers_plots_subdirectory(
+        self, tmp_path: Path,
+    ) -> None:
+        """plots/ 子目录登记进 pretrain run 目录布局契约（#258：与
+        checkpoints 平级的附属产物位）。目录本体由收尾绘图按需创建，
+        不进 init 契约最小集。"""
+        paths = PretrainRun.layout(tmp_path / "run")
+        assert paths.plots == tmp_path / "run" / "plots"
+
+    def test_completed_run_produces_per_metric_svgs(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """正常收尾：run 目录出现 plots/*.svg，每数值指标一张（pretrain
+        事件契约必产的数值字段各有一图；reconstruction_forwards /
+        measurement_volumes 当前执行路径每步都测、非 None，#171 AC5）。
+        x 轴 = step（pretrain 事件的轴字段），产物抽查为合法 SVG。"""
+        # 阈值 0.99 不可达 → 密集步进走满 4 步上限（每模态轮到一次）
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 4,
+        })
+        assert scenario.pretrain().code == 0
+        plots_dir = scenario.run_dir_path() / "plots"
+        produced = {path.name for path in plots_dir.glob("*.svg")}
+        assert {
+            "loss_discriminator.svg",
+            "heldout_auc.svg",
+            "reconstruction_forwards.svg",
+            "measurement_volumes.svg",
+            "lr.svg",
+            "elapsed_s.svg",
+        } <= produced
+        assert "<svg" in (
+            plots_dir / "loss_discriminator.svg"
+        ).read_text(encoding="utf-8")
+
+    def test_zero_event_run_leaves_empty_plots_dir(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """0 事件预训练正常收尾：plots/ 存在、无 svg、退出码 0（门槛
+        0.01 恒达标 → 全部条件首测+复测确认、零更新步——空指标流的
+        绘图是空产出而非故障）。"""
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
+        result = scenario.pretrain()
+        assert result.code == 0, result.stderr
+        plots_dir = scenario.run_dir_path() / "plots"
+        assert plots_dir.is_dir()
+        assert list(plots_dir.glob("*.svg")) == []
+
+    def test_plot_failure_warns_and_keeps_exit_code(
+        self, scenario: PretrainScenario,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """绘图注入失败：stderr 告警、退出码仍 0（预训练已成功，图是
+        附属产物——失败不升级为主命令失败）；主产物报告照常落盘。"""
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
+
+        def broken_write(self: MetricsPlotter) -> list[Path]:
+            raise RuntimeError("renderer exploded")
+
+        monkeypatch.setattr(MetricsPlotter, "write", broken_write)
+        result = scenario.pretrain()
+        assert result.code == 0, result.stderr
+        assert "指标绘图失败" in result.stderr
+        assert "RuntimeError: renderer exploded" in result.stderr
+        assert "预训练完成" in result.stdout
+        assert scenario.report().kind == "pretrain_report"
 
 
 class TestPretrainCliGuards:

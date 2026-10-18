@@ -1,7 +1,7 @@
 """预训练 run 目录与产物契约（ADR-0007：判别器 warm-start 的产物面）。
 
 - **PretrainRun**：预训练 run 目录布局（config 快照 + metrics.jsonl +
-  ``checkpoints/`` + 预训练报告）——与 train run 目录同惯例（不静默覆盖、
+  ``checkpoints/`` + ``plots/`` + 预训练报告）——与 train run 目录同惯例（不静默覆盖、
   唯一写者；单进程执行下 rank 0 独写退化为直写），但工件集最小：无
   Baseline manifest、无采样体（预训练不产出像素体，评测相不参与）；
 - **PretrainReport**：预训练报告契约（kind 标识 + per-condition held-out
@@ -355,6 +355,10 @@ class PretrainPaths:
     checkpoints: Path
     discriminator_ckpt: Path
     report: Path
+    plots: Path
+    """逐指标 SVG 曲线目录（pretrain 正常收尾自动绘图产出，#258；附属
+    产物位与 checkpoints 平级。目录本体由收尾绘图按需创建——0 事件
+    预训练同样落一个空目录，不在 init 契约最小集）。"""
 
 
 class PretrainRun:
@@ -395,6 +399,7 @@ class PretrainRun:
             checkpoints=root / "checkpoints",
             discriminator_ckpt=root / "checkpoints" / "pretrain_discriminator.pt",
             report=root / "pretrain_report.json",
+            plots=root / "plots",
         )
 
     def append_event(

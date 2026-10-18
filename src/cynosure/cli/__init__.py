@@ -332,32 +332,34 @@ class CynosureCli:
             f"{artifacts.paths.metrics}、checkpoint {artifacts.paths.checkpoints}",
             file=self._stdout,
         )
-        self._write_metric_plots(artifacts)
+        self._write_metric_plots(
+            artifacts.paths.metrics, artifacts.paths.plots, "训练",
+        )
         return 0
 
-    def _write_metric_plots(self, artifacts: RunArtifacts) -> None:
-        """train 正常收尾的自动绘图（#257）：读本 run 的 metrics.jsonl
-        绘逐指标 SVG，落 run 目录 plots/（布局登记的附属产物位）。续训
-        收尾同样覆盖——绘图输入是全量指标流，曲线图随续训延长。
+    def _write_metric_plots(
+        self, metrics: Path, plots: Path, subject: str,
+    ) -> None:
+        """train/pretrain 正常收尾的自动绘图（#257/#258）：读本 run 的
+        metrics.jsonl 绘逐指标 SVG，落 run 目录 plots/（布局登记的附属
+        产物位）。续训收尾同样覆盖——绘图输入是全量指标流，曲线图随
+        续训延长。
 
-        附属产物语义：训练已成功，图不改变命令结果——绘图任何失败只
+        附属产物语义：主命令已成功，图不改变命令结果——绘图任何失败只
         stderr 告警。宽捕 ``Exception`` 是该语义的结构性表达：``write``
         内部横跨指标流解析与 matplotlib 渲染，失败面无法窄枚举，收窄
         捕获面等于让部分绘图故障升级为主命令失败。"""
         try:
-            produced = MetricsPlotter(
-                artifacts.paths.metrics, artifacts.paths.plots,
-            ).write()
+            produced = MetricsPlotter(metrics, plots).write()
         except Exception as exc:
             print(
-                f"指标绘图失败（不影响训练结果）: "
+                f"指标绘图失败（不影响{subject}结果）: "
                 f"{type(exc).__name__}: {exc}",
                 file=self._stderr,
             )
             return
         print(
-            f"指标曲线已落盘: {artifacts.paths.plots}"
-            f"（{len(produced)} 张 SVG）",
+            f"指标曲线已落盘: {plots}（{len(produced)} 张 SVG）",
             file=self._stdout,
         )
 
@@ -727,6 +729,9 @@ class CynosureCli:
             f"（{len(run.read_events())} 条 pretrain 事件，离线查看收敛"
             "曲线与校准门槛阈值的数据源）",
             file=self._stdout,
+        )
+        self._write_metric_plots(
+            run.paths.metrics, run.paths.plots, "预训练",
         )
         return 0
 
