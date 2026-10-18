@@ -41,6 +41,15 @@ class TestTrainCommand:
         assert (artifacts.paths.manifest).is_file()
         assert (artifacts.paths.checkpoints).is_dir()
 
+    def test_layout_registers_plots_subdirectory(
+        self, valid_config_dict: dict, tmp_path: Path,
+    ) -> None:
+        """plots/ 子目录登记进 run 目录布局契约（#257：与 checkpoints/
+        samples 平级的附属产物位）。目录本体由 train 正常收尾的绘图按需
+        创建，不进 init 契约最小集。"""
+        paths = RunArtifacts.layout(tmp_path / "run")
+        assert paths.plots == tmp_path / "run" / "plots"
+
     def test_config_snapshot_is_normalized_input(
         self, valid_config_json: Path, valid_config_dict: dict, tmp_path: Path,
     ) -> None:

@@ -514,6 +514,10 @@ class RunPaths:
     """Baseline 与 RL 后重采的解码像素体目录（评测材料，契约布局成员）。"""
     trajectory_diagnostic: Path
     """轨迹诊断工件（fixture 诊断开关 --dump-trajectory 产出；诊断未跑则无此文件）。"""
+    plots: Path
+    """逐指标 SVG 曲线目录（train 正常收尾自动绘图产出，#257；附属产物位
+    与 checkpoints/samples 平级。目录本体由收尾绘图按需创建——0 事件训练
+    同样落一个空目录，不在 init 契约最小集）。"""
 
 
 class RunArtifacts:
@@ -558,6 +562,7 @@ class RunArtifacts:
             checkpoints=root / "checkpoints",
             samples=root / "samples",
             trajectory_diagnostic=root / "trajectory.json",
+            plots=root / "plots",
         )
 
     @classmethod

@@ -39,6 +39,7 @@ from cynosure.config import (
 from cynosure.distributed import DistributedContext
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
+from cynosure.plots import MetricsPlotter
 from cynosure.policy.condition import (
     CONDITION_SPACING_X1E2,
     ModalityMapping,
@@ -262,6 +263,66 @@ class TrainingLoopScenario:
 @pytest.fixture
 def scenario(cli: CliSession, tmp_path: Path) -> TrainingLoopScenario:
     return TrainingLoopScenario(cli, tmp_path)
+
+
+class TestMetricPlotsOnCompletion:
+    """train 正常收尾的自动绘图（#257）：CLI 进程内收尾读本 run 的
+    metrics.jsonl 绘图，产物落 run 目录 plots/（布局登记的附属产物位）；
+    绘图失败仅 stderr 告警、不改变命令退出码（训练已成功，图是附属产物）。"""
+
+    def test_completed_run_produces_per_metric_svgs(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """正常收尾：run 目录出现 plots/*.svg，每数值指标一张（iter 事件
+        契约必产的数值字段各有一图；None 字段随 fixture 走向、不进必含
+        集）。产物抽查为合法 SVG。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        plots_dir = scenario.run_dir / "plots"
+        produced = {path.name for path in plots_dir.glob("*.svg")}
+        assert {
+            "anchor_eval_reward.svg",
+            "intra_group_reward_std.svg",
+            "lr.svg",
+            "elapsed_s.svg",
+            "loss.svg",  # dict 数值字段的子键展开同图
+        } <= produced
+        assert "<svg" in (
+            plots_dir / "anchor_eval_reward.svg"
+        ).read_text(encoding="utf-8")
+
+    def test_zero_event_run_leaves_empty_plots_dir(
+        self, scenario: TrainingLoopScenario,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """0 事件训练正常收尾：plots/ 存在、无 svg、退出码 0（空指标流
+        的绘图是空产出而非故障；executor.run 替身短路主循环——装配全真、
+        收尾路径全真，metrics.jsonl 保持 init 的空文件）。"""
+        scenario.write_inputs()
+        monkeypatch.setattr(AsyncTrainingExecutor, "run", lambda self: 0)
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        plots_dir = scenario.run_dir / "plots"
+        assert plots_dir.is_dir()
+        assert list(plots_dir.glob("*.svg")) == []
+
+    def test_plot_failure_warns_and_keeps_exit_code(
+        self, scenario: TrainingLoopScenario,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """绘图注入失败：stderr 告警、退出码仍 0（训练已成功，图是附属
+        产物——失败不升级为主命令失败）；训练主产物不受影响。"""
+        scenario.write_inputs()
+
+        def broken_write(self) -> list[Path]:
+            raise RuntimeError("renderer exploded")
+
+        monkeypatch.setattr(MetricsPlotter, "write", broken_write)
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        assert "指标绘图失败" in result.stderr
+        assert "RuntimeError: renderer exploded" in result.stderr
+        assert "训练完成" in result.stdout
 
 
 class TestSingleIterationLoop:
