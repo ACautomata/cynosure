@@ -67,6 +67,10 @@ class TestSvgOutput:
             "mae.svg",
             "psnr.svg",
         }
+        for path in output.glob("*.svg"):
+            content = path.read_text(encoding="utf-8")
+            assert "<svg" in content, path.name
+            assert "<image" not in content, path.name
 
     def test_dict_field_subkeys_stack_in_one_figure(self, tmp_path: Path) -> None:
         """dict 数值字段（loss）一张图内多序列叠加：子键进图例；产物为
