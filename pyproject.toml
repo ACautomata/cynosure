@@ -23,6 +23,9 @@ dependencies = [
     # prepare 源影像读取的运行时依赖：src 经 MONAI LoadImage 懒加载 NIfTI
     # （import 层面仍只有 monai，零依赖白名单不变），见 reward/dataset
     "nibabel>=5",
+    # run 收尾的指标曲线绘图（metrics.jsonl → plots/ 逐指标矢量 SVG，
+    # Agg 后端；issue #255 决议 3）
+    "matplotlib>=3.9",
 ]
 
 [project.optional-dependencies]
