@@ -13,7 +13,9 @@
   次 run 权重 + 判别器 u/v buffer + RunTrajectory 事件流逐位）；异常
   fail-fast 与 barrier 软/硬超时可触发可断言；两域贯穿（BraTS +
   MR-RATE + 组2）；判别器链锚（#234：窗口任务摊派/real 抽取/recon
-  流任务粒度/事件 per-condition 明细/池化 AUC）。
+  流任务粒度/事件 per-condition 明细/池化 AUC）；N_d>1 续训恢复矩阵
+  （#265：N_d∈{2,4} × checkpoint 落点三类的在途窗口重导出 + AUC 桥
+  接账复原 + 恢复守卫，TestNDResumeWindow）。
 - **gauss 多卡 e2e 档（slow+gpu）**：单进程多卡换发射方式重建的验收
   路径（#217 门面 + M1 单点归约）——跨卡权重/u-v 逐位一致 + 层 3
   同 seed 多卡重放锚（判别器链全强度：梯度 allreduce SUM + 步末
@@ -1371,6 +1373,10 @@ class TestContinuationContract:
         "policy_network", "policy_optimizer",
         "discriminator_network", "discriminator_optimizer",
         "lr", "generators", "overfit", "seeds",
+        # #265 追加键（optional-additive，v12 不升版——裁决记于票评论）：
+        # 判别器窗口运行账的 AUC 桥接账，恢复后非判别器步 iter 事件的
+        # heldout_auc 桥接经它复原
+        "window_auc",
     }
 
     def test_v12_roundtrip_and_resume_continuity(
@@ -1655,6 +1661,419 @@ class TestContinuationContract:
         resumed = scenario.resume_build(config)  # 缺省槽数 = 设备数 = 1
         with pytest.raises(ValueError, match="协程数"):
             resumed.run()
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+class TestNDResumeWindow:
+    """N_d>1 续训恢复矩阵（#265）：N_d∈{2,4} × checkpoint 落点（周期/
+    里程碑/收尾兜底）——恢复序对包含恢复点的判别器窗口做纯函数重
+    导出（丢弃 iteration < 恢复点的任务、已过 iter 不补跑）、AUC 桥
+    接账经 payload 复原的端到端锚。同缝 = async resume 组
+    （``ExecutorScenario`` 门面直驱）：单 CPU 设备 4 协程、恢复连续性
+    经 RunTrajectory 对拍（同进程重放逐位口径）。
+
+    几何 = 生产代表面（槽数 4 ≥ 条件数 4、轮长 1、每 iter 全条件
+    活跃）：池化 AUC 账号每步全覆盖（#220 决议 14 回退点在槽数 <
+    条件数的 fixture 几何下结构性缺席——几何扩面随用例另行裁决，
+    本矩阵不在其范围）。
+
+    断言面（每格）：
+    - 恢复后 run 完成到目标 iteration、iter 事件序列 = 槽平铺全集；
+    - 恢复点 [r, w)（首个判别器步 w 之前）的 iter 事件与不中断基线
+      逐位一致（恢复连续性锚）；
+    - 恢复点之后的非判别器步 iter 事件 heldout_auc 与基线逐一相等
+      （桥接不断裂）；
+    - 恢复后首个判别器步不空桶崩溃（事件在场）、其池化 AUC 读数与
+      基线一致；
+    - 窗口起点落点 = 无 drift：全轨迹逐位一致 + 收官权重逐位；
+    - 非窗口起点落点 = 跨快照 fake 的 accepted drift：判别器步桶对数
+      缩减可见（事件流记账面可审计）。
+    """
+
+    def _step_and_window_start(self, r: int, n_d: int) -> tuple[int, int]:
+        """(首个 ≥ r 的判别器步, 其窗口起点) 的独立推导（不消费生产
+        代码的 next_step/window_start——测试期望的第二来源）。"""
+        step = next(m for m in range(r, r + n_d + 1) if m % n_d == 0)
+        start = step - min(n_d, step + 1) + 1
+        return step, start
+
+    def _iter_events(self, events: list[dict]) -> list[dict]:
+        return [event for event in events if event["event"] == "iter"]
+
+    def _step_pair_total(self, event: dict) -> int:
+        """判别器步 iter 事件的桶对数合计（单卡面 = 该步桶的全体对）。"""
+        return sum(
+            reading["pair_count"]
+            for reading in event["disc_update"]["conditions"].values()
+        )
+
+    @pytest.mark.parametrize("n_d", [2, 4])
+    def test_periodic_landing_resumes_with_drift_audited(
+        self, cli: CliSession, tmp_path: Path, n_d: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """周期落点（checkpoint_interval 整除点、崩溃在其后）：恢复点
+        非窗口起点 → 在途窗口重导出丢弃已过 iter 的任务，首个判别器
+        步桶对数缩减（accepted drift 记账面）且不空桶崩溃；恢复点前
+        后的事件桥接与基线一致。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        crash_iteration = 7 if n_d == 4 else 5
+        resume_from = 6 if n_d == 4 else 4
+        total = 10 if n_d == 4 else 6
+        config = scenario.prepare(seed=20 + n_d)
+        config.reward.disc_update_interval_n_d = n_d
+        config.schedule.max_iterations = total
+        config.schedule.checkpoint_interval = 3 if n_d == 4 else 2
+        real_run_iteration = AsyncTrainingExecutor._run_iteration
+        calls = {"count": 0}
+
+        async def crashing(executor, iteration):
+            calls["count"] += 1
+            if calls["count"] == crash_iteration + 1:
+                raise KeyboardInterrupt(
+                    f"模拟作业边界崩溃（iteration {crash_iteration}）"
+                )
+            return await real_run_iteration(executor, iteration)
+
+        monkeypatch.setattr(
+            AsyncTrainingExecutor, "_run_iteration", crashing,
+        )
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        with pytest.raises(KeyboardInterrupt):
+            executor.run()
+        shard = torch.load(
+            tmp_path / "run" / "checkpoints" / "resume_state.pt",
+            weights_only=True,
+        )
+        assert shard["iteration"] == resume_from
+
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        assert resumed.run() == total
+
+        baseline_config = scenario.prepare(seed=20 + n_d)
+        baseline_config.reward.disc_update_interval_n_d = n_d
+        baseline_config.schedule.max_iterations = total
+        baseline_config.schedule.checkpoint_interval = 3 if n_d == 4 else 2
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=4, owner_check=True,
+        )
+        assert baseline.run() == total
+        self._assert_resume_continuity(
+            scenario, tmp_path, n_d, resume_from, total, drift_at_step=True,
+        )
+
+    @pytest.mark.parametrize("n_d", [2, 4])
+    def test_milestone_landing_resumes_with_full_equality(
+        self, cli: CliSession, tmp_path: Path, n_d: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """里程碑强制落点（milestone_interval=5、周期恒不达）：恢复点
+        5 = 窗口首 iter（r ≡ 1 mod N_d）→ 重导出 = 全量抽取（无
+        drift），恢复后全轨迹与不中断基线逐位一致 + 收官权重逐位。
+        """
+        scenario = ExecutorScenario(cli, tmp_path)
+        total = 9
+        config = scenario.prepare(seed=30 + n_d)
+        config.reward.disc_update_interval_n_d = n_d
+        config.schedule.max_iterations = total
+        config.schedule.checkpoint_interval = 100
+        config.schedule.milestone_interval = 5
+        real_run_iteration = AsyncTrainingExecutor._run_iteration
+        calls = {"count": 0}
+
+        async def crashing(executor, iteration):
+            calls["count"] += 1
+            if calls["count"] == 7:  # iteration 6 的执行序入口
+                raise KeyboardInterrupt("模拟作业边界崩溃（iteration 6）")
+            return await real_run_iteration(executor, iteration)
+
+        monkeypatch.setattr(
+            AsyncTrainingExecutor, "_run_iteration", crashing,
+        )
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        with pytest.raises(KeyboardInterrupt):
+            executor.run()
+        shard = torch.load(
+            tmp_path / "run" / "checkpoints" / "resume_state.pt",
+            weights_only=True,
+        )
+        assert shard["iteration"] == 5  # 里程碑强制（周期 100 恒不达）
+
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        assert resumed.run() == total
+
+        baseline_config = scenario.prepare(seed=30 + n_d)
+        baseline_config.reward.disc_update_interval_n_d = n_d
+        baseline_config.schedule.max_iterations = total
+        baseline_config.schedule.checkpoint_interval = 100
+        baseline_config.schedule.milestone_interval = 5
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=4, owner_check=True,
+        )
+        assert baseline.run() == total
+        self._assert_resume_continuity(
+            scenario, tmp_path, n_d, 5, total, drift_at_step=False,
+        )
+        # 里程碑事件结构一致（FID 等数值面由全轨迹对拍之外的独立锚
+        # 承载；此处只锚完成数口径）
+        for events in (scenario.events(), scenario.events("run_baseline")):
+            assert [
+                event["iteration"] for event in events
+                if event.get("event") == "milestone"
+            ] == [5]
+
+    @pytest.mark.parametrize("n_d", [2, 4])
+    def test_cleanup_fallback_landing_resumes_with_drift_audited(
+        self, cli: CliSession, tmp_path: Path, n_d: int,
+    ) -> None:
+        """收尾兜底落点（干净截断、周期/里程碑恒不达）：恢复点非窗口
+        起点 → 重导出丢弃已过 iter 任务（drift 记账面）+ 恢复点前
+        事件桥接与基线一致。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        truncated = 7 if n_d == 4 else 6
+        total = 10 if n_d == 4 else 8
+        config = scenario.prepare(seed=40 + n_d)
+        config.reward.disc_update_interval_n_d = n_d
+        config.schedule.max_iterations = truncated
+        config.schedule.checkpoint_interval = 100
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == truncated
+        shard = torch.load(
+            tmp_path / "run" / "checkpoints" / "resume_state.pt",
+            weights_only=True,
+        )
+        assert shard["iteration"] == truncated  # 收尾兜底落盘
+
+        config.schedule.max_iterations = total
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        assert resumed.run() == total
+
+        baseline_config = scenario.prepare(seed=40 + n_d)
+        baseline_config.reward.disc_update_interval_n_d = n_d
+        baseline_config.schedule.max_iterations = total
+        baseline_config.schedule.checkpoint_interval = 100
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=4, owner_check=True,
+        )
+        assert baseline.run() == total
+        self._assert_resume_continuity(
+            scenario, tmp_path, n_d, truncated, total, drift_at_step=True,
+        )
+
+    def _assert_resume_continuity(
+        self,
+        scenario: ExecutorScenario,
+        tmp_path: Path,
+        n_d: int,
+        resume_from: int,
+        total: int,
+        *,
+        drift_at_step: bool,
+    ) -> None:
+        """矩阵格的共用断言面（几何独立推导 + 逐位对拍）。"""
+        events = self._iter_events(scenario.events())
+        baseline_events = self._iter_events(
+            scenario.events("run_baseline"),
+        )
+        assert [
+            event["iteration"] for event in events
+        ] == [
+            iteration
+            for iteration in range(total)
+            for _ in range(4)  # 本类 coroutines=4 平铺（生产几何）
+        ]
+        step, window_start = self._step_and_window_start(resume_from, n_d)
+        assert resume_from == window_start or drift_at_step
+
+        def at(iteration: int) -> dict:
+            return next(
+                event for event in events if event["iteration"] == iteration
+                and event["rank"] == 0
+            )
+
+        def at_baseline(iteration: int) -> dict:
+            return next(
+                event for event in baseline_events
+                if event["iteration"] == iteration and event["rank"] == 0
+            )
+
+        if resume_from == window_start:
+            # 无 drift 格：全轨迹逐位一致 + 收官权重逐位
+            assert RunTrajectory(events) == RunTrajectory(baseline_events)
+            scenario.assert_state_dicts_bitwise(
+                torch.load(
+                    tmp_path / "run" / "checkpoints"
+                    / f"policy_iter{total}.pt",
+                    weights_only=True,
+                ),
+                torch.load(
+                    tmp_path / "run_baseline" / "checkpoints"
+                    / f"policy_iter{total}.pt",
+                    weights_only=True,
+                ),
+                f"policy_iter{total}",
+            )
+            scenario.assert_state_dicts_bitwise(
+                torch.load(
+                    tmp_path / "run" / "checkpoints"
+                    / f"discriminator_iter{total}.pt",
+                    weights_only=True,
+                ),
+                torch.load(
+                    tmp_path / "run_baseline" / "checkpoints"
+                    / f"discriminator_iter{total}.pt",
+                    weights_only=True,
+                ),
+                f"discriminator_iter{total}",
+            )
+            return
+        # drift 格：恢复点 [r, w) 逐位一致（含桥接）、首步不空桶 +
+        # 池化读数一致 + 桶对数缩减记账、步后非步 iter 桥接一致。
+        # 全部对拍经 RunTrajectory（豁免 elapsed_s/phase_seconds 墙钟
+        # 字段）与同 rank 配对（heldout_auc 是逐条件读数，rank 即条件
+        # 槽——跨 rank 比较是错配）。
+        pre_step_resumed = [
+            event for event in events
+            if resume_from <= event["iteration"] < step
+        ]
+        pre_step_baseline = [
+            event for event in baseline_events
+            if resume_from <= event["iteration"] < step
+        ]
+        assert RunTrajectory(pre_step_resumed) == RunTrajectory(
+            pre_step_baseline,
+        )
+        if resume_from < step:
+            assert pre_step_resumed, (
+                "恢复点落在步前窗口内（r < w）时 [r, w) 的 iter 事件应"
+                "非空（桥接对拍面）"
+            )
+        step_event = at(step)
+        assert step_event["disc_update"] is not None, (
+            "恢复后首个判别器步空桶崩溃（#265 回归）"
+        )
+        assert step_event["heldout_auc"] == at_baseline(step)["heldout_auc"]
+        # 重导出桶 = 恢复点后 iter 的任务：每 iter 每卡 K // N_d 笔、
+        # 剩余 iter 数 = step − r + 1（发射节奏几何的独立推导）
+        assert self._step_pair_total(step_event) == (
+            (step - resume_from + 1) * (4 // n_d)
+        ), "重导出桶 = 仅恢复点后 iter 的任务（drift 记账面）"
+        assert self._step_pair_total(at_baseline(step)) == 4
+        baseline_by_slot = {
+            (event["iteration"], event["rank"]): event
+            for event in baseline_events
+        }
+        for event in events:
+            if event["iteration"] > step and event["iteration"] % n_d != 0:
+                counterpart = baseline_by_slot[
+                    (event["iteration"], event["rank"])
+                ]
+                assert event["heldout_auc"] == counterpart["heldout_auc"]
+
+    def test_unrebuildable_window_rejected_at_restore(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """恢复守卫（#265）：K=2 < N_d=4——窗口任务全落窗口首 iter、
+        周期落点@4（判别器步 iter）在其后 → 恢复期拒绝，可读报错点名
+        窗口起点口径（N_d/K/窗口起点 iteration）——取代循环内「判别
+        器步须至少一桶」的误导性空桶崩溃。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=50)
+        config.reward.disc_update_interval_n_d = 4
+        config.reward.disc_batch_size_k = 2
+        config.schedule.max_iterations = 4
+        config.schedule.checkpoint_interval = 2
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == 4
+
+        config.schedule.max_iterations = 8
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        with pytest.raises(ValueError, match="窗口起点") as exc_info:
+            resumed.run()
+        message = str(exc_info.value)
+        assert "N_d=4" in message
+        assert "K=2" in message
+        assert "iteration 1" in message  # 窗口 [1,4] 的起点
+
+    def test_unreachable_step_skips_window_rebuild(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """守卫的消费面边界（#265）：同 K<N_d 几何、max_iterations 不
+        延长——判别器步在本 run 内不可达（无消费面），无操作续训不被
+        误拒。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=51)
+        config.reward.disc_update_interval_n_d = 4
+        config.reward.disc_batch_size_k = 2
+        config.schedule.max_iterations = 4
+        config.schedule.checkpoint_interval = 2
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == 4
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        assert resumed.run() == 4  # 恢复点已达标：完整无操作
+
+    def test_legacy_shard_without_window_auc_rejected_for_nd_gt_1(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """旧分片桥接守卫（#265 payload 裁决）：#265 前落盘的 v12 分片
+        （无 window_auc 键）在 N_d>1 下恢复期拒绝——桥接账不可重建、
+        恢复连续性锚会静默断裂，不静默放行。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=52)
+        config.reward.disc_update_interval_n_d = 2
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == 2
+        checkpoints = tmp_path / "run" / "checkpoints"
+        state = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        del state["window_auc"]
+        torch.save(state, checkpoints / "resume_state.pt")
+
+        config.schedule.max_iterations = 4
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        with pytest.raises(ValueError, match="window_auc"):
+            resumed.run()
+
+    def test_legacy_shard_without_window_auc_resumes_identically_for_nd_1(
+        self, cli: CliSession, tmp_path: Path,
+    ) -> None:
+        """旧分片兼容锚（#265 payload 裁决：「追加键不破坏 v12 读旧」）：
+        N_d=1 下桥接账从不被事件面读取（每 iter 皆判别器步、池化读数
+        即产即用），缺席键按空账复原——旧分片恢复与不中断基线逐位
+        一致，既有 N_d=1 恢复语义逐位复原锚不破。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=53)
+        config.schedule.max_iterations = 2
+        executor = scenario.build(config, coroutines=4, owner_check=True)
+        assert executor.run() == 2
+        checkpoints = tmp_path / "run" / "checkpoints"
+        state = torch.load(
+            checkpoints / "resume_state.pt", weights_only=True,
+        )
+        assert "window_auc" in state
+        del state["window_auc"]
+        torch.save(state, checkpoints / "resume_state.pt")
+
+        config.schedule.max_iterations = 4
+        resumed = scenario.resume_build(config, coroutines=4, owner_check=True)
+        assert resumed.run() == 4
+
+        baseline_config = scenario.prepare(seed=53)
+        baseline_config.schedule.max_iterations = 4
+        baseline = scenario.build(
+            baseline_config, run_name="run_baseline",
+            coroutines=4, owner_check=True,
+        )
+        assert baseline.run() == 4
+        assert RunTrajectory(scenario.events("run")) == RunTrajectory(
+            scenario.events("run_baseline"),
+        )
 
 
 class TestWeightDivergenceCheck:

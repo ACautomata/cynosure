@@ -1282,11 +1282,12 @@ class AsyncTrainingExecutor:
         return completed
 
     async def _restore(self) -> int:
-        """续训恢复（#222 恢复序直线）：分片输入契约校验（store：
-        版本/键清单/slots 拓扑/generators 嵌套/config 漂移守卫）→
-        权重与 optimizer 下发各卡（全卡覆写，非只卡 0——恢复的是
-        整机的落盘时刻状态）→ lr 槽位实测对账 → 命名流状态回填
-        （不重派生对账，#222 记录性字段口径）→ 分叉监控 adopt →
+        """续训恢复（#222 恢复序直线 + #265 窗口运行账复原）：分片输入
+        契约校验（store：版本/键清单/slots 拓扑/generators 嵌套/config
+        漂移守卫）→ 权重与 optimizer 下发各卡（全卡覆写，非只卡 0——
+        恢复的是整机的落盘时刻状态）→ lr 槽位实测对账 → 命名流状态
+        回填（不重派生对账，#222 记录性字段口径）→ 分叉监控 adopt →
+        窗口运行账复原（AUC 桥接账 adopt + 在途窗口重导出，#265）→
         指标流回退（删除恢复点之后的半截事件，重执行重写）。
         返回恢复点 iteration。"""
         payload = self._continuation.store.restore(
@@ -1307,8 +1308,36 @@ class AsyncTrainingExecutor:
                     slot, stream, saved_streams[f"slot{slot}"][stream],
                 )
         self._overfit.adopt(payload["overfit"])
+        self._restore_window_run(payload, iteration)
         self.artifacts.rewind_events(iteration, _STAGE_TAG)
         return iteration
+
+    def _restore_window_run(self, payload: dict, iteration: int) -> None:
+        """恢复点的窗口运行账复原（#265）：AUC 桥接账 adopt（旧分片
+        缺席键 → N_d=1 按空账复原、语义逐位不变；N_d>1 且本 run 将
+        执行时拒绝——桥接不可重建、恢复连续性锚会静默断裂）→ 在途
+        窗口重导出（判别器步在本 run 内可达才重建——不可达即无消费
+        面，不误拒无操作续训；重导出后无剩余任务即拒绝，可读报错
+        点名窗口起点口径，取代循环内「判别器步须至少一桶」的误导性
+        崩溃）。"""
+        window_auc = payload.get("window_auc")
+        if window_auc is None:
+            if (
+                self.window.n_d > 1
+                and iteration < self.config.schedule.max_iterations
+            ):
+                raise ValueError(
+                    f"续训分片无 window_auc 桥接账（#265 前落盘的 v12 "
+                    f"形态）且 N_d={self.window.n_d} > 1：恢复后非判别器"
+                    "步 iter 事件的 heldout_auc 桥接不可重建、「不中断"
+                    "run 逐条一致」的恢复连续性锚将断裂——请从产物"
+                    "checkpoint 重启新 run"
+                )
+            window_auc = {}
+        self._window_run.adopt(window_auc)
+        step = self.window.next_step(iteration)
+        if step < self.config.schedule.max_iterations:
+            self._window_run.reexport(step, iteration)
 
     def _assert_restored_lr(self, lr_slots: dict) -> None:
         """LR 槽位对账（应用后实测）：常数 LR 实现的 scheduler 状态 =
@@ -1403,11 +1432,14 @@ class AsyncTrainingExecutor:
     def _capture_resume_payload(
         self, iteration: int, card0_states: tuple[dict, dict],
     ) -> dict:
-        """v12 全清单快照的攒装（#222 终稿键清单）：卡 0 权威取数
-        （各卡副本经「同初始化 + 确定性 allreduce + 同步 step」结构
-        保证逐位一致，checkpoint 点的跨卡一致性校验刚把守过）；
-        optimizer 与 lr 卡 0 单份。``seeds`` = per-槽 seed 派生值的
-        记录性落痕（恢复不对账，#222 §1）。"""
+        """v12 全清单快照的攒装（#222 终稿键清单 + #265 追加键）：
+        卡 0 权威取数（各卡副本经「同初始化 + 确定性 allreduce +
+        同步 step」结构保证逐位一致，checkpoint 点的跨卡一致性校验
+        刚把守过）；optimizer 与 lr 卡 0 单份。``window_auc`` =
+        判别器窗口运行账的 AUC 桥接账（#265：跨窗口持久账进 payload，
+        恢复后非判别器步 iter 事件的 heldout_auc 桥接不断裂）；
+        ``seeds`` = per-槽 seed 派生值的记录性落痕（恢复不对账，
+        #222 §1）。"""
         policy_state, disc_state = card0_states
         card0 = self.cards[0].replica
         streams = _STREAM_NAMES
@@ -1437,6 +1469,7 @@ class AsyncTrainingExecutor:
                 for slot in range(self._continuation.rng.slot_count)
             },
             "overfit": self._overfit.state(),
+            "window_auc": self._window_run.state(),
             "seeds": {
                 "base": self.config.schedule.seed,
                 "per_slot": [

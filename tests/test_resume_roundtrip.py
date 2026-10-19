@@ -259,6 +259,15 @@ class TestResumeStateChecklist:
             assert divergence["count"] == 1
             assert isinstance(divergence["value"], float)
 
+        # window_auc 桥接账（#265 追加键，optional-additive）：判别器步
+        # 0 的池化读数入账（per-condition 末次有效读数，AUC ∈ [0,1]）
+        assert isinstance(state["window_auc"], dict)
+        assert state["window_auc"], "判别器步 0 的池化读数应已入账"
+        for condition, value in state["window_auc"].items():
+            assert isinstance(condition, str) and condition
+            assert isinstance(value, float)
+            assert 0.0 <= value <= 1.0
+
         # RNG：per-(槽×流) 嵌套清单，流状态 CPU generator 的 uint8 张量
         generators = state["generators"]
         assert set(generators) == {f"slot{index}" for index in range(slot_count())}
