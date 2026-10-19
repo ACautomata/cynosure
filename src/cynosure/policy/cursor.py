@@ -1,10 +1,11 @@
 """轨迹游标：RFlowScheduler 实际日程的自持快照（policy-modeling 章）。
 
 sigma 日程一律以 MONAI ``set_timesteps`` 的实际输出为准（ADR-0002：
-timestep transform 生效，config 字面 ``scale:1.4`` 是死参数、实际生效 1.0）。
-游标在构造期快照 timesteps——共享调度器被后续 ``set_timesteps`` 复写时，
-已开出的轨迹日程不受影响（spec：轨迹游标自持）；``next_timesteps`` 按位
-前移、末位补 0（MONAI 推理循环的组织）。
+timestep transform 生效，config 字面 ``scale:1.4`` 是死参数、实际生效 1.0；
+``use_discrete_timesteps=False`` 对齐上游 config——日程为 fp16 连续值，
+不取整，#264）。游标在构造期快照 timesteps——共享调度器被后续
+``set_timesteps`` 复写时，已开出的轨迹日程不受影响（spec：轨迹游标
+自持）；``next_timesteps`` 按位前移、末位补 0（MONAI 推理循环的组织）。
 """
 
 from collections.abc import Sequence
@@ -15,24 +16,42 @@ from monai.networks.schedulers import RFlowScheduler
 
 class TrajectoryCursor:
     """一条 rollout 的日程游标：timesteps 快照 + 按位前移的 next_timesteps
-    + 噪声水平换算（s = t/1000，1000=纯噪声）。"""
+    + 噪声水平换算（s = t/1000，1000=纯噪声）。
+
+    日程是 fp16 连续值（``use_discrete_timesteps=False``，#264 对齐上游
+    config 显式设定）：``timestep`` 经 python float 精确扩展（sigma 水平
+    与 UNet timestep 输入共用完整值），``next_timestep`` 取 int 截断形态
+    ——MONAI ``step()`` 内部对 next_timestep 先 ``int()`` 再算 dt，游标
+    在快照面同式截断，Δs 与 MONAI dt 逐位一致（上游推理循环同此算术）。
+    """
 
     def __init__(self, scheduler: RFlowScheduler) -> None:
         self._num_train_timesteps = scheduler.num_train_timesteps
         self.timesteps = scheduler.timesteps.clone()
-        self.next_timesteps = torch.cat(
-            (self.timesteps[1:], self.timesteps.new_zeros(1)),
+        # 按位前移、末位补 0（MONAI 推理循环的组织）。不写 torch.cat：
+        # fp16 张量的 cat 在 bf16 autocast 装配上下文中会被 autocast 派发
+        # 拦截（fp16 非该上下文的支持 dtype，报 at::autocast::prioritize；
+        # 本机 torch 2.14 CPU autocast 实测复现）——python 侧组装 +
+        # 显式 dtype 构造不经过该派发路径。
+        self.next_timesteps = torch.tensor(
+            self.timesteps.tolist()[1:] + [0.0],
+            dtype=self.timesteps.dtype,
+            device=self.timesteps.device,
         )
 
     @property
     def num_steps(self) -> int:
         return int(self.timesteps.numel())
 
-    def timestep(self, index: int) -> int:
-        """第 k 步的实际 timestep（0=最噪端，transform 后的 MONAI 输出）。"""
-        return int(self.timesteps[index])
+    def timestep(self, index: int) -> float:
+        """第 k 步的实际 timestep（0=最噪端，transform 后的 MONAI 输出；
+        fp16 连续值经 python float 精确扩展——不取整，日程小数部分
+        是基座推理日程的组成部分）。"""
+        return float(self.timesteps[index])
 
     def next_timestep(self, index: int) -> int:
+        """第 k 步的 next timestep（int 截断形态——复刻 MONAI ``step()``
+        内部的 ``int(next_timestep)``，见类 docstring；末位补 0 不受影响）。"""
         return int(self.next_timesteps[index])
 
     def sigma_level(self, index: int) -> float:
@@ -42,12 +61,12 @@ class TrajectoryCursor:
 
     def delta_s(self, index: int, stride: int = 1) -> float:
         """步长 Δs = (t_k − t_next)/1000，与 MONAI ``step()`` 内部 dt 同式
-        同精度（η=0 逐位 parity 的前提）；stride > 1 时 next 取抽稀日程的
-        访问位 k+stride（MGAI 粒度续跑的大步），越过日程末端时取 0
-        （末段直落 σ=0 终点）。"""
+        同精度（η=0 逐位 parity 的前提；t_next 的 int 截断口径见类
+        docstring）；stride > 1 时 next 取抽稀日程的访问位 k+stride
+        （MGAI 粒度续跑的大步），越过日程末端时取 0（末段直落 σ=0 终点）。"""
         next_index = index + stride
         next_timestep = (
-            self.timestep(next_index) if next_index < self.num_steps else 0
+            int(self.timestep(next_index)) if next_index < self.num_steps else 0
         )
         return (self.timestep(index) - next_timestep) / self._num_train_timesteps
 

@@ -78,26 +78,33 @@ class TestTrajectoryCursor:
         cursor = TrajectoryCursor(scheduler)
         scheduler.timesteps += 1  # 共享调度器被原地复写
         scheduler.set_timesteps(num_inference_steps=3, input_img_size_numel=32**3)
-        assert cursor.timesteps.tolist() == [1000, 442, 165]  # 快照不受影响
+        # #264 重锚：use_discrete_timesteps=False 的连续 fp16 日程
+        # （旧取整日程 [1000, 442, 165]）
+        assert cursor.timesteps.tolist() == [1000.0, 442.5, 165.625]  # 快照不受影响
 
     def test_next_timesteps_shift_with_zero_padding(
         self, cursor: TrajectoryCursor,
     ) -> None:
-        assert cursor.next_timesteps.tolist() == [442, 165, 0]  # 按位前移、末位补 0
+        assert cursor.next_timesteps.tolist() == [442.5, 165.625, 0.0]  # 按位前移、末位补 0
 
     def test_sigma_level_and_delta(self, cursor: TrajectoryCursor) -> None:
         assert cursor.num_steps == 3
         assert cursor.sigma_level(0) == pytest.approx(1.0)
-        assert cursor.sigma_level(1) == pytest.approx(0.442)
-        assert cursor.delta_s(1) == pytest.approx(0.277)
-        assert cursor.timestep(2) == 165
+        assert cursor.sigma_level(1) == pytest.approx(0.4425)
+        assert cursor.delta_s(1) == pytest.approx(0.2775)
+        assert cursor.timestep(2) == 165.625
         assert cursor.next_timestep(2) == 0
+        # next_timestep 是 MONAI step() 内部 int() 截断的形态（#264：
+        # 日程连续后与 timestep() 的 float 形态分离）
+        assert cursor.next_timestep(0) == 442
+        assert cursor.next_timestep(1) == 165
 
     def test_delta_s_matches_monai_step_dt_bitwise(
         self, cursor: TrajectoryCursor,
     ) -> None:
-        """Δs 与 MONAI step() 内部 dt 同式同精度（η=0 逐位 parity 的前提）。"""
-        expected = float(442 - 165) / 1000
+        """Δs 与 MONAI step() 内部 dt 同式同精度（η=0 逐位 parity 的前提）：
+        t_next 经 step 内部 int() 截断（上游推理实际算术，#264）。"""
+        expected = float(442.5 - 165) / 1000  # 硬编码字面量锚，非实现 mirror
         assert cursor.delta_s(1).hex() == expected.hex()
 
 
@@ -116,12 +123,20 @@ class TestSdeKernel:
     def test_eta0_matches_monai_step_bitwise(
         self, scheduler: RFlowScheduler, sample_state: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        """η=0 时单步核与 MONAI RFlowScheduler 确定性步 fp32 逐位一致（AC）。"""
+        """η=0 时单步核与 MONAI RFlowScheduler 确定性步 fp32 逐位一致（AC）。
+
+        经同一 scheduler 实例构造（#264）：日程为 fp16 连续值，t 与
+        next_t（step 内部 int() 截断）都取自 scheduler 实际日程——parity
+        对连续日程口径逐位成立。
+        """
         x, v = sample_state
         noise = torch.randn_like(x)
-        expected, _ = scheduler.step(v, 442, x, 165)
+        timestep = float(scheduler.timesteps[1])
+        next_timestep = int(scheduler.timesteps[2])
+        expected, _ = scheduler.step(v, timestep, x, next_timestep)
         outcome = SdeKernel(eta=0.0, s_max=0.999).transition(
-            x, v, sigma_level=0.442, delta_s=float(442 - 165) / 1000, noise=noise,
+            x, v, sigma_level=timestep / 1000,
+            delta_s=float(timestep - next_timestep) / 1000, noise=noise,
         )
         assert torch.equal(outcome.sample, expected)
 
@@ -889,9 +904,10 @@ class TestGranularContinuation:
     def test_delta_s_with_stride_matches_schedule_arithmetic(
         self, wide_cursor: TrajectoryCursor,
     ) -> None:
-        """跨 stride 的 Δs 与 MONAI dt 同式：(t_prev − t_visit)/1000。"""
+        """跨 stride 的 Δs 与 MONAI dt 同式：(t_prev − int(t_visit))/1000
+        ——visit 位经 step 内部 int() 截断（#264 连续日程口径）。"""
         by_hand = (
-            wide_cursor.timestep(0) - wide_cursor.timestep(2)
+            wide_cursor.timestep(0) - int(wide_cursor.timestep(2))
         ) / 1000
         assert wide_cursor.delta_s(0, stride=2) == by_hand
 
@@ -906,9 +922,12 @@ class TestGranularContinuation:
     def test_delta_s_default_stride_is_monai_dt(
         self, wide_cursor: TrajectoryCursor,
     ) -> None:
-        """stride=1 与既有逐位口径一致（MONAI step 内部 dt）。"""
+        """stride=1 与既有逐位口径一致（MONAI step 内部 dt；next 位经
+        int() 截断——#264 连续日程下与 σ 差口径分叉的来源）。"""
         assert wide_cursor.delta_s(1).hex() == (
-            float(wide_cursor.timestep(1) - wide_cursor.timestep(2)) / 1000
+            float(
+                wide_cursor.timestep(1) - int(wide_cursor.timestep(2)),
+            ) / 1000
         ).hex()
 
     def test_stride1_matches_stepwise_continuation(
@@ -938,7 +957,7 @@ class TestGranularContinuation:
         velocity = field.velocity(x, wide_cursor.timestep(3), conditions)
         x = deterministic.transition(
             x, velocity, wide_cursor.sigma_level(3),
-            wide_cursor.sigma_level(3) - wide_cursor.sigma_level(4),
+            (wide_cursor.timestep(3) - int(wide_cursor.timestep(4))) / 1000,
         ).sample
         velocity = field.velocity(x, wide_cursor.timestep(4), conditions)
         x = deterministic.transition(
@@ -964,12 +983,12 @@ class TestGranularContinuation:
         velocity = field.velocity(x, wide_cursor.timestep(1), conditions)
         x = deterministic.transition(
             x, velocity, wide_cursor.sigma_level(1),
-            wide_cursor.sigma_level(1) - wide_cursor.sigma_level(2),
+            (wide_cursor.timestep(1) - int(wide_cursor.timestep(2))) / 1000,
         ).sample
         velocity = field.velocity(x, wide_cursor.timestep(2), conditions)
         x = deterministic.transition(
             x, velocity, wide_cursor.sigma_level(2),
-            wide_cursor.sigma_level(2) - wide_cursor.sigma_level(4),
+            (wide_cursor.timestep(2) - int(wide_cursor.timestep(4))) / 1000,
         ).sample
         velocity = field.velocity(x, wide_cursor.timestep(4), conditions)
         x = deterministic.transition(
@@ -993,7 +1012,7 @@ class TestGranularContinuation:
         velocity = field.velocity(x, wide_cursor.timestep(2), conditions)
         x = deterministic.transition(
             x, velocity, wide_cursor.sigma_level(2),
-            wide_cursor.sigma_level(2) - wide_cursor.sigma_level(3),
+            (wide_cursor.timestep(2) - int(wide_cursor.timestep(3))) / 1000,
         ).sample
         velocity = field.velocity(x, wide_cursor.timestep(3), conditions)
         x = deterministic.transition(

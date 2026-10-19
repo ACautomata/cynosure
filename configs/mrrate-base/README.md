@@ -57,7 +57,9 @@ VAE（NV-Generate-CT 发布，MR-RATE 基座与之配对——上游
   发布）、掩码生成不在范围（地图 #67「范围外」）。
 - `noise_scheduler`：scheduler 由 `NetworkAssembler.rflow_scheduler`
   按**实际生效行为**装配（config 字面 `scale:1.4` 是死参数、实际生效
-  1.0——ADR-0002 + spec「sigma 日程」的 scale 陷阱）。
+  1.0——ADR-0002 + spec「sigma 日程」的 scale 陷阱；`use_discrete_timesteps:
+  false` 自 #264 起同式装配——上游显式设定，MONAI 默认 True 会把
+  transform 后 timesteps 取整，日程为 fp16 连续值）。
 - `autoencoder_def` 的 `save_mem` / `print_info` 等非架构默认值不在
   转写内（构造器默认即上游生效值）。
 

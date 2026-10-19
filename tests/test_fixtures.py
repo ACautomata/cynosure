@@ -199,19 +199,26 @@ class TestNetbuildForward:
         scheduler = NetworkAssembler.rflow_scheduler(
             num_inference_steps=3, input_img_size_numel=2048,
         )
-        assert scheduler.timesteps.tolist() == [1000, 442, 165]
+        assert scheduler.timesteps.tolist() == [1000.0, 442.5, 165.625]
+        assert scheduler.timesteps.dtype == torch.float16
+        # use_discrete_timesteps=False（#264 对齐上游 config）：MONAI 默认
+        # True 的取整日程 [1000, 442, 165] 已弃；连续 fp16 日程无取整
 
     def test_production_schedule_anchors_monai_transform_output(self) -> None:
         """生产数值锚 131072（= 64·64·32）：日程 = MONAI set_timesteps 实际
         输出，timestep transform 生效（无 transform 为 [1000,967,933,…]），
-        实际 scale=1.0——config 字面 scale=1.4 是死参数，禁止照抄（ADR-0002）。"""
+        实际 scale=1.0——config 字面 scale=1.4 是死参数，禁止照抄（ADR-0002）。
+        use_discrete_timesteps=False 对齐上游 config（#264 重锚：旧离散日程
+        [1000, 979, 956, …] 的取整漂移修复，日程为 fp16 连续值）。"""
         scheduler = NetworkAssembler.rflow_scheduler(
             num_inference_steps=30, input_img_size_numel=131072,
         )
+        assert scheduler.timesteps.dtype == torch.float16
         assert scheduler.timesteps.tolist() == [
-            1000, 979, 956, 934, 912, 888, 864, 839, 813, 787,
-            760, 732, 704, 675, 644, 613, 581, 548, 514, 479,
-            442, 404, 366, 325, 284, 241, 195, 149, 102, 51,
+            1000.0, 978.5, 957.0, 934.5, 911.5, 888.0, 864.0, 839.0,
+            813.5, 787.5, 760.5, 733.0, 704.0, 675.0, 644.5, 613.5,
+            581.5, 548.5, 514.0, 479.0, 442.5, 404.75, 366.0, 325.75,
+            284.0, 241.0, 196.25, 149.875, 101.8125, 51.90625,
         ]
 
     def test_unet_config_json_roundtrip_unknown_keys_ignored(

@@ -182,9 +182,17 @@ class NetworkAssembler:
         """装配 RFlowScheduler 并读入实际 timesteps。
 
         sigma 日程以 MONAI 实际输出为准（use_timestep_transform=true、
-        实际 scale=1.0，均为基座行为定死，不设开关）。
+        use_discrete_timesteps=false、实际 scale=1.0，均为基座行为定死，
+        不设开关）。``use_discrete_timesteps=False`` 对齐上游 config
+        （``config_network_rflow.json`` 的 ``noise_scheduler`` 段显式
+        设定；MONAI 默认 True 会把 transform 后 timesteps 取整成 int64
+        日程）——修复后日程为 fp16 连续值，policy 采样与基座 checkpoint
+        实际的推理日程同口径、保持分布内（#264）。
         """
-        scheduler = RFlowScheduler(use_timestep_transform=True)
+        scheduler = RFlowScheduler(
+            use_timestep_transform=True,
+            use_discrete_timesteps=False,
+        )
         scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             input_img_size_numel=input_img_size_numel,
