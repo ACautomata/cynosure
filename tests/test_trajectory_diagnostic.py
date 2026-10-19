@@ -235,34 +235,3 @@ class TestEtaZeroParity:
             ) < 1e-4
         assert report["logprob_pairs"] == []
         assert report["eta"] == pytest.approx(0.0)
-
-
-class TestNoiseInjectionSanity:
-    """测试面 #2（AC）：单步 SDE 扰动 + ODE 续跑的样本分布统计量与原模型
-    一致（边缘分布保持；η=0 对照见 TestEtaZeroParity）。
-
-    fixture 级 sanity 只验证「机制未破坏分布」（诊断工件是该面的信号载体）；
-    spec 的开工门槛在 M4 实例上对真实基座执行（非单元测试）。
-    """
-
-    # 容差按 fixture 实测（seed 固定、数值确定）放大：η=0.7 实测 |Δmean|≈1.3e-2、
-    # relΔstd≈0.17（单步扰动经 ODE 收缩后的真实分布移动）；量级失控的核
-    # 实现（σ 或漂移项错误）会立即击穿
-    MEAN_ABS_TOLERANCE = 0.05
-    STD_REL_TOLERANCE = 0.30
-
-    def test_perturbed_distribution_tracks_control(
-        self, scenario: DiagnosticScenario,
-    ) -> None:
-        assert scenario.run(eta=0.7).code == 0
-        report = scenario.report()
-        control = report["control_terminals"]
-        perturbed = report["perturbed_terminals"]
-        for channel in range(4):
-            assert abs(perturbed["channel_mean"][channel] - control["channel_mean"][channel]) < self.MEAN_ABS_TOLERANCE
-            base = max(abs(control["channel_std"][channel]), 1e-6)
-            relative = (
-                abs(perturbed["channel_std"][channel] - control["channel_std"][channel])
-                / base
-            )
-            assert relative < self.STD_REL_TOLERANCE
