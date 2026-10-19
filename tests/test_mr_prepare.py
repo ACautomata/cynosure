@@ -734,6 +734,24 @@ class TestThirdReviewHardening:
         assert "sampling_manifest_json" in result.stderr
         assert metadata_path.exists()  # 输入未被失效步删除
 
+    def test_output_path_aliasing_unlisted_input_rejected_before_deletion(
+        self, mr_scenario: MrPrepareScenario,
+    ) -> None:
+        """输出路径别名一件**旧读侧清单未枚举**的输入工件（基座 UNet
+        ckpt）→ 装配期拒绝且文件未被删：守卫清单改为 Artifacts 路径字段
+        自动生成后，``reward.channel_stats_json ≡ unet_ckpt`` 这类误配不再
+        静默 unlink 基座 checkpoint、收尾又把统计 JSON 写到同路径报成功
+        （#266 数据毁损面）。"""
+        config = mr_scenario.build_config()
+        unet_path = config.artifacts.unet_ckpt
+        unet_path.write_bytes(b"fake-unet-ckpt")  # 基座权重在场
+        config.reward.channel_stats_json = unet_path
+        result = mr_scenario.run_with_config(config)
+        assert result.code == 2
+        assert "channel_stats_json" in result.stderr
+        assert "unet_ckpt" in result.stderr
+        assert unet_path.exists()  # 基座权重未被失效步删除
+
     def test_study_with_conflicting_patient_owner_rejected(
         self, mr_scenario: MrPrepareScenario,
     ) -> None:

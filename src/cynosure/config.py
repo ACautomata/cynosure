@@ -16,7 +16,7 @@
 import json
 from math import prod
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, get_args
 
 from pydantic import (
     BaseModel,
@@ -86,6 +86,15 @@ class SpecField:
             json_schema_extra={"status": status, "source": source},
             **field_kwargs,
         )
+
+
+def _annotation_includes_path(annotation: Any) -> bool:
+    """字段标注是否含 ``Path``（``Path`` / ``Path | None`` / ``Optional``
+    形态；#266 别名守卫清单的自动生成源——Artifacts 新增路径字段无需
+    再改守卫代码，杜绝漏枚举重演）。"""
+    if annotation is Path:
+        return True
+    return any(_annotation_includes_path(arg) for arg in get_args(annotation))
 
 
 class Artifacts(BaseModel):
@@ -1286,7 +1295,7 @@ class CynosureConfig(BaseModel):
         cls, reward: RewardConfig, info: ValidationInfo,
     ) -> RewardConfig:
         """prepare 的读面与写面路径两两不同（别名 = 数据毁损面，#121/
-        #131）。
+        #131；清单自动覆盖 Artifacts 全部路径类字段，#266）。
 
         prepare 的失效步**先于**装配计划：它 unlink 输出路径（pool /
         held-out manifest、统计量、抽样留痕）并 rmtree 派生 latent 子树。
@@ -1294,25 +1303,28 @@ class CynosureConfig(BaseModel):
         （跑一次 prepare 删一份数据；同仓的失效-先于-计划改判正是为了让
         计划期失败也清盘，别名让这条纪律反过来咬输入）；两件输出别名同一
         路径 → 抽样留痕落在全流程最后写出，把先落盘的工件覆盖成另一份
-        schema 而 prepare 照报成功（train 随后装载不到 pool）。判据取
-        ``resolve()`` 后的路径：相对/绝对、``..`` 与符号链接指向的同一份
-        文件即同一路径。"""
+        schema 而 prepare 照报成功（train 随后装载不到 pool）。基座
+        UNet/ControlNet/判别器 checkpoint、网络配置对、modality mapping、
+        RadImageNet 权重等**全部**路径工件 + 预训练报告都在别名集内——
+        误配 ``reward.channel_stats_json ≡ unet_ckpt`` 即装配期拒绝，而非
+        unlink 基座权重后照报成功。清单的读侧由 ``Artifacts.model_fields``
+        的路径类字段**自动生成**（新增路径字段不改守卫代码）；写侧 =
+        prepare 四件输出 + 预训练报告。判据取 ``resolve()`` 后的路径：
+        相对/绝对、``..`` 与符号链接指向的同一份文件即同一路径。"""
         artifacts = info.data.get("artifacts")
         if artifacts is None:
             return reward
-        named = (
-            ("artifacts.vae_ckpt", artifacts.vae_ckpt),
-            ("artifacts.vae_config_json", artifacts.vae_config_json),
-            ("artifacts.condition_vocabulary_json",
-             artifacts.condition_vocabulary_json),
-            ("artifacts.mrrate_metadata_csv", artifacts.mrrate_metadata_csv),
-            ("artifacts.mrrate_splits_csv", artifacts.mrrate_splits_csv),
-            ("artifacts.eval_manifest_csv", artifacts.eval_manifest_csv),
+        named = [
+            (f"artifacts.{name}", getattr(artifacts, name))
+            for name, field in Artifacts.model_fields.items()
+            if _annotation_includes_path(field.annotation)
+        ] + [
             ("reward.real_pool_manifest", reward.real_pool_manifest),
             ("reward.heldout_real_manifest", reward.heldout_real_manifest),
             ("reward.channel_stats_json", reward.channel_stats_json),
             ("reward.sampling_manifest_json", reward.sampling_manifest_json),
-        )
+            ("reward.pretrain_report_json", reward.pretrain_report_json),
+        ]
         owners: dict[Path, str] = {}
         for name, path in named:
             if path is None:
