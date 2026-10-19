@@ -3,12 +3,19 @@
 唯一被优化的训练步 k 把确定性 ODE 步替换为带噪高斯核，其余步保持确定性：
 
     g(s) = η·√(s/(1−s))                              # s 经 s_max 钳制 σ→1 奇异点
-    μ    = x·(1 + g²/(2s)·Δs) + v·((1 + g²(1−s)/(2s))·Δs)
+    μ    = x·(1 − g²/(2s)·Δs) + v·((1 + g²(1−s)/(2s))·Δs)
     x'   = μ + g·√Δs·ε,   ε ~ N(0,I)                 # Δs = s_k − s_{k+1} > 0
+
+漂移是保边缘分布（Fokker–Planck 一阶恒等式）在 v 参数化下的唯一形式：
+x 项系数 1 − g²Δs/(2s)（#263 符号修正——G²RPO 论文代码口径
+dt = σ_prev − σ < 0、model_output = ε − x0，换算到本仓约定 v = x0 −
+noise、Δs = −dt > 0 时 v 项两个负号相消、x 修正项独余一负号；正号版
+均值向数据方向漂移 g²Δs(1−s)/s 且方差一阶失守）。
 
 **η=0 时 g=0，上式精确退化为 MONAI ``RFlowScheduler.step()`` 的
 ``sample + v·Δs``（fp32 逐位一致）——封装正确性的自检锚点**：系数式
-``x·(1.0 + 0.0) + v·(1.0·Δs)`` 的每个浮点运算都与 MONAI 同式同序。
+``x·(1.0 − 0.0) + v·(1.0·Δs)`` 与 MONAI 同式同序（``1.0 ± 0.0``
+均为精确 1.0，乘法逐位等价）。
 log-prob 即该高斯的 log 密度对非 batch 维取均值（沿用 G²RPO 口径；
 出自 research/granular-grpo.md §2 Eq.2-3）。
 """
@@ -68,7 +75,7 @@ class SdeKernel:
             )
         s_eff = min(sigma_level, self._s_max)
         g = self._eta * (s_eff / (1.0 - s_eff)) ** 0.5
-        mean = x * (1.0 + g * g / (2.0 * sigma_level) * delta_s) + velocity * (
+        mean = x * (1.0 - g * g / (2.0 * sigma_level) * delta_s) + velocity * (
             (1.0 + g * g * (1.0 - sigma_level) / (2.0 * sigma_level)) * delta_s
         )
         std = g * delta_s ** 0.5

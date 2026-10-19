@@ -1,8 +1,10 @@
 """policy：scheduler 轨迹游标、Anchor 轨迹、单步 SDE 核、ODE 续跑、
 per-group 采样场、log-prob（spec #15 模块划分）。
 
-核心测试面（η=0 parity / 噪声注入 sanity / log-prob 一致性）经 CLI 诊断
-工件驱动（spec「Testing Decisions」的唯一 seam）；薄封装单元的数值锚
+核心测试面（η=0 parity / log-prob 一致性）经 CLI 诊断工件驱动（spec
+「Testing Decisions」的唯一 seam）；核符号的哨兵由 η>0 边缘保持解析守卫
+（TestSdeKernelMarginalPreservation，fixture 级「噪声注入 sanity」分布
+断言 #263 退役后的承接者）直测。薄封装单元的数值锚
 （η=0 逐位对照、组合场 batch 组织、MONAI 日程实际输出）以 MONAI 库为
 真值直接测试——先例同 netbuild 装配测试。fixture 轨迹诊断回路
 （TrajectoryDiagnosticRunner）是 ``train --dump-trajectory`` 背后的编排。

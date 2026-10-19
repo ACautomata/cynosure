@@ -56,9 +56,11 @@ x_{k+1} = x_k + v·Δs，    Δs = s_k − s_{k+1} = (t_k − t_{k+1})/1000 > 0
 
 ```
 g(s_k) = η·√( s_k / (1−s_k) )                       # s_k ≤ s_max 钳制 σ→1 奇异点
-μ = x_k·(1 + g²/(2s_k)·Δs) + v_θ·(1 + g²(1−s_k)/(2s_k))·Δs
+μ = x_k·(1 − g²/(2s_k)·Δs) + v_θ·(1 + g²(1−s_k)/(2s_k))·Δs
 x_{k+1} = μ + g·√Δs·ε,   ε ~ N(0,I)                 # Δs 同上
 ```
+
+漂移是保边缘分布（Fokker–Planck 一阶恒等式）在 v 参数化下的唯一形式：x 项系数 `1 − g²Δs/(2s)`（#263 符号修正——G²RPO 论文代码口径 dt = σ_prev − σ < 0、model_output = ε − x0，换算到本仓约定 v = x0 − noise、Δs = −dt > 0 时 v 项两个负号相消、x 修正项独余一负号；正号版均值向数据方向漂移 g²Δs(1−s)/s 且方差一阶失守）。
 
 `v_θ` 按组取 `v_cfg`（组1）或单前向 `v`（组2）。**η=0 时上式精确退化为 MONAI `step()`**——确定性锚点，封装正确性的自检依据。
 
@@ -100,7 +102,7 @@ GRPO ratio 的 π_new/π_old 均在**各自组的采样场**上重算：组1 每
 
 ## 开工前门槛（sanity checks）
 
-1. **噪声注入 sanity**：单步 SDE 扰动后续跑 ODE，样本分布应与原模型一致（验证边缘分布保持；以 η=0 为对照）。
+1. **噪声注入 sanity**：单步 SDE 扰动后续跑 ODE，样本分布应与原模型一致（验证边缘分布保持；以 η=0 为对照）。核符号的哨兵职责由玩具线性速度场的 η>0 解析守卫承担（`TestSdeKernelMarginalPreservation`，#263——fixture 级分布统计断言已随之退役）。
 2. **组内 reward 方差检查**：组1（CFG=10 组合场可能压缩 G 个方向的差异）与组2（CFG=0）各自确认 G 个方向的 reward std 足够非零——raw-logit reward（`reward-model.md`）依赖组内方差，std→0 则 advantage 失效（1e-8 保护 + clamp 兜底）。判别器分辨率侧的对应监控见 `reward-model.md`「防 reward hacking」。
 
 ## 待定 / 移交

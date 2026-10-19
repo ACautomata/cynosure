@@ -1,4 +1,5 @@
-"""policy 薄封装测试：轨迹游标、单步 SDE 核（η=0 parity 锚点）、组1 CFG=10
+"""policy 薄封装测试：轨迹游标、单步 SDE 核（η=0 parity 锚点 + η>0 边缘
+保持解析守卫）、组1 CFG=10
 组合场（batch 组织逐字复刻）、rollout 编排（Anchor 轨迹 / 单步扰动 / ODE 续跑）。
 
 真值锚 = MONAI 库本身（step()、set_timesteps 输出），非基座仓库（零依赖）。"""
@@ -190,6 +191,89 @@ class TestSdeKernel:
         x = torch.randn(1, 4, 16, 16, 8)
         with pytest.raises(ValueError, match="sigma"):
             kernel.transition(x, x, sigma_level=0.0, delta_s=0.0)
+
+
+class TestSdeKernelMarginalPreservation:
+    """η>0 边缘保持守卫（#263）：玩具线性速度场上的纯 torch 解析断言，
+    无 UNet 前向。期望值由玩具模型的已知边缘结构独立推出（保边缘漂移
+    的推导与符号换算见 kernel.py docstring / policy-modeling spec「单步
+    SDE」节），不复述被测实现的算式；正号版（x 项 +g²Δs/(2s)）会让均值
+    向数据方向漂移 g²Δs(1−s)/s、方差一阶失守——本守卫对符号类系统性
+    核错误有判别力（fixture 级分布 sanity 已随之退役，哨兵职责由这里
+    承接）。"""
+
+    ETA = 0.7  # 生产噪声强度（policy-modeling 章超参初始值）
+    S_MAX = 0.999
+
+    @pytest.fixture
+    def kernel(self) -> SdeKernel:
+        return SdeKernel(eta=self.ETA, s_max=self.S_MAX)
+
+    def test_perturbation_mean_first_order_marginal_identity(
+        self, kernel: SdeKernel,
+    ) -> None:
+        """单步均值 = 确定性目标 − (g²Δs/(2s))·ε_z：x0 系数精确守恒
+        （数据方向零漂移），ε_z 系数恰收缩到新鲜噪声一阶补齐方差的位置。
+
+        玩具：固定数据 x0，边缘点 x = (1−s)·x0 + s·ε_z，真实速度
+        v = x0 − ε_z（该边缘点的精确去噪值）。"""
+        s, delta_s = 0.7, 0.05
+        g2 = self.ETA**2 * s / (1.0 - s)  # g(s) = η·√(s/(1−s)) → g²
+        torch.manual_seed(11)
+        x0 = torch.randn(3, 4, 8, 8, 8)
+        eps_z = torch.randn(3, 4, 8, 8, 8)
+        x = (1.0 - s) * x0 + s * eps_z
+        v = x0 - eps_z
+        outcome = kernel.transition(x, v, sigma_level=s, delta_s=delta_s)
+        # 独立真值：边缘结构 (1−s+Δs)·x0 + (s−Δs)·ε_z（纯 ODE 目标），
+        # 保边缘修正只允许在 ε_z 方向收缩 g²Δs/(2s)（方差由新鲜噪声补回）
+        deterministic = (1.0 - s + delta_s) * x0 + (s - delta_s) * eps_z
+        expected = deterministic - (g2 * delta_s / (2.0 * s)) * eps_z
+        assert torch.allclose(outcome.mean, expected, rtol=1e-5, atol=1e-6)
+
+    def test_single_step_variance_first_order_preserved(
+        self, kernel: SdeKernel,
+    ) -> None:
+        """全边缘（ε_z × 新鲜噪声联合）方差一阶保持：Var(x') = (s−Δs)² +
+        O(Δs²)，解析余项恰为 g²Δs²/s + (g²Δs/(2s))²；正号版对 (s−Δs)²
+        的偏差 O(Δs)（≈0.11）应击穿界（≈0.02）。数据取 δ_0，边缘方差
+        全部来自 ε_z。"""
+        s, delta_s = 0.7, 0.05
+        g2 = self.ETA**2 * s / (1.0 - s)
+        torch.manual_seed(23)
+        eps_z = torch.randn(1024, 4, 8, 8, 8)
+        fresh = torch.randn(1024, 4, 8, 8, 8)
+        x = s * eps_z  # x0 = 0 的边缘点
+        v = -eps_z  # v = x0 − ε_z
+        outcome = kernel.transition(
+            x, v, sigma_level=s, delta_s=delta_s, noise=fresh,
+        )
+        empirical = outcome.sample.var(correction=0).item()
+        target = (s - delta_s) ** 2
+        slack = g2 * delta_s**2 / s + (g2 * delta_s / (2.0 * s)) ** 2
+        assert abs(empirical - target) < 3.0 * slack + 2e-3
+
+    def test_chain_terminal_variance_does_not_inflate(
+        self, kernel: SdeKernel,
+    ) -> None:
+        """19 步链终端方差不膨胀：玩具精确去噪器 v(x,s) = (x0−x)/s
+        （数据 δ_{x0}，边缘方差恒 s²）逐链接力，终端方差应 ≈ s_f²
+        （一阶离散化余项，实测比 ≈1.17）；正号版每步 ×(1+g²Δs/s)
+        复合放大（实测比 ≈16），3× 上界足以分辨。下界防方差坍缩。"""
+        s, delta_s, steps = 0.9, 0.04, 19
+        torch.manual_seed(37)
+        x0 = torch.zeros(4, 8, 8, 8)
+        x = s * torch.randn(256, 4, 8, 8, 8)  # (1−s)x0 + s·ε，x0=0
+        for _ in range(steps):
+            v = (x0 - x) / s
+            x = kernel.transition(
+                x, v, sigma_level=s, delta_s=delta_s,
+                noise=torch.randn_like(x),
+            ).sample
+            s -= delta_s
+        terminal_var = x.var(correction=0).item()
+        assert terminal_var < 3.0 * s**2
+        assert terminal_var > s**2 / 3.0
 
 
 class TestCfgCombinedField:
