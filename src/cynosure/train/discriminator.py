@@ -38,6 +38,7 @@ fake 产出即 CPU 暂存（#220 决议 16）：任务 fake 构造（policy 前�
 桶 + 累积梯度。
 """
 
+import math
 import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -249,6 +250,14 @@ class DiscriminatorWindow:
             return step
         return None
 
+    def next_step(self, iteration: int) -> int:
+        """≥ ``iteration`` 的下一个判别器步号（``iteration`` 自身是步
+        即它自己）——恢复点在途窗口定位的纯函数（#265：恢复序对包含
+        恢复点的窗口重导 real 抽取，其判别器步经本函数确定）。"""
+        if iteration < 0:
+            raise ValueError(f"判别器步定位须非负 iteration，得到 {iteration}")
+        return iteration + (self._n_d - iteration % self._n_d) % self._n_d
+
     def launch_count(self, step_iteration: int, offset: int) -> int:
         """窗口内第 ``offset`` 个 iter 的发射数：``K // L``（余数补窗
         口首 iter），L = 实际窗口长。"""
@@ -455,7 +464,14 @@ class DiscriminatorWindowRun:
     （``_auc``）**跨窗口持久**——步末快照的覆盖式入账即「窗口内最后
     一次有效测量」（#220 决议 14），非判别器步 iter 的事件桥接与
     run 后的观测面都读这本持久账（其逐条件来源 iter = 该条件最后被
-    分配的判别器步，存在性由分配表纯函数钉死）。"""
+    分配的判别器步，存在性由分配表纯函数钉死）。
+
+    **恢复面**（#265）：任务账是 (seed, 步号) 的确定性函数，恢复序经
+    ``reexport`` 重导出包含恢复点的窗口（丢弃 iteration < 恢复点的
+    任务——已过 iter 不补跑，跨快照 fake 的 accepted drift 记入事件
+    流）；AUC 账是长寿命运行态，经 ``state``/``adopt`` 自持进续训
+    分片 payload（ADR-0014 协作者自持先例，overfit EMA 同款）。
+    """
 
     def __init__(
         self,
@@ -487,6 +503,55 @@ class DiscriminatorWindowRun:
         step = self._window.step_for_launch(iteration)
         if step is not None:
             self._draw = self._real_draw.assign(self._seed, step, self._window)
+
+    def reexport(self, step_iteration: int, resume_iteration: int) -> None:
+        """恢复点的在途窗口重导出（#265，恢复序调用、运行期账簿空账时）：
+        对包含恢复点的判别器步 ``step_iteration`` 重导 real 抽取（
+        (seed, 步号) 的确定性函数——分配表纯函数重导出同款先例）、
+        丢弃 iteration < ``resume_iteration`` 的任务（窗口内已过 iter
+        的任务不补跑——跨快照 fake 的 accepted drift 记入事件流，桶
+        对数缩减即记账面）。
+
+        恢复点即窗口首 iter 时重导出 = 全量抽取（与 run 循环
+        ``launch`` 同款，无丢弃）。重导出后无剩余任务（K < N_d 时窗
+        口任务全落窗口首 iter、恢复点在其后）即拒绝——可读报错点名
+        窗口起点口径，取代循环内「判别器步须至少一桶」的误导性空桶
+        报错路径；抽取失败（池容量守卫）原样上抛。"""
+        if not self._window.is_step(step_iteration):
+            raise ValueError(
+                f"窗口重导出须锚判别器步，得到 iteration {step_iteration}"
+                f"（% {self._window.n_d} ≠ 0）"
+            )
+        start = self._window.window_start(step_iteration)
+        if resume_iteration not in self._window.window_iterations(
+            step_iteration,
+        ):
+            raise ValueError(
+                f"恢复点 iteration {resume_iteration} 不在判别器窗口 "
+                f"[{start}, {step_iteration}] 内"
+            )
+        draw = self._real_draw.assign(
+            self._seed, step_iteration, self._window,
+        )
+        remaining = {
+            task: entry
+            for task, entry in draw.items()
+            if task.iteration >= resume_iteration
+        }
+        if not remaining:
+            raise ValueError(
+                f"续训不可恢复：恢复点 iteration {resume_iteration} 落在"
+                f"判别器窗口 [{start}, {step_iteration}] 内（窗口起点 = "
+                f"iteration {start}、N_d={self._window.n_d}），窗口任务"
+                f"全落窗口首 iter（K={self._window.batch_size_k} < N_d）"
+                "已过恢复点——在途窗口重导出后无剩余任务（#265：窗口内"
+                "已过 iter 的任务不补跑），判别器步 "
+                f"{step_iteration} 将无桶可装配；请从窗口首 iter 的"
+                "checkpoint 落点恢复（iteration ≡ 1 (mod N_d) 的落点，"
+                "或 K ≥ N_d 几何），或从产物 checkpoint 重启新 run"
+            )
+        self._draw = remaining
+        self._records = {}
 
     def tasks_for(
         self, iteration: int, slot: int,
@@ -525,6 +590,39 @@ class DiscriminatorWindowRun:
         本 run 尚无读数 = None——首现于非判别器步 iter 的条件，其所在
         窗口的测量尚未发生）。"""
         return self._auc.get(condition)
+
+    def state(self) -> dict[str, float]:
+        """AUC 桥接账的落盘形态（#265：续训分片 ``window_auc`` 键，
+        weights_only 兼容原语）——逐条件最后一次有效池化读数（未读数
+        条件无条目）。"""
+        return dict(self._auc)
+
+    def adopt(self, state: dict) -> None:
+        """AUC 桥接账回填（#265 恢复入口）：逐条件末次池化读数整体
+        重建为快照时刻状态（覆盖式——恢复即落盘时刻的账本）。损坏
+        形态显式拒绝（分片损坏/篡改不在恢复面静默漂移）。"""
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"AUC 桥接账形态非法（须为 per-condition dict）: "
+                f"{type(state)}"
+            )
+        restored: dict[str, float] = {}
+        for condition, value in state.items():
+            if not isinstance(condition, str) or not condition:
+                raise ValueError(
+                    f"AUC 桥接账条件名非法（须为非空 str）: {condition!r}"
+                )
+            if isinstance(value, bool) or not isinstance(value, float | int):
+                raise ValueError(
+                    f"AUC 桥接账 {condition!r} 形态非法（须为数值）: "
+                    f"{value!r}"
+                )
+            if not math.isfinite(float(value)):
+                raise ValueError(
+                    f"AUC 桥接账 {condition!r} 读数非有限: {value!r}"
+                )
+            restored[condition] = float(value)
+        self._auc = restored
 
     def clear(self) -> None:
         """判别器步末清**任务账**（``_draw``/``_records``——下一窗口

@@ -32,6 +32,7 @@ from cynosure.train.discriminator import (
     DiscriminatorBucket,
     DiscriminatorPhase,
     DiscriminatorWindow,
+    DiscriminatorWindowRun,
     WindowPairRecord,
     WindowRealDraw,
 )
@@ -200,6 +201,31 @@ class TestDiscriminatorWindow:
         with pytest.raises(ValueError):
             DiscriminatorWindow(self._table(), n_d=0, batch_size_k=1, card_slots={0: (0,)})
 
+    def test_next_step_is_first_discriminator_step_at_or_after(self) -> None:
+        """恢复点在途窗口定位的纯函数（#265）：≥ iteration 的下一个判别
+        器步号（iteration 自身是步即它自己）。"""
+        window = DiscriminatorWindow(
+            self._table(), n_d=4, batch_size_k=2, card_slots={0: (0, 1)},
+        )
+        assert window.next_step(0) == 0
+        assert window.next_step(1) == 4
+        assert window.next_step(3) == 4
+        assert window.next_step(4) == 4
+        assert window.next_step(6) == 8
+        pair = DiscriminatorWindow(
+            self._table(), n_d=2, batch_size_k=2, card_slots={0: (0, 1)},
+        )
+        assert pair.next_step(1) == 2
+        assert pair.next_step(2) == 2
+        assert pair.next_step(3) == 4
+
+    def test_next_step_rejects_negative_iteration(self) -> None:
+        window = DiscriminatorWindow(
+            self._table(), n_d=4, batch_size_k=2, card_slots={0: (0, 1)},
+        )
+        with pytest.raises(ValueError):
+            window.next_step(-1)
+
 
 class TestWindowRealDraw:
     """real 侧窗口起点全局无放回抽取（#220 决议 10）：条件名排序调用序、
@@ -305,6 +331,135 @@ class TestWindowRealDraw:
         )
         draw.assign(seed=7, step_iteration=0, window=window)
         assert calls == ["a", "b"]
+
+
+class TestDiscriminatorWindowRun:
+    """运行期账簿的恢复面（#265）：在途窗口纯函数重导出 + AUC 桥接账
+    自持（state/adopt——ADR-0014 协作者自持先例，overfit EMA 同款）。"""
+
+    def _manifest(self, entries_per_condition: dict[str, int]) -> LatentManifest:
+        entries = [
+            PoolEntry(
+                case_id=f"{condition}-{index}",
+                modality=condition,
+                latent=f"{condition}/{index}.pt",
+                spacing=(1.0, 1.0, 1.0),
+            )
+            for condition, count in sorted(entries_per_condition.items())
+            for index in range(count)
+        ]
+        return LatentManifest(
+            kind="real_pool",
+            encoder="synthetic",
+            latent_shape=(1, 4, 4, 4),
+            split_seed=0,
+            split_sizes={"train": len(entries)},
+            entries=entries,
+        )
+
+    def _run(self, *, n_d=4, k=4, slots=2, seed=7, conditions=("a", "b")):
+        window = DiscriminatorWindow(
+            AllocationTable(conditions, slots, seed=0),
+            n_d=n_d, batch_size_k=k, card_slots={0: tuple(range(slots))},
+        )
+        return DiscriminatorWindowRun(
+            window,
+            WindowRealDraw(self._manifest({c: 12 for c in conditions})),
+            seed,
+        )
+
+    def test_reexport_drops_tasks_before_resume_iteration(self) -> None:
+        """恢复点 6、N_d=4、K=4（窗口 [5,8]、每 iter 每卡 1 任务）：
+        重导出后仅 iteration 6/7/8 的任务在账、5 已弃——已过 iter 不
+        补跑（#265：跨快照 fake 的 accepted drift 进记账面）。"""
+        run = self._run()
+        run.reexport(step_iteration=8, resume_iteration=6)
+        assert run.planned_count(0) == 3  # 1 任务/iter × [6,7,8]
+        assert len(run.tasks_for(5, 0)) == 0
+        assert len(run.tasks_for(6, 0)) == 1
+        assert len(run.tasks_for(8, 0)) == 1
+
+    def test_reexport_keeps_original_entries_for_remaining_tasks(self) -> None:
+        """重导出 = 同 (seed, 步号) 的抽取纯函数：剩余任务的 real 条目
+        与全量抽取逐一相同（切片序不变、不重洗）。"""
+        run = self._run()
+        run.reexport(step_iteration=8, resume_iteration=6)
+        full = WindowRealDraw(self._manifest({"a": 12, "b": 12})).assign(
+            seed=7, step_iteration=8, window=run.window,
+        )
+        for iteration in (6, 7, 8):
+            for slot in (0, 1):
+                expected = tuple(
+                    (task, entry) for task, entry in full.items()
+                    if task.iteration == iteration and task.slot == slot
+                )
+                assert run.tasks_for(iteration, slot) == expected
+
+    def test_reexport_at_launch_iteration_is_full_window(self) -> None:
+        """恢复点即窗口首 iter：重导出 = 全量抽取（无丢弃——与 run
+        循环 launch 的抽取同款）。"""
+        run = self._run()
+        run.reexport(step_iteration=8, resume_iteration=5)
+        assert run.planned_count(0) == 4  # K 任务全集
+
+    def test_reexport_rejects_unrebuildable_window_with_start_criterion(self) -> None:
+        """恢复守卫（#265）：K=2 < N_d=4 时窗口任务全落窗口首 iter、
+        恢复点在其后 → 重导出后无剩余任务 → 可读报错点名窗口起点
+        口径（N_d、窗口起点 iteration 5、K<N_d 判据）——取代循环内
+        「判别器步须至少一桶」的误导性空桶报错。"""
+        run = self._run(n_d=4, k=2)
+        with pytest.raises(ValueError, match="窗口起点") as exc_info:
+            run.reexport(step_iteration=8, resume_iteration=6)
+        message = str(exc_info.value)
+        assert "N_d=4" in message
+        assert "K=2" in message
+        assert "5" in message  # 窗口起点 = iteration 5
+
+    def test_reexport_rejects_non_step_and_out_of_window(self) -> None:
+        run = self._run()
+        with pytest.raises(ValueError, match="判别器步"):
+            run.reexport(step_iteration=7, resume_iteration=6)
+        with pytest.raises(ValueError, match="窗口"):
+            run.reexport(step_iteration=8, resume_iteration=9)
+
+    def test_state_adopt_roundtrip_restores_auc_bridge(self) -> None:
+        """AUC 桥接账自持（#265 / ADR-0014）：record_auc 入账 → state()
+        落盘形态 → 新账簿 adopt 回填 → window_auc 逐条件复原（跨窗口
+        持久账的恢复面）。"""
+        run = self._run()
+        run.record_auc({"a": 0.8, "b": 0.3})
+        fresh = self._run()
+        fresh.adopt(run.state())
+        assert fresh.window_auc("a") == 0.8
+        assert fresh.window_auc("b") == 0.3
+        assert run.state() == {"a": 0.8, "b": 0.3}
+
+    def test_adopt_empty_state_is_empty_bridge(self) -> None:
+        """旧分片缺 window_auc 键的恢复面缺省 = 空账（#265 payload 裁决：
+        v12 追加键 optional-additive——缺席分片按空账复原，N_d=1 语义
+        逐位不变）。"""
+        run = self._run()
+        run.adopt({})
+        assert run.window_auc("a") is None
+
+    def test_adopt_rejects_malformed_state(self) -> None:
+        run = self._run()
+        for malformed in (
+            ["a"],                    # 非 dict
+            {"a": True},              # bool 值（isinstance(int) 的漏网形态）
+            {"a": float("nan")},      # 非有限浮点
+            {1: 0.5},                 # 非 str 条件名
+        ):
+            with pytest.raises(ValueError):
+                run.adopt(malformed)
+
+    def test_clear_keeps_auc_bridge(self) -> None:
+        """判别器步末清任务账不清 AUC 账（#220 决议 14 跨窗口持久的
+        恢复前提——桥接账的存续面）。"""
+        run = self._run()
+        run.record_auc({"a": 0.7})
+        run.clear()
+        assert run.window_auc("a") == 0.7
 
 
 class _RecorderScorer:

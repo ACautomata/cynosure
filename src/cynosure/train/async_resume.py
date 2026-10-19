@@ -37,9 +37,16 @@ v11 号位已被 #228 阶段 0（门控链退役）占用，v-next 账单一次 
   （``set_state``）不重派生对账——防未来含卡号的派生公式把跨
   卡数恢复误拒（#222 明文）。形态仍校验（损坏分片显式拒绝），
   值不参与对账。
-- **恢复序**（#218 直线）：config 守卫 → 权重/optimizer（门面下发
-  各卡）→ lr 槽位对账（门面实测）→ generators 状态回填 → overfit
-  adopt → 进循环。
+- **恢复序**（#218 直线 + #265 窗口复原）：config 守卫 → 权重/optimizer
+  （门面下发各卡）→ lr 槽位对账（门面实测）→ generators 状态回填 →
+  overfit adopt → 窗口运行账复原（AUC 桥接账 adopt + 在途窗口重导出，
+  门面编排）→ 进循环。
+- **``window_auc`` 追加键**（#265，optional-additive）：判别器窗口
+  运行账的 AUC 桥接账（per-condition 末次池化读数）自 v12 追加——
+  新代码读旧分片按缺席键空账复原（N_d=1 语义逐位不变，N_d>1 的旧
+  分片由门面恢复期拒绝：桥接不可重建）；旧代码读新分片容多键不受
+  影响。两向兼容故不升版（payload 版本裁决记于 #265 票评论），
+  ``_REQUIRED_KEYS`` 不含该键（形态校验由组件 ``adopt`` 自持）。
 
 「ResumeStore 挂运行时聚合层」的裁决（#222 §1，ADR-0014 平移）随
 #231 骨架期的新执行序装配形态落地为：**门面持有 store，payload 的
@@ -91,8 +98,12 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "overfit",
     "seeds",
 )
-"""v12 nominal 全键清单（#222 终稿汇总）：多一键少一键都是契约变更、
-须走版本 bump。"""
+"""v12 nominal 必选键清单（#222 终稿汇总）：多一键少一键都是契约变更、
+须走版本 bump。``window_auc``（#265 追加键）不在本清单——optional-
+additive：缺席 = #265 前落盘的旧分片（新代码按空账复原，N_d>1 旧分
+片由门面恢复期拒绝），携带 = 新分片（旧代码容多键、不受影响）。两向
+兼容故不升版，裁决记于 #265 票评论；键形态校验由
+``DiscriminatorWindowRun.adopt`` 组件自持（overfit 同款口径）。"""
 
 _STREAM_NAMES: frozenset[str] = frozenset(
     {

@@ -281,6 +281,27 @@ class TestFieldValidation:
             store.restore(config, slot_count=SLOTS)
 
 
+class TestWindowAucKeyCompat:
+    """window_auc 追加键的兼容锚（#265 payload 裁决：保持 v12、追加键
+    optional-additive——旧分片（缺席键）可读、新分片（携带键）往返
+    保留；键形态的组件级校验在 DiscriminatorWindowRun.adopt 自持，
+    store 不校验组件内部，overfit 同款口径）。"""
+
+    def test_window_auc_extra_key_roundtrips(self, store, config) -> None:
+        payload = make_payload(window_auc={"t1n": 0.87, "t1c": 0.42})
+        store.save(payload)
+        restored = store.restore(config, slot_count=SLOTS)
+        assert restored["window_auc"] == {"t1n": 0.87, "t1c": 0.42}
+
+    def test_window_auc_absent_key_restores(self, store, config) -> None:
+        """#265 前落盘的 v12 分片（无 window_auc 键）仍可读——「追加键
+        不破坏 v12 读旧」的 store 面锚（缺键不在 _REQUIRED_KEYS，旧
+        分片不为缺键所拒）。"""
+        store.save(make_payload())
+        restored = store.restore(config, slot_count=SLOTS)
+        assert "window_auc" not in restored
+
+
 class TestConfigDriftGuard:
     """续训 config 漂移白名单仅 max_iterations（#222 清单沿袭）。"""
 
