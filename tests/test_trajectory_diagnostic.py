@@ -106,10 +106,12 @@ class TestDiagnosticArtifact:
         self, scenario: DiagnosticScenario,
     ) -> None:
         """sigma 日程 = MONAI set_timesteps 实际输出（3 步 @2048 数值锚，
-        timestep transform 生效；实际 scale=1.0，非 config 字面 1.4）。"""
+        timestep transform 生效；实际 scale=1.0，非 config 字面 1.4；
+        use_discrete_timesteps=False 对齐上游 config——日程为 fp16 连续
+        值，#264 重锚：旧离散日程 [1000, 442, 165] 的取整漂移修复）。"""
         assert scenario.run().code == 0
         report = scenario.report()
-        assert report["schedule_timesteps"] == [1000.0, 442.0, 165.0]
+        assert report["schedule_timesteps"] == [1000.0, 442.5, 165.625]
         assert report["input_img_size_numel"] == 2048
 
     def test_perturbation_steps_follow_m(self, scenario: DiagnosticScenario) -> None:
@@ -128,7 +130,7 @@ class TestDiagnosticArtifact:
         for column in ("anchor_trajectory", "monai_step_trajectory"):
             steps = report[column]
             assert [entry["step_index"] for entry in steps] == [0, 1, 2, 3]
-            assert [entry["timestep"] for entry in steps] == [1000.0, 442.0, 165.0, 0.0]
+            assert [entry["timestep"] for entry in steps] == [1000.0, 442.5, 165.625, 0.0]
             for entry in steps:
                 assert math.isfinite(entry["mean"])
                 assert entry["std"] >= 0.0

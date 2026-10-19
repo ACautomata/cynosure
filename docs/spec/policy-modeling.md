@@ -42,6 +42,7 @@ policy 的采样分布必须**逐组复刻基座（NV-Generate-CTMR 各阶段推
 - `set_timesteps(num_inference_steps=30, input_img_size_numel=131072)`，`use_timestep_transform=true`——SD3 式 timestep transform 在 MONAI 内部触发，ratio 由 latent 尺寸决定（`(131072/32³)^(1/3) ≈ 1.587`）。
 - **数值锚逐条件（#129）**：锚语义不变（锚 = 采样体的空间 numel），组织逐条件化——BraTS 单域 = 全局锚 131072（单条件词汇特例）；MR-RATE 逐条件锚 = 词汇表该条件空间 numel（`ConditionVocabulary.latent_numel`），与 rollout 噪声形状同源派生（同一条件键取形状与锚——结构性防 transform 用错 numel 的静默错位；MR config 显式携带单域锚字段即字段级拒绝）。
 - ⚠️ **scale 陷阱**：config 里 `"scale": 1.4` 是**死参数**——MONAI 1.5.0 / 1.6.0 / dev 的 `set_timesteps`/`sample_timesteps` 调 `timestep_transform` 时均不传 `scale=`，实际生效 **1.0**。复刻日程必须按实际行为（1.0），照抄 config 字面会让整个日程错位。
+- ⚠️ **离散化陷阱（#264）**：config 显式 `"use_discrete_timesteps": false`，而 MONAI 默认 `True` 会把 transform 后 timesteps 取整成 int64 日程——漏传即日程整体偏离基座实际推理日程。装配面定死 `False`（fp16 连续值日程）；下游数值链随之：UNet timestep 以 float32 传入（NV-Generate-CTMR 推理循环的 timestep 传参 `torch.Tensor((t,))` 为 float32 上转，小数部分参与 time embedding），MONAI `step()` 内部对 next_timestep 先 `int()` 再算 dt——游标同式截断，Δs 与 dt 逐位一致。
 - 实操：直接调 MONAI `set_timesteps(30, input_img_size_numel=prod(latent.shape[2:]))` 读 `scheduler.timesteps`；轨迹游标自持（快照 timesteps 防共享调度器被复写、`next_timesteps` 按位取、末位补 0——参照 NV-Generate-CTMR domain 层薄封装）。
 
 ### 确定性步（η=0，即 MONAI `step()`）

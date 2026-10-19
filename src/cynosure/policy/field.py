@@ -24,10 +24,16 @@ from cynosure.policy.condition import RolloutCondition
 
 class VelocityField(Protocol):
     """采样场接口：给 (x, t, c) 求 velocity 的两种组级实现（组合场 /
-    裸条件单前向）。rollout 编排与 GRPO 更新只依赖本接口。"""
+    裸条件单前向）。rollout 编排与 GRPO 更新只依赖本接口。
+
+    ``timesteps`` 是日程游标的 fp16 连续值经 python float 传入（对齐
+    NV-Generate-CTMR 推理循环的 timestep 传参 ``torch.Tensor((t,))``——
+    float32 上转；非 MONAI docstring 示例），实现以 float32 张量送网络
+    ——time embedding 的小数部分是基座推理日程的组成部分（#264）。
+    """
 
     def velocity(
-        self, x: torch.Tensor, timesteps: int, condition: RolloutCondition,
+        self, x: torch.Tensor, timesteps: float, condition: RolloutCondition,
     ) -> torch.Tensor:
         """采样场 velocity（batch 维并行；Anchor 轨迹与 ODE 续跑走此入口）。"""
         ...
@@ -35,7 +41,7 @@ class VelocityField(Protocol):
     def group_velocity(
         self,
         x_shared: torch.Tensor,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
         group_size: int,
     ) -> torch.Tensor:
@@ -64,7 +70,7 @@ class CfgCombinedField:
     def velocity(
         self,
         x: torch.Tensor,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
     ) -> torch.Tensor:
         """组合场 velocity：batch=2B 单次前向、序 [cond, uncond]、无条件
@@ -81,7 +87,7 @@ class CfgCombinedField:
     def group_velocity(
         self,
         x_shared: torch.Tensor,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
         group_size: int,
     ) -> torch.Tensor:
@@ -102,14 +108,14 @@ class CfgCombinedField:
         self,
         x: torch.Tensor,
         batch: int,
-        timesteps: int,
+        timesteps: float,
         labels: torch.Tensor,
         spacing: torch.Tensor,
     ) -> torch.Tensor:
         return self._unet(
             x=x,
             timesteps=torch.full(
-                (batch,), timesteps, dtype=torch.int64, device=x.device,
+                (batch,), timesteps, dtype=torch.float32, device=x.device,
             ),
             class_labels=labels,
             spacing_tensor=spacing,
@@ -143,7 +149,7 @@ class BareConditionField:
     def velocity(
         self,
         x: torch.Tensor,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
     ) -> torch.Tensor:
         """裸条件单前向 velocity（batch 维并行；残差按 batch 一次算出）。"""
@@ -155,7 +161,7 @@ class BareConditionField:
     def group_velocity(
         self,
         x_shared: torch.Tensor,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
         group_size: int,
     ) -> torch.Tensor:
@@ -175,7 +181,7 @@ class BareConditionField:
         self,
         x: torch.Tensor,
         batch: int,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """ControlNet 残差：(down_block_res_samples, mid_block_res_sample)。
@@ -196,7 +202,7 @@ class BareConditionField:
         down_residuals, mid_residual = self._controlnet(
             x=x,
             timesteps=torch.full(
-                (batch,), timesteps, dtype=torch.int64, device=x.device,
+                (batch,), timesteps, dtype=torch.float32, device=x.device,
             ),
             controlnet_cond=condition.source_latent * self._scale_factor,
             class_labels=condition.source_label,
@@ -207,7 +213,7 @@ class BareConditionField:
         self,
         x: torch.Tensor,
         batch: int,
-        timesteps: int,
+        timesteps: float,
         condition: RolloutCondition,
         down_residuals: tuple[torch.Tensor, ...],
         mid_residual: torch.Tensor,
@@ -215,7 +221,7 @@ class BareConditionField:
         return self._unet(
             x=x,
             timesteps=torch.full(
-                (batch,), timesteps, dtype=torch.int64, device=x.device,
+                (batch,), timesteps, dtype=torch.float32, device=x.device,
             ),
             class_labels=condition.label,
             spacing_tensor=condition.spacing,
