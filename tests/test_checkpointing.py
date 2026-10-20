@@ -99,6 +99,62 @@ class TestAssembly:
             _build_policy(config)
 
 
+class TestToleranceTier:
+    """DTK 容差档的分支逻辑（#233 归因决议）：CPU 上以 monkeypatch 模拟
+    hip 后端，只守分支选择与容差界——生产网络 × 真实 DTK 的实测证明
+    在集群装配面（探针审计打印落 pretrain/train 日志）。"""
+
+    @staticmethod
+    def _probe() -> checkpointing_module.GradientCheckpointing:
+        # 断言面单测不担 config/网络构建重负，跳过 __init__ 直取比较逻辑
+        return checkpointing_module.GradientCheckpointing.__new__(
+            checkpointing_module.GradientCheckpointing,
+        )
+
+    def test_within_tolerance_passes_with_audit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(torch.version, "hip", "6.3.0")
+        probe = self._probe()
+        plain = torch.tensor([1.0, -2.0])
+        probe._assert_recompute_parity(
+            [plain], [plain + 5e-4], plain, plain + 5e-4,
+        )
+        assert "容差档通过" in capsys.readouterr().out
+
+    def test_beyond_tolerance_fails_fast(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(torch.version, "hip", "6.3.0")
+        probe = self._probe()
+        plain = torch.tensor([1.0, -2.0])
+        with pytest.raises(ValueError, match="重算一致性"):
+            probe._assert_within_tolerance(plain, plain + 0.5, "参数梯度")
+
+    def test_presence_mismatch_rejected_in_tolerance_tier(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(torch.version, "hip", "6.3.0")
+        probe = self._probe()
+        grad = torch.ones(1)
+        with pytest.raises(ValueError, match="在场性失配"):
+            probe._assert_recompute_parity(
+                [grad, None], [grad, grad], grad, grad,
+            )
+
+    def test_bitwise_tier_untouched_on_cpu(self) -> None:
+        """hip 缺省缺席（CPU/CUDA）：超界失配走 bitwise 文案——守卫
+        强度在确定性内核层不因容差档放松的形态。"""
+        probe = self._probe()
+        plain = torch.tensor([1.0])
+        with pytest.raises(ValueError, match="bitwise"):
+            probe._assert_recompute_parity(
+                [plain], [plain + 0.5], plain, plain,
+            )
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 class TestCheckpointingEndToEnd:
