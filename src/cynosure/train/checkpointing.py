@@ -9,12 +9,16 @@ FSDP 退役后（async 执行模型 per-card 完整副本）激活全量驻留�
 包装只覆盖可训练 ControlNet，梯度回传路径上的冻结 base UNet 激活恒
 驻留、不受本开关保护——组2 的显存账须将 UNet 侧另行计入。
 
-**装配期 bitwise 一致性探针（fail-fast）**：``checkpoint_wrapper`` 的
-数值透明性（重算前向与原前向逐位一致）不做声明假设——装配期以真实
+**装配期重算一致性探针（fail-fast，分层口径）**：``checkpoint_wrapper``
+的数值透明性（重算前向与原前向一致）不做声明假设——装配期以真实
 梯度前向对照校验：plain 腿（裸网络）与 wrapped 腿（包装后）各跑一次
-``field.group_velocity`` 前向 + 反向，梯度与输出逐位比较，失配即
+``field.group_velocity`` 前向 + 反向，梯度与输出比较，失配即
 ``ValueError``（静默数值漂移在首个消费点暴露，而不是训练中期以难归因
-的精度损失出现）；「探针不改网络状态」同为受守卫不变式——双根 buffer
+的精度损失出现）。CUDA/CPU 层逐位比较（fixture 双档验证域）；DTK
+（hip 后端）层为容差档（#233 首跑归因：生产网络 × DTK 内核重算偏差
+~1e-4 且逐次漂移，稳定失配、bitwise 不可满足——决议走容差档，
+``PROBE_RTOL``/``PROBE_ATOL``，实测偏差落装配日志为审计面，见
+``_assert_recompute_parity``）；「探针不改网络状态」同为受守卫不变式——双根 buffer
 键集与数值前后对账（新键/漂移即拒绝）。探针输入合成（latent 形状随
 dataset 派生、条件按组
 构造）、显式局部 generator（零全局 RNG 消耗，「训练路径禁碰全局 RNG」
@@ -48,7 +52,8 @@ from cynosure.policy.field import (
 
 class GradientCheckpointing:
     """policy 网络的梯度检查点装配（resnet 块 activation 重算包装 +
-    装配期 bitwise 一致性探针）；config 关闭时整体 no-op。"""
+    装配期重算一致性探针，分层口径见模块 docstring）；config 关闭时
+    整体 no-op。"""
 
     PROBE_TIMESTEP: int = 1
     """探针前向的 timestep 值（plain/wrapped 两腿一致即可，embedding 对
@@ -59,6 +64,19 @@ class GradientCheckpointing:
 
     PROBE_SEED: int = 0
     """探针显式局部 generator 的 seed（装配期固定；不触碰全局 RNG）。"""
+
+    PROBE_RTOL: float = 1e-3
+    """DTK 容差档的相对界：重算透明性在 DTK 内核上不逐位（#233 首跑
+    实测：生产网络重算偏差 ~1e-4 且逐次漂移，非确定性归约类），bitwise
+    口径在该栈不可满足——界须比内核噪声高一个量级、比真实破坏（重算
+    错路径 = O(1e-1) 级）低两个量级，检测力保留。"""
+
+    PROBE_ATOL: float = 5e-3
+    """DTK 容差档的绝对界（主导项）：DTK 梯度累加噪声是绝对型（求和
+    序重排的舍入差，与梯度自身幅度无关）——实测样本：第 80 参数梯度
+    偏差 1.03e-3 而该梯度 max 幅度仅 1.2e-3（相对 ~85%），rtol 对之
+    无效；5e-3 = 实测噪声 ~5× 余量，仍远紧于生产 bf16 autocast 的
+    ~4e-3 相对粒度（fp32 探针面，#233 决议容差档的校准）。"""
 
     def __init__(
         self,
@@ -79,11 +97,11 @@ class GradientCheckpointing:
     def verify_and_apply(
         self, unet: torch.nn.Module, network: torch.nn.Module,
     ) -> None:
-        """装配期单点入口：开启时 plain/wrapped 双腿逐位校验后包装 resnet
-        块（``GroupPolicy.build`` 在 FSDP wrap 之前调用——包装作用于裸
-        网络，根模块身份不变）；关闭时 no-op（fixture 双档测试面）。
-        组1 分支两参为同一对象（unet 即可训练网络）——buffer 快照同对象
-        双记，键带根序、语义无害。"""
+        """装配期单点入口：开启时 plain/wrapped 双腿重算一致性校验后
+        包装 resnet 块（``GroupPolicy.build`` 在 FSDP wrap 之前调用
+        ——包装作用于裸网络，根模块身份不变）；关闭时 no-op（fixture
+        双档测试面）。组1 分支两参为同一对象（unet 即可训练网络）
+        ——buffer 快照同对象双记，键带根序、语义无害。"""
         if not self._config.policy.gradient_checkpointing:
             return
         probe_input = self._probe_input()
@@ -101,7 +119,9 @@ class GradientCheckpointing:
         wrapped_grads, wrapped_output = self._forward_backward(
             field, probe_input, network,
         )
-        self._assert_bitwise(plain_grads, wrapped_grads, plain_output, wrapped_output)
+        self._assert_recompute_parity(
+            plain_grads, wrapped_grads, plain_output, wrapped_output,
+        )
         network.zero_grad(set_to_none=True)
         self._assert_buffers_untouched(buffers, unet, network)
         # training 标志同属「网络状态」：探针后恢复进位（下游相位切换
@@ -188,15 +208,60 @@ class GradientCheckpointing:
         ]
         return grads, velocity.detach().clone()
 
-    def _assert_bitwise(
+    @property
+    def _hip_backend(self) -> bool:
+        """DTK/ROCm（hip 后端）判定单点：容差档的分层开关（CUDA/CPU 层
+        恒 bitwise——fixture 双档验证域，守卫强度不因容差档放松）。"""
+        return torch.version.hip is not None
+
+    def _assert_recompute_parity(
         self,
         plain_grads: list[torch.Tensor | None],
         wrapped_grads: list[torch.Tensor | None],
         plain_output: torch.Tensor,
         wrapped_output: torch.Tensor,
     ) -> None:
-        """梯度 + 输出的逐位比较（``torch.equal``）；任一失配即 fail-fast
-        （带参数名与偏差量的诊断面）。``None`` 两侧须同齐同缺。"""
+        """梯度 + 输出的重算一致性比较，fail-fast（带参数名与偏差量的
+        诊断面）。``None`` 两侧须同齐同缺（结构性失配，两层同拒）。
+
+        分层口径：CUDA/CPU = bitwise（``torch.equal``）；DTK（hip 后端）
+        = 容差档（``PROBE_RTOL``/``PROBE_ATOL``，界 = atol + rtol·幅度
+        上界），实测偏差打印落装配日志为审计面——探针守卫的语义是
+        「重算路径无实质数值破坏」，bitwise 只是它在确定性内核上的
+        最强形态（#233 首跑归因：DTK 生产网络重算偏差 ~1e-4 且逐次
+        漂移，稳定失配、bitwise 不可满足，容差档为决议口径）。"""
+        for index, (plain, wrapped) in enumerate(
+            zip(plain_grads, wrapped_grads),
+        ):
+            if (plain is None) != (wrapped is None):
+                raise ValueError(
+                    f"梯度检查点校验失败：第 {index} 个参数梯度"
+                    f"在场性失配（plain={plain is not None}，"
+                    f"wrapped={wrapped is not None}）"
+                )
+        if self._hip_backend:
+            output_deviation = self._assert_within_tolerance(
+                plain_output, wrapped_output, "wrapped 腿输出与 plain 腿",
+            )
+            grad_deviation = 0.0
+            for index, (plain, wrapped) in enumerate(
+                zip(plain_grads, wrapped_grads),
+            ):
+                if plain is not None:
+                    grad_deviation = max(
+                        grad_deviation,
+                        self._assert_within_tolerance(
+                            plain, wrapped, f"第 {index} 个参数梯度",
+                        ),
+                    )
+            print(
+                "[checkpointing-probe] DTK 容差档通过：输出最大偏差 "
+                f"{output_deviation:.3e}，梯度最大偏差 "
+                f"{grad_deviation:.3e}（rtol={self.PROBE_RTOL}，"
+                f"atol={self.PROBE_ATOL}）",
+                flush=True,
+            )
+            return
         if not torch.equal(plain_output, wrapped_output):
             deviation = (plain_output - wrapped_output).abs().max().item()
             raise ValueError(
@@ -207,12 +272,6 @@ class GradientCheckpointing:
         for index, (plain, wrapped) in enumerate(
             zip(plain_grads, wrapped_grads),
         ):
-            if (plain is None) != (wrapped is None):
-                raise ValueError(
-                    f"梯度检查点 bitwise 校验失败：第 {index} 个参数梯度"
-                    f"在场性失配（plain={plain is not None}，"
-                    f"wrapped={wrapped is not None}）"
-                )
             if plain is not None and not torch.equal(plain, wrapped):
                 deviation = (plain - wrapped).abs().max().item()
                 raise ValueError(
@@ -220,6 +279,25 @@ class GradientCheckpointing:
                     f"{index} 个参数梯度不逐位一致（最大偏差 {deviation}）"
                     "——activation 重算路径数值透明性被破坏，装配期拒绝"
                 )
+
+    def _assert_within_tolerance(
+        self, plain: torch.Tensor, wrapped: torch.Tensor, what: str,
+    ) -> float:
+        """DTK 容差档的单张量判定：偏差超出 ``atol + rtol·幅度上界`` 即
+        fail-fast；实测偏差返回给审计面。"""
+        deviation = (plain - wrapped).abs().max().item()
+        magnitude = torch.maximum(
+            plain.abs().max(), wrapped.abs().max(),
+        ).item()
+        bound = self.PROBE_ATOL + self.PROBE_RTOL * magnitude
+        if deviation > bound:
+            raise ValueError(
+                "梯度检查点重算一致性校验失败："
+                f"{what}偏差 {deviation} 超出容差界 {bound}"
+                f"（rtol={self.PROBE_RTOL}，atol={self.PROBE_ATOL}）"
+                "——activation 重算路径数值透明性被破坏，装配期拒绝"
+            )
+        return deviation
 
     @staticmethod
     def _is_resnet_block(module: torch.nn.Module) -> bool:
