@@ -34,9 +34,7 @@ from cynosure.config import (
     CynosureConfig,
     DEFAULT_CROSS_MODAL_PAIRS,
     MODALITIES,
-    RewardConfig,
 )
-from cynosure.distributed import DistributedContext
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.plots import MetricsPlotter
@@ -49,11 +47,8 @@ from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
-from cynosure.reward.assembly import PairBatch
-from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
-    RewardCoordinator,
     RunArtifacts,
 )
 from cynosure.train.executor import AsyncTrainingExecutor
@@ -70,8 +65,6 @@ from tests.conftest import (
     FixtureArtifactLibrary,
     FixturePrepareScenario,
     PretrainLightweightReward,
-    RecordingScorer,
-    RecordingUpdate,
     execution_slot_count as slot_count,
 )
 
@@ -118,7 +111,7 @@ class TrainingLoopScenario:
         group: str = "modal-label",
         reward: dict | None = None,
     ) -> None:
-        """落盘训练 config（group 选实验组：组2/组3 的 config 携带
+        """落盘训练 config（group 选实验组：组2 的 config 携带
         ControlNet 工件）。
 
         场景工件（fixture 网络工件 + prepare 三工件 + 预训练产物）由
@@ -567,18 +560,6 @@ class TestSingleIterationLoop:
         event = scenario.events()[0]
         assert "policy_step_2" in event["loss"]
         assert "discriminator" in event["loss"]
-
-    def test_sequential_group_rejected_at_production_entry(
-        self, scenario: TrainingLoopScenario,
-    ) -> None:
-        """组3 序贯两阶段编排随旧执行序退役（SequentialTrainer 删除）：
-        生产入口对 sequential config 显式拒绝（新执行序为单阶段门面，
-        两阶段由两次独立 run 衔接——不静默只跑一段）。"""
-        scenario.write_inputs(group="sequential")
-        result = scenario.train()
-        assert result.code == 2
-        assert "组3" in result.stderr
-        assert not scenario.run_dir.exists()  # 拒绝在 run 目录预占之前
 
     def test_only_unet_params_updated(
         self, scenario: TrainingLoopScenario,
@@ -1045,45 +1026,11 @@ class TestModalLabelTargetSampling:
         assert torch.equal(before, stream.get_state())
 
 
-def _reward_config() -> RewardConfig:
-    """判别器侧协作者装配的最小 RewardConfig（默认 knobs；纯单测用途）。"""
-    return RewardConfig(
-        disc_batch_size_k=4,
-        real_pool_manifest="artifacts/real_pool.json",
-        heldout_real_manifest="artifacts/heldout_real.json",
-        channel_stats_json="artifacts/channel_stats.json",
-        pretrain_report_json="artifacts/pretrain_report.json",
-    )
-
-
 class TestDiscriminatorSideOrchestration:
-    """判别器侧编排（train 循环第 2 相的配对批供给与判别器相位）。"""
-
-    def test_update_step_consumes_pair_batch_and_restores_phase(self) -> None:
-        """配对批原样透传给 update（ADR-0012：混采置换退役——批就是
-        更新批），判别器在更新期间处 train 相（spectral norm
-        power iteration 属训练语义）、结束后恢复 eval 相（打分/监控
-        前向不得漂移其有效权重）。"""
-        discriminator = torch.nn.Linear(1, 1)
-        update = RecordingUpdate(discriminator)
-        coordinator = RewardCoordinator(
-            update, auc=None,  # type: ignore[arg-type]  # 本测试不触 AUC
-            overfit=OverfitMonitor(
-                _reward_config(), conditions=tuple(MODALITIES),
-            ),
-            assembler=None,  # type: ignore[arg-type]  # 替身场景不经装配原语
-        )
-        pair = PairBatch(
-            reals=torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1, 1),
-            fakes=torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1, 1) + 10,
-            modality="t2w",
-        )
-        coordinator.update_step(pair)
-        assert torch.equal(update.received[0].reals, pair.reals)
-        assert torch.equal(update.received[0].fakes, pair.fakes)
-        assert update.received[0].modality == "t2w"
-        assert update.training_at_call[0] is True  # 更新期间 train 相
-        assert discriminator.training is False  # 结束恢复 eval 相
+    """判别器侧编排的打分面锚（train 循环第 2 相的相位纪律）：更新步
+    的 train/eval 相位时序锚由 test_discriminator_chain 的
+    DiscriminatorPhase 族承担（#234；ADR-0019 决策 7 的 update_step
+    注入形态退役口径）。"""
 
     def test_scoring_forward_is_idempotent_under_spectral_norm(
         self, scenario: TrainingLoopScenario,

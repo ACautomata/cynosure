@@ -666,19 +666,19 @@ class TestAssemblyInputHardening:
         assert result.code == 2
         assert "ST00/t1w-raw-axi" in result.stderr
 
-    def test_capacity_guard_uses_declared_world_size(
+    def test_capacity_guard_uses_declared_card_count(
         self, mr_scenario: MrPrepareScenario,
     ) -> None:
-        """容量守卫按 config 声明的部署宽度判定（``K × world_size``）：
-        夹具池每条件 4 卷在 world=1 下刚好供满，声明 2 路即不足——train
-        装配期同款守卫按**真实 rank 数**拒绝同一份 manifest，prepare 侧
-        钉死 world=1 放行等于把「开工前失败」推迟到烧完全量预编码之后。"""
+        """容量守卫按 config 声明的卡数判定（``K × 卡数``）：
+        夹具池每条件 4 卷在卡数=1 下刚好供满，声明 2 卡即不足——train
+        装配期同款守卫按**真实卡数**拒绝同一份 manifest，prepare 侧
+        钉死卡数=1 放行等于把「开工前失败」推迟到烧完全量预编码之后。"""
         config = mr_scenario.build_config()
         config.deployment.nproc_per_node = 2
         result = mr_scenario.run_with_config(config)
         assert result.code == 2
         assert "容量不足" in result.stderr
-        assert "world_size=2" in result.stderr
+        assert "card_count=2" in result.stderr
         assert not list((mr_scenario.work_dir / "fixtures").rglob("*.pt"))
 
     def test_failed_plan_invalidates_artifacts(

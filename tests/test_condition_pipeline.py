@@ -30,14 +30,13 @@ from cynosure.eval.sampling import EntrySample, ManifestLatentSampler
 from cynosure.eval.features import StubSliceFeatureExtractor
 from cynosure.eval.volumes import MrReferenceVolumeStore, VolumePairFidelity
 from cynosure.config import CynosureConfig, RewardConfig
-from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.cursor import TrajectoryCursor
 from cynosure.policy.field import CfgCombinedField
 from cynosure.policy.kernel import SdeKernel
-from cynosure.policy.numerics import AMP_DTYPES, AmpContext
+from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import PerConditionSchedules
 from cynosure.pretrain.artifacts import PretrainProvenance, PretrainReport
@@ -52,7 +51,6 @@ from cynosure.train.artifacts import (
     RunArtifacts,
 )
 from cynosure.train.rollout import MrConditionSampler, RolloutPhase
-from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import SyntheticMrRateDataset
 from tests.test_condition_vocabulary import (
     PRODUCTION_CENSUS_PATH,
@@ -116,14 +114,13 @@ class TestRolloutShapesFollowConditions:
             "t1w/axial": (4, 16, 16, 8),
             "flair/axial": (4, 8, 8, 16),
         }
-        seen: set[tuple[int, ...]] = set()
-        for _ in range(12):  # 均匀轮转下 12 次采样两条件覆盖概率 > 1−2⁻¹³
-            record = rollout.run_iteration()
-            latent_shape = tuple(record.new_fakes.shape[1:])
-            assert latent_shape in expected.values()
-            assert latent_shape == expected[record.modality]
-            seen.add(latent_shape)
-        assert seen == set(expected.values())
+        # 目标条件来自分配表（run_iteration 显式条件名）：逐条件一轮
+        # rollout，产出 latent 形状与词汇表该条件统一网格一致——逐条件
+        # 断言钉死形状↔条件名绑定（集合相等挡不住两条件形状互换）
+        for condition_name, shape in expected.items():
+            record = rollout.run_iteration(condition_name=condition_name)
+            assert record.modality == condition_name
+            assert tuple(record.new_fakes.shape[1:]) == shape
 
 
 class TestBaselineSamplingShapes:
@@ -289,7 +286,6 @@ class TestDiscriminatorInputBatchOrganization:
         })
         schedules = PerShapeSchedules({"t1w/axial": 4, "flair/axial": 5})
         assembler = ReconstructionAssembler(
-            real_sampler=real_draw,
             sampler=RolloutSampler(
                 CfgCombinedField(ZeroVelocityUnet()),
                 SdeKernel(eta=0.7, s_max=0.999), schedules,
@@ -312,9 +308,13 @@ class TestDiscriminatorInputBatchOrganization:
                 pretrain_report_json="report.json",
             ),
         )
-        pair_t1w = assembler.assemble("t1w/axial")
+        pair_t1w = assembler.reconstruct_assigned(
+            real_draw.sample(4, modality="t1w/axial"), "t1w/axial",
+        )
         update.step(pair_t1w)
-        pair_flair = assembler.assemble("flair/axial")
+        pair_flair = assembler.reconstruct_assigned(
+            real_draw.sample(4, modality="flair/axial"), "flair/axial",
+        )
         update.step(pair_flair)
         # 配对批两侧同形、形状逐条件随词汇表
         assert pair_t1w.reals.shape == pair_t1w.fakes.shape == (4, *t1w_shape)
@@ -1009,25 +1009,16 @@ class TestRealPoolVocabularyShapeGuard:
     def test_assembly_rejects_stale_shape_contract(
         self, mr_pretrain_artifacts,
     ) -> None:
-        """装配缝收口：``assemble_rewards`` 在装配期拒绝同名异形的 real
+        """装配缝收口：``assemble_real_pool`` 在装配期拒绝同名异形的 real
         pool（判别器侧无「两套影像空间拼一批」的窗口）。"""
         vocab, config = mr_pretrain_artifacts
         MrPretrainArtifactsFixture.write_manifest(
             Path(config.reward.real_pool_manifest), vocab, kind="real_pool",
             shape_override=(4, 16, 16, 8),
         )
-        dist = DistributedContext.bootstrap()
         with pytest.raises(ValueError, match="词汇表"):
-            TrainingRuntime.assemble_rewards(
-                config,
-                AmpContext(
-                    device=torch.device("cpu"),
-                    dtype=AMP_DTYPES[config.policy.amp_dtype],
-                ),
-                TrainingRngStreams(
-                    dist.derive_seed(config.schedule.seed),
-                ),
-                dist,
+            TrainingRuntime.assemble_real_pool(
+                config, vocab, card_count=1,
             )
 
     def test_missing_contract_rejected_at_assembly(
@@ -1042,18 +1033,9 @@ class TestRealPoolVocabularyShapeGuard:
             Path(config.reward.real_pool_manifest), vocab,
             kind="real_pool", with_condition_shapes=False,
         )
-        dist = DistributedContext.bootstrap()
         with pytest.raises(ValueError, match="逐条件形状契约"):
-            TrainingRuntime.assemble_rewards(
-                config,
-                AmpContext(
-                    device=torch.device("cpu"),
-                    dtype=AMP_DTYPES[config.policy.amp_dtype],
-                ),
-                TrainingRngStreams(
-                    dist.derive_seed(config.schedule.seed),
-                ),
-                dist,
+            TrainingRuntime.assemble_real_pool(
+                config, vocab, card_count=1,
             )
 
 

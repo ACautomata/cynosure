@@ -124,9 +124,8 @@ class ManifestVolumeSampler:
         self._decoder = decoder
         self._paths = paths
         self._decode_batch_size = decode_batch_size
-        # 产物写盘闸门（分布式）：policy 采样前向是 FSDP 集合操作，评测
-        # 执行必须全 rank 参与；样本落盘与 manifest 回写是 rank 0 独写
-        # 产物契约——非 writer rank 冗余产出一致样本但不落盘
+        # 产物写盘闸门：单进程门面恒为 writer（True）——False 仅装配期
+        # 失败路径的测试变体（不落盘副作用隔离，样本采样/解码照常执行）
         self._write_enabled = write_enabled
 
     def sample_baseline(self) -> None:
@@ -146,8 +145,8 @@ class ManifestVolumeSampler:
         baseline 相位跳过 ``baseline_sample`` 已填充的条目——「冻结只采
         一次」的工件级幂等：续训恢复点 policy 已非冻结初始权重，重采会
         把训练后样本污染进基线（experiment-design「对照基线」）。
-        ``write_enabled=False``（分布式非 0 rank）照常采样与解码（集合
-        安全），只跳过写盘与 manifest 回写。"""
+        ``write_enabled=False``（装配期失败路径的测试变体）照常采样与解码
+        （不落盘副作用面），只跳过写盘与 manifest 回写。"""
         entries = self._manifest.entries_for_stage(self._stage)
         if phase == PHASE_BASELINE:
             entries = [

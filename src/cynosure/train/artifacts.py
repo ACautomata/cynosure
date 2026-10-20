@@ -21,9 +21,6 @@ from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
 from cynosure.train.allocation import SeedMixer
 
-_SEQUENTIAL_STAGES: list[str] = ["modal-label", "cross-modal"]
-"""组3 序贯 = 先组1 后组2（experiment-design 章），manifest conditions 按两阶段名记录。"""
-
 POLICY_CHECKPOINT_TEMPLATE = "policy_iter{iteration}.pt"
 """policy checkpoint 文件名模板（契约布局的一部分：stage-1 产物按此
 形态被下游 run 复用装载）。"""
@@ -69,9 +66,9 @@ class IterEvent(BaseModel):
     event: Literal["iter"] = "iter"
     iteration: int
     stage: int = 1
-    """组内阶段号（序贯两阶段的归因轴）：单阶段组（组1/组2）恒 1，
-    组3 stage-2 事件 = 2——「每组判别器独立」在指标流上的观测面（各
-    阶段事件互不混淆）。"""
+    """组内阶段号（序贯两阶段的归因轴）：组3 序贯编排随 #242 退役后
+    恒 1——字段随事件契约「可扩不可改名」保留（历史 run 事件的解析面
+    不收缩）。"""
     rank: int = 0
     """产出本事件的 rank（分布式归并的排序轴：同一 iteration 的 N 条
     事件按 rank 升序连续排列——无重复/无丢失的观测面；单进程恒 0，
@@ -117,8 +114,9 @@ class IterEvent(BaseModel):
     """逐 iter 相位**墙钟**分解（#123 tracer 首跑的成本读数面；「卡时」
     措辞随 #222 §4 退役——实现是 ``time.monotonic`` 墙钟，协程数 >
     卡数时字面「卡时」为假）：本 iteration 各相位的墙钟秒数，键 = 相位
-    名（``rollout`` / ``heldout_auc`` / ``policy_update`` /
-    ``discriminator``，可扩）。
+    名（``rollout`` / ``policy_update`` / ``discriminator`` 三相，
+    可扩；旧执行序四相的 ``heldout_auc`` 独立相位随 #226 切换期退役
+    ——池化原料打分计入 rollout 相，ADR-0019 决策 5）。
     覆盖区间与 ``elapsed_s`` 同界——[iteration 起点, 本事件构造]：周期
     checkpoint、里程碑解码评测与迭代末 barrier 在该区间之外（随既有
     ``elapsed_s`` 口径，不单列）。各相位之和 ≤ ``elapsed_s``（差额 =
@@ -136,7 +134,8 @@ class MilestoneEvent(BaseModel):
     event: Literal["milestone"] = "milestone"
     iteration: int
     stage: int = 1
-    """里程碑归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    """里程碑归属阶段号（序贯退役后恒 1；字段随事件契约保留，与
+    IterEvent 同轴）。"""
     fid: float
     kid: float | None = None
     ssim: float | None = None
@@ -188,7 +187,8 @@ class OverfitAlertEvent(BaseModel):
     """报警所属轴号：RL 相 = iteration 号（回退记账轴）；预训练相 =
     预训练步号（与 pretrain 事件的 ``step`` 同轴）。"""
     stage: int = 1
-    """报警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    """报警归属阶段号（序贯退役后恒 1；字段随事件契约保留，与
+    IterEvent 同轴）。"""
     rank: int = 0
     """产出本事件的 rank（分布式归并的排序轴）：预训练相 = 观测 rank
     （ADR-0016 决策 8 的归因语义）；async 执行序 RL 相 = 0（per-condition
@@ -276,7 +276,8 @@ class BarrierTimeoutAlertEvent(BaseModel):
     iteration: int
     """告警所属 iteration（回退记账轴，与 iter 事件同 ITERATION 口径）。"""
     stage: int = 1
-    """告警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    """告警归属阶段号（序贯退役后恒 1；字段随事件契约保留，与
+    IterEvent 同轴）。"""
     k: int | None = Field(None, ge=1)
     """越过软超时阈值的被优化训练步 k；非 k barrier（判别器步的集合
     段：桶装配 / optimizer.step）= None——判别器步非 policy k 相位，
@@ -308,7 +309,8 @@ class WeightDivergenceAlertEvent(BaseModel):
     """告警所属 iteration（回退记账轴，与 iter 事件同 ITERATION 口径；
     已完成的 iteration 数 = 校验触发点）。"""
     stage: int = 1
-    """告警归属阶段号（组3 两阶段事件互不混淆，与 IterEvent 同轴）。"""
+    """告警归属阶段号（序贯退役后恒 1；字段随事件契约保留，与
+    IterEvent 同轴）。"""
     elapsed_s: float
     """权重一致性校验窗口的墙钟秒数（校验耗时读数，越线时的耗时背景）。"""
 
@@ -398,7 +400,7 @@ class ManifestEntry(BaseModel):
     stage: int = 1
     index: int
     condition: str | list[str]
-    """本采样位的条件（组1 = 目标序列名；组2/组3-stage2 = [源序列, 目标序列]）。"""
+    """本采样位的条件（组1 = 目标序列名；组2 = [源序列, 目标序列]）。"""
     source_case: str | None = None
     """组2 锁定的源病例 id（baseline 采样期写入；组1 为 None）。"""
     noise_seed: int
@@ -424,7 +426,7 @@ class BaselineManifest(BaseModel):
     seed: int
     group: str
     conditions: list
-    """本组条件的词汇表（组1 四序列 / 组2 12 有序对 / 组3 两阶段名）。"""
+    """本组条件的词汇表（组1 四序列 / 组2 12 有序对）。"""
     entries: list[ManifestEntry] = Field(default_factory=list)
 
     @staticmethod
@@ -436,7 +438,7 @@ class BaselineManifest(BaseModel):
     @classmethod
     def build(cls, config: CynosureConfig) -> "BaselineManifest":
         """按 config 确定性生成清单：组1 = 四序列轮转，组2 = 12 有序对
-        轮转，组3 = 两阶段各自的采样位（条目数均为 N_baseline）。"""
+        轮转（条目数均为 N_baseline）。"""
         entries = [
             ManifestEntry(
                 stage=stage,
@@ -461,28 +463,14 @@ class BaselineManifest(BaseModel):
         条件词汇表装配（``ConditionVocabulary.assemble`` 统一分派）的
         names()（#129——schema 不读文件，装载发生在本 build 消费点，
         与评测/policy 装配同口径）。本方法只叠加执行
-        语义。
-
-        组3 指定 ``stage1_run_dir``（复用既有 stage-1 产物）时只建
-        stage-2 条目：stage-1 不在本 run 执行，manifest 不留无人填充的
-        null 条目（stage-1 样本对住在源 run 自己的 manifest）。"""
+        语义。"""
         if config.experiment.dataset == "MR-RATE":
-            stages = {1: list(ConditionVocabulary.assemble(config).names())}
-        else:
-            stages = config.stage_condition_vocabulary()
-        if (
-            config.experiment.group == "sequential"
-            and config.experiment.stage1_run_dir is not None
-        ):
-            return {2: stages[2]}
-        return stages
+            return {1: list(ConditionVocabulary.assemble(config).names())}
+        return config.stage_condition_vocabulary()
 
     @classmethod
     def _condition_vocabulary(cls, config: CynosureConfig) -> list:
-        stages = cls._stage_conditions(config)
-        if len(stages) == 1:
-            return next(iter(stages.values()))
-        return list(_SEQUENTIAL_STAGES)
+        return next(iter(cls._stage_conditions(config).values()))
 
     @classmethod
     def load(cls, path: Path) -> "BaselineManifest":
@@ -494,7 +482,7 @@ class BaselineManifest(BaseModel):
         Path(path).write_text(self.model_dump_json(indent=2), encoding="utf-8")
 
     def entries_for_stage(self, stage: int) -> list[ManifestEntry]:
-        """本阶段的采样条目（单阶段组恒 stage=1；组3 两阶段各取各的）。"""
+        """本阶段的采样条目（序贯退役后恒 stage=1）。"""
         entries = [entry for entry in self.entries if entry.stage == stage]
         if not entries:
             raise ValueError(f"manifest 无 stage={stage} 的采样条目")

@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.policy.condition import ModalityMapping, RolloutCondition
 from cynosure.policy.field import CfgCombinedField
@@ -37,9 +36,6 @@ NUM_STEPS = 4
 """小锚日程步数（M 候选 = {1, 2}，s=1 奇异端与 σ=0 端都被排除）。"""
 TRAIN_STEPS = (1, 2)
 CONDITION = "t1n"
-_UNSET: object = object()
-"""assembler 工厂的 real_sampler 缺省哨兵：显式 None 透传（供给语义
-装配），缺省才回落默认池采样器。"""
 
 
 class ZeroVelocityUnet:
@@ -90,26 +86,6 @@ class FixedRealSampler:
         for index in range(count):
             batch[index] = float(index)
         return batch
-
-
-class RecordingRealSampler:
-    """real 采样替身：记录 (count, modality) 穿参并返回零批
-    （装配原语把目标条件穿给 real 侧采样的观测缝）。"""
-
-    def __init__(self, count: int, shape: tuple[int, ...]) -> None:
-        self._count = count
-        self._shape = shape
-        self.calls: list[tuple[int, str]] = []
-
-    @property
-    def size(self) -> int:
-        return 64
-
-    def sample(
-        self, count: int, *, modality: str | None = None,
-    ) -> torch.Tensor:
-        self.calls.append((count, modality or ""))
-        return torch.zeros(count, *self._shape)
 
 
 class WrittenPool:
@@ -172,11 +148,9 @@ class AssemblyScenario:
         self,
         *,
         seed: int = 11,
-        real_seed: int = 5,
         train_steps: tuple[int, ...] = TRAIN_STEPS,
         num_steps: int = NUM_STEPS,
         scale_factor: float = 1.0,
-        real_sampler=_UNSET,
         conditions=None,
     ) -> ReconstructionAssembler:
         schedules = self.schedules(num_steps)
@@ -185,13 +159,7 @@ class AssemblyScenario:
             SdeKernel(eta=0.7, s_max=0.999),
             schedules,
         )
-        pool = LatentManifest.load(self.pool_path, kind="real_pool")
-        if real_sampler is _UNSET:
-            real_sampler = RealPoolSampler(
-                pool, torch.Generator().manual_seed(real_seed),
-            )
         return ReconstructionAssembler(
-            real_sampler=real_sampler,
             sampler=sampler,
             schedules=schedules,
             conditions=conditions if conditions is not None else StubConditions(),
@@ -201,6 +169,21 @@ class AssemblyScenario:
             generator=torch.Generator().manual_seed(seed),
             amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
         )
+
+    def reals(
+        self,
+        *,
+        count: int | None = None,
+        modality: str = CONDITION,
+        seed: int = 5,
+    ) -> torch.Tensor:
+        """调用方供给的 real 批（生产 real 侧的窗口抽取形态：池采样在
+        装配原语之外，本 helper 同构——独立采样器 + 独立流）。"""
+        pool = LatentManifest.load(self.pool_path, kind="real_pool")
+        sampler = RealPoolSampler(
+            pool, torch.Generator().manual_seed(seed),
+        )
+        return sampler.sample(count if count is not None else self.K, modality=modality)
 
 
 @pytest.fixture
@@ -215,7 +198,8 @@ class TestPairBatchProperties:
     def test_fake_differs_from_real_and_shapes_match(
         self, scenario: AssemblyScenario,
     ) -> None:
-        pair = scenario.assembler().assemble(CONDITION)
+        reals = scenario.reals()
+        pair = scenario.assembler().reconstruct_assigned(reals, CONDITION)
         assert isinstance(pair, PairBatch)
         assert pair.reals.shape == pair.fakes.shape == (
             scenario.K, *SHAPE,
@@ -229,10 +213,9 @@ class TestPairBatchProperties:
         """同源配对（零速度 ODE 恒等下可手工复算）：fake[i] = (1−s_i)·
         real[i] + s_i·ε_i——第 i 条 fake 由第 i 条 real 与第 i 条 ε 构造。"""
         fixed = FixedRealSampler(scenario.K, SHAPE)
-        assembler = scenario.assembler(
-            seed=11, real_sampler=fixed,
-        )
-        pair = assembler.assemble(CONDITION)
+        reals = fixed.sample(scenario.K, modality=CONDITION)
+        assembler = scenario.assembler(seed=11)
+        pair = assembler.reconstruct_assigned(reals, CONDITION)
         # 同 seed 手工重放抽取序：先 randint 抽日程位（= s）、后 randn 抽 ε
         generator = torch.Generator().manual_seed(11)
         position = torch.randint(
@@ -249,24 +232,13 @@ class TestPairBatchProperties:
         expected = pair.reals * (1.0 - sigmas) + noise * sigmas
         assert torch.equal(pair.fakes, expected)
 
-    def test_real_side_is_sampled_with_target_condition(
-        self, scenario: AssemblyScenario,
-    ) -> None:
-        """real 侧按目标条件过滤采样（无放回、容量硬守卫照旧——装配
-        原语把条件穿给 RealSampling）。"""
-        recording = RecordingRealSampler(scenario.K, SHAPE)
-        assembler = scenario.assembler(real_sampler=recording)
-        pair = assembler.assemble("t2w")
-        assert recording.calls == [(scenario.K, "t2w")]
-        assert pair.modality == "t2w"
-
     def test_pool_sourced_reals_are_without_replacement(
         self, scenario: AssemblyScenario,
     ) -> None:
         """real 批来自真实样本库（无放回——条条不同、值来自 pool）。"""
-        pair = scenario.assembler().assemble(CONDITION)
+        reals = scenario.reals()
         fingerprints = {
-            tuple(real.flatten().tolist()) for real in pair.reals
+            tuple(real.flatten().tolist()) for real in reals
         }
         assert len(fingerprints) == scenario.K
 
@@ -302,26 +274,6 @@ class TestReconstructAssigned:
         torch.randn((3, *SHAPE), generator=replay)
         assert torch.equal(assembler.generator_state(), replay.get_state())
 
-    def test_assemble_without_real_sampler_rejected(
-        self, scenario: AssemblyScenario,
-    ) -> None:
-        """供给语义装配（real_sampler=None）下旧 assemble 入口显式拒绝
-        ——半供给形态不静默可用。"""
-        assembler = scenario.assembler(real_sampler=None)
-        with pytest.raises(ValueError, match="real 侧采样器"):
-            assembler.assemble(CONDITION)
-
-    def test_reconstruct_assigned_works_without_real_sampler(
-        self, scenario: AssemblyScenario,
-    ) -> None:
-        """供给入口在 real_sampler=None 下可用（real 由调用方给定的
-        前提正是采样器缺席）。"""
-        reals = torch.randn(2, *SHAPE)
-        pair = scenario.assembler(real_sampler=None).reconstruct_assigned(
-            reals, CONDITION,
-        )
-        assert pair.fakes.shape == reals.shape
-
 
 class TestDeterministicReconstruction:
     """AC：s=0 重构恒等 + 同 seed 重放逐位一致。"""
@@ -332,7 +284,7 @@ class TestDeterministicReconstruction:
         """s=0：加噪恒等 + σ=0 位于日程终点之后（零步续跑）——重构
         输出 = 输入（确定性 ODE 终点 = 起点）。"""
         assembler = scenario.assembler()
-        reals = assembler._real_sampler.sample(scenario.K, modality=CONDITION)
+        reals = scenario.reals()
         condition = StubConditions().sample_target(CONDITION)
         noise = torch.randn(scenario.K, *SHAPE)
         fakes = assembler.reconstruct(
@@ -346,7 +298,7 @@ class TestDeterministicReconstruction:
         """s=0 恒等在非中性域换算系数下同样逐位成立（短路透传不走
         乘除往返——生产 scale_factor ≠ 1 时回归锚不降级为近似）。"""
         assembler = scenario.assembler(scale_factor=1.7)
-        reals = assembler._real_sampler.sample(scenario.K, modality=CONDITION)
+        reals = scenario.reals()
         condition = StubConditions().sample_target(CONDITION)
         fakes = assembler.reconstruct(
             reals, condition, [0.0] * scenario.K, torch.randn(scenario.K, *SHAPE),
@@ -358,8 +310,12 @@ class TestDeterministicReconstruction:
     ) -> None:
         """同 seed 双装配逐位一致：real 采样流与重构流（先 s 后 ε）的
         确定性重放 + ODE 确定性（ADR-0011）。"""
-        first = scenario.assembler().assemble(CONDITION)
-        second = scenario.assembler().assemble(CONDITION)
+        first = scenario.assembler().reconstruct_assigned(
+            scenario.reals(), CONDITION,
+        )
+        second = scenario.assembler().reconstruct_assigned(
+            scenario.reals(), CONDITION,
+        )
         assert torch.equal(first.reals, second.reals)
         assert torch.equal(first.fakes, second.fakes)
 
@@ -368,7 +324,7 @@ class TestDeterministicReconstruction:
     ) -> None:
         """重构核对固定 (real, σ, ε) 输入无随机性：两次调用逐位一致。"""
         assembler = scenario.assembler()
-        reals = assembler._real_sampler.sample(scenario.K, modality=CONDITION)
+        reals = scenario.reals()
         condition = StubConditions().sample_target(CONDITION)
         sigma = scenario.schedules().cursor(CONDITION).sigma_level(1)
         noise = torch.randn(scenario.K, *SHAPE)
@@ -432,10 +388,8 @@ class TestReconStreamIsolation:
     ) -> None:
         streams = TrainingRngStreams(seed=0)
         pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+        real_sampler = RealPoolSampler(pool, streams.real_pool)
         assembler = ReconstructionAssembler(
-            real_sampler=RealPoolSampler(
-                pool, streams.real_pool,
-            ),
             sampler=RolloutSampler(
                 CfgCombinedField(ZeroVelocityUnet()),
                 SdeKernel(eta=0.7, s_max=0.999),
@@ -453,7 +407,8 @@ class TestReconStreamIsolation:
             name: generator.get_state().clone()
             for name, generator in streams.named().items()
         }
-        assembler.assemble(CONDITION)
+        reals = real_sampler.sample(scenario.K, modality=CONDITION)
+        assembler.reconstruct_assigned(reals, CONDITION)
         assert not torch.equal(
             streams.recon.get_state(), before["recon"],
         )  # 重构加噪（s 与 ε）走 recon 流
@@ -478,9 +433,7 @@ class TestAssemblerContract:
         （fixture 全 CPU 口径覆盖不到的路径——生产可用性的回归锚）。"""
         device = torch.device("cuda")
         assembler = scenario.assembler()
-        reals = assembler._real_sampler.sample(
-            scenario.K, modality=CONDITION,
-        ).to(device)
+        reals = scenario.reals().to(device)
         condition = RolloutCondition(
             label=torch.tensor([29], device=device),
             spacing=SPACING.to(device),
@@ -509,12 +462,8 @@ class TestAssemblerContract:
 
     def test_non_positive_batch_size_rejected(self, scenario) -> None:
         schedules = scenario.schedules()
-        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
         with pytest.raises(ValueError, match="batch_size_k"):
             ReconstructionAssembler(
-                real_sampler=RealPoolSampler(
-                    pool, torch.Generator().manual_seed(5),
-                ),
                 sampler=RolloutSampler(
                     CfgCombinedField(ZeroVelocityUnet()),
                     SdeKernel(eta=0.7, s_max=0.999), schedules,
@@ -533,7 +482,7 @@ class TestAssemblerContract:
     ) -> None:
         """重构核收到日程点外的 σ：显式拒绝（起点无从定位）。"""
         assembler = scenario.assembler()
-        reals = assembler._real_sampler.sample(scenario.K, modality=CONDITION)
+        reals = scenario.reals()
         condition = StubConditions().sample_target(CONDITION)
         with pytest.raises(ValueError, match="日程点"):
             assembler.reconstruct(
@@ -547,7 +496,7 @@ class TestAssemblerContract:
         """σ=s_0（最噪端日程点）：重构核拒绝（无「下标 −1」的起点——
         s≈1 只可由 M 排除的日程下标 0 产生）。"""
         assembler = scenario.assembler()
-        reals = assembler._real_sampler.sample(scenario.K, modality=CONDITION)
+        reals = scenario.reals()
         condition = StubConditions().sample_target(CONDITION)
         sigma_zero = scenario.schedules().cursor(CONDITION).sigma_level(0)
         with pytest.raises(ValueError, match="奇异点"):
@@ -555,90 +504,6 @@ class TestAssemblerContract:
                 reals, condition, [sigma_zero] * scenario.K,
                 torch.randn(scenario.K, *SHAPE),
             )
-
-
-class TestRankStructuralAlignment:
-    """分布式集合序列对齐（#165 review P1 的装配原语延伸）：
-    ``continue_to_terminal`` 携带 ``chunk_sync`` 集合通信且前向过
-    FSDP——其**调用次数与逐次批量**是跨 rank 集合序列的一部分。s 抽样
-    若逐 rank 相异，分组结构（每 σ 的组存在性与组大小）相异，首个判别
-    器更新步即集合序列错位死锁。生产 seeding 规则 = 流注册表按 rank
-    派生（``DistributedContext.derive_seed``，runtime 装配位的同一规
-    则）——本测试按同一规则模拟两 rank，锁定重构续跑的调用结构逐位
-    一致。"""
-
-    @staticmethod
-    def _rank_assembler(
-        scenario: "AssemblyScenario", rank: int,
-    ) -> tuple[ReconstructionAssembler, list[tuple[int, int]]]:
-        # 生产 seeding 规则（runtime/driver 装配位同款）：数据侧流按
-        # rank 派生主 seed、recon 流按 rank 无关 shared seed 派生
-        streams = TrainingRngStreams(
-            DistributedContext(rank, 2, True).derive_seed(11),
-            shared_seed=11,
-        )
-        schedules = scenario.schedules()
-        sampler = RolloutSampler(
-            CfgCombinedField(ZeroVelocityUnet()),
-            SdeKernel(eta=0.7, s_max=0.999),
-            schedules,
-        )
-        calls: list[tuple[int, int]] = []
-        original = sampler.continue_to_terminal
-
-        def recording(noised, start, condition, _original=original):
-            calls.append((start, noised.shape[0]))
-            return _original(noised, start, condition)
-
-        sampler.continue_to_terminal = recording
-        pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
-        assembler = ReconstructionAssembler(
-            real_sampler=RealPoolSampler(pool, streams.real_pool),
-            sampler=sampler,
-            schedules=schedules,
-            conditions=StubConditions(),
-            train_step_indices=TRAIN_STEPS,
-            batch_size_k=scenario.K,
-            latent_scale_factor=1.0,
-            generator=streams.recon,
-            amp=AmpContext(device=torch.device("cpu"), dtype=torch.bfloat16),
-        )
-        return assembler, calls
-
-    def test_continue_call_structure_is_rank_invariant(
-        self, scenario: AssemblyScenario,
-    ) -> None:
-        structures = []
-        for rank in (0, 1):
-            assembler, calls = self._rank_assembler(scenario, rank)
-            assembler.assemble(CONDITION)
-            structures.append(calls)
-        assert structures[0] == structures[1]
-
-    def test_recon_stream_shared_and_data_streams_rank_derived(self) -> None:
-        """注册表级不变量：recon 流跨 rank 同 seed（集合序列一致性的
-        源头），数据侧流跨 rank 异 seed（多样性语义不被误伤）。"""
-        base = 11
-        registries = [
-            TrainingRngStreams(
-                DistributedContext(rank, 2, True).derive_seed(base),
-                shared_seed=base,
-            )
-            for rank in (0, 1)
-        ]
-        assert (
-            registries[0].recon.initial_seed()
-            == registries[1].recon.initial_seed()
-            == base + 9
-        )
-        assert (
-            registries[0].rollout.initial_seed()
-            != registries[1].rollout.initial_seed()
-        )
-        assert (
-            registries[0].real_pool.initial_seed()
-            != registries[1].real_pool.initial_seed()
-        )
 
 
 class TestCrossModalConditionStream:
@@ -668,8 +533,8 @@ class TestCrossModalConditionStream:
     ) -> None:
         streams = TrainingRngStreams(seed=0)
         pool = LatentManifest.load(scenario.pool_path, kind="real_pool")
+        real_sampler = RealPoolSampler(pool, streams.real_pool)
         assembler = ReconstructionAssembler(
-            real_sampler=RealPoolSampler(pool, streams.real_pool),
             sampler=RolloutSampler(
                 CfgCombinedField(ZeroVelocityUnet()),
                 SdeKernel(eta=0.7, s_max=0.999),
@@ -687,7 +552,8 @@ class TestCrossModalConditionStream:
         )
         rollout_before = streams.rollout.get_state().clone()
         recon_before = streams.recon.get_state().clone()
-        pair = assembler.assemble("t1c")
+        reals = real_sampler.sample(scenario.K, modality="t1c")
+        pair = assembler.reconstruct_assigned(reals, "t1c")
         assert pair.modality == "t1c"
         assert torch.equal(streams.rollout.get_state(), rollout_before)
         assert not torch.equal(streams.recon.get_state(), recon_before)

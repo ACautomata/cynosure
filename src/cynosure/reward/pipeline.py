@@ -272,10 +272,10 @@ class PreparePipeline:
         """MR-RATE 装配期守卫（编码之前、计数口径；#121 AC5）：
 
         - **逐条件容量**（ADR-0008-03）：逐（条件, 全量）容量 ≥
-          ``disc_batch_size_k × world_size``，world_size 取 config 声明的
+          ``disc_batch_size_k × 卡数``，卡数取 config 声明的
           部署宽度（``deployment.nproc_per_node``）——train 装配期的同一
-          守卫按**真实 rank 数**判定同一份 manifest（
-          ``TrainingRuntime.assemble_rewards``），prepare 侧钉死 1 等于把
+          守卫按**真实卡数**判定同一份 manifest（
+          ``TrainingRuntime.assemble_real_pool``），prepare 侧钉死 1 等于把
           「开工前失败」推迟到烧完全量预编码之后才由 train 拒绝；条件全集
           = 词汇表 11 格——稀疏模态小池任一条件不足即装配期可读拒绝；
         - **逐条件 held-out 覆盖**：pool 侧出现的条件在 held-out 侧须有卷。

@@ -97,7 +97,7 @@ class NetworkAssembler:
     @classmethod
     def controlnet(cls, artifact: NetworkArtifact) -> ControlNetMaisi:
         """按网络工件构建 ControlNet（ControlNetMaisi）并装载 checkpoint
-        （组2/组3 的 policy：残差每次前向注入 frozen base UNet，
+        （组2 的 policy：残差每次前向注入 frozen base UNet，
         policy-modeling 章「实现接缝」第 5 条）。"""
         model = ControlNetMaisi(
             **cls._known_kwargs(ControlNetMaisi, artifact.config),

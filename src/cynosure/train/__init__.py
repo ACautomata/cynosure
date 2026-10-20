@@ -27,7 +27,6 @@ from cynosure.train.artifacts import (
 )
 from cynosure.train.earlystop import EarlyStopJudge, EarlyStopVerdict
 from cynosure.train.executor import AsyncTrainingExecutor
-from cynosure.train.rewards import RewardCoordinator
 from cynosure.train.rollout import (
     ConditionSampler,
     CrossModalConditionSampler,
@@ -58,7 +57,6 @@ __all__ = [
     "MrConditionSampler",
     "OverfitAlertEvent",
     "PretrainEvent",
-    "RewardCoordinator",
     "RewindAccounting",
     "RolloutPhase",
     "RunArtifacts",

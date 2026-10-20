@@ -72,8 +72,8 @@ Window``）：每窗口每卡恰 K 任务、逐 iter 发射 floor(K/L)（余数�
 train acc − 池化 AUC)、每条件一条、窗口内最后一次有效测量配窗口末
 train acc（#220 决议 13/14）；UpdateReport/IterEvent 升格 per-condition
 明细（可扩不可改名）。ReplicatedDiscriminator 的 RL 构造点随本票
-解耦退役、本体已随 #238 pretrain driver 期收口删除：RL 装配缝
-（``TrainingRuntime.assemble_rewards``）不再 DDP 化判别器。
+解耦退役、本体已随 #238 pretrain driver 期收口删除：新执行序装配缝
+（``AsyncTrainingExecutor``）不再 DDP 化判别器。
 
 续训与事件契约期增量（#236，加厚 4/6，#222/#218 结票全口径）：
 **v12 单文件续训分片**——``AsyncResumeStore``（nominal-v12 常量，
@@ -106,9 +106,9 @@ bootstrap 独立 generator 的主线程单点执行随之保留）；里程碑�
 #222 既裁口径；单进程单写者无 rank 广播面）。
 
 切换期第一步增量（#240，#226 决策 16）：**生产入口改指本门面**——
-CLI train 单口径（torchrun 拒绝 + 组3 序贯拒绝），v12 单常量全局收口
-（旧执行序 v11 store 随其唯一消费者 trainer 退役删除），fixture 测试
-驱动之外本门面获得生产消费者。
+CLI train 单口径（torchrun 拒绝；组3 序贯拒绝随 #242 schema 化），
+v12 单常量全局收口（旧执行序 v11 store 随其唯一消费者 trainer 退役
+删除），fixture 测试驱动之外本门面获得生产消费者。
 
 原骨架期「不含」段的历史记档（各随加厚期补齐，#226）：pretrain
 driver（#238 ADR-0018 独立门面）、生产入口（本票补齐）。
@@ -116,6 +116,7 @@ driver（#238 ADR-0018 独立门面）、生产入口（本票补齐）。
 
 import asyncio
 import copy
+import os
 import threading
 import time
 from collections.abc import Callable, Coroutine
@@ -127,10 +128,6 @@ import torch
 
 from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
-from cynosure.distributed.process import (
-    DistributedContext,
-    PG_TIMEOUT_MINUTES_ENV,
-)
 from cynosure.eval import EvaluationPhase, ManifestEvaluation
 from cynosure.grpo import ClippedPolicyLoss, MgaiAdvantage, StepwisePolicyUpdate
 from cynosure.policy.sampler import RolloutSampler
@@ -269,9 +266,8 @@ class CardReplica:
     ) -> "CardReplica":
         """本卡副本装配：policy 网络构建（checkpoint 装载，单进程无
         FSDP 包装——分片随执行模型退役）+ 判别器副本（原型 deepcopy 后
-        迁卡——单点装载、逐位复制）+ 采样封装（前向激活预算本地解析，
-        ``chunk_sync`` 恒 None：无 FSDP 即无「前向调用次数绑定集合序列」，
-        #165 挂死类结构性消失）+ 逐 k 更新编排 + 判别器步相位编排
+        迁卡——单点装载、逐位复制）+ 采样封装（前向激活预算本地解析）
+        + 逐 k 更新编排 + 判别器步相位编排
         （``DiscriminatorPhase``，判别器链期 #234——判别器更新步的
         train/eval 相位切换自此组件自持，打分/AUC 前向的 eval 钉相由
         步编排的 finally 语义保证）。"""
@@ -722,12 +718,11 @@ class BarrierTimeoutPolicy:
     """环境变量未设置时的硬超时缺省（分钟）——沿用 torch 进程组 watchdog
     的默认 10 分钟口径，换绑不改缺省。"""
 
-    ENV = PG_TIMEOUT_MINUTES_ENV
-    """沿用变量的语义换绑声明：旧语义 = 进程组 watchdog 超时（分钟），
-    新语义 = per-k barrier 硬超时（分钟）——sugon 已设 40，零部署变更
-    （#217 §4 门面形态）。字面单点在 ``distributed.process``
-    （``PG_TIMEOUT_MINUTES_ENV``），两语义共享变量名、各按自己的执行序
-    解读。"""
+    ENV = "CYNOSURE_PG_TIMEOUT_MIN"
+    """per-k barrier 硬超时的环境变量（分钟）——``CYNOSURE_PG_TIMEOUT_MIN``
+    语义换绑后的字面单点（#231）：变量名沿用旧执行序进程组 watchdog
+    超时的公共命名，sugon 已设 40，零部署变更；本执行序的解读 = barrier
+    硬超时（§4 门面形态）。"""
 
     def __init__(
         self, hard_seconds: float, *, soft_fraction: float | None = None,
@@ -746,12 +741,27 @@ class BarrierTimeoutPolicy:
                 f"（硬阈值 {self.hard_seconds}s × 比率 {soft_fraction}）"
             )
 
+    @staticmethod
+    def parse_timeout_minutes() -> int | None:
+        """``ENV`` 的分钟值解析/校验单点：未设置 = None（调用方自取
+        缺省）；非正整数显式拒绝（部署侧拼写错误静默回落默认会让
+        SothisAI 平台的长 watchdog 预期失效）。"""
+        raw = os.environ.get(BarrierTimeoutPolicy.ENV)
+        if raw is None:
+            return None
+        minutes = int(raw)
+        if minutes <= 0:
+            raise ValueError(
+                f"{BarrierTimeoutPolicy.ENV} 须为正整数分钟，得到 {raw!r}"
+            )
+        return minutes
+
     @classmethod
     def from_env(cls) -> "BarrierTimeoutPolicy":
         """生产口径：环境变量（分钟）→ 硬超时秒数；未设置 = 缺省 10
-        分钟；非正整数显式拒绝（读取/校验单点 =
-        ``DistributedContext.parse_timeout_minutes``）。"""
-        minutes = DistributedContext.parse_timeout_minutes()
+        分钟；非正整数显式拒绝（解析/校验单点 =
+        ``parse_timeout_minutes``）。"""
+        minutes = cls.parse_timeout_minutes()
         if minutes is None:
             minutes = cls.DEFAULT_HARD_MINUTES
         return cls(minutes * 60)
@@ -931,6 +941,16 @@ class AsyncTrainingExecutor:
         读数的对拍取数口）。"""
         return self._window_run
 
+    @staticmethod
+    def env_rank() -> int | None:
+        """torchrun 注入的 ``RANK`` 环境变量探测单点：async 执行序是单
+        进程多卡拓扑（进程内多卡由设备发现承担），检测到 torchrun 环境
+        即拒绝——CLI 的 train/pretrain 入口守卫与本门面装配守卫共用本
+        读取点（旧执行序 rendezvous 之前的 rank 判定语义随进程组退役，
+        变量的存活语义只剩「拒绝」一面）。"""
+        raw = os.environ.get("RANK")
+        return None if raw is None else int(raw)
+
     @classmethod
     def build(
         cls,
@@ -952,7 +972,7 @@ class AsyncTrainingExecutor:
         钉单 CPU 设备——生产口径缺省 = 本进程可见全卡，卡集裁剪经
         ``CUDA_VISIBLE_DEVICES``）；``owner_check`` 透传注册表（测试档
         开启，#218 debug-only 口径）。"""
-        if DistributedContext.env_rank() is not None:
+        if cls.env_rank() is not None:
             raise ValueError(
                 "async 门面是单进程执行序：检测到 torchrun 注入的 RANK "
                 "环境——进程内多卡由设备发现承担、不经 torchrun（多进程"
@@ -1029,7 +1049,7 @@ class AsyncTrainingExecutor:
         # 全局无放回抽取——需量倍数传卡数（窗口单条件最大需求上界 =
         # K×卡数，#220 决议 9/10；装配期容量守卫把门不变）
         real_pool = TrainingRuntime.assemble_real_pool(
-            config, vocabulary, world_size=len(devices),
+            config, vocabulary, card_count=len(devices),
         )
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -1127,11 +1147,10 @@ class AsyncTrainingExecutor:
         """本卡组件装配的闭包工厂（绑卡线程执行；流 owner-thread 断言的
         记录点 = 绑卡线程）：per-槽 RolloutPhase（槽 rollout 流注入，
         #218 五处消费面注入面零改动口径）+ ReconstructionAssembler
-        （供给语义装配，#234：real_sampler=None——real 由窗口起点全局
-        无放回抽取经任务注入，per-槽 real_pool 流随 #232 过渡形态退役、
-        fake 侧随机性 = 槽 recon 流；assembler 构造只读流种子、不消耗
-        流位置）+ 池化 AUC 测量段（heldout 流 = 卡首槽——per-卡测量取代
-        per-例测量后的卡内单一消耗面）。"""
+        （供给语义装配，#234：real 由窗口起点全局
+        无放回抽取经任务注入、fake 侧随机性 = 槽 recon 流；assembler
+        构造只读流种子、不消耗流位置）+ 池化 AUC 测量段（heldout 流 =
+        卡首槽——per-卡测量取代 per-例测量后的卡内单一消耗面）。"""
 
         def build_components() -> "tuple[list[SlotRunner], PooledHeldOutAuc]":
             amp = TrainingRuntime.amp_context(config, replica.device)
@@ -1150,7 +1169,6 @@ class AsyncTrainingExecutor:
                 )
                 assembler = TrainingRuntime.assemble_pair_assembler(
                     config,
-                    real_sampler=None,
                     sampler=replica.sampler,
                     conditions=replica.policy.conditions,
                     generator=rng.get_stream(slot, TrainingRngStreams.RECON),

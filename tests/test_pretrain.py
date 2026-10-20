@@ -27,12 +27,10 @@ import torch
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig, MODALITIES
-from cynosure.distributed import DistributedContext
 from cynosure.fixtures import Fixture
 from cynosure.netbuild import NetworkAssembler
 from cynosure.plots import MetricsPlotter
 from cynosure.policy.condition import RolloutCondition
-from cynosure.policy.numerics import AMP_DTYPES
 from cynosure.pretrain import (
     PretrainProvenance,
     PretrainReport,
@@ -50,7 +48,6 @@ from cynosure.reward.update import (
 )
 from cynosure.train import (
     REWIND_ACCOUNTING,
-    AmpContext,
     BarrierTimeoutAlertEvent,
     CrossModalConditionSampler,
     IterEvent,
@@ -62,8 +59,6 @@ from cynosure.train import (
     TrainingRuntime,
     WeightDivergenceAlertEvent,
 )
-from cynosure.train.policy import GroupPolicy
-from cynosure.train.rng import TrainingRngStreams
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -435,8 +430,6 @@ class TestPretrainReportGuard:
         assert "modal-label" in message  # 报告侧组别值
         assert "cross-modal" in message  # config 侧组别值
         assert "同组别" in message  # 预训练与上岗须同组别口径的指引
-        assert "stage2_pretrain_report_json" in message  # 组3 stage-2 的绑定配置面
-        assert "stage-1" in message  # 不继承 stage-1 报告的指引
 
     def test_group_match_passes(
         self, report_scenario: PretrainReportScenario,
@@ -971,29 +964,17 @@ class TestPretrainDriverAssembly:
                     config.reward.overfit_alert_divergence
                 )
                 assert monitor._span == config.reward.overfit_ema_span
-            # 在线装配同缝重放：产物监控器 knobs 与预训练侧逐位一致
-            dist = DistributedContext.bootstrap()
-            amp = AmpContext(
-                device=torch.device("cpu"),
-                dtype=AMP_DTYPES[config.policy.amp_dtype],
+            # 在线装配同缝重放：镜像在线侧的装配位调用（train/executor.py
+            # 门面装配：``OverfitMonitor(config.reward,
+            # conditions=TrainingRuntime.assemble_vocabulary(config).names())``
+            # ——同调用同入参，knobs 与预训练侧逐位一致）；两生产构造点
+            # （预训练 driver / 在线门面）共享同一 OverfitMonitor 构造
+            online = OverfitMonitor(
+                config.reward,
+                conditions=TrainingRuntime.assemble_vocabulary(config).names(),
             )
-            streams = TrainingRngStreams(
-                dist.derive_seed(config.schedule.seed),
-                shared_seed=config.schedule.seed,  # 生产装配位同款
-            )
-            policy = GroupPolicy.build(config, streams.rollout, amp.device)
-            sampler = TrainingRuntime.assemble_sampler(
-                config, policy.field, device=amp.device,
-            )
-            online = TrainingRuntime.assemble_rewards(
-                config, amp, streams, dist,
-                sampler=sampler, conditions=policy.conditions,
-            )
-            assert isinstance(online.overfit, OverfitMonitor)
-            assert online.overfit._threshold == (
-                driver._overfit[0]._threshold
-            )
-            assert online.overfit._span == driver._overfit[0]._span
+            assert online._threshold == driver._overfit[0]._threshold
+            assert online._span == driver._overfit[0]._span
         finally:
             for card in driver._cards:
                 card.stop()

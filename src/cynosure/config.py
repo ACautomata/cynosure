@@ -136,12 +136,12 @@ class Artifacts(BaseModel):
     )
     controlnet_ckpt: Path | None = SpecField(
         "运行时", "experiment-design",
-        "组2/组3 必需：fork P3 跨序列 ControlNet checkpoint（本地工件）",
+        "组2 必需：fork P3 跨序列 ControlNet checkpoint（本地工件）",
         default=None,
     )
     controlnet_config_json: Path | None = SpecField(
         "运行时", "policy-modeling",
-        "组2/组3 必需：ControlNet 网络配置 JSON（键 = MONAI ControlNetMaisi "
+        "组2 必需：ControlNet 网络配置 JSON（键 = MONAI ControlNetMaisi "
         "构造参数名；netbuild 与 UNet 同构的 artifact 构建契约）",
         default=None,
     )
@@ -235,14 +235,16 @@ class Artifacts(BaseModel):
 
 
 class Experiment(BaseModel):
-    """三组实验矩阵（experiment-design 章）：group 三选一 + 各组定死语义。"""
+    """实验组矩阵（experiment-design 章）：group 二选一 + 各组定死语义。"""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    group: Literal["modal-label", "cross-modal", "sequential"] = SpecField(
+    group: Literal["modal-label", "cross-modal"] = SpecField(
         "定死", "experiment-design",
-        "实验组：modal-label（组1 模态标签）/ cross-modal（组2 跨模态）/ sequential（组3 序贯），"
-        "每次运行三选一",
+        "实验组：modal-label（组1 模态标签）/ cross-modal（组2 跨模态），"
+        "每次运行二选一。组3（sequential）序贯两阶段编排属旧执行序，已随"
+        "#226 切换期退役——两阶段由组1 + 组2 两次独立 run 衔接（stage-1 "
+        "产物 checkpoint 经 config 工件路径装配）",
     )
     base_model: Literal["rflow-mr-brain_v1"] = SpecField(
         "定死", "experiment-design",
@@ -264,19 +266,6 @@ class Experiment(BaseModel):
         "定死", "experiment-design",
         "组2 跨模态方向 = 脑 MRI 四序列 12 个有序 src→tgt 对（非 CT↔MR），均匀采样",
         default_factory=lambda: list(DEFAULT_CROSS_MODAL_PAIRS),
-    )
-    stage1_run_dir: Path | None = SpecField(
-        "定死", "本 spec 补钉",
-        "组3：既有 stage-1 产物路径（指定则跳过 stage-1 训练；None = 同一次运行内先跑 stage-1）",
-        default=None,
-    )
-    stage2_pretrain_report_json: Path | None = SpecField(
-        "定死", "本 spec 补钉",
-        "组3：stage-2（cross-modal config）上岗消费的 cross-modal 预训练报告路径"
-        "（stage 级报告绑定，#116——序贯编排把绑定路径重写进 stage-2 计划 config 的"
-        " reward.pretrain_report_json，不静默继承 stage-1 报告；序贯必填，非序贯组"
-        "携带即拒绝）",
-        default=None,
     )
 
     @field_validator("dataset")
@@ -308,61 +297,15 @@ class Experiment(BaseModel):
 
     @model_validator(mode="after")
     def _mrrate_supports_modal_label_only(self) -> "Experiment":
-        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态/
-        序贯是 BraTS 语义）——非组1 即拒绝：组2/组3 的 cross_modal_pairs、
+        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态
+        是 BraTS 语义）——非组1 即拒绝：组2 的 cross_modal_pairs、
         ControlNet 工件等 BraTS 条件语义在 MR config 里静默错位。"""
         if self.dataset == "MR-RATE" and self.group != "modal-label":
             raise ValueError(
                 "MR-RATE 线只定义组1（modal-label）：上游无 MR ControlNet，"
-                f"跨模态/序贯是 BraTS 语义（地图 #67），得到组 {self.group}"
+                f"跨模态是 BraTS 语义（地图 #67），得到组 {self.group}"
             )
         return self
-
-    @field_validator("stage1_run_dir")
-    @classmethod
-    def _stage1_product_only_for_sequential(
-        cls, value: Path | None, info: ValidationInfo,
-    ) -> Path | None:
-        """既有 stage-1 产物路径只对组3 有语义：其他组携带即拒绝
-        （拼错组名时静默跳过 stage-1 比显式拒绝危险）。"""
-        group = info.data.get("group")
-        if value is not None and group != "sequential":
-            raise ValueError(
-                "stage1_run_dir 仅对组3（sequential）有语义：既有 stage-1 "
-                f"产物路径用于跳过 stage-1 训练，得到组 {group}"
-            )
-        return value
-
-    @field_validator("stage2_pretrain_report_json")
-    @classmethod
-    def _stage2_report_binding_is_sequential_only(
-        cls, value: Path | None, info: ValidationInfo,
-    ) -> Path | None:
-        """stage-2 报告绑定只对组3 有语义，双向显式拒绝（#116）：
-
-        - 非序贯组携带即拒绝（与 ``stage1_run_dir`` 同款——拼错组名时
-          静默绑定比显式拒绝危险）；
-        - 序贯缺绑定也拒绝——stage-2 若不绑定 cross-modal 报告，就会沿
-          stage-1 的 ``reward.pretrain_report_json`` 装载 modal-label
-          报告、到 stage-2 装配期才被组别等值守卫（#113）拒绝；装载期
-          显式拒绝把指引提前到 config 面，不静默继承。"""
-        group = info.data.get("group")
-        if group != "sequential" and value is not None:
-            raise ValueError(
-                "stage2_pretrain_report_json 仅对组3（sequential）有语义："
-                "stage-2 消费的 cross-modal 预训练报告路径绑定，得到组 "
-                f"{group}"
-            )
-        if group == "sequential" and value is None:
-            raise ValueError(
-                "组3（sequential）须配置 stage2_pretrain_report_json"
-                "（stage-2 消费的 cross-modal 预训练报告路径，#116 stage 级"
-                "报告绑定）：缺省时 stage-2 会沿 stage-1 的 reward."
-                "pretrain_report_json 继承 modal-label 报告，被组别等值守卫"
-                "在装载期拒绝——序贯不静默继承 stage-1 报告，两份预训练产物"
-                "的路径须分别显式声明"
-            )
-        return value
 
 
 class PolicyConfig(BaseModel):
@@ -858,8 +801,8 @@ class ScheduleConfig(BaseModel):
         "使里程碑 FID/KID 跨里程碑可比）。小样本相对信号：K 只服务于训练期"
         "跨里程碑 plateau 比较（特征空间高维、K 小则协方差秩亏，绝对值噪声"
         "大）；验收口径 = N_baseline 全量对照（experiment-design「对照基线」）。"
-        "默认钉 12 = 组2/组3 条件词汇表宽——三组（组1 四序列、组2/组3 12 有序"
-        "对）与 MR-RATE 11 条件的样本面下界在全数据集/全组生效，纯默认 "
+        "默认钉 12 = 组2 条件词汇表宽——组1 四序列、组2 12 有序"
+        "对与 MR-RATE 11 条件的样本面下界在全数据集/全组生效，纯默认 "
         "config 即通过生产守卫（K ≥ 词汇表、K ≤ N_baseline），缩小评测面"
         "属 fixture 须显式声明",
         default=12, ge=2,
@@ -959,33 +902,21 @@ class ScheduleConfig(BaseModel):
         return self.max_iterations >= self.milestone_interval
 
 
-class ShardingConfig(BaseModel):
-    """分布式分片（orchestration 章 + ADR-0003）：torchrun + FSDP 同卡交替。
-
-    梯度检查点不再是本节配套（#233 解耦为 ``policy.gradient_checkpointing``
-    独立 config 项，应用缝 = GroupPolicy 构建面）。"""
-
-    model_config = ConfigDict(extra="forbid", validate_default=True)
-
-    strategy: Literal["fsdp", "ddp", "zero3"] = SpecField(
-        "定死 + fallback", "orchestration",
-        "分片策略：FSDP full-shard 起步（降级链 DDP → ZeRO-3，fallback 非默认）",
-        default="fsdp",
-    )
-
-
 class DeploymentConfig(BaseModel):
-    """部署默认（orchestration 章 + ADR-0005）：SothisAI 单实例 4 卡 torchrun、产物落持久分区。
+    """部署默认（orchestration 章 + ADR-0005）：SothisAI 单实例 4 卡、产物落持久分区。
 
     原为 zzeshell SLURM 的 ``SlurmConfig``（partition/gres/walltime），集群访问权
     永久失去后随平台迁移整体替换；无作业调度器，sbatch 专属字段不再存在。
+    执行模型 = 单进程多卡（torchrun 多进程启动显式拒绝，#226/#242）——
+    本节的存活消费面 = prepare/train 装配期 real 池容量守卫的部署宽度。
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     nproc_per_node: int = SpecField(
         "部署默认", "orchestration + ADR-0005",
-        "每实例进程数 = DCU 卡数（torchrun --nproc_per_node=4；BW/gfx936 4×64GiB/实例）",
+        "每实例 DCU 卡数（BW/gfx936 4×64GiB/实例；执行模型 = 单进程多卡，"
+        "本值为 real 池容量守卫的部署宽度乘数）",
         default=4, ge=1,
     )
     output_root: Path = SpecField(
@@ -1029,7 +960,7 @@ class CynosureConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    experiment: Experiment = SpecField("定死", "experiment-design", "实验组矩阵（三选一）")
+    experiment: Experiment = SpecField("定死", "experiment-design", "实验组矩阵（二选一）")
     artifacts: Artifacts = SpecField("运行时", "experiment-design", "输入工件路径")
     latent_shape: tuple[int, int, int, int] = SpecField(
         "定死（fixture 可缩小）", "reward-model",
@@ -1056,9 +987,6 @@ class CynosureConfig(BaseModel):
     )
     reward: RewardConfig = SpecField("定死", "reward-model", "Reward model（在线 PatchDiscriminator）")
     schedule: ScheduleConfig = SpecField("运行时", "experiment-design", "运行时 knobs（规模/里程碑/早停/续训）")
-    sharding: ShardingConfig = SpecField(
-        "定死", "orchestration", "分布式分片", default_factory=ShardingConfig,
-    )
     deployment: DeploymentConfig = SpecField(
         "部署默认", "orchestration + ADR-0005",
         "部署默认（SothisAI 单实例 4 卡、产物落持久分区）",
@@ -1131,15 +1059,15 @@ class CynosureConfig(BaseModel):
 
     @field_validator("artifacts")
     @classmethod
-    def _controlnet_required_for_stage2_groups(
+    def _controlnet_required_for_cross_modal(
         cls, artifacts: Artifacts, info: ValidationInfo,
     ) -> Artifacts:
-        """组2/组3 的训练对象含 ControlNet：checkpoint 与网络配置 JSON
+        """组2 的训练对象含 ControlNet：checkpoint 与网络配置 JSON
         构成的 artifact 对都必需（netbuild 按 artifact 构建的同一契约）。"""
         experiment = info.data.get("experiment")
         if experiment is None:
             return artifacts
-        if experiment.group in ("cross-modal", "sequential"):
+        if experiment.group == "cross-modal":
             missing = [
                 name for name in ("controlnet_ckpt", "controlnet_config_json")
                 if getattr(artifacts, name) is None
@@ -1407,9 +1335,9 @@ class CynosureConfig(BaseModel):
         return self
 
     def stage_condition_vocabulary(self) -> dict[int, list]:
-        """组 → {阶段号: 条件词汇表} 的唯一映射（组1 四序列、组2 12 有序对、
-        组3 两阶段各一份）——Baseline manifest 条目生成与本 validator 共同
-        消费（词汇表单一来源，组矩阵一变只改此处）。
+        """组 → {阶段号: 条件词汇表} 的唯一映射（组1 四序列、组2 12 有序
+        对）——Baseline manifest 条目生成与本 validator 共同消费（词汇表
+        单一来源，组矩阵一变只改此处）。
 
         BraTS 口径：条件集是代码内常量语义，schema 层可直接给出。
         MR-RATE 口径（#129）：条件集来自条件词汇表工件（schema 不读
@@ -1429,7 +1357,6 @@ class CynosureConfig(BaseModel):
         return {
             "modal-label": {1: list(MODALITIES)},
             "cross-modal": {1: pairs},
-            "sequential": {1: list(MODALITIES), 2: pairs},
         }[self.experiment.group]
 
     @model_validator(mode="after")
@@ -1521,7 +1448,6 @@ __all__ = [
     "REGISTERED_DATASETS",
     "RewardConfig",
     "ScheduleConfig",
-    "ShardingConfig",
     "SPACING_CONDITION_SCALE",
     "SpecField",
     "UNCONDITIONAL_LABEL",

@@ -15,7 +15,6 @@ import torch
 
 from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
-from cynosure.distributed.shard import PolicySharding
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.condition import ModalityMapping
 from cynosure.policy.field import BareConditionField, CfgCombinedField, VelocityField
@@ -55,23 +54,15 @@ class GroupPolicy:
         config: CynosureConfig,
         generator: torch.Generator,
         device: torch.device,
-        sharding: PolicySharding | None = None,
     ) -> "GroupPolicy":
-        """按组装配（三组实验矩阵的唯一分派点）：网络工件经 netbuild 装载、
+        """按组装配（实验组的唯一分派点）：网络工件经 netbuild 装载、
         可训练对象与采样场/条件分布按 experiment.group 落位。
 
-        ``sharding``（FSDP 封装）在 optimizer 构建之前应用——优化器状态
-        活在分片后参数上；单进程为 None（网络原样透传）。梯度检查点
-        （#233 解耦，``GradientCheckpointing``）在分片之前应用于裸网络，
-        并以装配期 bitwise 探针 fail-fast。
+        梯度检查点（#233 解耦，``GradientCheckpointing``）应用于裸网络
+        （根模块身份不变），并以装配期 bitwise 探针 fail-fast——在
+        optimizer 构建之前（探针 fail-fast 不留优化器状态）。
         """
         group = config.experiment.group
-        if group == "sequential":
-            raise ValueError(
-                "组3（sequential）的序贯两阶段编排属旧执行序，已随切换期"
-                "退役（单次训练循环只面对一个可训练对象——两阶段由两次"
-                "独立 run 衔接）"
-            )
         unet = NetworkAssembler.unet(NetworkArtifact(
             config=NetworkAssembler.load_json(config.artifacts.net_config_json),
             checkpoint=config.artifacts.unet_ckpt,
@@ -110,16 +101,11 @@ class GroupPolicy:
         DropoutGuard.assert_clean(
             network, origin=f"group={group} 的 policy 网络",
         )
-        # 检查点先于分片（#233）：包装作用于裸网络（根模块身份不变），
-        # 探针 fail-fast 在任何分片/优化器状态构建之前
+        # 检查点包装作用于裸网络（根模块身份不变），探针 fail-fast 在
+        # 优化器状态构建之前
         GradientCheckpointing(
             config, device, vocabulary,
         ).verify_and_apply(unet, network)
-        if sharding is not None:
-            # 分片先于采样场构建：field 必须引用 FSDP wrapper（裸网络的
-            # 前向不进分片的梯度聚合路径）；optimizer 最后构建（状态活在
-            # 分片后参数上）
-            network = sharding.wrap(network)
         if group == "cross-modal":
             field: VelocityField = BareConditionField(
                 unet,
@@ -138,18 +124,21 @@ class GroupPolicy:
 
     def full_state(self) -> dict:
         """可训练网络权重的 full state dict（裸网络键形，checkpoint 落盘
-        与续训状态的保存形态；FSDP 装配下由 PolicySharding 导出）。"""
-        return PolicySharding.full_state_dict(self._network)
+        与续训状态的保存形态；张量回落 CPU 存储形态）。"""
+        return {
+            key: value.detach().cpu()
+            for key, value in self._network.state_dict().items()
+        }
 
     def load_full_state(self, state: dict) -> None:
-        """full state dict 整体装载（续训恢复路径；FSDP 内部分片分发）。"""
-        PolicySharding.load_full_state_dict(self._network, state)
+        """full state dict 整体严格装载（续训恢复路径）。"""
+        self._network.load_state_dict(state, strict=True)
 
     @staticmethod
     def _assemble_cross_modal(
         unet: torch.nn.Module, config: CynosureConfig, device: torch.device,
     ) -> torch.nn.Module:
-        """组2/组3-stage2 的可训练对象 = ControlNet；base UNet 冻结
+        """组2 的可训练对象 = ControlNet；base UNet 冻结
         （requires_grad 关闭 + 复检断言，AC「base 冻结经断言验证」）。"""
         controlnet = NetworkAssembler.controlnet(NetworkArtifact(
             config=NetworkAssembler.load_json(
@@ -167,13 +156,13 @@ class GroupPolicy:
 
     @property
     def unet(self) -> torch.nn.Module:
-        """base UNet（组2/组3-stage2 为冻结 base；checkpoint 不经它落盘）。"""
+        """base UNet（组2 为冻结 base；checkpoint 不经它落盘）。"""
         return self._unet
 
     @property
     def network(self) -> torch.nn.Module:
         """本组被 RL 训练的网络（glossary「Policy」）：组1 = UNet 全参、
-        组2/组3-stage2 = ControlNet。checkpoint 落盘与优化器主体。"""
+        组2 = ControlNet。checkpoint 落盘与优化器主体。"""
         return self._network
 
     @property

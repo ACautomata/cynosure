@@ -684,40 +684,25 @@ class FixtureArtifactLibrary:
         if reward:
             config.reward = config.reward.model_copy(update=reward)
         pretrain_config = PretrainLightweightReward.apply(config)
-        # stage 级报告映射（#116）：序贯变体真跑**两份**预训练——stage-1
-        # 消费 modal-label 报告（pretrain_run/）、stage-2 消费 cross-modal
-        # 报告（pretrain_run_stage2/；driver 已按 config 完全参数化，同
-        # 一条路径仅 config 不同）；单阶段组沿用本组一份
-        if group == "sequential":
-            pretrain_jobs = [
-                ("modal-label", fixture_dir / "pretrain_run"),
-                ("cross-modal", fixture_dir / "pretrain_run_stage2"),
-            ]
-        else:
-            pretrain_jobs = [(group, fixture_dir / "pretrain_run")]
-        for job_group, run_dir in pretrain_jobs:
-            job = pretrain_config.model_copy(deep=True)
-            job.experiment.group = job_group
-            # 序贯编排字段（stage1_run_dir / stage2_pretrain_report_json）
-            # 只对组3 有语义：预训练 job 是单阶段组别 config，不携带
-            job.experiment.stage1_run_dir = None
-            job.experiment.stage2_pretrain_report_json = None
-            # 容量守卫按 K×卡数把门（#238）：K 沿用 config 默认（4）
-            # 或调用方 reward 覆写、不在此钉值（无条件钉值会静默覆盖
-            # 调用方锚定语义，如 test_async_eval 多卡档锚 K=2 的窗口
-            # 容量守卫）。2 卡口径全过线：4×2=8 ≤ real 14、held-out
-            # 2 ≥ 2
-            job.reward.pretrain_report_json = str(
-                run_dir / "pretrain_report.json",
-            )
-            pretrain_path = cls._library_root() / (
-                f"pretrain_config_{token}_{job_group}.json"
-            )
-            pretrain_path.write_text(
-                job.model_dump_json(indent=2), encoding="utf-8",
-            )
-            result = cli.run("pretrain", "--config", str(pretrain_path))
-            assert result.code == 0, result.stderr
+        # 预训练 warm-start 前置（ADR-0007）：本组一份预训练产物
+        # （driver 已按 config 完全参数化，同一条路径仅 config 不同）
+        job = pretrain_config.model_copy(deep=True)
+        run_dir = fixture_dir / "pretrain_run"
+        # 容量守卫按 K×卡数把门（#238）：K 沿用 config 默认（4）或调用方
+        # reward 覆写、不在此钉值（无条件钉值会静默覆盖调用方锚定语义，
+        # 如 test_async_eval 多卡档锚 K=2 的窗口容量守卫）。2 卡口径全
+        # 过线：4×2=8 ≤ real 14、held-out 2 ≥ 2
+        job.reward.pretrain_report_json = str(
+            run_dir / "pretrain_report.json",
+        )
+        pretrain_path = cls._library_root() / (
+            f"pretrain_config_{token}.json"
+        )
+        pretrain_path.write_text(
+            job.model_dump_json(indent=2), encoding="utf-8",
+        )
+        result = cli.run("pretrain", "--config", str(pretrain_path))
+        assert result.code == 0, result.stderr
         SceneCache.store(disk_key, fixture_dir)
         cls._cache[signature] = fixture_dir
         return fixture_dir
@@ -732,9 +717,9 @@ class RecordingScorer:
 class RecordingUpdate:
     """测试仪器：以注入判别器冒充打分器与更新编排（记录 update.step
     收到的配对批、条件与调用时的判别器相位；optimizer 为真实现——
-    续训状态机的判别器侧 checkpoint 经 RewardCoordinator 消费
-    update.optimizer，协作者契约面的一部分）。train 循环与预训练
-    driver 的 update_step 穿参观测共用同一替身。"""
+    续训状态机的判别器侧 checkpoint 经 update.optimizer 消费，
+    协作者契约面的一部分）。train 循环与预训练 driver 的 update_step
+    穿参观测共用同一替身。"""
 
     def __init__(self, discriminator: torch.nn.Module) -> None:
         self.scorer = RecordingScorer(discriminator)

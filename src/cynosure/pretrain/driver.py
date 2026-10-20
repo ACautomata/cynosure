@@ -427,7 +427,7 @@ class PretrainDriver:
         # 需量倍数 = 卡数（每步每卡 K 对，最大需求上界 = K×卡数，
         # #221 决议 8「容量守卫 ≥ K×卡数零改动」）
         real_pool = TrainingRuntime.assemble_real_pool(
-            config, vocabulary, world_size=len(devices),
+            config, vocabulary, card_count=len(devices),
         )
         heldout = LatentManifest.load(
             config.reward.heldout_real_manifest, kind="heldout_real",
@@ -495,8 +495,8 @@ class PretrainDriver:
         """本卡组件装配的闭包工厂（绑卡线程执行）：冻结基座 policy +
         判别器副本（原型 deepcopy 迁卡——单点装载、逐位复制）+ 卡轴
         recon 流的装配原语（``seed + 卡×10⁶ + 9``——卡 0 恒等 = 现行
-        rank0 recon 数值；real_sampler=None 供给语义，real 由主控全局
-        抽取经任务注入）+ 判别器步相位编排。"""
+        rank0 recon 数值；供给语义装配，real 由主控全局抽取经任务注入）
+        + 判别器步相位编排。"""
         def build_rig() -> PretrainCardRig:
             amp = AmpContext(device=device, dtype=amp_dtype)
             # 条件分布主流在新执行序无消费（测量条件穿模板流、更新批
@@ -516,7 +516,6 @@ class PretrainDriver:
             )
             assembler = TrainingRuntime.assemble_pair_assembler(
                 config,
-                real_sampler=None,
                 sampler=TrainingRuntime.assemble_sampler(
                     config, policy.field, device=device,
                 ),

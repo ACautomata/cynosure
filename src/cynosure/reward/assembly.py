@@ -1,9 +1,8 @@
 """判别器更新批装配原语（ADR-0012 的唯一新缝）。
 
-输入 = 目标条件 + 专属随机流；输出 = 配对批（real 批 + 同源重构 fake 批
-+ 条件标记）。real 侧经 ``RealSampling`` 无放回采样（条件匹配、容量硬
-守卫照旧——``LatentManifest.assert_condition_capacity`` 装配期把门）；
-fake 侧由**同批 real** 逐样本重构而来：
+输入 = 目标条件 + 调用方注入的 real 批 + 专属随机流；输出 = 配对批
+（real 批 + 同源重构 fake 批 + 条件标记）。fake 侧由**同批 real** 逐
+样本重构而来：
 
 1. real latent（pool 存储域）乘回 policy 工作域；
 2. 逐样本从该条件**被优化步**（``train_step_indices_m``，{2..15}）的
@@ -24,9 +23,8 @@ real/fake 同内容配对——判别器只能学生成伪影分界，「记真�
 条件内的自由度抽取（组2 的源对/源条目，组1 实现不耗 RNG）、
 ``randint`` 抽日程位（= s）、``randn`` 抽 ε 依次全走本流——ε 的消耗
 量与 s 的取值无关，同 seed 重放逐位一致、随续训分片落盘恢复后序列
-不漂移。seeding 按 rank 无关的 shared seed 派生（runtime 装配位传原
-seed）：s 抽样的调用结构是分布式 FSDP 集合序列的一部分，跨 rank 必须
-一致（逐 rank 相异 = 首个判别器更新步集合错位死锁）。
+不漂移。流种子 = 槽派生（#218：recon 流随续训分片落盘恢复，调度槽数
+不进对账——恢复语义由流状态自身承载）。
 
 按组语义（ADR-0012 决策 7）：条件构造与重构前向按组自然分派——组1
 CFG 组合场、组2 裸条件单前向（condition 经 ``ConditionSampler`` 产出、
@@ -35,14 +33,11 @@ CFG 组合场、组2 裸条件单前向（condition 经 ``ConditionSampler`` 产
 影像——ADR-0012 非目标，stage-2 到来时另行设计）：机制缝本票照常对
 组2 开放（机械链路可行），判别任务语义留待专项票。
 
-两条供批入口共用同一重构核（``reconstruct``），差在 s 的导出方式与随机流：
-
-- ``assemble``（**更新批**）：s 逐样本均匀抽自被优化步日程点（ADR-0012
-  决策 2）、ε 同流 —— 训练分布；
-- gate 测量批（ADR-0012 决策 5 的 recon-AUC 构造面）已随 #221 决议 5
-  迁出本原语：主控单点复位测量模板（``cynosure.pretrain.measurement``
-  ——seed+19 显式直锚 + 按卡序逐段抽 ε），本原语只承担更新批与
-  供给入口的重构核。
+供批入口 = ``reconstruct_assigned``（**供给语义**）：real 由判别器
+窗口起点全局无放回抽取（#220 决议 10）经任务注入，本原语只承担 fake
+构造；gate 测量批（ADR-0012 决策 5 的 recon-AUC 构造面）已随 #221
+决议 5 迁出本原语（主控单点复位测量模板，``cynosure.pretrain.
+measurement``——seed+19 显式直锚 + 按卡序逐段抽 ε）。
 """
 
 from dataclasses import dataclass
@@ -54,7 +49,6 @@ from cynosure.policy.condition import RolloutCondition
 from cynosure.policy.numerics import AmpContext
 from cynosure.policy.sampler import RolloutSampler
 from cynosure.policy.schedules import ConditionSchedules
-from cynosure.reward.sampler import RealSampling
 
 if TYPE_CHECKING:
     from cynosure.train.rollout import ConditionSampler
@@ -80,15 +74,14 @@ class PairBatch:
 class ReconstructionAssembler:
     """判别器更新批装配原语：目标条件 + 专属随机流 → 配对批。
 
-    依赖全部协议注入（real 采样 / ODE 续跑 / sigma 日程 / 条件构造），
-    预训练（冻结基座 + driver 装配）与在线（当前 policy + train 装配）
-    两阶段经同一原语供批——构造同构、warm-start 权重不面临分布跳变
-    （ADR-0012 决策 7）。
+    依赖全部协议注入（ODE 续跑 / sigma 日程 / 条件构造），real 侧由
+    调用方注入（``reconstruct_assigned``）；预训练（冻结基座 + driver
+    装配）与在线（当前 policy + train 装配）两阶段经同一原语供批——
+    构造同构、warm-start 权重不面临分布跳变（ADR-0012 决策 7）。
     """
 
     def __init__(
         self,
-        real_sampler: RealSampling | None,
         sampler: RolloutSampler,
         schedules: ConditionSchedules,
         conditions: "ConditionSampler",
@@ -107,7 +100,6 @@ class ReconstructionAssembler:
             )
         if batch_size_k < 1:
             raise ValueError(f"batch_size_k 必须为正整数，得到 {batch_size_k}")
-        self._real_sampler = real_sampler
         self._sampler = sampler
         self._schedules = schedules
         self._conditions = conditions
@@ -116,25 +108,6 @@ class ReconstructionAssembler:
         self._scale_factor = latent_scale_factor
         self._generator = generator
         self._amp = amp
-
-    def assemble(self, modality: str) -> PairBatch:
-        """装配该条件的判别器更新批：real 无放回采样 → 条件构造 → 先抽 s
-        后抽 ε → 同源重构 → 配对批（no_grad + autocast 口径——重构是
-        policy 的 inference 前向，与 rollout 相同数值口径）。
-
-        real 侧采样须本原语持有采样器（供给语义装配——
-        ``real_sampler=None`` 的窗口任务形态经
-        ``reconstruct_assigned`` 供 real，本入口显式拒绝）。"""
-        if self._real_sampler is None:
-            raise ValueError(
-                "assemble 入口需要 real 侧采样器，本原语按供给语义装配"
-                "（real_sampler=None，#220 决议 10 窗口抽取形态）——"
-                "real 由调用方经 reconstruct_assigned 注入"
-            )
-        reals = self._real_sampler.sample(
-            self._batch_size_k, modality=modality,
-        )
-        return self.reconstruct_assigned(reals, modality)
 
     def reconstruct_assigned(
         self, reals: torch.Tensor, modality: str,
@@ -188,7 +161,7 @@ class ReconstructionAssembler:
         sigmas: Sequence[float],
         noise: torch.Tensor,
     ) -> PairBatch:
-        """两条供批入口的共用装配尾：重构 → 配对批（no_grad + autocast
+        """供批入口的共用装配尾：重构 → 配对批（no_grad + autocast
         口径——重构是 policy 的 inference 前向，与 rollout 相同数值
         口径）。``condition`` 由调用方按其抽取序构造后注入。"""
         with torch.no_grad(), torch.autocast(
@@ -212,7 +185,7 @@ class ReconstructionAssembler:
         noise: torch.Tensor,
     ) -> torch.Tensor:
         """同源重构核：逐样本加噪到 σ 水平 → η=0 确定性 ODE 续跑到
-        σ=0 → 域除回（纯数学，无 RNG——``assemble`` 持流，锚测试直接
+        σ=0 → 域除回（纯数学，无 RNG——调用方持流，锚测试直接
         喂确定性输入）。
 
         同一 σ 水平的样本分组批量续跑（``continue_to_terminal`` 的

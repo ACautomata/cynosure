@@ -20,34 +20,11 @@ ADR-0008-03：online update 的 real 侧按本 iteration 目标模态过滤采�
 补洞（小池 bagging 是过拟合加速器，ADA, arXiv:2006.06676）。
 """
 
-from typing import Protocol, Sequence
+from typing import Sequence
 
 import torch
 
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
-
-
-class RealSampling(Protocol):
-    """「真」侧批采样的策略接口（glossary「Real sample」的采样语义）。
-
-    Online update（train real）与 HeldOutAuc（held-out real）依赖本接口；
-    pool / held-out 两侧共用 RealPoolSampler 实现，kind 语义由
-    LatentManifest 装载层守卫。
-    """
-
-    @property
-    def size(self) -> int:
-        """条目总数（held-out AUC 对称采样的参照）。"""
-        ...
-
-    def sample(
-        self, count: int, *, modality: str | None = None,
-    ) -> torch.Tensor:
-        """无放回均匀采 count 条 latent（``modality`` 给定时候选收窄为
-        该条件键的条目——条件键两域同名（#129）：BraTS = 序列名、MR-RATE
-        = 生成条件名。MR-RATE 线按条件采样是批内同形的前提：同条件同
-        统一网格，异条件 latent 异形状）。"""
-        ...
 
 
 class RealPoolSampler:
