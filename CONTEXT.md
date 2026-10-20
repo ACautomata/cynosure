@@ -96,8 +96,8 @@ _Avoid_: 裸「组」指方向集合（与实验组撞名）
 _Avoid_: 样本（sample 指样本库条目）、「每卡恰一例」当定义（那是默认协程数的特例）
 
 **前向激活预算（Forward Activation Budget）**:
-rollout 续跑里单次 policy 前向允许吃掉的激活显存上限（config `policy.forward_activation_budget_gib`）：超预算的 G 方向整批前向按 latent 体素切子批**顺序**积分，峰值以子批为界（#123 首跑 OOM 修复——探针实测激活 ≈3.2 KiB / latent 体素 / 前向样本，而 UNet 权重驻留仅 0.687 GiB）。缺省按设备**总**显存的比例自动探测（同设备可复现；共享实例不反映他进程占用，须显式钉值），显式值在设备总显存可探测时（CUDA）超过即装配期拒绝。**G 不是显存旋钮**：分块改的是「同时算几个样本」，不改任何样本的数值路径（调度等价，实测 rel ≈4e-7）。**分布式下分块上限必须 rank 一致**：FSDP 逐前向参数 all-gather 的调用序列与「前向调用次数」绑定，而条件逐 rank 独立采样（seed 的 rank 派生是设计意图）使各 rank 的体素数/本地上限不同——本地各自取值即前向次数分叉、集合序列错配、全体互等挂死（#165 review P1，sugon train2 首跑实录：iter 0 rollout 后全 rank 阻塞直至 watchdog abort）。故本地预算先经 `all_reduce_min` 取全 rank 最小再截断（子批只小不大，任何一侧的显存上界语义都不破）。
-_Avoid_: 用降 G 换显存（改变算法口径的最后手段）、把预算当空闲显存配额、按空闲显存探测（同设备不可复现）、分布式下各 rank 本地各自取分块上限（前向次数分叉 = 集合互等挂死）
+rollout 续跑里单次 policy 前向允许吃掉的激活显存上限（config `policy.forward_activation_budget_gib`）：超预算的 G 方向整批前向按 latent 体素切子批**顺序**积分，峰值以子批为界（#123 首跑 OOM 修复——探针实测激活 ≈3.2 KiB / latent 体素 / 前向样本，而 UNet 权重驻留仅 0.687 GiB）。缺省按设备**总**显存的比例自动探测（同设备可复现；共享实例不反映他进程占用，须显式钉值），显式值在设备总显存可探测时（CUDA）超过即装配期拒绝。**G 不是显存旋钮**：分块改的是「同时算几个样本」，不改任何样本的数值路径（调度等价，实测 rel ≈4e-7）。旧执行序分布式下曾有「分块上限跨 rank 一致」约束（FSDP 集合序列绑定前向调用次数，#165 review P1）——随执行模型单进程化结构性消失，本地预算直接生效（#242 chunk_sync 退役）。
+_Avoid_: 用降 G 换显存（改变算法口径的最后手段）、把预算当空闲显存配额、按空闲显存探测（同设备不可复现）
 
 ### Reward model
 
@@ -151,7 +151,7 @@ RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool�
 _Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）、量产 rollout 当 fake 源（旧语义，ADR-0012）
 
 **预训练棘轮（Pretrain ratchet）**:
-判别器预训练的终止判据（ADR-0007/0008 决策 3/6，ADR-0017 门控链退役后保留面的升格口径）：per-condition recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012）逐条件「首测过线 → 换批复测确认」棘轮式入列（报告值取两次较小者，确认步不更新），全部条件过线即提前终止；`pretrain_max_steps` 耗尽则过线条件 = 已确认者、未确认条件对落盘权重补测。过线判定含支撑度规则（小样本条件走 bootstrap CI 下界）。**不设 train 侧上岗门槛**（ADR-0017：白名单空拒绝开跑的启动期硬检查已退役）——报告的过线条件清单与达标与否只承载预训练自身的终止形态与人工判读面；warm-start 装载守卫只对账数据口径指纹与形态指纹（组别绑定 #113：报告 group 与消费 config 严格等值，跨组显式拒绝；组3 序贯 stage-2 的合法消费路径 = `experiment.stage2_pretrain_report_json` 绑定的 cross-modal 报告，stage 级绑定、不继承 stage-1 报告——#116）。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值（准入体检 vs 在岗考核，ADR-0012）。
+判别器预训练的终止判据（ADR-0007/0008 决策 3/6，ADR-0017 门控链退役后保留面的升格口径）：per-condition recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012）逐条件「首测过线 → 换批复测确认」棘轮式入列（报告值取两次较小者，确认步不更新），全部条件过线即提前终止；`pretrain_max_steps` 耗尽则过线条件 = 已确认者、未确认条件对落盘权重补测。过线判定含支撑度规则（小样本条件走 bootstrap CI 下界）。**不设 train 侧上岗门槛**（ADR-0017：白名单空拒绝开跑的启动期硬检查已退役）——报告的过线条件清单与达标与否只承载预训练自身的终止形态与人工判读面；warm-start 装载守卫只对账数据口径指纹与形态指纹（组别绑定 #113：报告 group 与消费 config 严格等值，跨组显式拒绝）。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值（准入体检 vs 在岗考核，ADR-0012）。
 _Avoid_: 上岗门槛/RM readiness gate（启动期拒绝语义已随 ADR-0017 退役）、池化达标（全池单一标量口径，已被按条件取代）、把过线清单当更新开关（policy 每 iteration 无条件更新，ADR-0017）
 
 **支撑度规则（Support rule）**:
@@ -171,7 +171,7 @@ _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 
 **过拟合分叉监控（Overfit divergence monitoring）**:
-判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量——复算保证两侧同一估计量口径），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件独立记账（**rank 轴随执行模型退役**——async 执行模型裁决 #220：单进程多卡全池共享下数据切片异质性结构性消失、rank 间离散失去诊断对象，AUC 与 train acc 池化为 per-condition 单值；现行多进程 DDP 的「按 rank 独立记账、rank 离散 = 切片异质性诊断信号」口径随之退役，AUC 侧消费 per-condition 池化读数、观测面 RNG 拆流入 per-(卡×流名) 注册表），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：系统侧无任何自动动作（门控链已随 ADR-0017 退役，无机制可实现自动动作）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝挂进 RewardCoordinator 的 OverfitMonitor）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在预训练棘轮终止之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；分布式预训练（ADR-0016）下越线告警经 gather 归并到 rank0 事件流、仅 rank0 写出（train 侧 EventMerger 同构，rank 归因观测 rank，写出序 = 步序 + 步内 pretrain 先于告警）；per-condition EMA 状态随续训分片落盘（分叉监控状态自 v6 起在 payload 内、格式随 payload 版本走——现行 v12），恢复逐位复原。
+判别器内收敛健康度观测面（ADR-0009-β 在线侧 / γ 预训练侧）：分叉 = EMA(train pairwise acc − held-out AUC)，两侧统一干净域、同一 Mann-Whitney pairwise 占比估计量（不同采样平面）——train 侧每判别器步用干净域输入 no_grad 复算一次准确率（更新前快照、随单步更新报告上行；不复用 loss 伴生量——复算保证两侧同一估计量口径），held-out 侧消费现成 per-condition AUC 流（更新前快照）。健康判别器两侧近似相等、分叉贴 0；判别器记住训练批共性而非真假分界时 train 侧被 in-sample 拟合抬高、分叉上行——hacking 后果出现前的病因信号。分叉按条件独立记账（**rank 轴随执行模型退役**——async 执行模型裁决 #220：单进程多卡全池共享下数据切片异质性结构性消失、rank 间离散失去诊断对象，AUC 与 train acc 池化为 per-condition 单值；现行多进程 DDP 的「按 rank 独立记账、rank 离散 = 切片异质性诊断信号」口径随之退役，AUC 侧消费 per-condition 池化读数、观测面 RNG 拆流入 per-(卡×流名) 注册表），EMA 跨度与报警阈值进 config（`reward.overfit_ema_span` / `reward.overfit_alert_divergence`，暂定 8 / 0.2，MR-RATE 预训练曲线校准后定版）。分叉 EMA 自下而上越线 → `overfit_alert` 事件进指标流（modality、分叉值、train acc、held-out AUC、rank + γ 的相判别字段 `phase`；事件契约「可扩不可改名」、非有限浮点构造期拒绝）——只报警、人工裁决：系统侧无任何自动动作（门控链已随 ADR-0017 退役，无机制可实现自动动作）。预训练与在线两阶段同一套组件、同一 knobs（共享装配缝同参构造：预训练 driver / 在线门面各持 OverfitMonitor 实例）：warm-start 预训练每个更新步喂入两侧干净域读数，per-condition 分叉监控在预训练棘轮终止之前即暴露稀疏模态（MRA）记忆化；预训练相告警随 pretrain 事件之后写出，`phase="pretrain"` 登记 EXEMPT 记账（预训练执行史全量保留——不参与续训回退重写），RL 相告警按 iteration 轴参与回退记账（随所属 iteration 删除、回退重执行重发）；分布式预训练（ADR-0016）下越线告警经 gather 归并到 rank0 事件流、仅 rank0 写出（train 侧 EventMerger 同构）的口径随旧执行序退役——gather/EventMerger 面已随 #238/#242 删除，现行 async 单点写者直接写出（写出序 = 步序 + 步内 pretrain 先于告警）；per-condition EMA 状态随续训分片落盘（分叉监控状态自 v6 起在 payload 内、格式随 payload 版本走——现行 v12），恢复逐位复原。
 _Avoid_: 训练/验证损失分叉（机器学习泛指——本项目分叉轴是 in-sample 训练批 vs held-out 池）、自动动作（只报警、人工裁决；旧「自动降 σ」升级项随噪声注入取消作废，ADR-0012；门控联动已随 ADR-0017 退役）、把 rank 离散当诊断信号（#220 后 rank 轴退役——其诊断对象是数据切片异质性，单进程全池下不存在）、预训练/在线口径断层（两阶段同一套组件与 knobs，γ 已收口）
 
 **Reward hacking（奖励攻击）**:
@@ -203,21 +203,21 @@ _Avoid_: 分辨率、尺度（尺度另有所指，见 多尺度判别器）
 ### 分布式执行
 
 **Rank（进程秩）**:
-torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0018 退役：pretrain 已单进程多卡化（RANK env 守卫历史回环恢复）、记账/归并/事件归因全轴收敛到「槽」或「卡」（iter 事件的 rank 字段语义 = 槽号、预训练告警的 rank 字段语义 = 卡号——字段名随事件契约「可扩不可改名」保留）；旧执行序 trainer 已随 #226 切换期第一步删除，残余（DistributedContext 控制面）待切换期第二步清尾。
+torchrun 进程组内进程的全局编号（0 起）；rank 0 独占产物写盘（run 目录创建、指标归并、checkpoint），其余 rank 只参与集合通信。词条随 ADR-0018 退役：pretrain 已单进程多卡化（RANK env 守卫历史回环恢复）、记账/归并/事件归因全轴收敛到「槽」或「卡」（iter 事件的 rank 字段语义 = 槽号、预训练告警的 rank 字段语义 = 卡号——字段名随事件契约「可扩不可改名」保留）；旧执行序 trainer 已随 #226 切换期第一步删除，DistributedContext 控制面已随 #242 切换期第二步清尾（RANK 探测与超时解析单点平移 AsyncTrainingExecutor / BarrierTimeoutPolicy）。
 _Avoid_: 进程号、节点（node 是机器，rank 是进程）、把 pretrain 说成多进程
 
 **World size（进程组规模）**:
 参与训练的 rank 总数（torchrun ``--nproc_per_node`` 语义）；续训状态的 world_size 契约对账拒绝跨拓扑恢复。词条随 ADR-0018 退役（同 rank 词条口径）；async 执行序的拓扑对账字段 = `slots`（协程数，卡数不进对账，#218/#222），payload 无 world_size 键。
 
 **FSDP full-shard（全分片）**:
-可训练网络的参数/梯度/优化器状态按 rank 切分、前向按需重组的数据并行方式；梯度 allreduce 保证各 rank 权重同步（ADR-0003：同构 rank、无角色划分）。
+可训练网络的参数/梯度/优化器状态按 rank 切分、前向按需重组的数据并行方式；梯度 allreduce 保证各 rank 权重同步（ADR-0003：同构 rank、无角色划分）。词条随 #242 退役：执行模型 = 单进程多卡 per-card 完整副本（PolicySharding 本体删除），仓内无存活实现。
 
 **每卡判别器副本（per-card discriminator replica）**:
 判别器不参与分片的执行口径：每卡完整副本（deepcopy 逐位复制），跨卡一致性由「同初始化 + 确定性梯度 allreduce SUM + 同步 optimizer.step + 步末 u/v broadcast」结构性承载——DDP wrapper 已随 #238 删除（#234 解耦 RL 构造点后无构造点残留）；归约编排 = 主控单点（M1 形态，RL 侧 DiscriminatorPhase / 预训练同构）。
 _Avoid_: 判别器分片、DDP（本仓已无 wrapper）、各卡独立更新判别器
 
 **Rank-sliced pool（真实样本库切片）**:
-Real sample pool 按**活动条件集**分层的条带切片（每条件 entries[rank::world]），各 rank 判别器 real 侧只见本切片；条件集经装配注入（#129：BraTS = 四序列、MR-RATE = 词表条件集，代码内不设四序列副本）；held-out real 不切（out-of-sample 监控保持全量）。
+Real sample pool 按**活动条件集**分层的条带切片（每条件 entries[rank::world]），各 rank 判别器 real 侧只见本切片；条件集经装配注入（#129：BraTS = 四序列、MR-RATE = 词表条件集，代码内不设四序列副本）；held-out real 不切（out-of-sample 监控保持全量）。词条随 #242 退役：real 侧 = 主控全局无放回抽取（RankSlicedPool 本体删除），仓内无存活实现。
 
 **Resume generation marker（续训代际标记）**:
 全部 rank 分片均已持久化到同一 iteration 的提交记录（resume_generation.json，save 的 barrier 之后由 rank 0 写出）；恢复对账标记代际、混代际分片（保存中途崩溃现场）显式拒绝——各 rank 必须从同一 iteration 继续。词条随 #236 async 执行序退役：新执行序单文件分片 tmp + os.replace 原子写（写成功即一致、崩溃留旧代际完整可用），marker 提交语义冗余、整体退役；旧执行序（v11 ResumeStore）已随 #226 切换期第一步删除，本语义在仓内无任何存活实现。
@@ -227,7 +227,7 @@ _Avoid_: 把 marker 当 async 序的机制（新执行序无此概念，跨执�
 iter 事件写出的排序轴承诺——同一 iteration 的 N 条按调度槽号升序连续排列，无重复、无丢失、顺序稳定。async 执行序 = 单点写者（门面主线程）两档 flush：iter 族缓冲到 iteration 边界、按 (iteration, slot) 排序后单点写；告警族（barrier_timeout_alert / weight_divergence_alert / overfit_alert）产生即写。预训练相（ADR-0018）= 主控唯一写者：步内 pretrain 事件先直写、告警后按卡序追加（写出序 = 步序 + 步内 pretrain 先于告警）。EventMerger 本体已随 #238 删除（旧执行序衰减窗口内单事件直写——world-1 与归并器逐事件追加逐位同形）。
 
 **World-1 degeneration（world-1 恒等退化）**:
-单进程 = world size 1 的退化实现：不初始化进程组、集合通信原语恒等（barrier/gather 直接返回），训练循环对单进程/分布式走同一条执行序。
+单进程 = world size 1 的退化实现：不初始化进程组、集合通信原语恒等（barrier/gather 直接返回），训练循环对单进程/分布式走同一条执行序。词条随 #242 退役：单进程恒等退化实现（DistributedContext 本体）删除，「分布式/单进程同一条执行序」的旧口径不再存在——执行序恒为单进程多卡。
 _Avoid_: 单机模式（单机也可多进程）
 
 **分片自持（Component-owned resume state）**:

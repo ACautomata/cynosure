@@ -18,34 +18,19 @@ class TestFixtureConfig:
         config = Fixture().config(tmp_path)
         assert isinstance(config, CynosureConfig)
 
-    def test_fixture_config_passes_schema_for_all_three_groups(
+    def test_fixture_config_passes_schema_for_both_groups(
         self, tmp_path: Path,
     ) -> None:
-        """三组配置矩阵走同一 config schema（issue #23 验收「测试面 #4 绿」
-        的 fixture 面）：组1/组2/组3 的 fixture config 全字段校验通过。"""
-        for group in ("modal-label", "cross-modal", "sequential"):
-            config = Fixture().config(tmp_path, group=group)  # type: ignore[arg-type]
+        """实验组配置矩阵走同一 config schema（issue #23 验收「测试面
+        #4 绿」的 fixture 面）：组1/组2 的 fixture config 全字段校验通过。"""
+        for group in ("modal-label", "cross-modal"):
+            config = Fixture().config(tmp_path, group=group)
             assert config.experiment.group == group
-
-    def test_sequential_fixture_config_binds_stage2_report(
-        self, tmp_path: Path,
-    ) -> None:
-        """组3 fixture config 的 stage-2 报告绑定（#116）：指向工件库序贯
-        变体的第二份预训练产物（cross-modal 报告）；非序贯组不携带绑定。"""
-        config = Fixture().config(tmp_path, group="sequential")
-        assert config.experiment.stage2_pretrain_report_json == (
-            tmp_path / "pretrain_run_stage2" / "pretrain_report.json"
-        )
-        assert (
-            Fixture().config(tmp_path, group="cross-modal")
-            .experiment.stage2_pretrain_report_json
-            is None
-        )
 
     def test_cross_modal_fixture_config_carries_controlnet_artifacts(
         self, tmp_path: Path,
     ) -> None:
-        """组2/组3 config 携带 ControlNet 工件对（ckpt + 网络配置 JSON，
+        """组2 config 携带 ControlNet 工件对（ckpt + 网络配置 JSON，
         schema 强制）。"""
         config = Fixture().config(tmp_path, group="cross-modal")
         assert config.artifacts.controlnet_ckpt == tmp_path / "controlnet.pt"

@@ -279,20 +279,13 @@ class Fixture:
     ) -> CynosureConfig:
         """合法的缩小版全量 config（schema 全字段通过；CPU 全循环可跑）。
 
-        ``group`` 选实验组（三选一）；组2/组3 的 config 携带 ControlNet
+        ``group`` 选实验组（二选一）；组2 的 config 携带 ControlNet
         工件对（schema 强制），组1 携带亦无害（modal-label 训练不消费）。
-        组3 另携带 stage-2 报告绑定（#116，schema 必填）：指向工件库序贯
-        变体的第二份预训练产物（cross-modal 报告，``FixtureArtifactLibrary``
-        真跑 pretrain driver 产出）。
         ``dataset`` 选数据域（#127）：BraTS2023（默认，条件语义 = 四序列
         常量）或 MR-RATE（条件词汇表 = fixture 小词汇表工件，schema 强制
         ``condition_vocabulary_json`` 绑定；生产工件为 11 条件全量）。
         MR-RATE 线只定义组1。"""
         experiment: dict = {"group": group, "dataset": dataset}
-        if group == "sequential":
-            experiment["stage2_pretrain_report_json"] = str(
-                artifacts_dir / "pretrain_run_stage2" / "pretrain_report.json",
-            )
         artifacts: dict = {
             "unet_ckpt": str(artifacts_dir / "unet.pt"),
             # VAE 工件对：里程碑解码评测与 Baseline/重采的解码装配源
@@ -301,7 +294,7 @@ class Fixture:
             "net_config_json": str(artifacts_dir / "unet_config.json"),
             "modality_mapping_json": str(artifacts_dir / "modality_mapping.json"),
             "dataset_root": str(artifacts_dir / "dataset"),
-            # ControlNet 工件与 write_artifacts 同构：组2/组3 的 policy 装配源
+            # ControlNet 工件与 write_artifacts 同构：组2 的 policy 装配源
             "controlnet_ckpt": str(artifacts_dir / "controlnet.pt"),
             "controlnet_config_json": str(artifacts_dir / "controlnet_config.json"),
             # 判别器工件与 write_artifacts 同构：fixture 打分/在线更新装载源

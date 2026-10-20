@@ -39,7 +39,6 @@ import torch
 from pydantic import BaseModel, ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
-from cynosure.distributed import DistributedContext
 from cynosure.eval.mr_fid import MrFidConfig, MrFidInstrument
 from cynosure.eval.real_real_floor import (
     DEFAULT_PATH_TEMPLATE,
@@ -184,23 +183,12 @@ class CynosureCli:
     def _train(self, args: argparse.Namespace, config: CynosureConfig) -> int:
         # 单进程多卡执行序（#217/#226）：多进程拓扑属已退役的旧执行序，
         # 拒绝在 run 目录预占之前（usage 错误不落任何工件）
-        env_rank = DistributedContext.env_rank()
+        env_rank = AsyncTrainingExecutor.env_rank()
         if env_rank is not None:
             print(
                 f"train 以单进程多卡执行（async 执行序），"
                 f"拒绝 torchrun 启动（RANK={env_rank}）——进程内多卡由"
                 "设备发现承担（CUDA_VISIBLE_DEVICES 裁剪卡集）",
-                file=self._stderr,
-            )
-            return _EXIT_USAGE_ERROR
-        if config.experiment.group == "sequential":
-            # 组3 序贯两阶段编排是旧执行序组件（SequentialTrainer，随
-            # 切换期退役）：新执行序为单阶段门面，两阶段由两次独立 run
-            # 衔接（stage-1 产物 checkpoint 经 config 工件路径装配）
-            print(
-                "组3（sequential）的序贯两阶段编排已随旧执行序退役："
-                "请分别以组1（modal-label）与组2（cross-modal）run 执行，"
-                "stage-1 产物 checkpoint 经 config 工件路径衔接",
                 file=self._stderr,
             )
             return _EXIT_USAGE_ERROR
@@ -632,7 +620,7 @@ class CynosureCli:
         恰好退役的 RANK env 守卫在本票恢复）——执行模型已单进程多卡化，
         进程内多卡由设备发现承担、多进程拓扑退役；拒绝在 run 目录
         预占之前（usage 错误不落任何工件）。"""
-        env_rank = DistributedContext.env_rank()
+        env_rank = AsyncTrainingExecutor.env_rank()
         if env_rank is not None:
             print(
                 f"pretrain 以单进程多卡执行（ADR-0018），"

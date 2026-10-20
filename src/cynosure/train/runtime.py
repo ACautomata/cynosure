@@ -1,48 +1,27 @@
-"""一次装配的训练运行时（spec #15「一次装配 = 一个组的一个阶段」的
-组件组 Facade）。
+"""公开装配缝的命名空间（train / pretrain driver / async 门面共用的
+单一装配来源）。
 
-config 驱动的装配产物收敛：policy 侧（GroupPolicy）、判别器侧
-（RewardCoordinator）、逐 k 更新（StepwisePolicyUpdate）、rollout 相
-（RolloutPhase）、四条命名 RNG 流（TrainingRngStreams——RNG 侧唯一
-注册对象，归本聚合层持有；装配缝与续训状态枚举一律经它取流，无裸
-dict 第二载体，#218/#230）、数值口径（AmpContext，定义在
-policy/numerics——train 与 eval 共用的 import 环安全位，此处
-re-export 保持既有消费面）与分布式运行时（DistributedContext）。
-执行序门面只面对本 Facade 的静态装配缝编排，装配细节（含分布式包装）
-不进循环代码路径。
+config 驱动的装配单点收敛：条件词汇表（``assemble_vocabulary``）、
+采样封装与 σ 日程（``assemble_sampler`` / ``assemble_schedules``）、
+前向激活预算（``forward_activation_budget``）、real pool 守卫装载
+（``assemble_real_pool``）、判别器更新批装配原语
+（``assemble_pair_assembler``）、判别器 scorer 权重来源分派
+（``assemble_scorer``）与数值口径（``amp_context``——定义在
+policy/numerics，此处 re-export 保持既有消费面）。「无第二套装配逻辑」
+由本类承载：新执行序门面（``AsyncTrainingExecutor``）与预训练 driver
+（``PretrainDriver.build``）都只面对这些缝编排，装配细节不进循环
+代码路径。
 
-聚合面口径（ADR-0014 平移先行，#230）：本 Facade 是续训聚合层——
-长寿命协作者由本层持有注册；「任务无自持状态」档为空（任务是协程跑
-的短寿命对象，无状态长于其上，#222 spec 明文），不为骨架期任务建
-注册面。骨架期 RNG 注册表 per-槽实例化（#218）即在本层持有的注册
-对象载体上进行。
-
-分布式装配点（ADR-0003，仅 torchrun 多进程下生效、单进程恒等）：
-- seed 的 rank 派生（各 rank 数据流独立；rank 0 恒等 = 单进程等价前提）；
-- 可训练网络 FSDP full-shard + 梯度检查点（PolicySharding，optimizer
-  构建于分片后参数之上）；
-- 判别器不再 DDP 化（ReplicatedDiscriminator 已随 #238 pretrain driver
-  期收口删除——#234 解耦 RL 构造点后无任何构造点残留）+ Real sample
-  pool 切片（RankSlicedPool；held-out 不切）。
-
-``build`` 是旧执行序（torchrun 多进程 trainer）的装配入口，其唯一
-消费者已随 #226 切换期第一步退役——本方法现为零入口死代码，与
-DistributedContext 控制面残余一并待切换期第二步（#242 全删除面）
-删除；静态装配缝（``assemble_*``）为新执行序活跃消费面。
+旧执行序（torchrun 多进程 trainer）的装配入口（``build``）与其分布式
+装配面（seed rank 派生 / FSDP 分片 / pool 切片）已随 #226 切换期第二步
+（#242 全删除面）删除——执行模型 = async 单进程多卡（每卡完整副本 +
+主控单点 allreduce + 同步 step），跨卡一致性由执行序自身编排。
 """
-
-from collections.abc import Callable
 
 import torch
 
 from cynosure.conditions import ConditionVocabulary
 from cynosure.config import CynosureConfig
-from cynosure.distributed import (
-    DistributedContext,
-    PolicySharding,
-    RankSlicedPool,
-)
-from cynosure.grpo import ClippedPolicyLoss, StepwisePolicyUpdate
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.policy.field import VelocityField
 from cynosure.policy.kernel import SdeKernel
@@ -60,133 +39,14 @@ from cynosure.policy.schedules import (
 from cynosure.pretrain.artifacts import PretrainReport
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
 from cynosure.reward.assembly import ReconstructionAssembler
-from cynosure.reward.auc import HeldOutAuc
-from cynosure.reward.overfit import OverfitMonitor
-from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import RewardScorer
-from cynosure.reward.update import OnlineUpdate
-from cynosure.train.artifacts import RunArtifacts
-from cynosure.train.policy import GroupPolicy
-from cynosure.train.rewards import RewardCoordinator
-from cynosure.train.rollout import ConditionSampler, RolloutPhase
-from cynosure.train.rng import TrainingRngStreams
+from cynosure.train.rollout import ConditionSampler
 
 __all__ = ["AMP_DTYPES", "AmpContext", "TrainingRuntime"]
 
 
 class TrainingRuntime:
-    """一次装配的运行时组件组（trainer 循环的协作者容器 + 分布式装配点）。"""
-
-    def __init__(
-        self,
-        config: CynosureConfig,
-        policy: GroupPolicy,
-        rewards: RewardCoordinator,
-        updater: StepwisePolicyUpdate,
-        rollout: RolloutPhase,
-        rng: TrainingRngStreams,
-        amp: AmpContext,
-        dist: DistributedContext,
-    ) -> None:
-        self.config = config
-        self.policy = policy
-        self.rewards = rewards
-        self.updater = updater
-        self.rollout = rollout
-        self.rng = rng
-        self.amp = amp
-        self.dist = dist
-
-    @classmethod
-    def build(
-        cls,
-        config: CynosureConfig,
-        run_artifacts: RunArtifacts,
-        *,
-        device: torch.device | None = None,
-        dist_context: DistributedContext | None = None,
-        resume: bool = False,
-    ) -> "TrainingRuntime":
-        """config 驱动装配：单进程与分布式同一条装配序，分布式包装点
-        （FSDP/DDP/切片/归并/seed 派生）在 world-1 下恒等。
-
-        ``resume=True`` 时跳过 warm-start 报告装载：续训状态分片已含
-        判别器全量状态（权重与 optimizer 恢复时整体覆写），报告在
-        resume 路径无消费价值——强制装载会让预训练产物被清理的中断
-        run 永不可恢复；判别器占位装配走冷启动随机初始化路径，恢复即
-        覆写（resume 模块「装配期随机性被整体覆写」的既有语义）。"""
-        dist = dist_context if dist_context is not None else DistributedContext.bootstrap()
-        # seed 的 rank 派生：数据侧流的演化各 rank 独立（rollout 数据
-        # 多样性来源）；rank 0 恒等偏移 = world-1 与单进程逐位一致的等价性
-        # 前提。recon 流除外（shared_seed = 未派生原 seed）：s 抽样的调用
-        # 结构是 FSDP 集合序列的一部分，必须跨 rank 一致——判别器冷启动
-        # 初始化同理不经派生（跨 rank 一致初始权重，装配内 fork_rng）。
-        # 流注册表（TrainingRngStreams）按名保存/恢复续训状态；装配期
-        # 各消费面直接经注册对象取流（无裸 dict 中转，#218「领域命名
-        # 注册对象」归本聚合层）。
-        streams = TrainingRngStreams(
-            dist.derive_seed(config.schedule.seed),
-            shared_seed=config.schedule.seed,
-        )
-        # 设备默认 = 本 rank 计算设备（cuda:LOCAL_RANK）：未索引 "cuda"
-        # 会让各 rank 都把网络建到 GPU 0，与 FSDP/DDP 包装的 device_id
-        # （cuda:LOCAL_RANK）错位；CPU fixture 下即 cpu
-        amp = cls.amp_context(
-            config,
-            device if device is not None else dist.local_device(),
-        )
-        sharding = PolicySharding.from_config(dist, config)
-        # FSDP 包装在 optimizer 构建之前（优化器状态活在分片后参数上）
-        policy = GroupPolicy.build(
-            config, streams.rollout, amp.device, sharding=sharding,
-        )
-        # 分块上限的 rank 一致化（#165 review P1）：分布式下 rollout 续跑
-        # 的前向调用次数必须跨 rank 一致（FSDP 集合序列绑定调用次数），
-        # 注入全 rank 取最小；单进程恒等 None（本地预算直接生效）
-        sampler = cls.assemble_sampler(
-            config, policy.field, device=amp.device,
-            chunk_sync=(
-                dist.all_reduce_min if dist.distributed else None
-            ),
-        )
-        rewards = cls.assemble_rewards(
-            config, amp, streams, dist,
-            report=(
-                None if resume
-                else PretrainReport.load(config.reward.pretrain_report_json)
-            ),
-            resume=resume,
-            sampler=sampler,
-            conditions=policy.conditions,
-        )
-        updater = StepwisePolicyUpdate(
-            sampler=sampler,
-            optimizer=policy.optimizer,
-            loss=ClippedPolicyLoss(clip_range=config.policy.ratio_clip),
-            device_type=amp.device_type,
-            amp_dtype=amp.dtype,
-        )
-        rollout = RolloutPhase(
-            config,
-            sampler,
-            rewards.update.scorer,
-            streams.rollout,
-            condition_sampler=policy.conditions,
-            vocabulary=cls.assemble_vocabulary(config),
-            device_type=amp.device_type,
-            autocast_dtype=amp.dtype,
-            device=amp.device,
-        )
-        return cls(
-            config=config,
-            policy=policy,
-            rewards=rewards,
-            updater=updater,
-            rollout=rollout,
-            rng=streams,
-            amp=amp,
-            dist=dist,
-        )
+    """公开装配缝的命名空间（train / pretrain driver / async 门面共用）。"""
 
     @classmethod
     def assemble_vocabulary(cls, config: CynosureConfig) -> ConditionVocabulary:
@@ -201,19 +61,15 @@ class TrainingRuntime:
         config: CynosureConfig,
         field: VelocityField,
         device: "torch.device | None" = None,
-        chunk_sync: "Callable[[int], int] | None" = None,
     ) -> RolloutSampler:
         """policy 采样封装装配（日程表 + 本组采样场 + SDE 核）。
 
-        公开装配缝：train 运行时与预训练 driver（单进程 world-1 语境）
-        共用同一份装配代码——采样日程/核参数的调整单点生效。
+        公开装配缝：async 门面（在线 train）与预训练 driver 共用同一份
+        装配代码——采样日程/核参数的调整单点生效。
 
         ``device`` 参与前向激活预算解析（``forward_activation_budget``）：
         config 显式值优先、缺省按设备总显存自动探测；无 CUDA 设备
-        （CPU fixture 口径）回落默认常量。``chunk_sync`` 是分块上限的
-        rank 一致化回调——分布式 build 注入 ``dist.all_reduce_min``
-        （#165 review P1：FSDP 集合序列绑定前向调用次数）；单进程语境
-        缺省 None，本地预算直接生效。"""
+        （CPU fixture 口径）回落默认常量。"""
         policy = config.policy
         kernel = SdeKernel(eta=policy.sde_eta, s_max=policy.sde_s_max)
         return RolloutSampler(
@@ -221,7 +77,6 @@ class TrainingRuntime:
             forward_activation_budget=cls.forward_activation_budget(
                 config, device,
             ),
-            chunk_sync=chunk_sync,
         )
 
     @classmethod
@@ -267,135 +122,26 @@ class TrainingRuntime:
         )
 
     @classmethod
-    def assemble_rewards(
-        cls,
-        config: CynosureConfig,
-        amp: AmpContext,
-        rng: TrainingRngStreams,
-        dist: DistributedContext,
-        report: PretrainReport | None = None,
-        *,
-        resume: bool = False,
-        sampler: RolloutSampler | None = None,
-        conditions: ConditionSampler | None = None,
-    ) -> RewardCoordinator:
-        """判别器侧装配：网络构建 → pool 切片（real 侧；held-out 不切）
-        → 配对批装配原语 / Online update / AUC 协作者。
-
-        公开装配缝：**旧执行序 trainer 的装配缝**（新执行序门面经
-        小装配缝自行组装、预训练 driver 经 ``PretrainDriver.build``
-        组装）——「无第二套判别器训练逻辑」在装配层同样成立。
-        ``rng`` 收命名注册对象本体（TrainingRngStreams，#218 禁裸容器
-        ——各协作者经它取各自的专属流）。
-
-        **判别器无 DDP**（#234 解耦 + #238 本体删除）：Replicated
-        Discriminator 已退役——新执行序梯度 allreduce SUM + 步末
-        u/v broadcast 的全卡一致由执行序自身编排。
-
-        ``sampler`` + ``conditions``（policy 侧依赖，须成对提供）驱动
-        判别器更新批装配原语（ADR-0012 唯一新缝）的组装——两阶段供给
-        点（预训练 driver / 在线 trainer）经本缝获得同一原语形态；组别
-        守卫在组装缝（同源重构仅组 1 有语义，ADR-0012 非目标：跨模态
-        阶段需要（源影像, 目标标签）配对条件化）。
-
-        权重来源按语境三分：``report`` 给定（train 新 run 语境）=
-        warm-start 守卫重载（数据口径指纹对照 → 形态指纹对照 → 报告
-        checkpoint 严格装载，ADR-0007——RL 不带预训练产物在装配层就
-        无法启动）；``report=None`` + ``resume=False`` = 冷启动路径
-        （``discriminator_ckpt`` 工件装载或随机初始化，消费方 = 预训练
-        driver——预训练本身即产物的生产方）；``resume=True`` = 占位
-        装配（不消费任何 checkpoint 工件，纯随机初始化——续训分片已含
-        判别器全量状态，占位权重被 ``ResumeStore.restore`` 整体覆写；
-        ``discriminator_ckpt`` 即便指向预训练目录，产物清理也不再阻断
-        续训）。"""
-        if report is not None and resume:
-            # 矛盾组合（带报告装配的恢复）显式拒绝：两来源权重同时
-            # 声明时以谁为准的歧义不许静默消解（build 层恒传
-            # report=None + resume=True，本守卫是 API 层的组合态收口）
-            raise ValueError(
-                "assemble_rewards 的 report 与 resume 互斥：warm-start 守卫"
-                "重载（新 run）与占位装配（续训恢复）是互斥语境"
-            )
-        if config.artifacts.discriminator_config_json is None:
-            raise ValueError(
-                "判别器网络配置缺失（discriminator_config_json）：判别器"
-                "网络构建的统一前提——warm-start 守卫重载（train 新 run）、"
-                "预训练 driver 冷启动、resume 占位装配均经它构建网络"
-                "（ADR-0007 后 train 侧不再有冷启动装配源，"
-                "discriminator_ckpt 仅预训练 driver 冷启动消费）"
-            )
-        scorer = cls.assemble_scorer(config, report, resume=resume)
-        scorer.to(amp.device)  # 单点递归迁移：判别器参数 + 统计量 buffer
-        # real 池装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：逐条件容量
-        # ≥ K×world_size——条带切片后每 rank 视图 ≥ K 的等价条件，判定放
-        # 全量保失败路径全 rank 一致（RankSlicedPool 切片前校验同款理由）；
-        # 条件集 = 本域条件名清单（#129 经词汇表装配注入）；切片视图供
-        # RealPoolSampler 消费（分布式 = 本 rank 条带切片，单进程 = 全池恒等）
-        vocabulary = cls.assemble_vocabulary(config)
-        real_pool = cls.assemble_real_pool(
-            config, vocabulary, dist.world_size,
-        )
-        heldout_real = LatentManifest.load(
-            config.reward.heldout_real_manifest, kind="heldout_real",
-        )
-        # 逐条件形状契约与活动词汇表的装配期对照（#129 消费侧守卫）：
-        # fake 侧形状经 vocabulary.latent_shape(name) 解析、real 侧经
-        # manifest 的 condition_latent_shapes 装载，两来源同名异形（词表
-        # 工件改动而 manifest 未重建）此前只在首次判别器拼接时才炸——
-        # 装配期显式拒绝（held-out 侧同款：分簇/AUC 的 real 侧同源；
-        # real 侧的对照在 assemble_real_pool 内）
-        heldout_real.assert_condition_shapes(vocabulary)
-        real_view = RankSlicedPool(real_pool, dist, vocabulary.names()).view()
-        update = OnlineUpdate(
-            scorer=scorer,
-            config=config.reward,
-        )
-        auc = HeldOutAuc(
-            heldout_manifest=heldout_real,
-            scorer=scorer,
-            generator=rng.heldout_auc,
-            device=amp.device,
-        )
-        return RewardCoordinator(
-            update, auc,
-            overfit=OverfitMonitor(
-                config.reward, conditions=vocabulary.names(),
-            ),
-            assembler=cls.assemble_pair_assembler(
-                config,
-                real_sampler=RealPoolSampler(
-                    real_view, rng.real_pool, amp.device,
-                ),
-                sampler=sampler,
-                conditions=conditions,
-                generator=rng.recon,
-                amp=amp,
-            ),
-        )
-
-    @classmethod
     def assemble_real_pool(
         cls,
         config: CynosureConfig,
         vocabulary: ConditionVocabulary,
-        world_size: int,
+        card_count: int,
     ) -> LatentManifest:
-        """real sample pool manifest 的装载与守卫单点（两执行序共用装配
-        缝）：装载 → 逐条件容量守卫（全量 ≥ K × ``world_size``）→ 逐条件
-        形状契约对照（#129 消费侧守卫）。
+        """real sample pool manifest 的装载与守卫单点（async 门面与预训练
+        driver 共用的装配缝）：装载 → 逐条件容量守卫（全量 ≥ K ×
+        ``card_count``）→ 逐条件形状契约对照（#129 消费侧守卫）。
 
-        ``world_size`` = 守卫的需量倍数，按执行序的 real 侧数据访问形态
-        取值：旧执行序条带切片（``entries[rank::world]``）下「每 rank 视图
-        ≥ K」的等价条件 = K × world_size（判定放全量保失败路径全 rank
-        一致，ADR-0008 决策 4 / ADR-0008-03）；async 执行序判别器链期
-        （#234）real 侧窗口起点全局无放回抽取——窗口单条件最大需求上界
-        = K × 卡数（#220 决议 9/10），需量倍数传卡数。无放回采样语义
-        不动，不引入有放回采样补洞。"""
+        ``card_count`` = 守卫的需量倍数 = 本执行序的计算卡数：real 侧
+        窗口起点全局无放回抽取（#234 判别器链期），窗口单条件最大需求
+        上界 = K × 卡数（#220 决议 9/10）。判定放全量保失败路径全卡一致
+        （ADR-0008 决策 4 / ADR-0008-03）。无放回采样语义不动，不引入
+        有放回采样补洞。"""
         real_pool = LatentManifest.load(
             config.reward.real_pool_manifest, kind="real_pool",
         )
         real_pool.assert_condition_capacity(
-            config.reward.disc_batch_size_k, world_size,
+            config.reward.disc_batch_size_k, card_count,
             vocabulary.names(),
         )
         real_pool.assert_condition_shapes(vocabulary)
@@ -405,7 +151,6 @@ class TrainingRuntime:
     def assemble_pair_assembler(
         cls,
         config: CynosureConfig,
-        real_sampler: RealPoolSampler | None,
         sampler: RolloutSampler | None,
         conditions: ConditionSampler | None,
         generator: torch.Generator,
@@ -422,17 +167,10 @@ class TrainingRuntime:
         无源影像（ADR-0012 非目标，stage-2 到来时另行设计）——机制缝本
         票照常对组2 开放（机械链路可行），判别任务语义留待专项票。
 
-        ``real_sampler`` 两态：旧执行序与预训练 driver = 本 rank 条带
-        切片采样器（经 ``assemble_rewards``，real 侧内部自采）；async
-        执行序（#234 判别器链期）= None 供给语义——real 由判别器窗口
-        起点全局无放回抽取（``WindowRealDraw``）经任务注入，装配原语
-        只承担 fake 构造（``reconstruct_assigned``）；两态共用同一
-        fake 构造核（ADR-0012 两阶段同原语的窗口化延伸）。
-
-        两执行序共用 fake 构造核：旧执行序/pretrain 经 ``assemble``
-        全批入口；async 执行序经 per-槽装配的消费（fake 侧 = 槽 recon
-        流，#218 五处消费面注入面零改动口径、#232 rollout 相重构任务）
-        与 ``reconstruct_assigned`` 供给入口。"""
+        real 侧 = 窗口起点全局无放回抽取（``WindowRealDraw``）经任务
+        注入（#234 判别器链期），装配原语只承担 fake 构造
+        （``reconstruct_assigned``，fake 侧 = 槽 recon 流，#218 五处
+        消费面注入面零改动口径、#232 rollout 相重构任务）。"""
         if (sampler is None) != (conditions is None):
             raise ValueError(
                 "配对批装配原语的 policy 侧依赖须成对提供：sampler 与 "
@@ -442,7 +180,6 @@ class TrainingRuntime:
         if sampler is None:
             return None
         return ReconstructionAssembler(
-            real_sampler=real_sampler,
             sampler=sampler,
             schedules=cls.assemble_schedules(config),
             conditions=conditions,
@@ -460,7 +197,11 @@ class TrainingRuntime:
         *,
         resume: bool = False,
     ) -> RewardScorer:
-        """判别器 scorer 的权重来源分派（公开装配缝，见 ``assemble_rewards``；async 门面新 run 语境同口径消费）。"""
+        """判别器 scorer 的权重来源分派（公开装配缝）：train 新 run =
+        warm-start 守卫重载（``report`` 给定）；预训练 driver 冷启动 =
+        ``report=None`` + ``resume=False``（``discriminator_ckpt`` 工件
+        装载或随机初始化）；async 门面续训恢复 = ``resume=True`` 占位
+        （不消费任何 checkpoint 工件，随机初始化被恢复整体覆写）。"""
         if report is not None:
             # warm-start 守卫链：数据口径指纹 → 形态指纹 → 严格装载
             # （任一不符在装配期拒绝，CLI 层回滚 run 目录）
@@ -493,7 +234,7 @@ class TrainingRuntime:
         config: CynosureConfig, device: torch.device,
     ) -> AmpContext:
         """数值口径的装配单点（amp_dtype → ``AmpContext`` 的同形构造
-        单点：本类 ``build`` 与 async 门面的副本/槽装配三处共享）。"""
+        单点：async 门面的副本/槽装配共用）。"""
         return AmpContext(
             device=device, dtype=AMP_DTYPES[config.policy.amp_dtype],
         )

@@ -1,5 +1,5 @@
 """config schema 校验测试：配置项清单全量字段落 schema、状态标注完备、
-定死值不可改、跨字段定死语义（数值锚、奇异端、组2/组3 ControlNet）。"""
+定死值不可改、跨字段定死语义（数值锚、奇异端、组2 ControlNet）。"""
 
 import copy
 import json
@@ -62,18 +62,17 @@ class TestValidConfigs:
         assert config.schedule.checkpoint_interval == 10
         # 日程默认面与生产守卫自洽（纯默认即合法）：N_baseline /
         # max_iterations 缺省 = 生产口径下界，milestone_eval_samples
-        # 缺省 12 = 组2/组3 词汇表宽（K ≥ 词汇表守卫全组生效）
+        # 缺省 12 = 组2 词汇表宽（K ≥ 词汇表守卫全组生效）
         assert config.schedule.baseline_samples == 200
         assert config.schedule.max_iterations == 200
         assert config.schedule.milestone_eval_samples == 12
-        assert config.sharding.strategy == "fsdp"
         # 部署行（orchestration + ADR-0005）：单实例 4 卡、产物根在持久分区下
         assert config.deployment.nproc_per_node == 4
         assert config.deployment.output_root == Path("/root/private_data/cynosure")
 
     def test_default_schedule_validates_for_every_group(self) -> None:
-        """纯默认 schedule（只填 seed）在三组全合法——默认面与生产守卫
-        自洽：milestone_eval_samples 缺省 12 覆盖组1 四序列与组2/组3
+        """纯默认 schedule（只填 seed）在两组全合法——默认面与生产守卫
+        自洽：milestone_eval_samples 缺省 12 覆盖组1 四序列与组2
         12 有序对（亦覆盖 MR-RATE 11 条件的装配期同款下界），N_baseline /
         max_iterations 缺省即生产口径。默认 config 不应撞上自己的 schema
         守卫（#123 首跑曾以缩小值踩中同类拒绝、train 集体 exit 2）。"""
@@ -83,19 +82,11 @@ class TestValidConfigs:
                 "controlnet_ckpt": "ckpts/controlnet.pt",
                 "controlnet_config_json": "configs/controlnet.json",
             },
-            "sequential": {
-                "controlnet_ckpt": "ckpts/controlnet.pt",
-                "controlnet_config_json": "configs/controlnet.json",
-            },
         }
         for group, extra_artifacts in group_artifacts.items():
             data = copy.deepcopy(MINIMAL_CONFIG_DICT)
             data["experiment"]["group"] = group
             data["artifacts"].update(extra_artifacts)
-            if group == "sequential":  # stage-2 报告绑定（#116 schema 必填）
-                data["experiment"]["stage2_pretrain_report_json"] = (
-                    "pretrain_run_stage2/pretrain_report.json"
-                )
             config = CynosureConfig.model_validate(data)
             assert config.schedule.milestone_eval_samples == 12
             assert config.schedule.baseline_samples == 200
@@ -327,17 +318,18 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert "gradient_checkpointing" in str(exc_info.value.errors())
 
-    def test_retired_sharding_gradient_checkpointing_key_rejected(
+    def test_retired_sharding_section_rejected(
         self, valid_config_dict: dict,
     ) -> None:
-        """#233 退役键拒绝面：旧 run 快照的 ``sharding.gradient_checkpointing``
-        键装载即拒（extra_forbidden，无迁移 shim）——orchestration.md
-        退役声明口径的回归锚（旧 run 请从产物 checkpoint 重启新 run）。"""
+        """旧执行序分片面（``sharding`` 节，#233 已退役键面）整节随
+        #242 删除：旧 run 快照携带 ``sharding`` 节装载即拒（extra_
+        forbidden，无迁移 shim）——退役声明口径的回归锚（旧 run 请从
+        产物 checkpoint 重启新 run）。"""
         data = copy.deepcopy(valid_config_dict)
-        data["sharding"] = {"gradient_checkpointing": True}
+        data["sharding"] = {"strategy": "fsdp"}
         with pytest.raises(ValidationError) as exc_info:
             CynosureConfig.model_validate(data)
-        assert "gradient_checkpointing" in str(exc_info.value.errors())
+        assert "sharding" in str(exc_info.value.errors())
 
     def test_artifacts_declare_source_dataset_root(self, valid_config_dict: dict) -> None:
         """prepare 的输入 = 原始影像 + VAE：源数据集根目录是必填工件路径（experiment-design「real 样本库」）。"""
@@ -427,26 +419,6 @@ class TestRejection:
             CynosureConfig.model_validate(data)
         assert "milestone_eval_samples" in str(exc_info.value.errors())
 
-    def test_milestone_samples_cover_sequential_stage2_vocabulary(
-        self, valid_config_dict: dict,
-    ) -> None:
-        """组3 stage-2 词汇表 = 12 有序对（取两阶段词汇表最大值）。"""
-        data = copy.deepcopy(valid_config_dict)
-        data["experiment"]["group"] = "sequential"
-        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
-        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        # 先补齐 stage-2 报告绑定（#116 schema 必填）：缺绑定的错误在
-        # 字段层先行短路，会掩盖本用例针对的 milestone 词汇表错误
-        data["experiment"]["stage2_pretrain_report_json"] = (
-            "pretrain_run_stage2/pretrain_report.json"
-        )
-        data["schedule"]["milestone_eval_samples"] = 8
-        with pytest.raises(ValidationError) as exc_info:  # 显式 K=8 < 12 对
-            CynosureConfig.model_validate(data)
-        assert "milestone_eval_samples" in str(exc_info.value.errors())
-        data["schedule"]["milestone_eval_samples"] = 12
-        CynosureConfig.model_validate(data)
-
     def test_milestone_samples_within_baseline_manifest(
         self, valid_config_dict: dict,
     ) -> None:
@@ -517,7 +489,7 @@ class TestRejection:
         assert ("schedule", "max_iterations") in self._locations(exc_info.value)
 
     def test_cross_modal_requires_controlnet_ckpt(self, valid_config_dict: dict) -> None:
-        """组2/组3 的训练对象含 ControlNet：无 checkpoint 即拒绝。"""
+        """组2 的训练对象含 ControlNet：无 checkpoint 即拒绝。"""
         data = copy.deepcopy(valid_config_dict)
         data["experiment"]["group"] = "cross-modal"
         with pytest.raises(ValidationError) as exc_info:
@@ -530,10 +502,10 @@ class TestRejection:
         config = CynosureConfig.model_validate(data)
         assert config.experiment.group == "cross-modal"
 
-    def test_stage2_groups_require_controlnet_network_config(
+    def test_cross_modal_requires_controlnet_network_config(
         self, valid_config_dict: dict,
     ) -> None:
-        """组2/组3 的 ControlNet 装配源 = checkpoint + 网络配置 JSON 两者
+        """组2 的 ControlNet 装配源 = checkpoint + 网络配置 JSON 两者
         （netbuild 按 artifact 构建契约，与 UNet 同构）：缺网络配置即拒绝。"""
         data = copy.deepcopy(valid_config_dict)
         data["experiment"]["group"] = "cross-modal"
@@ -545,76 +517,21 @@ class TestRejection:
             for loc, msg in self._locations_with_messages(exc_info.value)
         )
 
-    def test_sequential_group_minimal_config(self, valid_config_dict: dict) -> None:
-        """组3 最小合法 config：stage1_run_dir 缺省 = 同一次运行内先跑 stage-1
-        （spec 配置项清单「组3 衔接」行的两个分支之一）；stage-2 报告绑定
-        必填（#116）——缺省即装载期拒绝，不静默继承 stage-1 报告。"""
-        data = copy.deepcopy(valid_config_dict)
-        data["experiment"]["group"] = "sequential"
-        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
-        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
-        with pytest.raises(ValidationError) as exc_info:  # 未绑定 stage-2 报告
-            CynosureConfig.model_validate(data)
-        assert ("experiment", "stage2_pretrain_report_json") in self._locations(
-            exc_info.value,
-        )
-        assert "stage2_pretrain_report_json" in str(
-            exc_info.value.errors()[0]["msg"],
-        )  # 指引配置面
-        assert "stage-1" in str(exc_info.value.errors()[0]["msg"])  # 指引继承面
-        data["experiment"]["stage2_pretrain_report_json"] = (
-            "pretrain_run_stage2/pretrain_report.json"
-        )
-        config = CynosureConfig.model_validate(data)
-        assert config.experiment.group == "sequential"
-        assert config.experiment.stage1_run_dir is None
-        assert config.experiment.stage2_pretrain_report_json == Path(
-            "pretrain_run_stage2/pretrain_report.json",
-        )
-
-    def test_stage2_report_binding_only_valid_for_sequential(
+    def test_sequential_group_value_rejected_at_schema(
         self, valid_config_dict: dict,
     ) -> None:
-        """stage-2 报告绑定只对组3 有语义：非序贯组携带即拒绝（与
-        stage1_run_dir 同款——拼错组名时静默绑定比显式拒绝危险）。"""
+        """组3（sequential）序贯两阶段编排属旧执行序（SequentialTrainer
+        随切换期第一步删除）：group Literal 二选一，schema 装载即拒
+        ——装载期显式拒绝把指引提前到 config 面，不静默只跑一段；两阶段
+        由组1 + 组2 两次独立 run 衔接（stage-1 产物 checkpoint 经
+        config 工件路径装配）。"""
         data = copy.deepcopy(valid_config_dict)
-        data["experiment"]["group"] = "cross-modal"
-        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
-        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 12 有序对
-        data["experiment"]["stage2_pretrain_report_json"] = (
-            "pretrain_run_stage2/pretrain_report.json"
-        )
-        with pytest.raises(ValidationError) as exc_info:
-            CynosureConfig.model_validate(data)
-        assert ("experiment", "stage2_pretrain_report_json") in self._locations(
-            exc_info.value,
-        )
-
-    def test_stage1_run_dir_only_valid_for_sequential(
-        self, valid_config_dict: dict,
-    ) -> None:
-        """既有 stage-1 产物路径只对组3 有语义：组1/组2 config 携带即拒绝
-        （拼错组名时静默跳过 stage-1 比显式拒绝危险）。"""
-        data = copy.deepcopy(valid_config_dict)
-        data["experiment"]["group"] = "modal-label"
-        data["experiment"]["stage1_run_dir"] = "runs/stage1"
-        with pytest.raises(ValidationError) as exc_info:
-            CynosureConfig.model_validate(data)
-        assert ("experiment", "stage1_run_dir") in self._locations(exc_info.value)
-
         data["experiment"]["group"] = "sequential"
-        data["artifacts"]["controlnet_ckpt"] = "ckpts/controlnet.pt"
-        data["artifacts"]["controlnet_config_json"] = "configs/controlnet.json"
-        data["schedule"]["milestone_eval_samples"] = 12  # 覆盖 stage-2 有序对
-        # 组3 config 须绑定 stage-2 报告（#116 schema 必填，本用例补齐后
-        # 验证 stage1_run_dir 的组3 合法形态）
-        data["experiment"]["stage2_pretrain_report_json"] = (
-            "pretrain_run_stage2/pretrain_report.json"
-        )
-        config = CynosureConfig.model_validate(data)
-        assert config.experiment.stage1_run_dir == Path("runs/stage1")
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("experiment", "group") in self._locations(exc_info.value)
+        assert "modal-label" in str(exc_info.value)
+        assert "cross-modal" in str(exc_info.value)
 
     def test_source_latent_scale_factor_default(self, valid_config_dict: dict) -> None:
         """组2 双条件之一：ControlNet 条件 = 源影像 latent × scale_factor；
@@ -854,7 +771,7 @@ class TestMrRateConditionVocabularyBinding:
         self, valid_config_dict: dict,
     ) -> None:
         """BraTS config 携带 MR 词汇工件即拒绝：拼错 dataset 时两套口径
-        静默共存比显式拒绝危险（同 stage1_run_dir 守卫哲学）。"""
+        静默共存比显式拒绝危险。"""
         data = copy.deepcopy(valid_config_dict)
         data["artifacts"]["condition_vocabulary_json"] = (
             "data/conditions/mrrate_conditions.json"
@@ -876,21 +793,14 @@ class TestMrRateConditionVocabularyBinding:
         assert "BraTS2023" in str(exc_info.value)
 
     def test_mrrate_supports_modal_label_only(self, valid_config_dict: dict) -> None:
-        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态/
-        序贯是 BraTS 语义）——非组1 携带即拒绝，防 BraTS 条件语义静默错位。
-        序贯分支补齐 stage-2 报告绑定（#116 字段层先行短路的同款处理），
-        让 dataset 守卫成为显式拒绝面。"""
-        for group in ("cross-modal", "sequential"):
-            data = self._mr_config_dict(valid_config_dict)
-            data["experiment"]["group"] = group
-            if group == "sequential":
-                data["experiment"]["stage2_pretrain_report_json"] = (
-                    "pretrain_run_stage2/pretrain_report.json"
-                )
-            with pytest.raises(ValidationError) as exc_info:
-                CynosureConfig.model_validate(data)
-            assert ("experiment",) in self._locations(exc_info.value)
-            assert "modal-label" in str(exc_info.value)
+        """MR-RATE 线只定义组1（地图 #67：上游无 MR ControlNet，跨模态
+        是 BraTS 语义）——非组1 携带即拒绝，防 BraTS 条件语义静默错位。"""
+        data = self._mr_config_dict(valid_config_dict)
+        data["experiment"]["group"] = "cross-modal"
+        with pytest.raises(ValidationError) as exc_info:
+            CynosureConfig.model_validate(data)
+        assert ("experiment",) in self._locations(exc_info.value)
+        assert "modal-label" in str(exc_info.value)
 
     def test_mrrate_json_roundtrip(self, valid_config_dict: dict) -> None:
         """工件绑定路径 dump → reload 逐位一致；BraTS dump 不含词汇

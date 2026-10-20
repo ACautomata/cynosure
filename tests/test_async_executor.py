@@ -520,6 +520,19 @@ class TestBarrierTimeoutPolicy:
         with pytest.raises(ValueError):
             BarrierTimeoutPolicy.from_env()
 
+    def test_env_non_integer_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """非整数分钟显式拒绝（解析单点 ``parse_timeout_minutes``）：部署
+        侧拼写错误静默回落默认会让 SothisAI 平台的长 watchdog 预期失效。"""
+        monkeypatch.setenv(BarrierTimeoutPolicy.ENV, "abc")
+        with pytest.raises(ValueError):
+            BarrierTimeoutPolicy.parse_timeout_minutes()
+        monkeypatch.setenv(BarrierTimeoutPolicy.ENV, "40")
+        assert BarrierTimeoutPolicy.parse_timeout_minutes() == 40
+        monkeypatch.delenv(BarrierTimeoutPolicy.ENV, raising=False)
+        assert BarrierTimeoutPolicy.parse_timeout_minutes() is None
+
     def test_explicit_construction_scales_soft(self) -> None:
         policy = BarrierTimeoutPolicy(hard_seconds=0.05)
         assert policy.soft_seconds == pytest.approx(0.025)
@@ -1067,7 +1080,6 @@ class TestDiscriminatorChainWindow:
         registry = SlotRngRegistry(config.schedule.seed, slots=1)
         manual_assembler = TrainingRuntime.assemble_pair_assembler(
             config,
-            real_sampler=None,
             sampler=TrainingRuntime.assemble_sampler(
                 config, policy.field, device=device,
             ),

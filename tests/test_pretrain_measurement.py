@@ -290,7 +290,7 @@ class TestMeasurementReconstruction:
     def test_reconstruction_matches_hand_computation(
         self, scenario: AssemblyScenario,
     ) -> None:
-        assembler = scenario.assembler(real_sampler=None)
+        assembler = scenario.assembler()
         holder = template(scenario, train_steps=(1, 2))
         volumes = 6
         plan = ShardPlan.split(volumes, 2)
@@ -319,7 +319,7 @@ class TestMeasurementReconstruction:
     ) -> None:
         """分段重构 ≡ 全量重构对应行（逐位）：重构逐样本独立 + σ/ε 按
         全量位次对齐——多卡测量批拼接后与单卡全量测量逐位一致。"""
-        assembler = scenario.assembler(real_sampler=None)
+        assembler = scenario.assembler()
         volumes = 6
         reals = torch.randn(volumes, *SHAPE)
         full = template(scenario).draw(

@@ -273,7 +273,7 @@ class MilestoneEvaluator:
 
     @property
     def _is_cross_modal(self) -> bool:
-        """跨模态组另加 SSIM/MAE/PSNR（组3 stage-2 同语义，随阶段 config 判定）。"""
+        """跨模态组另加 SSIM/MAE/PSNR（ControlNet 阶段的像素域对照）。"""
         return self._config.experiment.group == "cross-modal"
 
     def _plane_metrics(

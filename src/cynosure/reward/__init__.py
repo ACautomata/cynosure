@@ -35,7 +35,7 @@ from cynosure.reward.encoder import (
 )
 from cynosure.reward.pipeline import PreparePipeline, PrepareReport
 from cynosure.reward.preprocessing import UpstreamPreprocessChain
-from cynosure.reward.sampler import RealPoolSampler, RealSampling
+from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import (
     ChannelNormalizer,
     LatentScorer,
@@ -73,7 +73,6 @@ __all__ = [
     "PrepareProvenance",
     "PrepareReport",
     "RealPoolSampler",
-    "RealSampling",
     "ReconstructionAssembler",
     "RewardScorer",
     "SamplingManifest",

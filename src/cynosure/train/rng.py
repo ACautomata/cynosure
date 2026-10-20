@@ -36,10 +36,9 @@ import threading
 import torch
 
 SLOT_SEED_STRIDE = 1_000_000
-"""async 执行序槽间 seed 派生的间隔步长（#218：线性步长沿用——
-``DistributedContext`` rank 步长的同一取值，派生公式本体复用、调用方
-dist.rank → 槽号）。槽 0 恒等（数值面与现行单进程派生值逐位相同）；
-流轴最大偏移差 19 ≪ 槽间距 10⁶，任何槽 × 流组合不撞位。"""
+"""async 执行序槽间 seed 派生的间隔步长（#218：线性步长——派生公式
+= 主 seed + 槽号 × 本步长）。槽 0 恒等（数值面与现行单进程派生值逐位
+相同）；流轴最大偏移差 19 ≪ 槽间距 10⁶，任何槽 × 流组合不撞位。"""
 
 
 class TrainingRngStreams:
@@ -61,11 +60,9 @@ class TrainingRngStreams:
         # +8（disc_noise）随 ADR-0012 退役空出，偏移不回收再用；
         # +6 = 冷启动判别器初始化的全局 fork seed、+7 = 预训练 SupportRule
         # 的 bootstrap 流（均注册表之外）。
-        # recon 用 rank 无关的 shared seed：s 抽样决定重构续跑
-        # ``continue_to_terminal`` 的调用次数与逐次批量——分布式下它是
-        # FSDP 集合序列的一部分（#165 review P1 的同一不变式），逐 rank
-        # 相异会让首个判别器更新步集合错位死锁。ε 与 s 同流（先 s 后 ε
-        # 的抽取次序契约）；rank 本地的只有真实样本库切片，重构加噪不是。
+        # recon 用 shared seed：fake 构造的 s 抽样与 ε 同走本流（先 s 后
+        # ε 的抽取次序契约）；同 seed 重放逐位一致、随 v12 续训分片落盘
+        # 恢复后序列不漂移（流状态自身承载恢复语义，调度槽数不进对账）。
         self.recon = torch.Generator().manual_seed(
             (shared_seed if shared_seed is not None else seed) + 9,
         )
@@ -86,8 +83,8 @@ class SlotRngRegistry:
     个 ``TrainingRngStreams`` 实例、seed 经槽派生（线性步长，槽 0 恒等）。
 
     - **RL 侧不传 shared_seed**：recon 流走槽轴（``seed_slot + 9``），
-      shared 特例消灭（#217 drift #2 的机制落地；pretrain torchrun
-      过渡期继续传 shared_seed，同一类两语境分叉）。
+      shared 特例消灭（#217 drift #2 的机制落地；pretrain 过渡期
+      继续传 shared_seed，同一类两语境分叉）。
     - **四流全顺序推进 / 在线零复位**：流实例注册期一次性实例化，
       ``get_stream`` 重复取同一实例（无复位入口）；在线主循环按任务
       枚举连续消耗、跨 iteration 不复位（按任务复位 = 同槽跨 iteration
@@ -99,9 +96,9 @@ class SlotRngRegistry:
       失败（#215 三律 3），断言是唯一主动暴露手段。默认关闭（热路径
       零开销），测试档开启。
 
-    本注册对象归 TrainingRuntime 聚合层口径持有（#218 禁裸容器）；
-    消费面（RolloutPhase / HeldOutAuc 等）一律经 ``get_stream`` 取流，
-    无第二取数通道。
+    本注册对象归 async 门面的续训协作者（RunContinuation）持有
+    （#218 禁裸容器，#236 聚合面落位）；消费面（RolloutPhase /
+    HeldOutAuc 等）一律经 ``get_stream`` 取流，无第二取数通道。
     """
 
     def __init__(

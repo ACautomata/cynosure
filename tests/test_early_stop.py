@@ -180,11 +180,11 @@ class TestPerModalityHacking:
 
 
 class TestPerRankStreams:
-    """多 rank 指标流的窗口语义：归并流里同一逻辑 iteration 有 world_size
-    条事件（每 rank 一条，(iteration, rank) 稳定序）——hacking 窗口必须
+    """多 rank 指标流的窗口语义：归并流里同一逻辑 iteration 有每卡一条
+    事件（rank=槽号语义，(iteration, rank) 稳定序）——hacking 窗口必须
     按 (modality, rank) 取**每 rank 自身**的时间序列。跨 rank 混采会把
-    窗口缩短成 N/world 个 iteration，且 rank 间稳定的 reward 偏移（各
-    rank 数据流差异的稳态）在 rank 序交错下被最小二乘误读成时间趋势。"""
+    窗口缩短成 N/卡数个 iteration，且 rank 间稳定的 reward 偏移（各
+    槽数据流差异的稳态）在 rank 序交错下被最小二乘误读成时间趋势。"""
 
     def test_rank_offset_interleaving_is_not_a_temporal_trend(self) -> None:
         """伪触发：两 rank 真实序列都平稳（斜率 0）、仅隔恒定偏移，AUC

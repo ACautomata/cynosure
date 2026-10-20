@@ -195,17 +195,13 @@ class PretrainReport(BaseModel):
         组别对照先行（纯内存比较）：group 是 fake 分布的归因轴，
         per-condition AUC 与过线判定都在预训练组别自己的 fake 分布上
         测量——跨组消费是口径错位而非可配置语义，显式拒绝、无逃生门
-        （#113）。组3 序贯 stage-2 的合法消费路径 = stage 级报告绑定
-        （#116）：序贯编排把 ``experiment.stage2_pretrain_report_json``
-        重写进 stage-2 计划 config 的 ``reward.pretrain_report_json``，
-        本守卫只见一份普通的同组（cross-modal）消费，无序贯分支。随后
-        latent 形状对照（纯内存比较）：口径指纹与判别器形态指纹都不覆盖
-        分辨率——全卷积 scorer 可用旧 shape 的 real 评新 shape 的 fake
-        静默通过过线判定并把错位数据带进在线更新。real pool / held-out
-        manifest / channel stats 任一文件内容与预训练时的指纹不符
-        （manifest 重建、统计量换源）都让上岗判别力与预训练报告脱钩——
-        warm-start 装载前显式拒绝，不给静默错位留缝（判别器形态指纹的
-        对照在 ``load_discriminator``）。
+        （#113）。随后 latent 形状对照（纯内存比较）：口径指纹与判别器
+        形态指纹都不覆盖分辨率——全卷积 scorer 可用旧 shape 的 real 评
+        新 shape 的 fake 静默通过过线判定并把错位数据带进在线更新。real
+        pool / held-out manifest / channel stats 任一文件内容与预训练时
+        的指纹不符（manifest 重建、统计量换源）都让上岗判别力与预训练
+        报告脱钩——warm-start 装载前显式拒绝，不给静默错位留缝（判别器
+        形态指纹的对照在 ``load_discriminator``）。
 
         多条件（MR-RATE）线加两道同旨对照（#129）：报告条件集须等于
         本域词汇表条件集（per-condition 实测值的取值域），词表工件内容
@@ -218,10 +214,8 @@ class PretrainReport(BaseModel):
                 f"{config.experiment.group}（预训练与 warm-start 消费须同组别口径——"
                 "per-condition AUC 与过线判定是在预训练组别自己的 fake "
                 "分布上测量的，跨组消费是显式拒绝的错误，无配置开关可"
-                f"绕过；单阶段组请核对 reward.pretrain_report_json 指向的"
-                f"预训练 run 组别；组3 序贯 stage-2 的对应配置面是 "
-                "experiment.stage2_pretrain_report_json——绑定 cross-modal "
-                "预训练产物、不继承 stage-1 报告（#116））"
+                f"绕过；请核对 reward.pretrain_report_json 指向的"
+                f"预训练 run 组别）"
             )
         # 形状与条件域对照（多条件线，#129）：形状口径逐条件派生自词表
         # 工件，故多条件报告记 None（派生副本不落报告）——单域（BraTS）

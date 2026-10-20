@@ -131,27 +131,25 @@ class LatentManifest(BaseModel):
         return sliced
 
     def assert_condition_capacity(
-        self, batch_size_k: int, world_size: int,
+        self, batch_size_k: int, card_count: int,
         conditions: list[str] | tuple[str, ...],
     ) -> None:
         """逐（目标条件, 本 manifest 全量）容量 ≥ ``batch_size_k`` 的
         装配期守卫（ADR-0008 决策 4 / ADR-0008-03）：判别器 real 侧按本
         iteration 条件匹配采样后每条件独立供满无放回 real 批——判定
-        按**全量**做、需量为 ``batch_size_k × world_size``（条带切片
-        ``entries[rank::world]`` 下「每 rank 视图 ≥ K」的等价条件；判定
-        放全量保失败路径全 rank 一致——与 RankSlicedPool 的切片前校验
-        同款理由，按切片后本地视图判定会让失败方单方面退出、其余 rank
-        互等）；单进程 world_size=1 判据退化为全池 ≥ K。无放回采样语义
+        按**全量**做、需量为 ``batch_size_k × card_count``（``card_count``
+        = 卡数：窗口起点全局无放回抽取，窗口单条件最大需求上界 = K ×
+        卡数；判定放全量保失败路径全卡一致）。无放回采样语义
         不动，不引入有放回采样补洞。条件集经注入（#129：BraTS = 四序列、
         MR-RATE = 词汇表条件集），本类不设代码内副本。
         """
         self.assert_capacity_counts(
-            self.modalities, batch_size_k, world_size, conditions,
+            self.modalities, batch_size_k, card_count, conditions,
         )
 
     @classmethod
     def assert_capacity_counts(
-        cls, counts: dict[str, int], batch_size_k: int, world_size: int,
+        cls, counts: dict[str, int], batch_size_k: int, card_count: int,
         conditions: list[str] | tuple[str, ...],
     ) -> None:
         """容量守卫的算术本体（``assert_condition_capacity`` 与 prepare
@@ -161,10 +159,11 @@ class LatentManifest(BaseModel):
         字面口径），两入口的判据与报错不设第二份。
 
         prepare 侧传的是**配额抽样后**的实取计数：配额本身也会触发本
-        守卫（候选充足但 real_pool_quota < K×world），故报错同时点名配额
-        与数据量两条修法——只报「增大 real pool」会把修法指错方向。
+        守卫（候选充足但 real_pool_quota < K×card_count），故报错同时
+        点名配额与数据量两条修法——只报「增大 real pool」会把修法指错
+        方向。
         """
-        required = batch_size_k * world_size
+        required = batch_size_k * card_count
         starved: list[tuple[str, int]] = []
         for condition in conditions:
             count = counts.get(condition, 0)
@@ -176,14 +175,14 @@ class LatentManifest(BaseModel):
             )
             raise ValueError(
                 f"Real sample pool 容量不足：逐条件 real 容量须 ≥ "
-                f"disc_batch_size_k={batch_size_k} × world_size={world_size}"
-                f" = {required} 条（条件匹配采样后每 rank 独立供满无放回 "
-                "real 批——ADR-0008 决策 4 装配期守卫；无放回采样语义"
-                f"不变，不引入有放回采样补洞）；不足: {detail}。"
+                f"disc_batch_size_k={batch_size_k} × card_count={card_count}"
+                f" = {required} 条（判别器窗口起点全局无放回抽取，单条件"
+                "最大需求 = K × 卡数——ADR-0008 决策 4 装配期守卫；无放回"
+                f"采样语义不变，不引入有放回采样补洞）；不足: {detail}。"
                 "计数是抽样后的实取卷数——先看该条件是否被配额截断"
                 "（MR-RATE 线 reward.real_pool_quota）：截断则增大配额，"
                 "候选本身不足才需增大 real pool（或减小 disc_batch_size_k "
-                "/ 切片路数）"
+                "/ 卡数）"
             )
 
     def assert_condition_shapes(

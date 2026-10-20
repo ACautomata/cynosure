@@ -120,12 +120,11 @@ class EarlyStopJudge:
         健康模态的最新事件遮蔽。无 ``modality`` 键的事件（合成测试流）
         同落单组，判定退化为全流口径。
 
-        多 rank 归并流（``rank`` 键，同一逻辑 iteration 有 world_size 条
-        事件）再按 rank 细分：每 rank 一条自身时间序列，窗口取该 rank
-        最近 N 个 iter——跨 rank 混采会把窗口缩短成 N/world 个 iteration，
-        且 rank 间稳定的 reward 偏移在 rank 序交错下被最小二乘误读成
-        时间趋势（伪触发/伪抑制）。无 ``rank`` 键的事件同落 0 组，单
-        进程与历史流的判定逐字不变。"""
+        事件流再按 ``rank`` 键（iter 事件的 rank 字段语义 = 调度槽号）
+        细分：每槽一条自身时间序列，窗口取该槽最近 N 个 iter——跨槽
+        混采会把窗口缩短成 N/槽数 个 iteration，且槽间稳定的 reward
+        偏移在槽序交错下被最小二乘误读成时间趋势（伪触发/伪抑制）。
+        无 ``rank`` 键的事件同落 0 组，历史流的判定逐字不变。"""
         groups: dict[object, list[dict]] = {}
         for event in iterations:
             key = (event.get("modality"), event.get("rank", 0))
