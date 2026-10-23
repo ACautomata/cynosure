@@ -11,9 +11,10 @@
   构成与 real 抽取量 = 分配表纯函数；
 - 逐对等权全局 mean（决议 8）：``Σ_b loss_b×(n_b/N_total)``——
   显式新裁（现行 patch 级 mean 的分离），不得表述为零变化；
-- 相位序列（决议 4 + #276 逐对粒度）：先全桶 eval（acc 复算、同一
-  参数快照、2×桶数整桶 no_grad 前向）后全对 train（2×总对数次逐对
-  前向、batch 恒 1、统一计算图加权累积）→ allreduce → optimizer.step；
+- 相位序列（决议 4 + #276/#285 逐对粒度）：先全桶 eval（acc 复算、
+  同一参数快照、2×桶数整桶 no_grad 前向）后全对 train（2×总对数次
+  逐对前向、batch 恒 1、逐对 backward 梯度累积）→ allreduce →
+  optimizer.step；
 - real 抽取（决议 10）：窗口起点全局无放回、调用序 = 条件名排序、
   逐条件抽窗口对数、切片到任务、同 (seed, 窗口, 条件) 可复算、不进
   命名流（一次性派生 generator）；
@@ -675,8 +676,9 @@ class _RecorderScorer:
 
 
 class TestDiscriminatorPhase:
-    """判别器步相位编排（#220 决议 4/8 + #276 逐对粒度）：先全桶 eval
-    后逐对 train（batch 恒 1、统一计算图加权 backward）、逐对等权全局
+    """判别器步相位编排（#220 决议 4/8 + #276/#285 逐对粒度）：先全桶
+    eval 后逐对 train（batch 恒 1、每对 loss×(1/N_total) 立即 backward
+    释放该对图、梯度经 .grad 线性累计）、逐对等权全局
     mean（loss×n_b/N_total → backward → allreduce SUM）、步末 u/v
     broadcast 卡 0 权威（多卡面；单卡结构性退化）。"""
 
@@ -710,15 +712,42 @@ class TestDiscriminatorPhase:
         assert all(dim == 1 for _, dim, _ in train_calls)
         assert all(grad for _, _, grad in train_calls)
 
+    def test_per_pair_backward_interleaves_with_forwards(self) -> None:
+        """train 段逐对 backward（#285）：每对 loss×(1/N_total) 前向后
+        **立即** backward——backward 数 = 总对数、第 i 次 backward 发生时
+        恰已完成 eval 段全部前向（2×桶数 = 4）+ 本对 real/fake 2 次，
+        下一对前向在其后。图激活随 backward 释放（retained 峰值 ≈ 单对
+        + 累积梯度），梯度线性累计落 .grad（allreduce/step 在其后，口
+        径不动）。"""
+        scorer = _RecorderScorer()
+        phase = DiscriminatorPhase(
+            scorer,
+            torch.optim.SGD(scorer.discriminator.parameters(), lr=0.0),
+            total_pairs=3,
+        )
+        events: list[int] = []
+        weight = next(iter(scorer.discriminator.parameters()))
+        hook = weight.register_post_accumulate_grad_hook(
+            lambda _p: events.append(
+                sum(1 for tag, _, _ in scorer.calls if tag == "fwd")
+            )
+        )
+        try:
+            phase.accumulate(self._buckets())
+        finally:
+            hook.remove()
+        assert events == [6, 8, 10]
+
     def test_per_pair_equal_weighting(self) -> None:
-        """逐对等权全局 mean（#220 决议 8）的数学恒等锚（#276）：
+        """逐对等权全局 mean（#220 决议 8）的数学恒等锚（#276/#285）：
         N_total=3、桶 a 2 对 / 桶 b 1 对——逐对实现 Σ loss_p×(1/3)
         ≡ 整桶复算 Σ loss_b×(n_b/3)。两锚：
 
-        1. SGD lr=1 单参更新反推：实现侧逐对加权 backward + step 后
-           的参数，与参照判别器手工整桶加权 loss backward + step
-           一致——加权系数错即分道（恒等的执行级证据，非仅数值上报
-           面；浮点次序差以容差收口，量级远低于加权错分的分道域）；
+        1. SGD lr=1 单参更新反推：实现侧逐对加权立即 backward（#285
+           梯度经 .grad 线性累计）+ step 后的参数，与参照判别器手工
+           整桶加权 loss backward + step 一致——加权系数错即分道（恒
+           等的执行级证据，非仅数值上报面；浮点次序差以容差收口，量
+           级远低于加权错分的分道域）；
         2. per-condition 明细 = 整桶复算：桶 loss 的逐对均值聚合与
            整桶 patch mean 恒等（明细语义不变面）。"""
         torch.manual_seed(0)

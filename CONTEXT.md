@@ -139,7 +139,7 @@ _Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义�
 _Avoid_: 重加噪/加噪判别（判别器输入带噪的旧注入语义，已废）、partial diffusion、把重构体当数据增强（它是 fake 的定义本身）
 
 **判别器桶（Discriminator bucket）**:
-混合条件配对批的卡内表示单元（async 执行模型裁决 #220）：单条件、同形的 (real, fake) 对集合——MR-RATE 异条件异形下混合条件批不可拼接为单一张量，判别器前向按桶组织：eval 段整桶 no_grad 前向，train 段逐对前向（batch 恒 1、跨桶统一计算图梯度累积、单次 backward，#276），跨卡聚合只有梯度 allreduce（配对数据不跨卡搬运）。桶序恒条件名排序（确定性遍历锚）；桶不变式（单条件、`fakes[i]`←`reals[i]` 同源、两侧同形同存储域）在容器构造期断言。BraTS 单条件域退化为单桶。
+混合条件配对批的卡内表示单元（async 执行模型裁决 #220）：单条件、同形的 (real, fake) 对集合——MR-RATE 异条件异形下混合条件批不可拼接为单一张量，判别器前向按桶组织：eval 段整桶 no_grad 前向，train 段逐对前向 + 逐对 backward（batch 恒 1，每对 loss×(1/N_total) 前向后立即 backward、梯度落 `.grad` 线性累计，#276/#285），跨卡聚合只有梯度 allreduce（配对数据不跨卡搬运）。桶序恒条件名排序（确定性遍历锚）；桶不变式（单条件、`fakes[i]`←`reals[i]` 同源、两侧同形同存储域）在容器构造期断言。BraTS 单条件域退化为单桶。
 _Avoid_: 跨卡拼批（数据跨卡搬运的 gather 方案，已否决）、逐桶 mean 等权求和（loss 聚合是逐对等权全局 mean，桶不等大时两者分离）、窗口对齐单条件卡（已否决：policy 轮换粒度不被判别器窗口绑架）
 
 **判别器窗口（N_d window）**:
