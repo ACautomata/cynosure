@@ -16,11 +16,16 @@
 - real 抽取（决议 10）：窗口起点全局无放回、调用序 = 条件名排序、
   逐条件抽窗口对数、切片到任务、同 (seed, 窗口, 条件) 可复算、不进
   命名流（一次性派生 generator）；
+- 任务双型（#277 / ADR-0020 决策 2）：任务型 = 创建序位置上的确定性
+  交错纯函数（每 ⌈1/ρ⌉ 个任务一个 rollout 型，零随机流）——ρ=0 时
+  任务集与现状逐位一致、指派确定性、比例与边界情形（ρ 不整除 /
+  K×卡数 < ⌈1/ρ⌉）、在途窗口重导出的类型一致；
 - UpdateReport 升格（决议 11）：per-condition 明细 + batch_size = 本卡
   K + 全局量 N_total；单值字段 property 化（单桶派生、多桶拒绝）。
 """
 
 import math
+from fractions import Fraction
 
 import pytest
 import torch
@@ -35,6 +40,7 @@ from cynosure.train.discriminator import (
     DiscriminatorWindowRun,
     WindowPairRecord,
     WindowRealDraw,
+    WindowTask,
 )
 
 
@@ -226,6 +232,154 @@ class TestDiscriminatorWindow:
         with pytest.raises(ValueError):
             window.next_step(-1)
 
+    def test_zero_ratio_all_recon_task_set_bitwise_current(self) -> None:
+        """ρ=0（默认）：全 recon 型，且任务集与现状逐位一致——默认构造
+        与显式 ρ=0.0 同 seed 重放逐位相等（类型字段默认值不参与结构
+        差异），任务五元组锚（条件, 卡, iter, 序, 槽）与分配表纯函数
+        派生值逐一相同（#277 验收 1）。"""
+        table = AllocationTable(("b", "a"), 2, seed=1)
+        default = DiscriminatorWindow(table, n_d=1, batch_size_k=2, card_slots={0: (0, 1)})
+        explicit = DiscriminatorWindow(
+            table, n_d=1, batch_size_k=2, card_slots={0: (0, 1)},
+            rollout_fake_ratio=0.0,
+        )
+        tasks = default.tasks(0)
+        assert tasks == explicit.tasks(0)  # 同 seed 重放逐位锚
+        assert all(task.kind == "recon" for task in tasks)
+        assert [
+            (t.condition, t.card, t.iteration, t.index, t.slot)
+            for t in tasks
+        ] == sorted(
+            (table.condition_for(0, slot), 0, 0, index, slot)
+            for index, slot in ((0, 0), (1, 1))
+        )
+
+    def test_kind_assignment_same_seed_window_is_bitwise_reproducible(self) -> None:
+        """指派确定性（#277 验收 2）：同 (seed, 窗口号) 重导出的任务型
+        序列逐位一致——两次导出全等（含类型字段的 dataclass 相等）。"""
+        window = DiscriminatorWindow(
+            self._table(), n_d=2, batch_size_k=4, card_slots={0: (0, 1)},
+            rollout_fake_ratio=0.25,  # 4 任务、interval=4 → 位置序 3 为 rollout
+        )
+        first = [task.kind for task in window.tasks(2)]
+        second = [task.kind for task in window.tasks(2)]
+        assert first == second
+        assert first == ["recon", "recon", "recon", "rollout"]
+
+    def test_kind_does_not_change_task_creation_order(self) -> None:
+        """类型字段不改变任务创建序（#277 验收 2）：ρ>0 的排序键序列
+        与 ρ=0 逐位相同——类型不参与排序，real 条目分配序与 recon 流
+        消耗序的锚不漂移。"""
+        table = self._table()
+        base = DiscriminatorWindow(table, n_d=2, batch_size_k=3, card_slots={0: (0, 1)})
+        typed = DiscriminatorWindow(
+            table, n_d=2, batch_size_k=3, card_slots={0: (0, 1)},
+            rollout_fake_ratio=0.5,
+        )
+        def order_key(t: WindowTask) -> tuple:
+            return (t.condition, t.card, t.iteration, t.index)
+
+        assert [order_key(t) for t in typed.tasks(2)] == [
+            order_key(t) for t in base.tasks(2)
+        ]
+
+    def test_rollout_ratio_interleaving_hits_one_per_interval(self) -> None:
+        """指派比例（#277 验收 3）：ρ=0.25 → ⌈1/ρ⌉=4，创建序位置序 i
+        （0 基）满足 (i+1)%4==0 的任务为 rollout 型——两卡 6 任务恰 1
+        个 rollout，落位 = 第 4 个（逐位锚，非只数个数）。"""
+        window = DiscriminatorWindow(
+            self._table(slots=4), n_d=2, batch_size_k=3,
+            card_slots={0: (0, 1), 1: (2, 3)},
+            rollout_fake_ratio=0.25,
+        )
+        tasks = window.tasks(2)  # 窗口 [1,2]，2 卡 × K=3 = 6 任务
+        assert len(tasks) == 6
+        assert [task.kind for task in tasks] == [
+            "recon", "recon", "recon", "rollout", "recon", "recon",
+        ]
+
+    def test_ratio_non_integer_reciprocal_uses_ceiling(self) -> None:
+        """ρ 不整除的边界（#277 验收 3）：⌈1/ρ⌉ 规则——ρ=0.3（1/ρ=3.33）
+        与 ρ=0.25 同为 interval 4，指派序列逐位相同；ρ=0.6（1/ρ=1.67）
+        → interval 2，每 2 个任务一个 rollout。"""
+        table = self._table(slots=4)
+        common = dict(n_d=2, batch_size_k=3, card_slots={0: (0, 1), 1: (2, 3)})
+        quarter = [t.kind for t in DiscriminatorWindow(
+            table, rollout_fake_ratio=0.25, **common,
+        ).tasks(2)]
+        point_three = [t.kind for t in DiscriminatorWindow(
+            table, rollout_fake_ratio=0.3, **common,
+        ).tasks(2)]
+        assert point_three == quarter  # ⌈1/0.3⌉=⌈1/0.25⌉=4
+        six = [t.kind for t in DiscriminatorWindow(
+            table, rollout_fake_ratio=0.6, **common,
+        ).tasks(2)]
+        assert six == [
+            "recon", "rollout", "recon", "rollout", "recon", "rollout",
+        ]
+
+    def test_window_smaller_than_interval_has_no_rollout(self) -> None:
+        """K×卡数 < ⌈1/ρ⌉ 的边界（#277 验收 3）：窗口任务数凑不满一个
+        交错周期 → 零 rollout 型（不静默摊、不越界指派）。"""
+        window = DiscriminatorWindow(
+            self._table(), n_d=1, batch_size_k=2, card_slots={0: (0, 1)},
+            rollout_fake_ratio=0.25,  # interval=4 > 2 任务
+        )
+        assert all(task.kind == "recon" for task in window.tasks(0))
+
+    def test_interval_snaps_unit_fraction_neighbors_to_intent(self) -> None:
+        """interval 的单位分数邻域锚：ρ 取配置浮点 snapping 后的简单有
+        理倒数取顶——double(1/3) 低于 1/3（精确算术取顶得 4，非语义），
+        double(1/49) 的浮点除法 1.0/ρ = 49.00000000000001（取顶得 50，
+        亦非语义）；用户写 1/n 即每 n 个任务一个 rollout（#277 验收 3
+        的数值保真面）。"""
+        rho_third = 1 / 3  # double 略低于 1/3
+        assert math.ceil(1.0 / rho_third) == 3  # 浮点除法本例碰巧合语义
+        assert Fraction(1) / Fraction(rho_third) > 3  # 精确算术反而失守
+        third = DiscriminatorWindow(
+            self._table(), n_d=1, batch_size_k=4, card_slots={0: (0, 1)},
+            rollout_fake_ratio=rho_third,
+        )
+        assert [task.kind for task in third.tasks(0)] == [
+            "recon", "recon", "rollout", "recon",
+        ]
+        rho_49 = 1 / 49  # double 略低于 1/49
+        assert math.ceil(1.0 / rho_49) == 50  # 浮点除法本例失守
+        forty_ninth = DiscriminatorWindow(
+            self._table(), n_d=1, batch_size_k=50, card_slots={0: (0, 1)},
+            rollout_fake_ratio=rho_49,
+        )
+        assert [task.kind for task in forty_ninth.tasks(0)] == (
+            ["recon"] * 48 + ["rollout", "recon"]
+        )
+
+    def test_tiny_ratio_below_snap_resolution_falls_back_without_crash(self) -> None:
+        """snapping 分辨率下界锚（评审复审新增）：ρ=1e-7 < 5e-7 时
+        limit_denominator snap 到 0（裸 snapping 路径 1/0 崩溃）——
+        声明域 (0,1) 内不得崩，退回浮点除法取顶（interval=1e7 > 窗口
+        任务数 → 全 recon）；小到倒数溢出则可读拒绝。"""
+        window = DiscriminatorWindow(
+            self._table(), n_d=1, batch_size_k=2, card_slots={0: (0, 1)},
+            rollout_fake_ratio=1e-7,
+        )
+        assert all(task.kind == "recon" for task in window.tasks(0))
+        with pytest.raises(ValueError, match="ρ"):
+            DiscriminatorWindow(
+                self._table(slots=1), n_d=1, batch_size_k=2,
+                card_slots={0: (0,)},
+                rollout_fake_ratio=1e-320,  # 倒数溢出 = 无可行窗口尺度
+            )
+
+    def test_rejects_rollout_ratio_out_of_domain(self) -> None:
+        """ρ 物理域 [0,1) 的直调防御（schema 域之外的兜底，ADR-0020：
+        ρ=1 = 纯 rollout 终点退化面为开区间）。"""
+        for bad in (1.0, -0.1, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="ρ"):
+                DiscriminatorWindow(
+                    self._table(), n_d=1, batch_size_k=1,
+                    card_slots={0: (0,)}, rollout_fake_ratio=bad,
+                )
+
 
 class TestWindowRealDraw:
     """real 侧窗口起点全局无放回抽取（#220 决议 10）：条件名排序调用序、
@@ -357,10 +511,11 @@ class TestDiscriminatorWindowRun:
             entries=entries,
         )
 
-    def _run(self, *, n_d=4, k=4, slots=2, seed=7, conditions=("a", "b")):
+    def _run(self, *, n_d=4, k=4, slots=2, seed=7, conditions=("a", "b"), ratio=0.0):
         window = DiscriminatorWindow(
             AllocationTable(conditions, slots, seed=0),
             n_d=n_d, batch_size_k=k, card_slots={0: tuple(range(slots))},
+            rollout_fake_ratio=ratio,
         )
         return DiscriminatorWindowRun(
             window,
@@ -401,6 +556,35 @@ class TestDiscriminatorWindowRun:
         run = self._run()
         run.reexport(step_iteration=8, resume_iteration=5)
         assert run.planned_count(0) == 4  # K 任务全集
+
+    def test_reexport_preserves_task_kinds(self) -> None:
+        """在途窗口重导出的类型字段覆盖（#277 验收 4）：ρ>0 时恢复后
+        剩余任务的类型与全量重导同窗口任务按 iteration ≥ 恢复点的
+        切片逐位一致——类型是创建序位置的纯函数，重导出不重指派、
+        丢弃任务不改变幸存任务的创建序位置。N_d=4、K=4：窗口 [5,8]
+        每 iter 1 任务、共 4 任务，ρ=0.25 → 位置序 3（0 基）为
+        rollout 型（全窗型序列的交错锚，与分配表无关）。"""
+        run = self._run(ratio=0.25)
+        full = run.window.tasks(8)
+        assert [task.kind for task in full] == [
+            "recon", "recon", "recon", "rollout",
+        ]
+        run.reexport(step_iteration=8, resume_iteration=6)
+        full_kinds = {
+            (t.condition, t.card, t.iteration, t.index): t.kind
+            for t in full
+        }
+        remaining = [
+            task
+            for iteration in (6, 7, 8)
+            for slot in (0, 1)
+            for task, _ in run.tasks_for(iteration, slot)
+        ]
+        assert len(remaining) == 3  # 1 任务/iter × [6,7,8]（#265 丢弃语义）
+        for task in remaining:
+            assert task.kind == full_kinds[
+                (task.condition, task.card, task.iteration, task.index)
+            ]
 
     def test_reexport_rejects_unrebuildable_window_with_start_criterion(self) -> None:
         """恢复守卫（#265）：K=2 < N_d=4 时窗口任务全落窗口首 iter、
