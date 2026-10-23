@@ -1044,6 +1044,7 @@ class AsyncTrainingExecutor:
             n_d=config.reward.disc_update_interval_n_d,
             batch_size_k=config.reward.disc_batch_size_k,
             card_slots=card_slots,
+            rollout_fake_ratio=config.reward.disc_rollout_fake_ratio,
         )
         # real 侧装载与守卫（两执行序共用装配缝）：全池直读、窗口起点
         # 全局无放回抽取——需量倍数传卡数（窗口单条件最大需求上界 =

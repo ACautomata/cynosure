@@ -48,8 +48,9 @@ backward 配对方程释放，不在本票执行粒度内）。
 
 import math
 import zlib
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from fractions import Fraction
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -171,16 +172,22 @@ class DiscriminatorBucket:
 
 @dataclass(frozen=True)
 class WindowTask:
-    """窗口内单重构任务：桶序×对序全局排序的调度单元（#220 决议 5）。
+    """窗口内单任务：桶序×对序全局排序的调度单元（#220 决议 5）。
 
     条件 = 分配表在该 (iteration, slot) 的派发值（纯函数）；``index``
-    = 本 (卡, iter) 内任务序（卡内槽轮转 j % n_slots 的 j）。"""
+    = 本 (卡, iter) 内任务序（卡内槽轮转 j % n_slots 的 j）；``kind``
+    = 任务型（#277 / ADR-0020 决策 2：recon = 同源重构 fake / rollout
+    = on-policy rollout 终点 fake），创建序位置上的确定性交错指派——
+    每 ⌈1/ρ⌉ 个任务一个 rollout 型，零随机流；ρ=0 时全 recon 且任务集
+    与现状逐位一致。fake 供给接线（rollout 型取数）属 #278，本字段暂
+    只由计划层产出、执行面无消费。"""
 
     card: int
     iteration: int
     slot: int
     index: int
     condition: str
+    kind: Literal["recon", "rollout"] = "recon"
 
 
 class DiscriminatorWindow:
@@ -188,6 +195,9 @@ class DiscriminatorWindow:
 
     全组件无状态、可重导出（同分配表先例）：窗口构成、发射节奏、桶
     计数都是纯函数——续训重放时从 (seed, 已完成的 iteration) 重导出。
+    任务双型（#277 / ADR-0020 决策 2）：``rollout_fake_ratio``（ρ）> 0
+    时任务带 rollout 型指派，创建序位置上的确定性交错（每 ⌈1/ρ⌉ 个
+    任务一个），零随机流；ρ=0（默认）时全 recon、任务集与现状逐位一致。
     """
 
     def __init__(
@@ -196,11 +206,18 @@ class DiscriminatorWindow:
         n_d: int,
         batch_size_k: int,
         card_slots: dict[int, tuple[int, ...]],
+        rollout_fake_ratio: float = 0.0,
     ) -> None:
         if n_d < 1:
             raise ValueError(f"判别器窗口的 N_d 须 ≥ 1，得到 {n_d}")
         if batch_size_k < 1:
             raise ValueError(f"判别器窗口的 K 须 ≥ 1，得到 {batch_size_k}")
+        if not math.isfinite(rollout_fake_ratio) or not 0.0 <= rollout_fake_ratio < 1.0:
+            raise ValueError(
+                f"判别器窗口的 rollout 型混合比 ρ 须 ∈ [0, 1)，得到 "
+                f"{rollout_fake_ratio}（schema 物理域之外的直调防御——"
+                "ρ=1 为纯 rollout 终点的退化面，见 ADR-0020）"
+            )
         if not card_slots:
             raise ValueError("判别器窗口须至少绑定一张卡（卡槽绑定为空）")
         bound = [slot for slots in card_slots.values() for slot in slots]
@@ -213,6 +230,27 @@ class DiscriminatorWindow:
         self._n_d = n_d
         self._batch_size_k = batch_size_k
         self._card_slots = {card: tuple(slots) for card, slots in card_slots.items()}
+        self._rollout_interval: int | None = None
+        if rollout_fake_ratio != 0.0:
+            # 单位分数邻域的语义钉：interval = ⌈1/ρ̂⌉，ρ̂ = 配置浮点 snapping
+            # 到最近简单有理（limit_denominator 1e6 界）——裸浮点路径在此
+            # 邻域全部失守：精确有理算术对 double(1/3)（< 1/3）取顶得 4，
+            # 1.0/ρ 浮点除法对 double(1/49) 取顶得 50，均非用户所写的 1/n
+            snapped = Fraction(rollout_fake_ratio).limit_denominator(10**6)
+            if snapped > 0:
+                self._rollout_interval = math.ceil(1 / snapped)
+            else:
+                # ρ < snapping 分辨率（≈5e-7）：用户写的就是小量本身，
+                # 退回浮点除法取顶（此域 interval ≥ 2e6，相对误差不越
+                # 界；小到倒数溢出 = 无可行窗口尺度，可读拒绝优于
+                # ZeroDivisionError / OverflowError）
+                reciprocal = 1.0 / rollout_fake_ratio
+                if not math.isfinite(reciprocal):
+                    raise ValueError(
+                        f"判别器窗口的 rollout 型混合比 ρ 过小，交错周期 "
+                        f"⌈1/ρ⌉ 不可行：ρ = {rollout_fake_ratio}"
+                    )
+                self._rollout_interval = math.ceil(reciprocal)
 
     @property
     def n_d(self) -> int:
@@ -288,7 +326,15 @@ class DiscriminatorWindow:
         的 iter 内相对序（桶序×对序）。per-槽流因此按「(iteration,
         本槽任务的创建序相对位)」消耗——同槽任务在 _draw 插入序
         （= 全局创建序）中的相对位即执行序，门面 ``tasks_for`` 的筛选
-        保序保证这一点；执行完成序（协程并发）与流消耗无关。"""
+        保序保证这一点；执行完成序（协程并发）与流消耗无关。
+
+        **任务型指派**（#277 / ADR-0020 决策 2）：ρ > 0 时排序后的创建
+        序位置上每 ⌈1/ρ⌉ 个任务指派一个 rollout 型（位置序 i（0 基）满足
+        ``(i+1) % ⌈1/ρ⌉ == 0``）——纯函数、不进 RNG 注册表；指派不改变
+        排序键与任务创建序（类型字段不参与排序）。ρ=0 时全 recon 且
+        任务集与现状逐位一致；K×卡数 < ⌈1/ρ⌉ 时窗口无 rollout 型任务
+        （交错规则的边界情形）。rollout 型的 fake 供给接线属 #278。
+        """
         start = self.window_start(step_iteration)
         tasks: list[WindowTask] = []
         for card in sorted(self._card_slots):
@@ -307,6 +353,12 @@ class DiscriminatorWindow:
                         ),
                     ))
         tasks.sort(key=lambda t: (t.condition, t.card, t.iteration, t.index))
+        interval = self._rollout_interval
+        if interval is not None:
+            tasks = [
+                replace(task, kind="rollout" if (position + 1) % interval == 0 else "recon")
+                for position, task in enumerate(tasks)
+            ]
         return tuple(tasks)
 
     def bucket_counts(self, step_iteration: int) -> tuple[tuple[str, int], ...]:
