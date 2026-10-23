@@ -45,7 +45,10 @@ from cynosure.reward.scorer import ChunkedScorer
 from cynosure.train.allocation import AllocationTable
 from cynosure.train.artifacts import IterEvent, RunArtifacts
 from cynosure.train.async_resume import AsyncResumeStore
-from cynosure.train.discriminator import WindowRealDraw
+from cynosure.train.discriminator import (
+    DiscriminatorBucket,
+    WindowRealDraw,
+)
 from cynosure.train.executor import (
     AsyncTrainingExecutor,
     BarrierTimeoutPolicy,
@@ -1148,6 +1151,126 @@ class TestDiscriminatorChainWindow:
                 coroutines=1,
                 devices=[torch.device("cpu"), torch.device("cpu")],
             )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+class TestRolloutKindFakeSupply:
+    """rollout 型任务 fake 供给接线（#278 / ADR-0020 决策 2 执行序档）：
+    rollout 型任务在 slot worker 中从本 (iteration, 槽) rollout 相产出的
+    终点集确定性选取 fake、跳过同源重构前向；recon 型照旧、real 侧照旧。
+    缝 = ``run_example`` 的任务型分派 + ``WindowPairRecord`` 构造期断言
+    （#278 Agreements）。"""
+
+    def test_rollout_kind_fake_is_selected_window_endpoint(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ρ>0：rollout 型 pair.fake 逐位 = 本 (iteration, 槽) rollout 相
+        终点集的某行（fp32 对齐、CPU 暂存——与 recon fake 同容器口径）；
+        同源重构调用数 = recon 型任务数（rollout 型跳过前向——每 rollout
+        型任务省一次 ODE 续跑）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=0)
+        config.reward.disc_rollout_fake_ratio = 0.5
+        config.schedule.max_iterations = 1
+        calls = scenario.spy_window_pairs(monkeypatch)
+        examples = scenario.spy_slot_examples(monkeypatch)
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        executor.run()
+        kinds = Counter(task.kind for task in executor.window.tasks(0))
+        assert kinds["rollout"] >= 1, "ρ=0.5 的窗口须含 rollout 型任务"
+        assert len(calls) == kinds["recon"], (
+            "同源重构调用数 ≠ recon 型任务数——rollout 型未跳过重构前向"
+            "或 recon 型被误跳"
+        )
+        rollout_pairs = []
+        for example in examples:
+            for task, record in example.window_pairs:
+                assert record.real.device.type == "cpu"
+                assert record.fake.device.type == "cpu"
+                assert record.fake.dtype == torch.float32
+                if task.kind == "rollout":
+                    endpoints = example.record.new_fakes
+                    selected = task.index % endpoints.shape[0]
+                    assert torch.equal(
+                        record.fake[0], endpoints[selected].float().cpu(),
+                    ), (
+                        "rollout 型 fake ≠ 终点集选定项（任务序号纯函数 "
+                        "index % N 的行为锚失守）"
+                    )
+                    rollout_pairs.append((task, record))
+        assert len(rollout_pairs) == kinds["rollout"]
+
+    def test_rollout_kind_fake_same_seed_replay_bitwise(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """选取规则 = 任务序号的纯函数（#278 验收 2）：同 seed 两次 run
+        的 rollout 型任务型序列与 fake 数值逐位一致（终点集经 rollout 流
+        重放逐位重现，选取零随机流——若混入任何随机性必然分道）。"""
+        rollout_fakes: list[list[torch.Tensor]] = []
+        for run_name in ("run1", "run2"):
+            scenario = ExecutorScenario(cli, tmp_path)
+            config = scenario.prepare(seed=0)
+            config.reward.disc_rollout_fake_ratio = 0.5
+            config.schedule.max_iterations = 1
+            examples = scenario.spy_slot_examples(monkeypatch)
+            executor = scenario.build(
+                config, run_name=run_name, coroutines=2, owner_check=True,
+            )
+            executor.run()
+            collected = []
+            for example in examples:
+                for task, record in example.window_pairs:
+                    if task.kind == "rollout":
+                        collected.append(
+                            (example.slot, task.index, record.fake),
+                        )
+            collected.sort(key=lambda item: item[:2])
+            rollout_fakes.append([fake for _, _, fake in collected])
+        assert len(rollout_fakes[0]) == len(rollout_fakes[1]) >= 1
+        for first, second in zip(rollout_fakes[0], rollout_fakes[1]):
+            assert torch.equal(first, second)
+
+    def test_mixed_ratio_keeps_recon_stream_and_bucket_assembly(
+        self, cli: CliSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ρ>0 混合下的两缝锚（#278 验收 2/3）：recon 流消耗 = recon 型
+        任务数（rollout 型零消耗——任一误消耗即「先 s 后 ε」重放逐位
+        分道）；rollout 型配对记录穿过 ``WindowPairRecord`` 构造期断言
+        （单条件、同形、同 device）后与 recon 型同桶 ``assemble`` 成功
+        （桶装配零改动、容器不变式不感知 fake 来源）。"""
+        scenario = ExecutorScenario(cli, tmp_path)
+        config = scenario.prepare(seed=0)
+        config.reward.disc_rollout_fake_ratio = 0.5
+        config.schedule.max_iterations = 1
+        examples = scenario.spy_slot_examples(monkeypatch)
+        executor = scenario.build(config, coroutines=2, owner_check=True)
+        before = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        executor.run()
+        recon_strokes = sum(
+            1
+            for example in examples
+            if example.slot == 0
+            for task, _ in example.window_pairs
+            if task.kind == "recon"
+        )
+        after = executor.rng.stream_state(0, TrainingRngStreams.RECON)
+        assert torch.equal(after, scenario.replay_recon_stream(
+            before,
+            strokes=recon_strokes,
+            latent_shape=tuple(config.latent_shape),
+            step_count=len(sorted(config.policy.train_step_indices_m)),
+        )), "recon 流消耗 ≠ recon 型任务数（rollout 型须零消耗）"
+        by_condition: dict[str, list] = {}
+        for example in examples:
+            for _, record in example.window_pairs:
+                by_condition.setdefault(record.condition, []).append(record)
+        assert by_condition
+        for condition, pairs in by_condition.items():
+            bucket = DiscriminatorBucket.assemble(
+                condition, pairs, torch.device("cpu"),
+            )
+            assert bucket.pair_count == len(pairs)
 
 
 @pytest.mark.gpu

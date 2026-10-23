@@ -38,7 +38,10 @@ mean 等权求和在异形桶下不等价——以条件对称意图为名立此
 以「零变化」表述。
 
 fake 产出即 CPU 暂存（#220 决议 16）：任务 fake 构造（policy 前向）
-后立即落 CPU，判别器步前 join 后逐桶按桶序回迁装配。GPU 峰值的如实
+后立即落 CPU，判别器步前 join 后逐桶按桶序回迁装配。fake 双源并存
+（#278 / ADR-0020 执行序档）：recon 型 = 同源重构（policy 前向）、
+rollout 型 = 本 (iteration, 槽) rollout 相终点集的任务序号确定性
+选取（跳过同源重构前向）——容器与损失路径不感知来源。GPU 峰值的如实
 账（#276 逐对口径）：统一计算图 + 单次 backward 使**全对图激活**
 retained 至 backward（主项 ≈ 全对总量、与整桶前向同量级）+ 单对
 瞬态前向激活——逐对粒度解耦的是单次前向的瞬态上界（不再整桶一次
@@ -74,8 +77,10 @@ class WindowPairRecord:
     """单对任务产出（fake 产出即 CPU 暂存的记账单元，#220 决议 16）。
 
     不变式构造期断言：条件非空、real/fake 同形同 device、批维恰 1
-    （单对容器——桶由对聚合、不由批切分）；``fake`` 由 ``real`` 同源
-    重构而来是装配链的结构性质，同形同量是产出点的可断言面。"""
+    （单对容器——桶由对聚合、不由批切分）；断言面**不感知 fake 来源**
+    （#278 Agreements 容器缝）：recon 型 fake 由 ``real`` 同源重构而来、
+    rollout 型 fake 取自本 (iteration, 槽) rollout 相终点集——同形同量
+    是产出点的可断言面，来源是产出点上游的分派语义。"""
 
     condition: str
     real: torch.Tensor
@@ -91,8 +96,9 @@ class WindowPairRecord:
             )
         if self.fake.shape != self.real.shape:
             raise ValueError(
-                f"单对记录两侧须同形（fakes[i]←reals[i] 同源配对），得到 "
-                f"real {tuple(self.real.shape)} / fake {tuple(self.fake.shape)}"
+                f"单对记录两侧须同形（任务 fake 与 real 同条件同统一网格的"
+                f"配对容器口径），得到 real {tuple(self.real.shape)} / "
+                f"fake {tuple(self.fake.shape)}"
             )
         if self.fake.device != self.real.device:
             raise ValueError(
@@ -124,7 +130,7 @@ class DiscriminatorBucket:
             )
         if self.fakes.shape != self.reals.shape:
             raise ValueError(
-                f"判别器桶两侧须同形同量（同源配对），real "
+                f"判别器桶两侧须同形同量（(real, fake) 配对批），real "
                 f"{tuple(self.reals.shape)} / fake {tuple(self.fakes.shape)}"
             )
         if self.fakes.device != self.reals.device:
@@ -179,8 +185,10 @@ class WindowTask:
     = 任务型（#277 / ADR-0020 决策 2：recon = 同源重构 fake / rollout
     = on-policy rollout 终点 fake），创建序位置上的确定性交错指派——
     每 ⌈1/ρ⌉ 个任务一个 rollout 型，零随机流；ρ=0 时全 recon 且任务集
-    与现状逐位一致。fake 供给接线（rollout 型取数）属 #278，本字段暂
-    只由计划层产出、执行面无消费。"""
+    与现状逐位一致。fake 供给接线（#278 执行序档）：rollout 型在
+    slot worker 中从本 (iteration, 槽) rollout 相终点集按 ``index``
+    确定性选取 fake、跳过同源重构前向（``SlotRunner._pair_record``
+    分派单点）。"""
 
     card: int
     iteration: int
@@ -333,7 +341,9 @@ class DiscriminatorWindow:
         ``(i+1) % ⌈1/ρ⌉ == 0``）——纯函数、不进 RNG 注册表；指派不改变
         排序键与任务创建序（类型字段不参与排序）。ρ=0 时全 recon 且
         任务集与现状逐位一致；K×卡数 < ⌈1/ρ⌉ 时窗口无 rollout 型任务
-        （交错规则的边界情形）。rollout 型的 fake 供给接线属 #278。
+        （交错规则的边界情形）。rollout 型的 fake 供给接线（#278 执行
+        序档）= slot worker 从本 (iteration, 槽) rollout 相终点集按
+        任务序号确定性选取，不在本计划层。
         """
         start = self.window_start(step_iteration)
         tasks: list[WindowTask] = []

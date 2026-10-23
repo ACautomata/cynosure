@@ -131,7 +131,7 @@ MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#
 _Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
-Real sample pool 真实 latent 的同源重构体（构造见 同源重构），作为判别器的「假」——与 real 同内容、仅生成伪影不同。ADR-0020 修订为双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入微比例的 rollout 终点型 fake（见 判别器窗口 的 rollout 型任务）；双源机制实施票 #277–#280 未启动，ρ=0 默认下本词条现状语义逐位成立。
+Real sample pool 真实 latent 的同源重构体（构造见 同源重构）或本 (iteration, 槽) rollout 相的终点 latent（见 Rollout 型任务），作为判别器的「假」——ADR-0020 双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入 rollout 终点型 fake，rollout 型在 slot worker 中从本 (iteration, 槽) rollout 相终点集按任务序号确定性选取、跳过同源重构前向（#278 执行序接线）；配对记录、桶装配与 LSGAN 损失路径不感知来源。
 _Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代；ADR-0020 起为「按 ρ 并存的第二源」而非定义本身——默认 ρ=0 时仍是取代语义）
 
 **同源重构（Reconstruction fake）**:
@@ -139,12 +139,12 @@ _Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义�
 _Avoid_: 重加噪/加噪判别（判别器输入带噪的旧注入语义，已废）、partial diffusion、把重构体当数据增强（它是 fake 的定义本身）
 
 **判别器桶（Discriminator bucket）**:
-混合条件配对批的卡内表示单元（async 执行模型裁决 #220）：单条件、同形的 (real, fake) 对集合——MR-RATE 异条件异形下混合条件批不可拼接为单一张量，判别器前向按桶组织：eval 段整桶 no_grad 前向，train 段逐对前向（batch 恒 1、跨桶统一计算图梯度累积、单次 backward，#276），跨卡聚合只有梯度 allreduce（配对数据不跨卡搬运）。桶序恒条件名排序（确定性遍历锚）；桶不变式（单条件、`fakes[i]`←`reals[i]` 同源、两侧同形同存储域）在容器构造期断言。BraTS 单条件域退化为单桶。
+混合条件配对批的卡内表示单元（async 执行模型裁决 #220）：单条件、同形的 (real, fake) 对集合——MR-RATE 异条件异形下混合条件批不可拼接为单一张量，判别器前向按桶组织：eval 段整桶 no_grad 前向，train 段逐对前向（batch 恒 1、跨桶统一计算图梯度累积、单次 backward，#276），跨卡聚合只有梯度 allreduce（配对数据不跨卡搬运）。桶序恒条件名排序（确定性遍历锚）；桶不变式（单条件、两侧同形同存储域）在容器构造期断言——断言面不感知 fake 来源（ADR-0020：recon 型 fake 由同批 real 同源重构、rollout 型 fake 取自本 (iteration, 槽) rollout 终点集，来源是产出点上游的任务型分派语义而非容器性质）。BraTS 单条件域退化为单桶。
 _Avoid_: 跨卡拼批（数据跨卡搬运的 gather 方案，已否决）、逐桶 mean 等权求和（loss 聚合是逐对等权全局 mean，桶不等大时两者分离）、窗口对齐单条件卡（已否决：policy 轮换粒度不被判别器窗口绑架）
 
 **判别器窗口（N_d window）**:
-判别器更新节奏的 iteration 区间：每 N_d 个 RL iteration 一次判别器步，消费本窗口内积累的恰 K×卡数 对（与 N_d 无关）；K 个重构任务摊到窗口内各 iter 的 rollout 相异步执行、判别器步前 join——任务发射序与窗口桶构成都是分配表的确定性纯函数。N_d>1 时窗口批内 fake 跨最多 N_d−1 步 policy 快照（accepted drift，进记账面）。
-**Rollout 型任务（ADR-0020，实施票 #277/#278 未启动）**：窗口任务的双型之一（recon | rollout）——rollout 型的 fake 取自本 (iteration, 槽) rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐；指派 = (seed, 窗口号, 任务创建序) 的确定性纯函数，每 ⌈1/ρ⌉ 个任务一个 rollout 型）。混合比 ρ = `reward.disc_rollout_fake_ratio` ∈ [0,1) 默认 0.0：默认下任务集与现状逐位一致（全 recon 型）；实验包络以 0.5 为顶（内容捷径回归风险，ADR-0020）。任务型指派确定性测试缝 = #274 Testing Decisions 缝 2。
+判别器更新节奏的 iteration 区间：每 N_d 个 RL iteration 一次判别器步，消费本窗口内积累的恰 K×卡数 对（与 N_d 无关）；K 个窗口任务（双型，见 Rollout 型任务）摊到窗口内各 iter 的 rollout 相异步执行、判别器步前 join——任务发射序与窗口桶构成都是分配表的确定性纯函数。N_d>1 时窗口批内 fake 跨最多 N_d−1 步 policy 快照（accepted drift，进记账面）。
+**Rollout 型任务（ADR-0020，#277 计划层 + #278 执行序接线已落地）**：窗口任务的双型之一（recon | rollout）——rollout 型的 fake 取自本 (iteration, 槽) rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐；指派 = (seed, 窗口号, 任务创建序) 的确定性纯函数，每 ⌈1/ρ⌉ 个任务一个 rollout 型），执行序在 slot worker 中按任务序号从本例终点集确定性选取、跳过同源重构前向（每 rollout 型任务省一次 ODE 续跑）。混合比 ρ = `reward.disc_rollout_fake_ratio` ∈ [0,1) 默认 0.0：默认下任务集与现状逐位一致（全 recon 型）；实验包络以 0.5 为顶（内容捷径回归风险，ADR-0020）。任务型指派确定性测试缝 = #274 Testing Decisions 缝 2。
 _Avoid_: 每 iter 每卡 K 对（有效批随 N_d 膨胀，已否决）、N_d 计数器状态（节奏恒 `iteration % N_d`）、把 ρ>0 当默认（默认恒 0，消融臂显式开启）
 
 **Warm-start pre-training（判别器预训练）**:
@@ -164,11 +164,11 @@ RL 条件的按 (模态, 平面) 分组单位（MR-RATE 换域线口径，BraTS 
 _Avoid_: 把 skull-stripped 码当生成 token（生成分组恒用 whole-brain 条目）、在 BraTS config 里携带 MR 词汇工件（互斥携带即拒）、在 MR config 里声明单域锚字段（形状/锚逐条件派生，#129 互斥携带即拒）、在代码里写 token/网格常量副本（唯一来源是工件）
 
 **Online update（在线更新）**:
-reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start）：fake = 当前 policy 的同源重构、现做现用（ADR-0012），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
+reward model 在 RL 期间每个 iteration 用新 fake 样本继续重训（紧随预训练 warm-start）：fake = 当前 policy 的同源重构（recon 型）或本 (iteration, 槽) rollout 终点（rollout 型，按混合比 ρ 混入，ADR-0020 / 见 Rollout 型任务），现做现用（ADR-0012），追踪 policy 演化、抗 Reward hacking——对抗博弈里判别器一侧的必要运动（见 对抗博弈）。
 _Avoid_: 在线从零（冷启动形态，已被预训练取代）
 
 **条件匹配采样（Condition-matched sampling）**:
-判别器一步更新的 real 侧按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采喂出的模态分类捷径；fake 侧经同源重构自动匹配（fake 由同批 real 重构而来，ADR-0012）。real 池逐（目标模态, 每 rank 切片）容量 ≥ K 是装配期硬守卫（不足 fail-fast 可读报错；无放回采样语义不动，不引入有放回采样补洞）。
+判别器一步更新的 real 侧按本 iteration 的目标模态过滤——判别器永远在「同一目标模态的 real vs fake」内比较，杜绝跨模态混采喂出的模态分类捷径；fake 侧经任务型自动匹配（recon 型由同批 real 同源重构、rollout 型为同槽 rollout 终点，ADR-0012 / ADR-0020）。real 池逐（目标模态, 每 rank 切片）容量 ≥ K 是装配期硬守卫（不足 fail-fast 可读报错；无放回采样语义不动，不引入有放回采样补洞）。
 _Avoid_: 混采（real 全池混采的旧口径，已被本词条取代）
 
 **过拟合分叉监控（Overfit divergence monitoring）**:
