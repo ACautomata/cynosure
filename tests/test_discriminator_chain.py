@@ -11,8 +11,9 @@
   构成与 real 抽取量 = 分配表纯函数；
 - 逐对等权全局 mean（决议 8）：``Σ_b loss_b×(n_b/N_total)``——
   显式新裁（现行 patch 级 mean 的分离），不得表述为零变化；
-- 相位序列（决议 4）：先全桶 eval（acc 复算、同一参数快照）后全桶
-  train（更新前向 + backward 累积）→ allreduce → optimizer.step；
+- 相位序列（决议 4 + #276 逐对粒度）：先全桶 eval（acc 复算、同一
+  参数快照、2×桶数整桶 no_grad 前向）后全对 train（2×总对数次逐对
+  前向、batch 恒 1、统一计算图加权累积）→ allreduce → optimizer.step；
 - real 抽取（决议 10）：窗口起点全局无放回、调用序 = 条件名排序、
   逐条件抽窗口对数、切片到任务、同 (seed, 窗口, 条件) 可复算、不进
   命名流（一次性派生 generator）；
@@ -490,9 +491,10 @@ class _RecorderScorer:
 
 
 class TestDiscriminatorPhase:
-    """判别器步相位编排（#220 决议 4/8）：先全桶 eval 后全桶 train、
-    逐桶等权全局 mean（loss×n_b/N_total → backward → allreduce SUM）、
-    步末 u/v broadcast 卡 0 权威（多卡面；单卡结构性退化）。"""
+    """判别器步相位编排（#220 决议 4/8 + #276 逐对粒度）：先全桶 eval
+    后逐对 train（batch 恒 1、统一计算图加权 backward）、逐对等权全局
+    mean（loss×n_b/N_total → backward → allreduce SUM）、步末 u/v
+    broadcast 卡 0 权威（多卡面；单卡结构性退化）。"""
 
     def _buckets(self):
         first = DiscriminatorBucket.assemble(
@@ -504,28 +506,45 @@ class TestDiscriminatorPhase:
         return [first, second]
 
     def test_eval_phase_precedes_all_train_forwards(self) -> None:
-        """相位序列锚：全部 eval 前向（no_grad）先于全部 train 前向
-        （grad）——同一参数快照的 acc 复算不被更新前向污染。"""
+        """相位序列锚（#276 逐对粒度）：eval 段 = 2×桶数次**整桶**
+        no_grad 前向，train 段 = 2×总对数次**逐对**前向（batch 恒 1）
+        ——eval 段完整先于 train 段（同一参数快照的 acc 复算不被更新
+        前向污染、逐桶交替结构性否决），train 段每次前向批维恒 1（
+        峰值显存与桶宽/条件尺寸解耦的执行粒度锚）。"""
         scorer = _RecorderScorer()
         phase = DiscriminatorPhase(scorer, torch.optim.SGD(scorer.discriminator.parameters(), lr=0.0), total_pairs=3)
         phase.accumulate(self._buckets())
-        grad_flags = [flag for _, _, flag in scorer.calls]
-        assert False in grad_flags and True in grad_flags
-        first_true = grad_flags.index(True)
-        assert all(flag is False for flag in grad_flags[:first_true]), (
-            "eval 段（no_grad）必须完整先于 train 段（grad）——逐桶交替否决"
-        )
-        # 每桶 2 次 eval 前向 + 2 次 train 前向（real/fake 各一）
-        assert len(scorer.calls) == 8
+        eval_calls = scorer.calls[:4]
+        train_calls = scorer.calls[4:]
+        # eval 段：桶序（a, b）× real/fake 整桶前向、no_grad、批维 = 桶对数
+        assert [(tag, dim, grad) for tag, dim, grad in eval_calls] == [
+            ("fwd", 2, False), ("fwd", 2, False),  # 桶 a：2 对
+            ("fwd", 1, False), ("fwd", 1, False),  # 桶 b：1 对
+        ]
+        # train 段：桶序×对序×real/fake = 2×总对数 = 6 次前向，批维恒 1
+        assert len(train_calls) == 6
+        assert all(dim == 1 for _, dim, _ in train_calls)
+        assert all(grad for _, _, grad in train_calls)
 
     def test_per_pair_equal_weighting(self) -> None:
-        """逐对等权全局 mean（#220 决议 8 显式新裁）：N_total=3、
-        桶 a 2 对 / 桶 b 1 对——backward 的 loss = loss_a×(2/3) +
-        loss_b×(1/3)。以 lr=1 的 SGD 单参更新反推实际 backward 的
-        加权 loss（加权系数错即分道）。"""
+        """逐对等权全局 mean（#220 决议 8）的数学恒等锚（#276）：
+        N_total=3、桶 a 2 对 / 桶 b 1 对——逐对实现 Σ loss_p×(1/3)
+        ≡ 整桶复算 Σ loss_b×(n_b/3)。两锚：
+
+        1. SGD lr=1 单参更新反推：实现侧逐对加权 backward + step 后
+           的参数，与参照判别器手工整桶加权 loss backward + step
+           一致——加权系数错即分道（恒等的执行级证据，非仅数值上报
+           面；浮点次序差以容差收口，量级远低于加权错分的分道域）；
+        2. per-condition 明细 = 整桶复算：桶 loss 的逐对均值聚合与
+           整桶 patch mean 恒等（明细语义不变面）。"""
         torch.manual_seed(0)
         scorer = _RecorderScorer()
+        reference = _RecorderScorer()
+        reference._disc.load_state_dict(scorer.discriminator.state_dict())
         optimizer = torch.optim.SGD(scorer.discriminator.parameters(), lr=1.0)
+        reference_optimizer = torch.optim.SGD(
+            reference.discriminator.parameters(), lr=1.0,
+        )
         phase = DiscriminatorPhase(scorer, optimizer, total_pairs=3)
         report = phase.accumulate(self._buckets())
         # 手工复算：每桶未缩放 loss（复用 scorer 前向，参数未 step）
@@ -539,7 +558,23 @@ class TestDiscriminatorPhase:
                 float(real_term + fake_term), abs=1e-6,
             )
             expected += float(real_term + fake_term) * (detail.pair_count / 3)
+        # 参照侧：整桶加权 loss 在独立计算图 backward（现行数值语义的
+        # 独立重算），两侧各经 SGD lr=1 一步
+        for bucket in self._buckets():
+            logits_real = reference.patch_logits(bucket.reals)
+            logits_fake = reference.patch_logits(bucket.fakes)
+            terms = reference.discriminator_terms(logits_real, logits_fake)
+            (terms.total * (bucket.pair_count / 3)).backward()
+        optimizer.step()
+        reference_optimizer.step()
         assert report.loss_discriminator == pytest.approx(expected, abs=1e-6)
+        for parameter, reference_parameter in zip(
+            scorer.discriminator.parameters(),
+            reference.discriminator.parameters(),
+        ):
+            assert torch.allclose(
+                parameter, reference_parameter, rtol=1e-5, atol=1e-6,
+            )
 
     def test_report_is_per_condition_with_global_fields(self):
         """UpdateReport 升格（#220 决议 11）：per-condition 明细（桶序

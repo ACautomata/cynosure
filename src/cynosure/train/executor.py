@@ -542,7 +542,7 @@ class CardWorker:
     ) -> UpdateReport:
         """判别器步的卡内段：窗口记录按桶装配（桶序恒条件名排序、桶内
         对序 = 任务创建序）→ ``DiscriminatorPhase.accumulate``（先全桶
-        eval 后全桶 train + 逐对等权加权 backward）。
+        eval 后逐对 train + 逐对等权加权 backward，#276）。
 
         ``expected`` = 窗口计划的本卡任务数——join 后逐位对账，缺失 /
         多余即拒绝（#220 决议 6 的「不静默降批」机器面：任务在 rollout

@@ -9,9 +9,10 @@ iter——K < N_d 时「均匀」名不副实，#220 决议 5 spec 注明）；�
 
 **判别器桶（Discriminator bucket）**：单条件同形 (real, fake) 同源
 对集合——MR-RATE 异条件异形下混合条件批不可拼接为单一张量，判别器
-前向按桶进行（同桶批前向、跨桶梯度累积），跨卡聚合只有梯度 allreduce
-（配对数据不跨卡搬运）。容器不变式（单条件、两侧同形同量同 device、
-桶内对同形）构造期断言（#220 决议 3）。
+前向按桶组织：eval 段整桶 no_grad 前向，train 段**逐对前向**（batch
+恒 1，real/fake 各自独立前向、跨桶统一计算图梯度累积，#276），跨卡
+聚合只有梯度 allreduce（配对数据不跨卡搬运）。容器不变式（单条件、
+两侧同形同量同 device、桶内对同形）构造期断言（#220 决议 3）。
 
 **real 侧窗口起点全局无放回抽取**（#220 决议 10）：逐条件抽「窗口内
 该条件总对数」（分配表纯函数）→ 切片到任务；抽取调用序 = 条件名排序
@@ -22,20 +23,27 @@ recon 流（fake 侧）——real 侧是池数据不是随机流：随机性经
 (seed, 窗口号) 重导出）。
 
 **判别器步相位序列**（#220 决议 4）：先全桶 eval（train acc 复算、
-同一参数快照、eval 相不推进 spectral norm 幂迭代）后全桶 train
-（更新前向 + backward 累积，SN 推进 = 2×桶数：real/fake 各一次）→
-跨卡梯度 allreduce（SUM，M1 形态与逐 k 收集-同步同构）→ optimizer
-.step → 步末 spectral norm u/v broadcast（卡 0 权威；奇异向量不可
-平均，broadcast 即最优）。
+同一参数快照、eval 相不推进 spectral norm 幂迭代）后全对 train（
+逐对更新前向 batch 恒 1 + 统一图 backward 累积，SN 推进 = 2×总对数
+：每对 real/fake 各一次，#276）→跨卡梯度 allreduce（SUM，M1 形态与
+逐 k 收集-同步同构）→ optimizer.step → 步末 spectral norm u/v
+broadcast（卡 0 权威；奇异向量不可平均，broadcast 即最优）。
 
 **逐对等权全局 mean**（#220 决议 8 显式新裁）：``loss = Σ_b
 loss_b×(n_b/N_total)`` → backward → allreduce SUM；N_total = K×卡数
-常量。⚠️ 与现行 patch 级 mean 分离、与逐桶 mean 等权求和在异形桶下
-不等价——以条件对称意图为名立此存照，不得以「零变化」表述。
+常量。**逐对执行粒度**（#276）：实现为 Σ_对 loss_p×(1/N_total)（
+逐对前向、统一计算图、单次 backward）——与整桶加权数学恒等，只改
+执行粒度、不改训练数值语义。⚠️ 与现行 patch 级 mean 分离、与逐桶
+mean 等权求和在异形桶下不等价——以条件对称意图为名立此存照，不得
+以「零变化」表述。
 
 fake 产出即 CPU 暂存（#220 决议 16）：任务 fake 构造（policy 前向）
-后立即落 CPU，判别器步前 join 后逐桶按桶序回迁装配；GPU 峰值 = 最大
-桶 + 累积梯度。
+后立即落 CPU，判别器步前 join 后逐桶按桶序回迁装配。GPU 峰值的如实
+账（#276 逐对口径）：统一计算图 + 单次 backward 使**全对图激活**
+retained 至 backward（主项 ≈ 全对总量、与整桶前向同量级）+ 单对
+瞬态前向激活——逐对粒度解耦的是单次前向的瞬态上界（不再整桶一次
+物化），图激活主项仍随对数线性累积（其 OOM 暴露面的完全解除须逐对
+backward 配对方程释放，不在本票执行粒度内）。
 """
 
 import math
@@ -635,9 +643,10 @@ class DiscriminatorPhase:
     """判别器步的 per-卡相位编排（#220 决议 4/8）。
 
     段一 ``accumulate``（卡线程）：先全桶 eval（train acc 复算、同一
-    参数快照、eval 相不推进 spectral norm 幂迭代）后全桶 train（更新
-    前向 ×2×桶数 + 加权 backward 累积，SN 推进 = 2×桶数）——逐桶交替
-    结构性否决（跨桶快照分叉破坏 ADR-0009 同刻可比）。段二门面跨卡
+    参数快照、eval 相不推进 spectral norm 幂迭代）后全对 train（
+    逐对更新前向 ×2×总对数、batch 恒 1，#276 + 加权 backward 统一图
+    累积，SN 推进 = 2×总对数）——逐桶交替结构性否决（跨桶快照分叉
+    破坏 ADR-0009 同刻可比）。段二门面跨卡
     梯度 allreduce SUM（M1 形态，与逐 k 收集-同步同构）。段三
     ``step``：optimizer.step + eval 相恢复。段四门面步末 u/v broadcast
     （卡 0 权威）——多卡面；单卡/CPU fixture 全部结构性退化。
@@ -664,7 +673,11 @@ class DiscriminatorPhase:
         return self._optimizer
 
     def accumulate(self, buckets: list[DiscriminatorBucket]) -> UpdateReport:
-        """eval 全桶 + train 全桶 + 加权 backward（梯度落本卡 .grad）。
+        """eval 全桶 + train 全对 + 加权 backward（梯度落本卡 .grad）。
+
+        eval 段按桶整桶 no_grad 前向（acc 复算）；train 段逐对前向（
+        batch 恒 1，real/fake 各自独立前向、桶序×对序遍历），全部对
+        跨桶在统一计算图内按 1/N_total 加权累积、单次 backward（#276）。
 
         ``buckets`` 须非空且按桶序（条件名排序）传入——每卡每窗口恰
         K ≥ 1 任务的窗口不变量保证非空，直调空清单显式拒绝。"""
@@ -685,21 +698,37 @@ class DiscriminatorPhase:
         weighted: torch.Tensor | None = None
         details: list[ConditionUpdateDetail] = []
         for bucket, accuracy in zip(buckets, accuracies):
-            logits_real = self._scorer.patch_logits(bucket.reals)
-            logits_fake = self._scorer.patch_logits(bucket.fakes)
-            terms = self._scorer.discriminator_terms(
-                logits_real, logits_fake,
-            )
-            # 逐对等权全局 mean（#220 决议 8 显式新裁）：
-            # loss_b × (n_b/N_total) 求和 → 单次 backward（跨桶梯度
-            # 累积在统一计算图内，allreduce 在 backward 之后）
-            scaled = terms.total * (bucket.pair_count / self._total)
-            weighted = scaled if weighted is None else weighted + scaled
+            pair_totals: list[torch.Tensor] = []
+            real_terms: list[torch.Tensor] = []
+            fake_terms: list[torch.Tensor] = []
+            for index in range(bucket.pair_count):
+                # 逐对前向（batch 恒 1，#276）：real/fake 各自独立前向，
+                # 峰值激活与条件尺寸、桶宽、卡数解耦；全部对跨桶在统一
+                # 计算图内累积，单次 backward（梯度落本卡 .grad）
+                logits_real = self._scorer.patch_logits(
+                    bucket.reals[index:index + 1],
+                )
+                logits_fake = self._scorer.patch_logits(
+                    bucket.fakes[index:index + 1],
+                )
+                terms = self._scorer.discriminator_terms(
+                    logits_real, logits_fake,
+                )
+                # 逐对等权全局 mean（#220 决议 8 显式新裁）的逐对实现：
+                # 每对 loss×(1/N_total)——Σ_对 = loss_b×(n_b/N_total)，
+                # 与整桶加权数学恒等（只改执行粒度，不改训练数值语义）
+                scaled = terms.total * (1.0 / self._total)
+                weighted = scaled if weighted is None else weighted + scaled
+                pair_totals.append(terms.total)
+                real_terms.append(terms.real_term)
+                fake_terms.append(terms.fake_term)
             details.append(ConditionUpdateDetail(
                 condition=bucket.condition,
-                loss_discriminator=terms.total.item(),
-                loss_real_term=terms.real_term.item(),
-                loss_fake_term=terms.fake_term.item(),
+                # 桶 loss = 逐对均值聚合（同形桶与整桶 patch mean 数学
+                # 恒等——per-condition 明细语义不变）
+                loss_discriminator=torch.stack(pair_totals).mean().item(),
+                loss_real_term=torch.stack(real_terms).mean().item(),
+                loss_fake_term=torch.stack(fake_terms).mean().item(),
                 pair_count=bucket.pair_count,
                 train_pairwise_acc=accuracy,
             ))
