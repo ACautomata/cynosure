@@ -57,13 +57,13 @@ retained 主项 = **单对**前向激活 + 累积梯度——train 段峰值与�
 import math
 import zlib
 from dataclasses import dataclass, replace
-from fractions import Fraction
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.auc import HeldOutAuc
+from cynosure.reward.mixing import FakeSourceInterleave
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import ChunkedScorer, LatentScorer
 from cynosure.reward.update import ConditionUpdateDetail, UpdateReport
@@ -233,6 +233,9 @@ class DiscriminatorWindow:
             )
         if not card_slots:
             raise ValueError("判别器窗口须至少绑定一张卡（卡槽绑定为空）")
+        # 任务双型的交错规则（#277 计划层；#280 起与预训练 fake 供给
+        # 共用同一策略件——ρ 解析单点在 FakeSourceInterleave）
+        interleave = FakeSourceInterleave(rollout_fake_ratio)
         bound = [slot for slots in card_slots.values() for slot in slots]
         if sorted(bound) != list(range(allocation.slot_count)):
             raise ValueError(
@@ -243,27 +246,7 @@ class DiscriminatorWindow:
         self._n_d = n_d
         self._batch_size_k = batch_size_k
         self._card_slots = {card: tuple(slots) for card, slots in card_slots.items()}
-        self._rollout_interval: int | None = None
-        if rollout_fake_ratio != 0.0:
-            # 单位分数邻域的语义钉：interval = ⌈1/ρ̂⌉，ρ̂ = 配置浮点 snapping
-            # 到最近简单有理（limit_denominator 1e6 界）——裸浮点路径在此
-            # 邻域全部失守：精确有理算术对 double(1/3)（< 1/3）取顶得 4，
-            # 1.0/ρ 浮点除法对 double(1/49) 取顶得 50，均非用户所写的 1/n
-            snapped = Fraction(rollout_fake_ratio).limit_denominator(10**6)
-            if snapped > 0:
-                self._rollout_interval = math.ceil(1 / snapped)
-            else:
-                # ρ < snapping 分辨率（≈5e-7）：用户写的就是小量本身，
-                # 退回浮点除法取顶（此域 interval ≥ 2e6，相对误差不越
-                # 界；小到倒数溢出 = 无可行窗口尺度，可读拒绝优于
-                # ZeroDivisionError / OverflowError）
-                reciprocal = 1.0 / rollout_fake_ratio
-                if not math.isfinite(reciprocal):
-                    raise ValueError(
-                        f"判别器窗口的 rollout 型混合比 ρ 过小，交错周期 "
-                        f"⌈1/ρ⌉ 不可行：ρ = {rollout_fake_ratio}"
-                    )
-                self._rollout_interval = math.ceil(reciprocal)
+        self._interleave = interleave
 
     @property
     def n_d(self) -> int:
@@ -368,10 +351,16 @@ class DiscriminatorWindow:
                         ),
                     ))
         tasks.sort(key=lambda t: (t.condition, t.card, t.iteration, t.index))
-        interval = self._rollout_interval
-        if interval is not None:
+        if self._interleave.interval is not None:
             tasks = [
-                replace(task, kind="rollout" if (position + 1) % interval == 0 else "recon")
+                replace(
+                    task,
+                    kind=(
+                        "rollout"
+                        if self._interleave.is_rollout(position)
+                        else "recon"
+                    ),
+                )
                 for position, task in enumerate(tasks)
             ]
         return tuple(tasks)

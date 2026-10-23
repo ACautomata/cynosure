@@ -255,6 +255,21 @@ class PretrainEvent(BaseModel):
     measurement_volumes: int | None = None
     """本步测量批的卷数（= 该条件 held-out 全量卷数；支撑度判定的卷数
     轴在事件流上的留痕）。None 同 ``reconstruction_forwards``。"""
+    rollout_fake_volumes: int | None = None
+    """本步测量批中 rollout 终点型 fake 的卷数（#280 / ADR-0020 双源
+    并存的构成读数：fake 侧按 ρ 交错混入冻结基座 rollout 终点，其余为
+    同源重构体——``reconstruction_forwards`` 只计重构位的重构前向）。
+    None = #280 前的旧事件（无此读数）；ρ=0 的新事件写 0（明确零混入）。"""
+    rollout_fake_pairs: int | None = None
+    """本步更新批中 rollout 终点型 fake 的对数（#280 构成读数：更新批
+    = K×卡数 对，rollout 型位按 ρ 交错、其余为同源重构对）。None 同
+    ``rollout_fake_volumes``。"""
+    rollout_runs: int | None = None
+    """本步为 fake 供给跑的冻结基座完整 rollout 次数（测量批 + 更新批
+    的终点集产生成本读数——「rollout 仅为 fake 供给而跑」在事件流上
+    可核对；一次完整 rollout 的前向结构 = Anchor 全 ODE + 逐 k 扰动 +
+    各 λ 续跑，与测量批重构前向的 σ 推算口径异构，故记 run 数而非
+    前向数）。None 同 ``rollout_fake_volumes``。"""
     lr: float
     elapsed_s: float
 

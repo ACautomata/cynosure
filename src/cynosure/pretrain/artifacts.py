@@ -111,8 +111,10 @@ class PretrainReport(BaseModel):
     报告不落派生副本：唯一来源是工件本身）。"""
     condition_auc: dict[str, float]
     """每条件最终 **recon-AUC**（ADR-0012 决策 5 的过线判据：该条件
-    held-out 全量卷**原始** vs 其冻结基座**同源重构体**的池化点估计；
-    条件名域 = 本域词汇表条件集——BraTS 四序列 / MR-RATE 生成条件名）：
+    held-out 全量卷**原始** vs 冻结基座 fake 侧的池化点估计——fake 侧
+    构成 = 同源重构体为主体、ρ>0 时按 ρ 交错混入冻结基座 rollout 终点
+    （构成比例见 ``disc_rollout_fake_ratio``，ADR-0020/#280）；条件名
+    域 = 本域词汇表条件集——BraTS 四序列 / MR-RATE 生成条件名）：
     过线条件 = 确认时刻「首测 + 换批复测」的较小者（保守口径；
     确认后判别器继续受训，该值与最终落盘 checkpoint 不必同快照——
     它是确认时刻的测量记录，数据口径漂移由装载期指纹对照把守）；
@@ -129,15 +131,24 @@ class PretrainReport(BaseModel):
     （warm-start 装载守卫只对账数据口径与指纹，不做门槛判定）。"""
     auc_criterion: Literal["recon_auc", "rollout_auc"] = "recon_auc"
     """本报告的判据口径标识（ADR-0012 决策 5 的审计面）：``"recon_auc"``
-    = held-out real 原始 vs 同源重构体（当前口径，产报路径恒显式写入）；
-    ``"rollout_auc"`` = 旧 ADR-0008 口径（held-out real vs 量产 rollout
-    fake）。字段名随 ADR-0017 改名（旧名 ``gate_criterion``，「gate」
-    术语一次清干净；事件契约「可扩不可改名」的改名特例由 ADR-0017
-    记录），缺省值随之对齐当前口径——改名后旧键名报告在
-    ``extra=forbid`` 下整体拒绝装载，历史断代由 schema 拒绝承载，
-    不再依赖缺省值的断代语义。消费方据此判定跨阶段读数可比性
-    （recon-AUC 与 rollout-AUC 不可横向比较），装载守卫的时点把控在
-    provenance 指纹与格式断代层。"""
+    = held-out real 原始 vs 冻结基座 fake 侧（同源重构体为主体、ρ>0 时
+    按 ρ 混入 rollout 终点——混合口径经 ADR-0020 决策 4 授权、本字段
+    维持 ``recon_auc`` 标识、构成比例由 ``disc_rollout_fake_ratio``
+    承载，#280 裁决；产报路径恒显式写入）；``"rollout_auc"`` = 旧
+    ADR-0008 口径（held-out real vs 量产 rollout fake）。字段名随
+    ADR-0017 改名（旧名 ``gate_criterion``，「gate」术语一次清干净；
+    事件契约「可扩不可改名」的改名特例由 ADR-0017 记录），缺省值随之
+    对齐当前口径——改名后旧键名报告在 ``extra=forbid`` 下整体拒绝
+    装载，历史断代由 schema 拒绝承载，不再依赖缺省值的断代语义。消费方
+    据此判定跨阶段读数可比性（recon-AUC 与 rollout-AUC 不可横向比较），
+    装载守卫的时点把控在 provenance 指纹与格式断代层。"""
+    disc_rollout_fake_ratio: float = 0.0
+    """本 run 的判别器 fake 双源混合比 ρ（``reward.disc_rollout_fake_ratio``
+    配置留痕，ADR-0020 / #280）：测量批与更新批的 fake 侧按 ρ 交错混入
+    冻结基座 rollout 终点、其余为同源重构体——棘轮 AUC 的 fake 侧构成
+    与在线期一致（warm-start 上岗不面临分布跳变），构成比例由此字段
+    明确记录。0.0 = 纯同源重构（#280 前行为；旧报告装载缺省 0.0 放行
+    ——``extra=forbid`` 只拒未知新键，向后兼容的默认扩展不破守卫链）。"""
     condition_volumes: dict[str, int] = Field(default_factory=dict)
     """每条件的 held-out 卷数（支撑度规则 ``SupportRule`` 的判定输入，
     ADR-0008 决策 6）：< ``reward.gate_support_min_volumes`` 的条件走

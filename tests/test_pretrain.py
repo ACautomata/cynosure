@@ -40,6 +40,7 @@ from cynosure.pretrain.driver import MeasurementSources, PretrainDriver
 from cynosure.pretrain.measurement import MeasurementTemplate
 from cynosure.pretrain.sharding import ShardPlan
 from cynosure.reward.artifacts import ChannelStats, LatentManifest
+from cynosure.reward.mixing import FakeSourceInterleave
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.update import (
     ConditionUpdateDetail,
@@ -750,6 +751,11 @@ class TestPretrainEndToEnd:
         assert [event["modality"] for event in events] == [
             MODALITIES[step % len(MODALITIES)] for step in range(12)
         ]
+        # ρ=0（默认）的构成读数显式零（「可扩不可改名」的新字段语义
+        # 衔接面：明确零混入，非旧事件断代 None）
+        assert all(event["rollout_fake_volumes"] == 0 for event in events)
+        assert all(event["rollout_fake_pairs"] == 0 for event in events)
+        assert all(event["rollout_runs"] == 0 for event in events)
         # 曲线的操作者可见面：终点报出指标流路径与事件数（离线查看收敛
         # 曲线、校准过线阈值的数据源）
         assert f"{len(events)} 条 pretrain 事件" in result.stdout
@@ -1142,22 +1148,19 @@ class TestPretrainDriverAssembly:
 
 
 class TestPretrainReconstructionFakeSupply:
-    """#171 AC1：「预训练全程 fake 均来自装配原语（冻结基座重构），
-    量产 rollout 不再被预训练路径调用」——执行路径面与事件读数面两侧
-    钉住。
-
-    量产退役是**范围收窄**（RolloutPhase 从 driver 装配面消失、成本
-    读数改口径），不是「换个名字继续跑」：本类断言 driver 上不存在
-    任何量产入口，且测量面模板 / 更新面供给缝各就各位（#221 决议 5
-    的主控单点形态）。
+    """#171 AC1 与 #280 扩展后的供给面裁决：ρ=0 时预训练全程 fake
+    均来自装配原语、量产 rollout 不可达（rollout 机器结构性缺席、
+    rollout 流零消费死条目）；ρ>0 时 fake 双源按 ADR-0020 交错混入
+    （供给面在场、测量模板与更新面供给缝各就各位）。测量面模板 /
+    更新面供给缝的主控单点形态（#221 决议 5）不动。
     """
 
     def test_driver_has_no_rollout_phase_seam(
         self, scenario: PretrainScenario,
     ) -> None:
-        """装配面：driver 不再持有 RolloutPhase（``rollout`` 公开面、
+        """装配面：driver 本体不持有 RolloutPhase（``rollout`` 公开面、
         ``_rollout`` 私有位与旧量产入口 `_measurement_batch` 一律不在）
-        ——量产路径在预训练相结构性不可达，而非「约定不调用」。"""
+        ——fake 双源的 rollout 供给面归 rig 持有（ρ 开关在 rig 装配）。"""
         scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
         config = scenario.config()
         run = PretrainRun.init(config, scenario.tmp_path / "supply_run")
@@ -1170,6 +1173,62 @@ class TestPretrainReconstructionFakeSupply:
         assert driver._sources is not None
         assert callable(driver._cards[0].update_segment)
         assert callable(driver._cards[0].measure_segment)
+
+    def test_rho_zero_keeps_rollout_machine_absent(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """#280 AC1：ρ=0（默认）与现状逐位一致的结构前提——rig 不装配
+        rollout 机器：rollout 流恒零消费死条目（per-卡注册表实例的四流
+        中仍仅 recon 有消费者），测量/更新批供给面走全 recon 原路径。"""
+        scenario.write_config(reward={"pretrain_pass_threshold": 0.01})
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "supply0")
+        driver = PretrainDriver.build(
+            config, run, devices=[torch.device("cpu")],
+        )
+        assert driver._interleave.interval is None
+        for card in driver._cards:
+            card.start()
+        try:
+            for card in driver._cards:
+                assert card._require_rig().rollouts is None
+        finally:
+            for card in driver._cards:
+                card.stop()
+
+    def test_rho_positive_assembles_rollout_machine_on_card_stream(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """#280：ρ>0 时 rig 装配 rollout 终点机器，消费**卡轴** rollout
+        流（``seed + 卡×10⁶ + 0``——与在线槽轴派生同公式，卡 0 恒等）；
+        recon 流不受 ρ 影响（卡轴 seed+9 的恒等面保持）。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.01,
+            "disc_rollout_fake_ratio": 0.5,
+        })
+        config = scenario.config()
+        seed = config.schedule.seed
+        run = PretrainRun.init(config, scenario.tmp_path / "supplyR")
+        driver = PretrainDriver.build(config, run, devices=[
+            torch.device("cpu"), torch.device("cpu"),
+        ])
+        for card in driver._cards:
+            card.start()
+        try:
+            assert driver._interleave.interval == 2
+            for card in driver._cards:
+                rollouts = card._require_rig().rollouts
+                assert rollouts is not None
+                assert rollouts._generator.initial_seed() == (
+                    seed + card.index * 1_000_000
+                )
+                # recon 流恒等面不因 ρ 装配漂移
+                assert card._require_rig().assembler._generator.initial_seed() == (
+                    seed + card.index * 1_000_000 + 9
+                )
+        finally:
+            for card in driver._cards:
+                card.stop()
 
     def test_measurement_draw_is_full_heldout_geometry(
         self, scenario: PretrainScenario,
@@ -1231,6 +1290,268 @@ class TestPretrainReconstructionFakeSupply:
         )
         assert payload["auc_criterion"] == "recon_auc"
         assert payload["condition_volumes"] == report.condition_volumes
+
+
+class TestPretrainRolloutFakeMixing:
+    """#280 / ADR-0020 执行序档：预训练 fake 双源的数值与读数锚。
+
+    数值锚（缝级）：掩码版构成 ≡ 同 seed 机器的手工组装（rollout 位 =
+    终点集顺序消费项、recon 位 = 子集重构——两侧独立流互不扰动，逐位
+    对照承载「混入只发生在被指位」）。读数锚（e2e）：事件流的构成/
+    成本读数与交错规则一致、报告留痕 ρ；同 seed 重放逐位（随机面隔
+    离纪律：recon 流与 rollout 流互不漂移）。
+    """
+
+    def _rigged_driver(
+        self, scenario: PretrainScenario, name: str,
+    ) -> tuple[PretrainDriver, CynosureConfig]:
+        """ρ=0.5 的单卡 CPU driver（门槛不可达、步数上限 1——本族只取
+        装配与段级缝，不走完整步进）。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 1,
+            "disc_rollout_fake_ratio": 0.5,
+        })
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / name)
+        driver = PretrainDriver.build(
+            config, run, devices=[torch.device("cpu")],
+        )
+        for card in driver._cards:
+            card.start()
+        return driver, config
+
+    def test_measurement_segment_mixed_fakes_bitwise(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """测量批缝级锚：``_mixed_fakes``（掩码 [1]）≡ 手工组装——
+        recon 位（σ 定序轮转下两卷 σ 互异、子集批维与全量对应组一致）
+        逐位 = 全量重构批的对应行；rollout 位逐位 = 同 seed rollout 机器
+        终点集的首项（.float() 对齐）。两侧各自走 recon / rollout 流，
+        顺序消费互不扰动。"""
+        driver_a, config = self._rigged_driver(scenario, "mixA")
+        driver_b, _ = self._rigged_driver(scenario, "mixB")
+        try:
+            card_a, card_b = driver_a._cards[0], driver_b._cards[0]
+            rig_a, rig_b = card_a._require_rig(), card_b._require_rig()
+            order = driver_a._sources.draw_order("t1n")
+            assert len(order) == 2
+            template = MeasurementTemplate(
+                config.schedule.seed,
+                TrainingRuntime.assemble_schedules(config),
+                card_a.conditions,
+                sorted(config.policy.train_step_indices_m),
+            )
+            plan = ShardPlan.split(len(order), 1)
+            draw = template.draw(
+                "t1n", driver_a._sources.shape_of("t1n"), plan,
+            )
+            reals_a = torch.stack(
+                [rig_a.heldout.load_latent(entry) for entry in order]
+            )
+            condition = card_a.conditions.sample_target("t1n")
+            # A：掩码版构成（rollout 位 [1]）
+            fakes_a = card_a._mixed_fakes(
+                rig_a, reals_a, condition, draw.sigmas, draw.noises[0], [1],
+            )
+            # B：手工组装（同 seed 同输入；rollout 流先消耗、recon 流
+            # 后消耗——两流独立，对照与实现内次序无关）
+            order_b = driver_b._sources.draw_order("t1n")
+            reals_b = torch.stack(
+                [rig_b.heldout.load_latent(entry) for entry in order_b]
+            )
+            pool_b = rig_b.rollouts.endpoint_fakes("t1n")
+            # 同批维对照：单行重构（组批 1 ≡ 掩码版的 recon 子集批维）
+            # 逐位等——批维依赖的 CPU 库层位漂（σ 同值分组下全量批与
+            # 子集批的 CFG 前向批维不同，ADR-0018 决策 9 形态）不进锚
+            single_b = rig_b.assembler.reconstruct(
+                reals_b[[0]], card_b.conditions.sample_target("t1n"),
+                [draw.sigmas[0]], draw.noises[0][0:1],
+            )
+            full_b = rig_b.assembler.reconstruct(
+                reals_b, card_b.conditions.sample_target("t1n"),
+                list(draw.sigmas), draw.noises[0],
+            )
+            # rollout 位 = 终点池首项（纯拷贝 + fp32 对齐，跨 rig 严格等）
+            assert torch.equal(fakes_a[1], pool_b[0].float())
+            assert torch.equal(fakes_a[0], single_b[0])
+            assert not torch.equal(fakes_a[1], full_b[1])  # 混入真实发生
+        finally:
+            for card in driver_a._cards + driver_b._cards:
+                card.stop()
+
+    def test_update_segment_rollout_fill_is_endpoint_sequence(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """更新批缝级锚：``_fill_rollout_fakes`` 的顺序消费 ≡ 同 seed
+        机器终点集的前 k 项（掩码 [1, 3] → 池项 0/1、跨位序连续）；ρ=0
+        的 rig 收到掩码即 fail-fast（装配/主控分叉的显式暴露）。"""
+        driver_a, _ = self._rigged_driver(scenario, "fillA")
+        driver_b, _ = self._rigged_driver(scenario, "fillB")
+        try:
+            rig_a = driver_a._cards[0]._require_rig()
+            rig_b = driver_b._cards[0]._require_rig()
+            pool_b = rig_b.rollouts.endpoint_fakes("t1n")
+            fakes = torch.empty(
+                2, *rig_a.real_pool.load_latent(
+                    driver_a._sources.draw_reals("t1n", 1)[0],
+                ).shape,
+            )
+            driver_a._cards[0]._fill_rollout_fakes(
+                rig_a, fakes, "t1n", [0, 1],
+            )
+            assert torch.equal(fakes[0], pool_b[0].float())
+            assert torch.equal(fakes[1], pool_b[1].float())
+        finally:
+            for card in driver_a._cards + driver_b._cards:
+                card.stop()
+        # ρ=0：掩码即拒绝
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.01,
+            "disc_rollout_fake_ratio": 0.0,
+        })
+        config = scenario.config()
+        run = PretrainRun.init(config, scenario.tmp_path / "fill0")
+        driver0 = PretrainDriver.build(
+            config, run, devices=[torch.device("cpu")],
+        )
+        for card in driver0._cards:
+            card.start()
+        try:
+            rig0 = driver0._cards[0]._require_rig()
+            with pytest.raises(RuntimeError, match="rollout"):
+                driver0._cards[0]._fill_rollout_fakes(
+                    rig0, torch.zeros(1, 4, 16, 16, 8), "t1n", [0],
+                )
+        finally:
+            for card in driver0._cards:
+                card.stop()
+
+    def test_rho_positive_end_to_end_readings_and_report(
+        self, scenario: PretrainScenario,
+    ) -> None:
+        """e2e 读数锚（#280 AC1/AC3）：ρ>0 跑满步数上限——每步事件的
+        rollout_fake_volumes / rollout_fake_pairs 与 FakeSourceInterleave
+        的交错判定一致（测量批按全局卷序、更新批按全局对序），
+        rollout_runs 按卡轴分片逐卡取整（本卡 run 数 = ⌈本卡 rollout
+        位 / 单跑终点数⌉）；reconstruction_forwards 只计重构位；报告
+        落 disc_rollout_fake_ratio 构成留痕、auc_criterion 保持
+        recon_auc（缺省兼容：旧报告装载不受影响由报告契约族背书）。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 2,
+            "disc_rollout_fake_ratio": 0.5,
+        })
+        assert scenario.pretrain().code == 0, scenario.events()
+        config = scenario.config()
+        events = [
+            event for event in scenario.events()
+            if event["event"] == "pretrain"
+        ]
+        assert len(events) == 2
+        rule = FakeSourceInterleave(0.5)
+        cards = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        heldout = LatentManifest.load(
+            config.reward.heldout_real_manifest, kind="heldout_real",
+        )
+        for event in events:
+            # 测量批：全局卷序（每条件 2 卷、interval 2 → 恰 1 个位）
+            assert event["rollout_fake_volumes"] == sum(
+                1 for p in range(heldout.modalities[event["modality"]])
+                if rule.is_rollout(p)
+            )
+            # 更新批：全局对序（K×卡数、interval 2）
+            assert event["rollout_fake_pairs"] == sum(
+                1 for p in range(config.reward.disc_batch_size_k * cards)
+                if rule.is_rollout(p)
+            )
+            # 成本读数：按卡轴分片逐卡 ⌈本卡 rollout 位 / 单跑终点数⌉
+            # 之和（全局位跨卡分布后计——测量批 2 卷切 2 卡、位 1 落
+            # 卡 1 → 1 run；更新批每卡 2 位 → 每卡 1 run × 2 卡）
+            endpoint_count = (
+                len(sorted(config.policy.train_step_indices_m))
+                * len(sorted(config.policy.granularity_intervals_lambda))
+                * config.policy.group_size_g
+                + 1
+            )
+            expected_runs = 0
+            for count in (
+                heldout.modalities[event["modality"]],
+                config.reward.disc_batch_size_k * cards,
+            ):
+                for start, stop in ShardPlan.split(count, cards).bounds:
+                    card_rollouts = sum(
+                        1 for p in range(start, stop)
+                        if rule.is_rollout(p)
+                    )
+                    expected_runs += -(
+                        -card_rollouts // endpoint_count
+                    ) if card_rollouts else 0
+            assert event["rollout_runs"] == expected_runs
+            # 重构成本读数：重构位（每条件 2 卷 − 1 rollout 位 = 1 卷）
+            assert 0 < event["reconstruction_forwards"] < (
+                heldout.modalities[event["modality"]]
+                * config.policy.num_inference_steps
+            )
+        report = scenario.report()
+        assert report.disc_rollout_fake_ratio == pytest.approx(0.5)
+        assert report.auc_criterion == "recon_auc"
+
+    def test_rho_positive_same_seed_replay_bitwise(
+        self, scenario: PretrainScenario,
+        deterministic_cpu_replay: None,
+        checkpoint_parity: Callable[[dict, dict], None],
+    ) -> None:
+        """ρ>0 同 seed 重放逐位（#280 AC2：预训练随机面隔离——recon
+        流与 rollout 流互不漂移，同 config 同卡数重放逐位）：两 run 的
+        事件流除 elapsed 墙钟外逐字段一致（含构成与成本读数）、报告
+        逐字段一致、checkpoint 容差一致。"""
+        scenario.write_config(reward={
+            "pretrain_pass_threshold": 0.99,
+            "pretrain_max_steps": 2,
+            "disc_rollout_fake_ratio": 0.5,
+        })
+        config = scenario.config()
+        reports = []
+        metric_lines = []
+        ckpts = []
+        for index in range(2):
+            torch.manual_seed(config.schedule.seed)
+            run = PretrainRun.init(
+                config, scenario.tmp_path / f"mix_replay_{index}",
+            )
+            driver = PretrainDriver.build(
+                config, run, devices=[torch.device("cpu")],
+            )
+            for card in driver._cards:
+                card.start()
+            try:
+                reports.append(driver.run())
+            finally:
+                for card in driver._cards:
+                    card.stop()
+            metrics = run.paths.metrics.read_text(encoding="utf-8")
+            metric_lines.append([
+                json.loads(line) for line in metrics.splitlines() if line
+            ])
+            ckpts.append(torch.load(
+                run.paths.discriminator_ckpt,
+                map_location="cpu", weights_only=True,
+            ))
+        first, second = reports
+        assert first.condition_auc == second.condition_auc
+        assert first.disc_rollout_fake_ratio == second.disc_rollout_fake_ratio
+        assert first.steps_completed == second.steps_completed
+        for events_a, events_b in zip(*metric_lines):
+            for field in (
+                "event", "step", "modality", "heldout_auc",
+                "loss_discriminator",
+                "reconstruction_forwards", "measurement_volumes",
+                "rollout_fake_volumes", "rollout_fake_pairs",
+                "rollout_runs", "lr",
+            ):
+                assert events_a[field] == events_b[field], field
+        checkpoint_parity(ckpts[0], ckpts[1])
 
 
 class StubConditionsForTargets:
@@ -1355,7 +1676,9 @@ class TestPretrainRotationStateMachine:
 
             def fake_measurement(modality: str):
                 measurements.append(modality)
-                return face(modality), 1  # forwards 占位（成本读数不涉本组断言）
+                # (聚类替身, 重构前向占位, rollout 卷数占位——成本与
+                # 构成读数不涉本组断言；签名对齐主控三元组契约)
+                return face(modality), 1, 0
 
             def fake_update(modality: str):
                 updates.append(modality)

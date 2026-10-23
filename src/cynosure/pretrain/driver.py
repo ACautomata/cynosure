@@ -26,14 +26,21 @@ recon-AUC 合成分叉观测，per-condition EMA 自下而上越线落预训练�
 为空同样落盘全部产物——报告与 checkpoint 是诊断产物，不丢（warm-start
 装载无门槛判定，ADR-0017）。
 
-**预训练相不产 rollout**（ADR-0012 决策 6）：量产 rollout 整体退出本
-执行路径——fake 侧只剩「全量 held-out 卷的重构」（测量批，σ 定序
-轮转）与「更新批的重构」（σ 逐样本抽自被优化步）两条，均经装配原语；
-事件流的 ``reconstruction_forwards`` / ``measurement_volumes`` 是本
-口径的读数面。判据口径的两阶段差异记录在案（ADR-0012 决策 5）：预训练
-判据是 recon-AUC（判别器训练任务的 out-of-sample 泛化力）、在线运行
-口径是 rollout-AUC（对打分对象的分辨力），**不可跨阶段比较绝对值**
-——准入体检 vs 在岗考核。
+**fake 双源并存（ADR-0020 / #280，修订 ADR-0012 决策 6 的「预训练相
+不产 rollout」）**：ρ = ``reward.disc_rollout_fake_ratio`` > 0 时，
+测量批与更新批的 fake 侧按 ``FakeSourceInterleave`` 交错混入**冻结
+基座完整 rollout 的终点**（anchor + 扰动 + λ 续跑，rollout 机器与在线
+同构——``RolloutPhase.endpoint_fakes``、policy 恒冻结推理相），其余
+fake 仍为同源重构体；ρ=0（默认）时 rollout 供给面整体缺席（rig 不装
+配 rollout 机器、rollout 流恒零消费）——两批的构成与在线期一致，
+warm-start 上岗不面临分布跳变，棘轮 recon-AUC 的 fake 侧构成同步
+（``disc_rollout_fake_ratio`` 进报告留痕、事件流记
+``rollout_fake_volumes`` / ``rollout_fake_pairs`` / ``rollout_runs``
+构成与成本读数；``reconstruction_forwards`` 只计重构位）。判据口径的
+两阶段差异记录在案（ADR-0012 决策 5）：预训练判据是 recon-AUC
+（判别器训练任务的 out-of-sample 泛化力）、在线运行口径是 rollout-AUC
+（对打分对象的分辨力），**不可跨阶段比较绝对值**——准入体检 vs 在岗
+考核。
 
 **执行形态（ADR-0018，取代 ADR-0016 的 torchrun 多进程拓扑）**：单进程
 多卡，步进循环 resident **主控（编排层）**，每卡一条静态绑卡执行线程
@@ -62,18 +69,25 @@ recon 数值；每卡 σ 位与 ε 独立、「先 s 后 ε」次序契约保持
 drift：卡 ≥1 的 σ/ε 进迁移轨迹对照验收）；real 侧 = 主控对全池全局
 无放回抽 K×卡数再切片（``seed+1`` 单点直派——``RankSlicedPool`` 条带
 切片退役，抽取空间条带→全池、抽取者各卡→主控，同为 accepted drift）；
-rollout 流恒零消费死条目（``TrainingRngStreams`` per-卡实例的四流中
-仅 recon 有消费者）。恒等面（排列 +3 / 模板 +19 / SupportRule +7 /
-冷启动 +6 / 卡 0 recon +9）与 drift 面（real 抽取空间与抽取者、
-卡 ≥1 σ/ε）的对照表见 ADR-0018。
+rollout 流 = ρ=0 恒零消费死条目（``TrainingRngStreams`` per-卡实例的
+四流中仅 recon 有消费者），ρ>0 时消费**卡轴** rollout 流
+``seed + 卡×10⁶ + 0``（与在线槽轴派生同公式、每卡 rig 独享
+``RolloutPhase`` 实例；条件构造 → 初始噪声 → 逐 k 扰动的消耗序与在线
+rollout 相同构，跨测量/更新相顺序推进不复位——同 seed 同卡数重放
+逐位）。恒等面（排列 +3 / 模板 +19 / SupportRule +7 /
+冷启动 +6 / 卡 0 recon +9 / 卡轴 rollout +0）与 drift 面（real 抽取
+空间与抽取者、卡 ≥1 σ/ε）的对照表见 ADR-0018。
 
-**产物契约零改动（决议 17/18）**：checkpoint = 判别器步末**卡 0 副本
-直写**（确定性 allreduce + u/v broadcast 保证全卡逐位一致，含
+**产物契约（决议 17/18 + #280 扩展）**：checkpoint = 判别器步末**卡 0
+副本直写**（确定性 allreduce + u/v broadcast 保证全卡逐位一致，含
 ``_u``/``_v`` buffer；``loadable_state_dict`` 键集/格式不变；不设
 checkpoint 周期 bitwise 守卫 = 显式裁决——run 短风险低）；``Pretrain
-Report`` 字段集与 provenance 指纹面不变；``PretrainEvent`` 字段不动
-（``reconstruction_forwards`` / ``measurement_volumes`` = 全量 σ 列表
-推算与全量排列长度——分段求和的加法结合恒等）；train 侧消费面
+Report`` 增 ``disc_rollout_fake_ratio`` 构成留痕（缺省 0.0，旧报告
+装载不受影响）、provenance 指纹面不变；``PretrainEvent`` 按「可扩不
+改名」增 ``rollout_fake_volumes`` / ``rollout_fake_pairs`` /
+``rollout_runs`` 构成与成本读数（缺省 None = 旧事件断代；
+``reconstruction_forwards`` = 重构位 σ 子列表推算与全量排列长度——
+ρ=0 时 = 全量推算的原口径）；train 侧消费面
 （``load_discriminator`` + 组别绑定守卫 + 报告白名单）零改动。
 告警轴 (步, rank) → (步, 卡) 的迁移对象仅 ``OverfitAlertEvent``
 （``rank`` 字段归因观测卡；``OverfitMonitor`` 每卡实例——本地
@@ -120,6 +134,7 @@ from cynosure.pretrain.sharding import ShardPlan
 from cynosure.reward.artifacts import LatentManifest, PoolEntry
 from cynosure.reward.assembly import ReconstructionAssembler
 from cynosure.reward.auc import HeldOutAuc, VolumeScoreClusters
+from cynosure.reward.mixing import FakeSourceInterleave
 from cynosure.reward.overfit import OverfitMonitor
 from cynosure.reward.sampler import RealPoolSampler
 from cynosure.reward.scorer import LatentScorer
@@ -128,6 +143,7 @@ from cynosure.reward.update import OnlineUpdate, UpdateReport
 from cynosure.train.artifacts import OverfitAlertEvent, PretrainEvent
 from cynosure.train.discriminator import DiscriminatorBucket, DiscriminatorPhase
 from cynosure.train.policy import GroupPolicy
+from cynosure.train.rollout import RolloutPhase
 from cynosure.train.rng import SLOT_SEED_STRIDE, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
 
@@ -145,11 +161,14 @@ _WORKER_JOIN_TIMEOUT_S = 10.0
 class PretrainCardRig:
     """单卡的预训练组件组（绑卡线程装配、单线程消费）：冻结基座
     policy 副本 + 判别器 scorer 副本 + 配对批装配原语（卡轴 recon 流）
-    + 判别器步相位编排 + 数值口径 + 两侧 manifest 的加载面。"""
+    + rollout 终点机器（ρ>0 时在场——卡轴 rollout 流；ρ=0 缺席即
+    rollout 流恒零消费）+ 判别器步相位编排 + 数值口径 + 两侧 manifest
+    的加载面。"""
 
     policy: GroupPolicy
     scorer: LatentScorer
     assembler: ReconstructionAssembler
+    rollouts: RolloutPhase | None
     disc_phase: DiscriminatorPhase
     amp: AmpContext
     real_pool: LatentManifest
@@ -245,20 +264,29 @@ class PretrainCardWorker:
         sigmas: Sequence[float],
         noise: torch.Tensor,
         condition: RolloutCondition,
+        rollout_positions: Sequence[int] | None = None,
     ) -> VolumeScoreClusters:
-        """测量相的本卡段：real 连续段上卡 → 冻结基座同源重构
-        （主控给定的定序 σ 与模板流 ε——本段零随机消耗）→ 本卡判别器
-        副本打分的卷级分数聚类（CPU 形态回传——跨线程传递不带设备
-        语义，秩统计是 CPU 工作负载）。"""
+        """测量相的本卡段：real 连续段上卡 → fake 侧按位构成（#280：
+        默认全量同源重构；``rollout_positions`` 给定时该位 fake 换为
+        本卡 rollout 机器终点集的**顺序消费**项——池耗尽再跑，消耗序
+        跨测量/更新相连续推进；rollout 位跳过重构前向，其余位照旧
+        定序 σ + 模板流 ε 重构）→ 本卡判别器副本打分的卷级分数聚类
+        （CPU 形态回传——跨线程传递不带设备语义，秩统计是 CPU 工作
+        负载）。"""
         rig = self._require_rig()
         reals = self._load(rig.heldout, entries)
         with torch.no_grad(), torch.autocast(
             rig.amp.device_type, dtype=rig.amp.dtype,
         ):
-            fakes = rig.assembler.reconstruct(
-                reals, condition.to(self.device), list(sigmas),
-                noise.to(self.device),
-            )
+            if rollout_positions:
+                fakes = self._mixed_fakes(
+                    rig, reals, condition, sigmas, noise, rollout_positions,
+                )
+            else:
+                fakes = rig.assembler.reconstruct(
+                    reals, condition.to(self.device), list(sigmas),
+                    noise.to(self.device),
+                )
         clusters = HeldOutAuc.volume_clusters(reals, fakes, rig.scorer)
         return VolumeScoreClusters(
             real_volume_scores=tuple(
@@ -269,18 +297,97 @@ class PretrainCardWorker:
 
     def update_segment(
         self, entries: Sequence[PoolEntry], modality: str,
+        rollout_positions: Sequence[int] | None = None,
     ) -> UpdateReport:
         """更新相的本卡段：主控全局无放回抽取的本卡 K 对 real 上卡 →
-        配对批装配原语（卡轴 recon 流：先 s 后 ε、同源重构）→ 单条件
-        单桶的判别器步相位段（先 eval 复算 train acc 后 train 加权
-        backward——梯度落本卡 .grad，跨卡 SUM 由主控编排）。"""
+        fake 侧按位构成（#280：默认全部同源重构，recon 流「先 s 后 ε」
+        按本卡段批量消耗；``rollout_positions`` 给定时该位 fake 换为
+        本卡 rollout 机器终点集顺序消费项、recon 位只对**重构子集**
+        消耗 recon 流——rollout 位零 recon 流消耗，与在线「rollout 型
+        任务省重构前向」同构）→ 单条件单桶的判别器步相位段（先 eval
+        复算 train acc 后 train 加权 backward——梯度落本卡 .grad，跨卡
+        SUM 由主控编排）。"""
         rig = self._require_rig()
         reals = self._load(rig.real_pool, entries)
-        pair = rig.assembler.reconstruct_assigned(reals, modality)
+        if rollout_positions:
+            rollout_set = set(rollout_positions)
+            recon_rows = [
+                index for index in range(reals.shape[0])
+                if index not in rollout_set
+            ]
+            fakes = torch.empty_like(reals)
+            if recon_rows:
+                rows = torch.tensor(recon_rows, device=reals.device)
+                pair = rig.assembler.reconstruct_assigned(
+                    reals[rows], modality,
+                )
+                fakes[rows] = pair.fakes
+            self._fill_rollout_fakes(rig, fakes, modality, rollout_positions)
+        else:
+            pair = rig.assembler.reconstruct_assigned(reals, modality)
+            fakes = pair.fakes
         bucket = DiscriminatorBucket(
-            condition=modality, reals=pair.reals, fakes=pair.fakes,
+            condition=modality, reals=reals, fakes=fakes,
         )
         return rig.disc_phase.accumulate([bucket])
+
+    def _fill_rollout_fakes(
+        self,
+        rig: PretrainCardRig,
+        fakes: torch.Tensor,
+        modality: str,
+        rollout_positions: Sequence[int],
+    ) -> None:
+        """rollout 位填充：本卡 rollout 机器终点集**顺序消费**（池耗尽
+        再跑一次完整 rollout——流式语义，消耗序跨测量/更新相连续推进
+        不复位；``rig.rollouts`` 为 None（ρ=0）时拒绝——掩码只在 ρ>0
+        下发，缺席即主控/装配分叉的 fail-fast 面）。选取项 ``.float()``
+        对齐在线 rollout 型 fake 的 fp32 容器口径（与 real 侧同批 cat）。"""
+        if rig.rollouts is None:
+            raise RuntimeError(
+                "收到 rollout 位掩码但本卡无 rollout 机器（ρ=0 的装配"
+                "不应下发掩码——主控/装配分叉）"
+            )
+        pool = None
+        consumed = 0
+        for position in rollout_positions:
+            if pool is None or consumed >= pool.shape[0]:
+                pool = rig.rollouts.endpoint_fakes(modality)
+                consumed = 0
+            fakes[position] = pool[consumed].float()
+            consumed += 1
+
+    def _mixed_fakes(
+        self,
+        rig: PretrainCardRig,
+        reals: torch.Tensor,
+        condition: RolloutCondition,
+        sigmas: Sequence[float],
+        noise: torch.Tensor,
+        rollout_positions: Sequence[int],
+    ) -> torch.Tensor:
+        """测量批的按位 fake 构成（#280）：rollout 位 → 终点集顺序
+        消费；其余位 → 定序 σ + 模板流 ε 的冻结基座同源重构（recon
+        位只对子集消耗一次重构——ε 已在主控全量抽取、rollout 位的
+        ε 白抽但模板复位语义不变）。返回与 ``reals`` 同位次序的完整
+        fake 批（fp32，两侧同 dtype 打分）。"""
+        rollout_set = set(rollout_positions)
+        recon_rows = [
+            index for index in range(reals.shape[0])
+            if index not in rollout_set
+        ]
+        fakes = torch.empty_like(reals)
+        if recon_rows:
+            rows = torch.tensor(recon_rows, device=reals.device)
+            fakes[rows] = rig.assembler.reconstruct(
+                reals[rows], condition.to(self.device),
+                [sigmas[index] for index in recon_rows],
+                noise.to(reals.device)[rows],
+            )
+        self._fill_rollout_fakes(
+            rig, fakes, condition.name_or_raise(), rollout_positions,
+        )
+        return fakes
 
     def disc_step(self) -> None:
         """判别器步收尾（主控跨卡梯度 SUM 之后）：本卡 optimizer.step
@@ -390,6 +497,7 @@ class PretrainDriver:
         schedules: ConditionSchedules,
         vocabulary: ConditionVocabulary,
         cards: list[PretrainCardWorker],
+        interleave: FakeSourceInterleave,
     ) -> None:
         self._config = config
         self._run = run
@@ -398,6 +506,9 @@ class PretrainDriver:
         self._schedules = schedules
         self._cards = cards
         self._template: MeasurementTemplate | None = None
+        # fake 双源交错规则（ADR-0020 / #280）：主控位掩码的单一解析
+        # （ρ=0 → interval None → 全 recon，供给面整体不触发）
+        self._interleave = interleave
         # 过拟合分叉监控（ADR-0009-γ）每卡实例：本地 train acc + 全局
         # AUC 的合成分叉观测、per-condition EMA 账轴 = 词汇表条件集
         self._overfit: list[OverfitMonitor] = [
@@ -444,13 +555,17 @@ class PretrainDriver:
         scorer_prototype = TrainingRuntime.assemble_scorer(config, None)
         total_pairs = config.reward.disc_batch_size_k * len(devices)
         amp_dtype = AMP_DTYPES[config.policy.amp_dtype]
+        # fake 双源交错规则（#280）：driver 与各卡 rig 共用同一解析实例
+        # ——「是否装配 rollout 机器」与主控位掩码判定同源
+        interleave = FakeSourceInterleave(config.reward.disc_rollout_fake_ratio)
         cards = [
             PretrainCardWorker(
                 index,
                 device,
                 cls._card_rig_factory(
                     config, index, device, scorer_prototype,
-                    real_pool, heldout, total_pairs, amp_dtype,
+                    real_pool, heldout, total_pairs, amp_dtype, vocabulary,
+                    interleave,
                 ),
             )
             for index, device in enumerate(devices)
@@ -467,6 +582,7 @@ class PretrainDriver:
         return cls(
             config, run, sources, support,
             TrainingRuntime.assemble_schedules(config), vocabulary, cards,
+            interleave,
         )
 
     @staticmethod
@@ -491,38 +607,58 @@ class PretrainDriver:
         heldout: LatentManifest,
         total_pairs: int,
         amp_dtype,
+        vocabulary: ConditionVocabulary,
+        interleave: FakeSourceInterleave,
     ) -> Callable[[], PretrainCardRig]:
         """本卡组件装配的闭包工厂（绑卡线程执行）：冻结基座 policy +
         判别器副本（原型 deepcopy 迁卡——单点装载、逐位复制）+ 卡轴
         recon 流的装配原语（``seed + 卡×10⁶ + 9``——卡 0 恒等 = 现行
         rank0 recon 数值；供给语义装配，real 由主控全局抽取经任务注入）
-        + 判别器步相位编排。"""
+        + rollout 终点机器（ρ>0：卡轴 rollout 流 ``seed + 卡×10⁶ + 0``
+        的 ``RolloutPhase``——与在线 rollout 相同构的冻结基座完整
+        rollout 出口；ρ=0 缺席，rollout 流保持零消费）+ 判别器步相位
+        编排。"""
         def build_rig() -> PretrainCardRig:
             amp = AmpContext(device=device, dtype=amp_dtype)
             # 条件分布主流在新执行序无消费（测量条件穿模板流、更新批
-            # 条件穿卡轴 recon 流）——注入独立一次性 generator 仅满足
-            # 装配签名（async 门面同款口径）
+            # 条件穿卡轴 recon 流；rollout 机器的条件构造穿卡轴 rollout
+            # 流）——注入独立一次性 generator 仅满足装配签名（async
+            # 门面同款口径）
             policy = GroupPolicy.build(
                 config,
                 torch.Generator().manual_seed(config.schedule.seed),
                 device,
             )
             scorer = copy.deepcopy(scorer_prototype).to(device)
-            # per-卡注册表实例：仅 recon 流有消费者（rollout/real_pool/
-            # heldout 三流是预训练消费清单里的恒零消费死条目，#221
-            # 决议 13——实例在场、消耗为零）
+            # per-卡注册表实例：recon 流恒有消费者；rollout 流仅 ρ>0
+            # 消费（real_pool/heldout 两流是预训练消费清单里的恒零消费
+            # 死条目，#221 决议 13——实例在场、消耗为零）
             streams = TrainingRngStreams(
                 config.schedule.seed + index * SLOT_SEED_STRIDE,
             )
+            sampler = TrainingRuntime.assemble_sampler(
+                config, policy.field, device=device,
+            )
             assembler = TrainingRuntime.assemble_pair_assembler(
                 config,
-                sampler=TrainingRuntime.assemble_sampler(
-                    config, policy.field, device=device,
-                ),
+                sampler=sampler,
                 conditions=policy.conditions,
                 generator=streams.recon,
                 amp=amp,
             )
+            rollouts = None
+            if interleave.interval is not None:
+                rollouts = RolloutPhase(
+                    config,
+                    sampler,
+                    scorer,
+                    streams.rollout,
+                    condition_sampler=policy.conditions,
+                    vocabulary=vocabulary,
+                    device_type=amp.device_type,
+                    autocast_dtype=amp.dtype,
+                    device=device,
+                )
             disc_phase = DiscriminatorPhase(
                 scorer,
                 OnlineUpdate.assemble_optimizer(scorer, config.reward),
@@ -532,6 +668,7 @@ class PretrainDriver:
                 policy=policy,
                 scorer=scorer,
                 assembler=assembler,
+                rollouts=rollouts,
                 disc_phase=disc_phase,
                 amp=amp,
                 real_pool=real_pool,
@@ -581,7 +718,7 @@ class PretrainDriver:
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
             modality = targets[step % len(targets)]
-            clusters, forwards = self._measurement(modality)
+            clusters, forwards, rollout_volumes = self._measurement(modality)
             volumes[modality] = clusters.volume_count
             # 首测判定（主控 inline 四态：更新/复测/确认/终止，即下方
             # if/continue/break 控制流——单进程无分发面）：更新前快照
@@ -598,7 +735,7 @@ class PretrainDriver:
                 # 由数据侧池规模与支撑度界兜底，不以本相为抗噪防线）。
                 # 复测只读 AUC——配对批不留存（与首测批同一释放口径）
                 first_auc = auc
-                confirm_clusters, _ = self._measurement(modality)
+                confirm_clusters, _, _ = self._measurement(modality)
                 confirm_auc = confirm_clusters.pooled_auc()
                 if self._support.passes(confirm_auc, confirm_clusters):
                     confirmed[modality] = min(first_auc, confirm_auc)
@@ -643,16 +780,31 @@ class PretrainDriver:
             global_loss = sum(
                 report.loss_discriminator for report in per_card_reports
             )
+            card_count = len(self._cards)
             self._run.append_event(PretrainEvent(
                 step=step,
                 modality=modality,
                 loss_discriminator=global_loss,
                 heldout_auc=auc,
                 # 重构成本读数（#171 AC5 的成本口径落点）：测量批重构的
-                # 前向次数（全量 σ 列表推算——分段求和与全量求和的加法
-                # 结合恒等）与测量批规模——「没有量产」在事件流上可核对
+                # 前向次数（ρ>0 时只计重构位——rollout 位跳过重构；分段
+                # 求和与全量求和的加法结合恒等）与测量批规模——「没有
+                # 量产」的成本面由 rollout_fake_volumes / rollout_fake_pairs
+                # / rollout_runs 双源构成读数并行可核对
                 reconstruction_forwards=forwards,
                 measurement_volumes=volumes[modality],
+                rollout_fake_volumes=rollout_volumes,
+                rollout_fake_pairs=len(
+                    self._interleaved_positions(
+                        reward.disc_batch_size_k * card_count,
+                    ) or (),
+                ),
+                rollout_runs=(
+                    self._rollout_runs_for(volumes[modality], card_count)
+                    + self._rollout_runs_for(
+                        reward.disc_batch_size_k * card_count, card_count,
+                    )
+                ),
                 lr=reward.disc_lr,
                 elapsed_s=time.monotonic() - started,
             ))
@@ -667,7 +819,7 @@ class PretrainDriver:
             # 已确认条件的报告值 = 确认时的两次较小者，保留不覆盖）
             for target in targets:
                 if target not in reported:
-                    clusters, _ = self._measurement(target)
+                    clusters, _, _ = self._measurement(target)
                     reported[target] = clusters.pooled_auc()
                     volumes[target] = clusters.volume_count
         return self._finalize(
@@ -677,18 +829,22 @@ class PretrainDriver:
 
     def _measurement(
         self, modality: str,
-    ) -> tuple[VolumeScoreClusters, int]:
+    ) -> tuple[VolumeScoreClusters, int, int]:
         """单条件测量批 → 卷级分数聚类（过线测量/复测/补测共用入口）。
 
         主控单点：排列抽取（seed+3 流一次 randperm）→ ``ShardPlan``
         卡轴连续段切片 → 测量模板复位抽取（seed+19 直锚：条件构造
-        一次 → 全量 σ 定序轮转列表 → 按卡序逐段 ε）→ 测量扇出（每卡
-        一段：real 切片加载 + 冻结基座同源重构 + 本卡打分）→ join →
-        卡序 plain 拼接聚类（卷级归属保留、连续段拼接还原全量排列序）。
-        返回 (全局聚类, 全局前向数)。随机流：held-out 全量卷的抽取消耗
-        主控排列流（卷内顺序不影响读数——AUC 是集合级秩统计）、重构
-        的 ε 走复位测量模板（不碰 recon 流）——预训练不参与续训，两处
-        消耗都由 seed 纯函数确定 ⇒ 同 seed 同卡数重跑逐位可复算。
+        一次 → 全量 σ 定序轮转列表 → 按卡序逐段 ε）→ **fake 双源位
+        掩码**（#280：ρ>0 时在全局卷序上按 ``FakeSourceInterleave``
+        交错判定 rollout 型卷，切片到各卡；rollout 型卷跳过重构、fake
+        换为本卡 rollout 终点集的顺序消费项；模板 ε 仍全量抽取、复位
+        语义不变）→ 测量扇出（每卡一段：real 切片加载 + fake 按位构成
+        + 本卡打分）→ join → 卡序 plain 拼接聚类（卷级归属保留、连续
+        段拼接还原全量排列序）。返回 (全局聚类, 全局**重构位**前向数,
+        rollout 型卷数)。随机流：held-out 全量卷的抽取消耗主控排列流
+        （卷内顺序不影响读数——AUC 是集合级秩统计）、重构的 ε 走复位
+        测量模板（不碰 recon 流）——预训练不参与续训，两处消耗都由
+        seed 纯函数确定 ⇒ 同 seed 同卡数重跑逐位可复算。
         """
         assert self._template is not None
         order = self._sources.draw_order(modality)
@@ -696,6 +852,7 @@ class PretrainDriver:
         draw = self._template.draw(
             modality, self._sources.shape_of(modality), plan,
         )
+        rollout_positions = self._interleaved_positions(len(order))
         futures = [
             card.submit(
                 card.measure_segment,
@@ -703,6 +860,7 @@ class PretrainDriver:
                 draw.sigmas_of(card_index, plan),
                 draw.noises[card_index],
                 draw.condition,
+                self._card_rollout_positions(rollout_positions, start, stop),
             )
             for card_index, (card, (start, stop)) in enumerate(
                 zip(self._cards, plan.bounds),
@@ -719,9 +877,64 @@ class PretrainDriver:
                 [segment.fake_scores for segment in per_card],
             ),
         )
-        return global_clusters, self._template.forward_count(
-            modality, draw.sigmas,
+        rollout_set = (
+            set() if rollout_positions is None else set(rollout_positions)
         )
+        recon_sigmas = [
+            sigma
+            for index, sigma in enumerate(draw.sigmas)
+            if index not in rollout_set
+        ]
+        return (
+            global_clusters,
+            self._template.forward_count(modality, recon_sigmas),
+            0 if rollout_positions is None else len(rollout_positions),
+        )
+
+    def _interleaved_positions(self, count: int) -> list[int] | None:
+        """fake 双源交错的 rollout 位序列（#280）：ρ>0 时按
+        ``FakeSourceInterleave`` 在全局序 0..count−1 判定，返回 rollout
+        位列表（主控切片到卡）；ρ=0 返回 None（全 recon，供给面不触发）。
+        """
+        if self._interleave.interval is None:
+            return None
+        return [
+            position for position in range(count)
+            if self._interleave.is_rollout(position)
+        ]
+
+    def _card_rollout_positions(
+        self, positions: list[int] | None, start: int, stop: int,
+    ) -> list[int] | None:
+        """主控全局 rollout 位 → 本卡连续段 ``[start, stop)`` 的段内位
+        切片（None = ρ=0 的全 recon 原样透传——卡任务入口以 None 区分
+        「无混入」与「本段恰无 rollout 位」）。"""
+        if positions is None:
+            return None
+        return [
+            position - start
+            for position in positions
+            if start <= position < stop
+        ]
+
+    def _rollout_runs_for(
+        self, count: int, card_count: int,
+    ) -> int:
+        """fake 供给的完整 rollout 次数读数（#280 成本口径）：按卡轴
+        分片逐卡取整上界求和（每卡的终点集顺序消耗——本卡 run 数 =
+        ⌈本卡 rollout 位 / 单跑终点数⌉；rollout 位是**全局序**交错位、
+        卡段取其全局切片，与掩码分派同一位序）。"""
+        plan = ShardPlan.split(count, card_count)
+        endpoint_count = RolloutPhase.endpoint_count(self._config)
+        runs = 0
+        for start, stop in plan.bounds:
+            card_rollouts = sum(
+                1 for position in range(start, stop)
+                if self._interleave.is_rollout(position)
+            )
+            if card_rollouts:
+                runs += -(-card_rollouts // endpoint_count)
+        return runs
 
     def _update(self, modality: str) -> list[UpdateReport]:
         """更新步：主控全局无放回抽 K×卡数 → ``ShardPlan`` 切片（K×D
@@ -735,9 +948,11 @@ class PretrainDriver:
         total = self._config.reward.disc_batch_size_k * card_count
         entries = self._sources.draw_reals(modality, total)
         plan = ShardPlan.split(total, card_count)
+        rollout_positions = self._interleaved_positions(total)
         futures = [
             card.submit(
                 card.update_segment, entries[start:stop], modality,
+                self._card_rollout_positions(rollout_positions, start, stop),
             )
             for card, (start, stop) in zip(self._cards, plan.bounds)
         ]
@@ -795,8 +1010,10 @@ class PretrainDriver:
             conditions_passed=conditions_passed,
             # 判据口径标识（ADR-0012 决策 5 的审计面）：本报告的 AUC 是
             # held-out real 原始 vs 冻结基座同源重构体的 recon-AUC——
-            # 与在线 iter 事件的 rollout-AUC 不可横向比较
+            # 与在线 iter 事件的 rollout-AUC 不可横向比较（ρ>0 时 fake
+            # 侧按 ρ 混入 rollout 终点，构成比例见下字段留痕）
             auc_criterion="recon_auc",
+            disc_rollout_fake_ratio=reward.disc_rollout_fake_ratio,
             condition_volumes=condition_volumes,
             steps_completed=steps_completed,
             pass_threshold=reward.pretrain_pass_threshold,
