@@ -57,6 +57,9 @@ class TestValidConfigs:
         # 随 ADR-0012 退役；gating_* 三 knob 与条件闸开关随 ADR-0017 退役）
         assert config.reward.overfit_ema_span == 8
         assert config.reward.overfit_alert_divergence == pytest.approx(0.2)
+        # fake 双源混合比 ρ（ADR-0020，修订 ADR-0012 决策 6/7）：默认 0.0 =
+        # 判别器 fake 侧纯同源重构、全仓行为与现状逐位一致；消融臂显式开启
+        assert config.reward.disc_rollout_fake_ratio == 0.0
         assert config.schedule.n_plateau == 3
         assert config.schedule.milestone_interval == 50
         assert config.schedule.checkpoint_interval == 10
@@ -146,6 +149,24 @@ class TestRejection:
             assert ("reward", "overfit_alert_divergence") in self._locations(
                 exc_info.value,
             )
+
+    def test_disc_rollout_fake_ratio_range(self, valid_config_dict: dict) -> None:
+        """fake 双源混合比 ρ（ADR-0020）：schema 层守物理域 [0,1)——负数无
+        语义、ρ=1 时 fake 侧全是 rollout 终点（内容捷径全面回归 + 预训练
+        recon-AUC 判据失真），均字段级拒绝；界内值（含 0 默认）合法。"""
+        for bad in (-0.1, 1.0, 1.5):
+            data = copy.deepcopy(valid_config_dict)
+            data["reward"]["disc_rollout_fake_ratio"] = bad
+            with pytest.raises(ValidationError) as exc_info:
+                CynosureConfig.model_validate(data)
+            assert ("reward", "disc_rollout_fake_ratio") in self._locations(
+                exc_info.value,
+            )
+        for good in (0.0, 0.25, 0.5, 0.999):
+            data = copy.deepcopy(valid_config_dict)
+            data["reward"]["disc_rollout_fake_ratio"] = good
+            config = CynosureConfig.model_validate(data)
+            assert config.reward.disc_rollout_fake_ratio == pytest.approx(good)
 
     def test_overfit_ema_span_rejects_non_positive(
         self, valid_config_dict: dict,

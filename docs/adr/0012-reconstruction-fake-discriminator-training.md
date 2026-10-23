@@ -2,7 +2,7 @@
 
 ADR-0008/0009 链路下判别器以 rollout 终点 latent 为 fake、以训练期对称噪声注入（σ ~ U[0, σ_max]）为过拟合防线；MR-RATE 线判别器预训练的实验结果不佳，维护者裁决旧机制整体不满意。根因：fake（rollout 产物）与 real 的差异混杂「内容分布差」与「生成伪影差」两层，判别器可走内容捷径（记 Real sample pool 病例共性），注入只是输入增强补丁、不改变任务结构。**决定：判别器 fake 构造换域为同源重构体（reconstruction fake）——真实 latent 加噪到被优化步的日程噪声水平、用当时的 policy 以确定性 ODE 去噪回 σ=0，real/fake 同内容配对；判别器输入恒干净域，ADR-0009 的注入决策（1/2/3）随之取消，其监控决策（4/5）保留。**同内容配对使「记病例共性」捷径结构性失效——任务结构上根治而非增强；s 取自被优化步使重构伪影谱贴近 rollout fake，判别力向打分对象（rollout 终点）迁移；机制面净简化：replay buffer 判别器链路、预训练量产 rollout、σ_max 强度校准问题一并退役。
 
-**Status**: accepted
+**Status**: accepted（决策 6/7 经 ADR-0020 修订：fake 供给从「替换而非并存」改为「同源重构与 on-policy rollout 终点按混合比 ρ 并存」——决策 6 的 replay 退役面不变，recon 主体地位不变；决策 7 两阶段同原语的精神保留、字面修订为含冻结基座 rollout 混入的 A-i。ρ=0 默认下本 ADR 语义逐位成立）
 
 ## Decision
 
