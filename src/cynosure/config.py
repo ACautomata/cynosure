@@ -572,15 +572,12 @@ class RewardConfig(BaseModel):
     )
     disc_rollout_fake_ratio: float = SpecField(
         "消融", "ADR-0020",
-        "判别器 fake 双源混合比 ρ（ADR-0020，修订 ADR-0012 决策 6/7）："
-        "rollout 型任务占窗口任务的比例——fake 侧按 ρ 混入本 (iteration, 槽) "
-        "rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐），"
-        "(1−ρ) 保持同源重构体的同内容配对（反内容捷径压力）。物理域 [0,1)："
-        "ρ=1 时 fake 侧全是 rollout 终点（内容捷径全面回归 + 预训练 recon-AUC "
-        "判据失真），故为开区间；实验校准包络以 0.5 为顶（ADR-0020 "
-        "Consequences，理由 = 内容捷径回归风险）。默认 0.0 = 纯同源重构、"
-        "全仓行为与现状逐位一致；消融臂由配置显式开启（gauss 验收三臂 "
-        "{0, 0.25, 0.5}，#281）",
+        "判别器 fake 双源混合比 ρ（ADR-0020，修订 ADR-0012 决策 6/7）：窗口任务"
+        "中 rollout 型（fake = 本 (iteration, 槽) rollout 终点 latent，on-policy）"
+        "所占比例，其余 (1−ρ) 保持同源重构体的同内容配对（反内容捷径压力）。"
+        "物理域 [0,1)（ρ=1 = 纯 rollout 终点的退化面，见 ADR-0020）；实验校准"
+        "包络以 0.5 为顶。默认 0.0 = 纯同源重构、全仓行为与现状逐位一致；消融臂"
+        "显式开启（gauss 验收三臂 {0, 0.25, 0.5}，#281）",
         default=0.0, ge=0.0, lt=1.0,
     )
     disc_update_interval_n_d: int = SpecField(
