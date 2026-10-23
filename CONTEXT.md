@@ -131,8 +131,8 @@ MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#
 _Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
-Real sample pool 真实 latent 的同源重构体（构造见 同源重构），作为判别器的「假」——与 real 同内容、仅生成伪影不同。
-_Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代）
+Real sample pool 真实 latent 的同源重构体（构造见 同源重构），作为判别器的「假」——与 real 同内容、仅生成伪影不同。ADR-0020 修订为双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入微比例的 rollout 终点型 fake（见 判别器窗口 的 rollout 型任务）；双源机制实施票 #277–#280 未启动，ρ=0 默认下本词条现状语义逐位成立。
+_Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代；ADR-0020 起为「按 ρ 并存的第二源」而非定义本身——默认 ρ=0 时仍是取代语义）
 
 **同源重构（Reconstruction fake）**:
 判别器 fake 的构造原语（ADR-0012）：真实 latent 乘回 policy 工作域后从日程步点 s 加噪（rectified flow 插值 x_s = (1−s)·x + s·noise），再用**当时的 policy**（预训练 = base 冻结权重、在线 = 当前 policy）以 η=0 确定性 ODE 去噪回 σ=0、归位 pool 存储域；s 逐样本均匀抽自该条件被优化步（`policy.train_step_indices_m`）的日程点，静态逐条件从各自 sigma 日程导出（与 rollout 同一 `ConditionSchedules`）。判别器输入恒干净域——加噪只发生在 fake 构造的输入端，不进判别器前向；real/fake 同内容配对使「记 Real sample pool 病例共性」捷径结构性失效。构造走专属命名随机流（先抽水平 s、后抽 ε，随续训分片落盘）。
@@ -144,7 +144,8 @@ _Avoid_: 跨卡拼批（数据跨卡搬运的 gather 方案，已否决）、逐
 
 **判别器窗口（N_d window）**:
 判别器更新节奏的 iteration 区间：每 N_d 个 RL iteration 一次判别器步，消费本窗口内积累的恰 K×卡数 对（与 N_d 无关）；K 个重构任务摊到窗口内各 iter 的 rollout 相异步执行、判别器步前 join——任务发射序与窗口桶构成都是分配表的确定性纯函数。N_d>1 时窗口批内 fake 跨最多 N_d−1 步 policy 快照（accepted drift，进记账面）。
-_Avoid_: 每 iter 每卡 K 对（有效批随 N_d 膨胀，已否决）、N_d 计数器状态（节奏恒 `iteration % N_d`）
+**Rollout 型任务（ADR-0020，实施票 #277/#278 未启动）**：窗口任务的双型之一（recon | rollout）——rollout 型的 fake 取自本 (iteration, 槽) rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐；指派 = (seed, 窗口号, 任务创建序) 的确定性纯函数，每 ⌈1/ρ⌉ 个任务一个 rollout 型）。混合比 ρ = `reward.disc_rollout_fake_ratio` ∈ [0,1) 默认 0.0：默认下任务集与现状逐位一致（全 recon 型）；实验包络以 0.5 为顶（内容捷径回归风险，ADR-0020）。任务型指派确定性测试缝 = #274 Testing Decisions 缝 2。
+_Avoid_: 每 iter 每卡 K 对（有效批随 N_d 膨胀，已否决）、N_d 计数器状态（节奏恒 `iteration % N_d`）、把 ρ>0 当默认（默认恒 0，消融臂显式开启）
 
 **Warm-start pre-training（判别器预训练）**:
 RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构；训练至预训练棘轮终止，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012；终止判据见 预训练棘轮）。
