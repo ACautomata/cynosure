@@ -56,6 +56,15 @@ gradient_checkpointing` 默认开、fixture 可关），装配期 bitwise 探针
 同步（loss×(1/N) + 逐 tensor SUM allreduce，骨架期已落的机器面）的
 验收锚升 multi-k 日程（重放锚 num_steps=5、M={1,2,3}，单卡与多卡档）。
 
+rollout 型 fake 供给接线增量（#278，ADR-0020 fake 双源并存的执行序
+档）：rollout 型窗口任务（#277 计划层指派）在 slot worker 中从本
+(iteration, 槽) rollout 相已产出的终点集（``new_fakes``，已归位
+pool 域）按任务序号确定性选取 fake（``_rollout_endpoint``，零随机流），
+跳过同源重构前向——每 rollout 型任务省一次 ODE 续跑；real 侧照旧走
+窗口起点全局无放回抽取。配对记录、桶装配、LSGAN 损失、逐对等权全局
+mean、跨卡梯度归约、步末 broadcast 全部不感知 fake 来源（容器缝裁决，
+#278 Agreements）。
+
 判别器链期增量（#234，加厚 3/6，#220 结票全口径）：**判别器步在 k 循
 环后落地**——混合条件配对批经判别器桶（``DiscriminatorBucket``，单
 条件同形对集合、构造期断言）承载，相位序列先全桶 eval 后全桶 train
@@ -224,11 +233,13 @@ class SlotExample:
     rollout 相内打分——打分在 fakes 所在卡，判别器副本同值；每活跃条
     件的池化 midrank 由门面在相末单点合成）。"""
     window_pairs: tuple[tuple[WindowTask, WindowPairRecord], ...] = ()
-    """本例承载的窗口重构任务产出（(任务, 单对记录) 序，#234）：
-    判别器步 iteration 所在窗口内各 iter 摊派的任务——fake = 本
-    iteration rollout 相当前权重 θ_t（drift #1 时点前移保持），产出
-    即 CPU 暂存；判别器步前 join（rollout 相 gather 即 join 形态），
-    门面按任务累计进窗口记录、步前按桶序回迁装配。"""
+    """本例承载的窗口任务产出（(任务, 单对记录) 序，#234）：判别器步
+    iteration 所在窗口内各 iter 摊派的任务——recon 型 fake = 本
+    iteration rollout 相当前权重 θ_t 的同源重构（drift #1 时点前移
+    保持）、rollout 型 fake = 本 (iteration, 槽) rollout 相终点集的
+    任务序号确定性选取（#278，跳过同源重构前向），产出即 CPU 暂存；
+    判别器步前 join（rollout 相 gather 即 join 形态），门面按任务
+    累计进窗口记录、步前按桶序回迁装配。"""
 
 
 class CardReplica:
@@ -316,10 +327,11 @@ class SlotRunner:
 
     rollout 相本体的编排序（#217 §3 + #234 判别器链期）：rollout
     （anchor → 扰动 → λ 续跑 → 打分）→ 池化 AUC 原料打分（本例
-    fakes 的判别器分数）→ 窗口重构任务（fake 构造即 CPU 暂存）——
-    三段同属 rollout 相，``rollout_seconds`` 计时窗口整体涵盖
-    （phase_seconds 无独立条目：AUC 池化与判别器步的计时归位见门面
-    _run_iteration）。
+    fakes 的判别器分数）→ 窗口任务产出（#278 任务型分派：recon 型
+    同源重构 fake 构造即 CPU 暂存 / rollout 型本例终点集确定性选取，
+    跳过同源重构前向）——三段同属 rollout 相，``rollout_seconds``
+    计时窗口整体涵盖（phase_seconds 无独立条目：AUC 池化与判别器步
+    的计时归位见门面 _run_iteration）。
     """
 
     def __init__(
@@ -350,25 +362,27 @@ class SlotRunner:
         score_fakes: bool = True,
     ) -> SlotExample:
         """一个例子的 rollout 相（分配表条件 → 初始噪声/扰动/续跑 →
-        池化原料打分（门控）→ 窗口重构任务）。
+        池化原料打分（门控）→ 窗口任务产出）。
 
         ``score_fakes`` = 本例 fakes 的池化原料打分门控：判别器步由
         门面经 ``run_examples`` 显式供给 True（#220 决议 12「每活跃
         条件恰一次读数」的 fake 原料，即产即用）；非判别器步 False——
         打分前不进静默丢弃面白付。缺省 True（直调/单测路径完整产出）。
 
-        ``window_tasks`` = 本 (iteration, 槽) 摊派的重构任务及其
+        ``window_tasks`` = 本 (iteration, 槽) 摊派的窗口任务及其
         real 池条目（窗口起点全局无放回抽取的切片，#220 决议 10）：
-        逐任务加载 real（CPU）→ 供给入口 fake 构造（recon 流消耗
-        「先 s 后 ε」、批维 1）→ 产出即 CPU 暂存（WindowPairRecord）。
-        无任务（非窗口 iter 或本槽未摊派）为空 tuple。"""
+        逐任务按型分派 fake 供给（#278）——recon 型同源重构（recon 流
+        消耗「先 s 后 ε」、批维 1）；rollout 型从本例 rollout 相终点集
+        按任务序号确定性选取（跳过同源重构前向、零随机流）。两侧产出
+        即 CPU 暂存（WindowPairRecord）。无任务（非窗口 iter 或本槽
+        未摊派）为空 tuple。"""
         started = time.monotonic()
         record = self._rollout.run_iteration(condition_name)
         fake_scores = (
             self._score_fakes(record.new_fakes) if score_fakes else None
         )
         pairs = tuple(
-            (task, self._reconstruct(task, entry))
+            (task, self._pair_record(task, entry, record))
             for task, entry in window_tasks
         )
         return SlotExample(
@@ -387,21 +401,41 @@ class SlotRunner:
         with torch.no_grad():
             return self._chunked.scores(new_fakes).cpu()
 
-    def _reconstruct(
-        self, task: WindowTask, entry: PoolEntry,
+    def _pair_record(
+        self,
+        task: WindowTask,
+        entry: PoolEntry,
+        record: IterationRollout,
     ) -> WindowPairRecord:
-        """单窗口任务：real 加载（CPU 池懒加载）→ 供给入口 fake 构造
-        （recon 流、先 s 后 ε、no_grad + autocast 与 rollout 同数值
-        口径）→ 单对 CPU 暂存（两侧同形断言在 WindowPairRecord）。"""
+        """单窗口任务的配对记录（#278 任务型分派单点）：real 侧两型
+        照旧（窗口起点全局无放回抽取条目的 CPU 池懒加载，零流消耗）；
+        fake 侧按 ``task.kind`` 分派——recon 型同源重构前向（recon 流），
+        rollout 型本例 rollout 终点集确定性选取（#278，零随机流）。"""
         real_cpu = self._real_pool.load_latent(entry).unsqueeze(0)
-        pair = self._assembler.reconstruct_assigned(
-            real_cpu.to(self._device), task.condition,
-        )
+        if task.kind == "rollout":
+            fake = self._rollout_endpoint(task, record)
+        else:
+            pair = self._assembler.reconstruct_assigned(
+                real_cpu.to(self._device), task.condition,
+            )
+            fake = pair.fakes.cpu()
         return WindowPairRecord(
             condition=task.condition,
             real=real_cpu,
-            fake=pair.fakes.cpu(),
+            fake=fake,
         )
+
+    @staticmethod
+    def _rollout_endpoint(
+        task: WindowTask, record: IterationRollout,
+    ) -> torch.Tensor:
+        """rollout 型任务的 fake（#278）：本 (iteration, 槽) rollout 相
+        终点集（``new_fakes``，已归位 pool 域）按任务序号确定性选取——
+        ``index % N``，纯函数、零随机流（同 seed 重放逐位一致）。fp32
+        对齐 recon fake 的容器口径（autocast 终点与 real fp32 的混合桶
+        不可 cat），CPU 暂存同 ``WindowPairRecord`` 两侧同 device。"""
+        endpoint = record.new_fakes[task.index % record.new_fakes.shape[0]]
+        return endpoint.unsqueeze(0).float().cpu()
 
     async def run_k(
         self, example: SlotExample, step_index: int, example_count: int,

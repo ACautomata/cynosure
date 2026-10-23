@@ -420,6 +420,23 @@ class TestSingleIterationLoop:
         assert "discriminator" in first["loss"]
         assert "discriminator" not in second["loss"]  # N_d 跳过
 
+    def test_rollout_fake_ratio_runs_green_end_to_end(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ρ>0 端到端（#278 / ADR-0020 fake 双源并存）：rollout 型窗口
+        任务的 fake（本 (iteration, 槽) rollout 终点）进判别器训练批，
+        run 跑通且 iter 事件携带判别器步全 facet（loss / train acc /
+        held-out AUC）。"""
+        scenario.write_inputs()
+        scenario.patch_config(reward={"disc_rollout_fake_ratio": 0.5})
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        event = scenario.events()[0]
+        assert "discriminator" in event["loss"]
+        assert event["train_pairwise_acc"] is not None
+        assert event["heldout_auc"] is not None
+        assert 0.0 < event["heldout_auc"] < 1.0
+
     def test_checkpoint_is_loadable_and_evolved(
         self, scenario: TrainingLoopScenario,
     ) -> None:
