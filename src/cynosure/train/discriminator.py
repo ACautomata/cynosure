@@ -655,6 +655,20 @@ class DiscriminatorWindowRun:
         """本卡已 join 的任务产出（判别器步桶装配的原料）。"""
         return self._records.get(card, [])
 
+    def fake_source_counts(self, card: int) -> dict[str, tuple[int, int]]:
+        """本卡窗口记录的 fake 来源对数分解（#279 事件面的取数口）：
+        per-condition 的 (recon 对数, rollout 对数)——读任务账的
+        ``WindowTask.kind``。来源记账只在账簿层：记录与桶容器不感知
+        fake 来源（#274/#278 容器缝），条件键集与桶装配原料天然一致。"""
+        counts: dict[str, tuple[int, int]] = {}
+        for task, _ in self.records(card):
+            recon, rollout = counts.get(task.condition, (0, 0))
+            if task.kind == "rollout":
+                counts[task.condition] = (recon, rollout + 1)
+            else:
+                counts[task.condition] = (recon + 1, rollout)
+        return counts
+
     def record_auc(self, pooled: dict[str, float]) -> None:
         """池化读数入账（覆盖式：本窗口活跃条件的「最后一次有效测量」
         刷新，#220 决议 12/14；本窗口未活跃条件的既有读数原样保留）。"""

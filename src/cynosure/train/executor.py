@@ -1771,9 +1771,17 @@ class AsyncTrainingExecutor:
                 for condition, reading in sorted(divergences.items())
                 if reading.alerted
             ]
+            # fake 来源对数分解同样清窗前取数（#279：来源记账读任务账
+            # 的 WindowTask.kind——记录/桶容器不感知来源，窗口账簿是
+            # 唯一在账面；clear 之后再取即空账）
+            fake_sources = {
+                card.index: self._window_run.fake_source_counts(card.index)
+                for card in self.cards
+            }
             self._window_run.clear()
         else:
             alert_data = []
+            fake_sources = {}
         disc_seconds = time.monotonic() - disc_started
         # —— 事件发射：两档 flush（#222）——
         # iter 族：缓冲到 iteration 边界、按 (iteration, slot) 排序后
@@ -1852,7 +1860,7 @@ class AsyncTrainingExecutor:
                     divergence.divergence if divergence is not None else None
                 ),
                 disc_update=self._disc_update_event(
-                    report, divergences,
+                    report, divergences, fake_sources[card_index],
                 ) if report is not None else None,
                 lr=self.config.policy.policy_lr,
                 elapsed_s=elapsed,
@@ -1897,27 +1905,34 @@ class AsyncTrainingExecutor:
 
     @staticmethod
     def _disc_update_event(
-        report: UpdateReport, divergences: dict[str, DivergenceReading],
+        report: UpdateReport,
+        divergences: dict[str, DivergenceReading],
+        fake_sources: dict[str, tuple[int, int]],
     ) -> DiscUpdateDetail:
         """判别器步的逐条件事件明细（#220 决议 11：升格面在 iter 事件
-        的映射；同卡各例一致读数）。"""
+        的映射；同卡各例一致读数）。``fake_sources`` = 本卡 per-condition
+        的 (recon, rollout) 对数分解（#279，窗口账簿清窗前的取数）——
+        条件键集与桶装配原料同源，缺键即账簿/桶分叉的 fail-fast。"""
+        conditions: dict[str, DiscConditionReading] = {}
+        for detail in report.conditions:
+            recon_pairs, rollout_pairs = fake_sources[detail.condition]
+            conditions[detail.condition] = DiscConditionReading(
+                loss=detail.loss_discriminator,
+                loss_real_term=detail.loss_real_term,
+                loss_fake_term=detail.loss_fake_term,
+                pair_count=detail.pair_count,
+                recon_pairs=recon_pairs,
+                rollout_pairs=rollout_pairs,
+                train_pairwise_acc=detail.train_pairwise_acc,
+                divergence_ema=(
+                    divergences[detail.condition].divergence
+                    if detail.condition in divergences else None
+                ),
+            )
         return DiscUpdateDetail(
             global_batch_size=report.global_batch_size,
             weighted_loss=report.loss_discriminator,
-            conditions={
-                detail.condition: DiscConditionReading(
-                    loss=detail.loss_discriminator,
-                    loss_real_term=detail.loss_real_term,
-                    loss_fake_term=detail.loss_fake_term,
-                    pair_count=detail.pair_count,
-                    train_pairwise_acc=detail.train_pairwise_acc,
-                    divergence_ema=(
-                        divergences[detail.condition].divergence
-                        if detail.condition in divergences else None
-                    ),
-                )
-                for detail in report.conditions
-            },
+            conditions=conditions,
         )
 
     async def _collect(
