@@ -59,6 +59,10 @@ from cynosure.train import (
     TrainingRuntime,
     WeightDivergenceAlertEvent,
 )
+from cynosure.train.artifacts import (
+    DiscConditionReading,
+    DiscUpdateDetail,
+)
 from tests.conftest import (
     CliResult,
     CliSession,
@@ -81,6 +85,23 @@ def iter_event(iteration: int, stage: int = 1) -> IterEvent:
         lr=5e-5,
         elapsed_s=0.0,
     )
+
+
+def disc_step_iter_event(iteration: int) -> IterEvent:
+    """判别器步 iter 事件（#279 的 fake 来源对数在 conditions[*] 上）。"""
+    return iter_event(iteration).model_copy(update={"disc_update": DiscUpdateDetail(
+        global_batch_size=4,
+        weighted_loss=1.0,
+        conditions={"t1n": DiscConditionReading(
+            loss=1.0,
+            loss_real_term=0.5,
+            loss_fake_term=0.5,
+            pair_count=4,
+            recon_pairs=3,
+            rollout_pairs=1,
+            train_pairwise_acc=0.75,
+        )},
+    )})
 
 
 def pretrain_event(step: int) -> PretrainEvent:
@@ -221,6 +242,25 @@ class TestEventRewindAccounting:
             ("pretrain", 0), ("iter", 0), ("pretrain", 1), ("iter", 1),
             ("milestone", 2), ("iter", 0),
         ]
+
+    def test_rewind_roundtrip_preserves_disc_update_source_counts(
+        self, tmp_path: Path,
+    ) -> None:
+        """``disc_update.conditions[*]`` 的 fake 来源对数扩展（#279）不进
+        rewind 删除判定：含新字段的判别器步 iter 事件随所属 iter 的
+        ITERATION 口径参与回退（字段级扩展不新增登记行），恢复点内
+        原样保留——rewind 的逐行 round-trip 是宽松 dict 消费，字段
+        原样透传。"""
+        artifacts = fresh_run_artifacts(tmp_path)
+        artifacts.append_event(disc_step_iter_event(1))
+        artifacts.append_event(iter_event(9))
+        assert artifacts.rewind_events(5, stage=1) == 1  # 只删半截 iter@9
+        survivors = artifacts.read_events()
+        assert len(survivors) == 1
+        reading = survivors[0]["disc_update"]["conditions"]["t1n"]
+        assert reading["pair_count"] == 4
+        assert reading["recon_pairs"] == 3
+        assert reading["rollout_pairs"] == 1
 
     def test_rewind_to_origin_keeps_pretrain_events(self, tmp_path: Path) -> None:
         """恢复点 0（stage 的首个 iteration 都未进 checkpoint 覆盖面）：

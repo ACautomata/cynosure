@@ -356,6 +356,45 @@ class TestSingleIterationLoop:
         assert event["lr"] == pytest.approx(2e-6)
         assert event["elapsed_s"] >= 0.0
 
+    def test_disc_update_counts_all_pairs_as_recon_under_default_pure_recon(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ρ=0（默认纯重构）的事件衔接面（#279）：``disc_update.
+        conditions[*]`` 携带 fake 来源对数分解——recon_pairs =
+        pair_count、rollout_pairs = 0（与旧流全 recon 语义的对接面）。"""
+        scenario.write_inputs()
+        assert scenario.train().code == 0
+        event = scenario.events()[0]
+        reading = event["disc_update"]["conditions"][event["modality"]]
+        assert reading["recon_pairs"] == reading["pair_count"]
+        assert reading["rollout_pairs"] == 0
+
+    def test_disc_update_fake_source_counts_decompose_under_rollout_mixing(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """ρ>0 混合下的分解锚（#279）：每条件 ``recon_pairs +
+        rollout_pairs == pair_count``（对账面），且混合真实发生（
+        rollout 对数 > 0——fixture 几何 K=4、ρ=0.5 → 交错周期 2，
+        窗口必含 rollout 型任务）。"""
+        scenario.write_inputs()
+        scenario.patch_config(reward={"disc_rollout_fake_ratio": 0.5})
+        assert scenario.train().code == 0
+        readings = [
+            reading
+            for event in scenario.events()
+            if event["event"] == "iter"
+            for reading in event["disc_update"]["conditions"].values()
+        ]
+        assert readings
+        assert all(
+            reading["recon_pairs"] + reading["rollout_pairs"]
+            == reading["pair_count"]
+            for reading in readings
+        )
+        assert sum(
+            reading["rollout_pairs"] for reading in readings
+        ) >= 1, "ρ=0.5 的窗口须有 rollout 型对进桶（零则分解字段失真）"
+
     def test_iter_event_carries_overfit_divergence_observations(
         self, scenario: TrainingLoopScenario,
     ) -> None:

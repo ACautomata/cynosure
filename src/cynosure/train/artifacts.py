@@ -37,6 +37,14 @@ class DiscConditionReading(BaseModel):
     loss_real_term: float
     loss_fake_term: float
     pair_count: int
+    recon_pairs: int
+    """本桶 recon 型 fake 对数（fake 来源对数分解，ADR-0020 / #279）——
+    与 ``rollout_pairs`` 合计 = ``pair_count``；ρ=0（默认纯重构）时
+    = ``pair_count``（与旧流全 recon 语义的衔接面：旧事件行无此二字段，
+    宽松 dict 消费不受影响）。"""
+    rollout_pairs: int
+    """本桶 rollout 型 fake 对数（同上，#279）：本 (iteration, 槽)
+    rollout 相终点集入桶的对数。"""
     train_pairwise_acc: float
     divergence_ema: float | None = None
 
@@ -381,7 +389,14 @@ REWIND_ACCOUNTING: dict[str, RewindAccounting] = {
 重写），**显式接受史实蒸发**（#222 论证：重执行负载已变大概率不再
 超时，删除后不重发；abort 证据链由进程日志承载运维史）。骨架期的
 ``barrier_soft_timeout`` 登记行随类型收口退役——其旧行若存在即表外，
-按「宁可留痕不可误删」兜底全量保留。"""
+按「宁可留痕不可误删」兜底全量保留。
+
+**字段级扩展不新增登记行**（#279）：``iter`` 事件的嵌套明细
+``disc_update.conditions[*]``（含 fake 来源对数 ``recon_pairs`` /
+``rollout_pairs``，ADR-0020）不是独立事件类型，随所属 iter 事件的
+ITERATION 口径参与回退；``rewind_events`` 的逐行 round-trip 是宽松
+dict 消费（读写透传全部字段、删除判定只读 ``event``/``iteration``/
+``stage``），新字段不进判定面、旧行缺字段无害。"""
 
 
 class ManifestEntry(BaseModel):

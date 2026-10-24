@@ -131,7 +131,7 @@ MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#
 _Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
-Real sample pool 真实 latent 的同源重构体（构造见 同源重构）或本 (iteration, 槽) rollout 相的终点 latent（见 Rollout 型任务），作为判别器的「假」——ADR-0020 双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入 rollout 终点型 fake，rollout 型在 slot worker 中从本 (iteration, 槽) rollout 相终点集按任务序号确定性选取、跳过同源重构前向（#278 执行序接线）；配对记录、桶装配与 LSGAN 损失路径不感知来源。
+Real sample pool 真实 latent 的同源重构体（构造见 同源重构）或本 (iteration, 槽) rollout 相的终点 latent（见 Rollout 型任务），作为判别器的「假」——ADR-0020 双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入 rollout 终点型 fake，rollout 型在 slot worker 中从本 (iteration, 槽) rollout 相终点集按任务序号确定性选取、跳过同源重构前向（#278 执行序接线）；配对记录、桶装配与 LSGAN 损失路径不感知来源。来源记账只在两处留痕：窗口任务账簿（`WindowTask.kind`，判别器步事件面的计数取数口）与 `disc_update.conditions[*]` 的 `recon_pairs` / `rollout_pairs` 对数分解（合计 = `pair_count`，ρ=0 时 recon = `pair_count` / rollout = 0，#279；字段级扩展不进 rewind 删除判定）。
 _Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代；ADR-0020 起为「按 ρ 并存的第二源」而非定义本身——默认 ρ=0 时仍是取代语义）
 
 **同源重构（Reconstruction fake）**:
