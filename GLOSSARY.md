@@ -270,7 +270,7 @@ _Avoid_: 评测路径的全 rank FSDP 集合前向（旧执行序语义，随切
 _Avoid_: 评测集（评估集是数据侧互斥分区的概念，样本面是 run 内 manifest 条目）
 
 **样本图版（sample plate）**:
-一个样本一张的 2×2 医学三视图 PNG（`samples` 子命令的产物，渲染入口与 `.pt`/NIfTI 散文件面 #294、run 目录面 #295）：三格 = 三正交面（XY/YZ/ZX，与 ADR-0004 同口径——切面约定单点在 `OrthoPlane`，朝向一致）+ 第四格信息面板（来源标识、条件与索引、noise seed、体形状、spacing、窗范围）；三格定位线互标切层位置、轴标注按 RAS 轴码（L/R/A/P/I/S）。物理 mm 口径渲染：panel 纵横比 = 显示两维 spacing 比——各向异性网格下层厚轴不被视觉拉伸/压扁（取代临时脚本拼图的比例坍缩）；逐体 percentile 窗（0.5–99.5）缺省、显式覆盖；切片缺省中心层、偏移可调。渲染入口是公共缝（体来源 + 渲染参数 → PNG 产物 + 布局元数据，元数据即测试断言面）；run 目录输入面读 manifest + config 快照一键产出，产物落 `plots/samples/{stage}-{phase}/{index:04d}.png`（plots/ 附属产物位之下，与样本落盘 `samples/stage{stage}/{phase}/` 姊妹位），spacing 经条件词汇表逐条件解析（`spacing_origin=vocabulary`，非体素等比降级）、每条件按 manifest 序确定性选取（缺省 1 张、`--samples N|all`）；与 Monitoring subsample 的关系：图版消费的是已落盘的解码像素体，不新增解码路径。
+一个样本一张的 2×2 医学三视图 PNG（`samples` 子命令的产物，渲染入口与 `.pt`/NIfTI 散文件面 #294、run 目录面 #295）：三格 = 三正交面（XY/YZ/ZX，与 ADR-0004 同口径——切面约定单点在 `OrthoPlane`，朝向一致）+ 第四格信息面板（来源标识、条件与索引、noise seed、体形状、spacing、窗范围）；三格定位线互标切层位置、轴标注按 RAS 轴码（L/R/A/P/I/S）。物理 mm 口径渲染：panel 纵横比 = 显示两维 spacing 比——各向异性网格下层厚轴不被视觉拉伸/压扁（取代临时脚本拼图的比例坍缩）；逐体 percentile 窗（0.5–99.5）缺省、显式覆盖；切片缺省中心层、偏移可调。渲染入口是公共缝（体来源 + 渲染参数 → PNG 产物 + 布局元数据，元数据即测试断言面）；run 目录输入面读 manifest + config 快照一键产出，产物落 `plots/samples/{stage}-{phase}/{index:04d}.png`（plots/ 附属产物位之下，与样本落盘 `samples/stage{stage}/{phase}/` 姊妹位），spacing 经条件词汇表逐条件解析（`spacing_origin=vocabulary`，非体素等比降级）、每条件按 manifest 序确定性选取（缺省 1 张、`--samples N|all`）；train 正常收尾对已落盘样本自动出 baseline/resample 两版（#296，附属产物语义与指标曲线同款：生成失败只 stderr 告警、不改变 train 结果；续训收尾同口径重打）；与 Monitoring subsample 的关系：图版消费的是已落盘的解码像素体，不新增解码路径。
 _Avoid_: 打印、拼图（临时脚本时代的口语——正式化后自然消亡）、三视图（泛指，无 2×2 布局与信息面板语义）
 
 **Adjudication FID（裁决性 FID 读数）**:

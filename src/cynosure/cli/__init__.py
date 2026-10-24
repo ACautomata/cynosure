@@ -371,6 +371,7 @@ class CynosureCli:
         self._write_metric_plots(
             artifacts.paths.metrics, artifacts.paths.plots, "训练",
         )
+        self._write_sample_plates(artifacts.paths.root, "训练")
         return 0
 
     def _write_metric_plots(
@@ -398,6 +399,37 @@ class CynosureCli:
             f"指标曲线已落盘: {plots}（{len(produced)} 张 SVG）",
             file=self._stdout,
         )
+
+    def _write_sample_plates(
+        self, run_root: Path, subject: str,
+    ) -> None:
+        """train 正常收尾的自动样本图版（#296）：对 run 目录已落盘样本
+        出 baseline/resample 两版图版，落 plots/samples/{stage}-{phase}/
+        （#295 落位契约，与 ``samples --run-dir`` 手动重打同源）。续训
+        收尾同样覆盖——manifest 与已落盘样本随续训读回，图版随续训重打。
+        附属产物语义：主命令已成功，图不改变命令结果——生成任何失败只
+        stderr 告警。宽捕 ``Exception`` 是该语义的结构性表达：渲染链
+        横跨 manifest 解析、词汇表 spacing 解析与 matplotlib 渲染，失败
+        面无法窄枚举，收窄捕获面等于让部分图版故障升级为主命令失败。
+        某版样本全未落盘（如提前中止的续训现场）则该版缺组、逐版 stderr
+        告警，另一版照常产出。"""
+        try:
+            report = RunSamplePlates(run_root).render()
+        except Exception as exc:
+            print(
+                f"样本图版生成失败（不影响{subject}结果）: "
+                f"{type(exc).__name__}: {exc}",
+                file=self._stderr,
+            )
+            return
+        if report.produced:
+            print(report.summary_line(), file=self._stdout)
+        for label in report.missing_groups():
+            print(
+                f"样本图版 {label} 版样本未落盘，跳过"
+                f"（不影响{subject}结果）",
+                file=self._stderr,
+            )
 
     def _dump_trajectory(
         self, config: CynosureConfig, artifacts: RunArtifacts,
@@ -673,14 +705,7 @@ class CynosureCli:
                 file=self._stdout,
             )
             return 0
-        counts = "、".join(
-            f"{group.label} {len(group.plates)} 张" for group in report.groups
-        )
-        origin = SPACING_ORIGIN_LABELS[report.spacing_origin]
-        print(
-            f"样本图版已落盘: {report.output_root}（{counts}；spacing 口径: {origin}）",
-            file=self._stdout,
-        )
+        print(report.summary_line(), file=self._stdout)
         if report.skipped:
             skipped = report.skipped_by_group()
             detail = "、".join(
