@@ -1676,9 +1676,10 @@ class TestPretrainRotationStateMachine:
 
             def fake_measurement(modality: str):
                 measurements.append(modality)
-                # (聚类替身, 重构前向占位, rollout 卷数占位——成本与
-                # 构成读数不涉本组断言；签名对齐主控三元组契约)
-                return face(modality), 1, 0
+                # (聚类替身, 重构前向占位, rollout 卷数占位——签名对齐
+                # 主控三元组契约；rollout 占位取非零值，供复测计入读数
+                # 的计数断言锚定「单段值 × 测量段次数」)
+                return face(modality), 1, 3
 
             def fake_update(modality: str):
                 updates.append(modality)
@@ -1769,6 +1770,14 @@ class TestPretrainRotationStateMachine:
             "t1n", "t1c", "t2w", "t2f",
         ]
         assert events[0]["heldout_auc"] == pytest.approx(0.9)  # 首测值落事件
+        # 复测段的 fake 供给消耗计入读数（#280 读数修复）：复测掉线步
+        # 发事件 → rollout_fake_volumes 覆盖本步全部测量段（首测 + 复测
+        # = 2 × 单段占位 3）；其余步只测一次 = 单段占位。AUC 口径不变
+        # （复测读数只作确认判定不入账），成本读数与统计读数分轨
+        assert events[0]["rollout_fake_volumes"] == 3 + 3
+        assert [event["rollout_fake_volumes"] for event in events[1:]] == [
+            3, 3, 3,
+        ]
 
     def test_pretrain_phase_alert_events_carry_modality_attribution(
         self, scripted,
