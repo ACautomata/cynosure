@@ -131,8 +131,8 @@ MR-RATE prepare 的抽样留痕工件（`reward.sampling_manifest_json`，#131/#
 _Avoid_: 抽样清单（泛指）、下载清单（#78 的另一工件）
 
 **Fake sample（伪样本）**:
-Real sample pool 真实 latent 的同源重构体（构造见 同源重构）或本 (iteration, 槽) rollout 相的终点 latent（见 Rollout 型任务），作为判别器的「假」——ADR-0020 双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入 rollout 终点型 fake，rollout 型在 slot worker 中从本 (iteration, 槽) rollout 相终点集按任务序号确定性选取、跳过同源重构前向（#278 执行序接线）；配对记录、桶装配与 LSGAN 损失路径不感知来源。来源记账只在两处留痕：窗口任务账簿（`WindowTask.kind`，判别器步事件面的计数取数口）与 `disc_update.conditions[*]` 的 `recon_pairs` / `rollout_pairs` 对数分解（合计 = `pair_count`，ρ=0 时 recon = `pair_count` / rollout = 0，#279；字段级扩展不进 rewind 删除判定）。
-_Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代；ADR-0020 起为「按 ρ 并存的第二源」而非定义本身——默认 ρ=0 时仍是取代语义）
+Real sample pool 真实 latent 的同源重构体（构造见 同源重构）或本 (iteration, 槽) rollout 相的终点 latent（见 Rollout 型任务），作为判别器的「假」——ADR-0020 双源并存：窗口任务按混合比 ρ（`reward.disc_rollout_fake_ratio`，默认 0.0 = 纯重构不变）混入 rollout 终点型 fake，rollout 型在 slot worker 中从本 (iteration, 槽) rollout 相终点集按任务序号确定性选取、跳过同源重构前向（#278 执行序接线）；配对记录、桶装配与 LSGAN 损失路径不感知来源。来源记账只在两处留痕：窗口任务账簿（`WindowTask.kind`，判别器步事件面的计数取数口）与 `disc_update.conditions[*]` 的 `recon_pairs` / `rollout_pairs` 对数分解（合计 = `pair_count`，ρ=0 时 recon = `pair_count` / rollout = 0，#279；字段级扩展不进 rewind 删除判定）。预训练 fake 侧同构（#280 / A-i 子选项）：ρ>0 时测量批与更新批按同一 `FakeSourceInterleave` 规则交错混入**冻结基座完整 rollout 的终点**（`RolloutPhase.endpoint_fakes`——anchor + 扰动 + λ 续跑、卡轴 rollout 流 `seed+卡×10⁶+0`、每卡 rig 独享机器、终点池顺序消耗耗尽再跑），rollout 位跳过重构前向、recon 位照旧；ρ=0 时 rollout 供给面整体缺席（rig 不装配机器、rollout 流零消费死条目）——棘轮 AUC 的 fake 侧构成与在线期一致，warm-start 不面临分布跳变；事件流记 `rollout_fake_volumes`/`rollout_fake_pairs`/`rollout_runs` 构成与成本读数、报告留痕 `disc_rollout_fake_ratio`。
+_Avoid_: 生成样本、负样本、rollout 产物当判别器 fake（旧语义，ADR-0012 取代；ADR-0020 起为「按 ρ 并存的第二源」而非定义本身——默认 ρ=0 时仍是取代语义）、ρ 双实现（ρ→交错周期解析单点在 `FakeSourceInterleave`，在线窗口与预训练共用）
 
 **同源重构（Reconstruction fake）**:
 判别器 fake 的构造原语（ADR-0012）：真实 latent 乘回 policy 工作域后从日程步点 s 加噪（rectified flow 插值 x_s = (1−s)·x + s·noise），再用**当时的 policy**（预训练 = base 冻结权重、在线 = 当前 policy）以 η=0 确定性 ODE 去噪回 σ=0、归位 pool 存储域；s 逐样本均匀抽自该条件被优化步（`policy.train_step_indices_m`）的日程点，静态逐条件从各自 sigma 日程导出（与 rollout 同一 `ConditionSchedules`）。判别器输入恒干净域——加噪只发生在 fake 构造的输入端，不进判别器前向；real/fake 同内容配对使「记 Real sample pool 病例共性」捷径结构性失效。构造走专属命名随机流（先抽水平 s、后抽 ε，随续训分片落盘）。
@@ -144,15 +144,15 @@ _Avoid_: 跨卡拼批（数据跨卡搬运的 gather 方案，已否决）、逐
 
 **判别器窗口（N_d window）**:
 判别器更新节奏的 iteration 区间：每 N_d 个 RL iteration 一次判别器步，消费本窗口内积累的恰 K×卡数 对（与 N_d 无关）；K 个窗口任务（双型，见 Rollout 型任务）摊到窗口内各 iter 的 rollout 相异步执行、判别器步前 join——任务发射序与窗口桶构成都是分配表的确定性纯函数。N_d>1 时窗口批内 fake 跨最多 N_d−1 步 policy 快照（accepted drift，进记账面）。
-**Rollout 型任务（ADR-0020，#277 计划层 + #278 执行序接线已落地）**：窗口任务的双型之一（recon | rollout）——rollout 型的 fake 取自本 (iteration, 槽) rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐；指派 = (seed, 窗口号, 任务创建序) 的确定性纯函数，每 ⌈1/ρ⌉ 个任务一个 rollout 型），执行序在 slot worker 中按任务序号从本例终点集确定性选取、跳过同源重构前向（每 rollout 型任务省一次 ODE 续跑）。混合比 ρ = `reward.disc_rollout_fake_ratio` ∈ [0,1) 默认 0.0：默认下任务集与现状逐位一致（全 recon 型）；实验包络以 0.5 为顶（内容捷径回归风险，ADR-0020）。任务型指派确定性测试缝 = #274 Testing Decisions 缝 2。
+**Rollout 型任务（ADR-0020，#277 计划层 + #278 执行序接线已落地）**：窗口任务的双型之一（recon | rollout）——rollout 型的 fake 取自本 (iteration, 槽) rollout 相已产出的终点 latent（on-policy，训练分布向打分分布对齐；指派 = (seed, 窗口号, 任务创建序) 的确定性纯函数，每 ⌈1/ρ⌉ 个任务一个 rollout 型），执行序在 slot worker 中按任务序号从本例终点集确定性选取、跳过同源重构前向（每 rollout 型任务省一次 ODE 续跑）。混合比 ρ = `reward.disc_rollout_fake_ratio` ∈ [0,1) 默认 0.0：默认下任务集与现状逐位一致（全 recon 型）；实验包络以 0.5 为顶（内容捷径回归风险，ADR-0020）。任务型指派确定性测试缝 = #274 Testing Decisions 缝 2。ρ→交错周期的解析（snapping/取顶/域防御）单点在 `FakeSourceInterleave`（`cynosure.reward.mixing`），在线窗口与预训练 fake 供给共用（#280）。
 _Avoid_: 每 iter 每卡 K 对（有效批随 N_d 膨胀，已否决）、N_d 计数器状态（节奏恒 `iteration % N_d`）、把 ρ>0 当默认（默认恒 0，消融臂显式开启）
 
 **Warm-start pre-training（判别器预训练）**:
-RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构；训练至预训练棘轮终止，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012；终止判据见 预训练棘轮）。
-_Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）、量产 rollout 当 fake 源（旧语义，ADR-0012）
+RL 启动前对 reward model 的离线密集训练：real 取 Real sample pool，fake 取同批 real 的 base policy 同源重构（ρ>0 时按 ρ 交错混入冻结基座 rollout 终点，ADR-0020 / #280 / 见 Fake sample）；训练至预训练棘轮终止，产物作为在线更新的初始权重（ADR-0007；fake 构造 ADR-0012；终止判据见 预训练棘轮）。
+_Avoid_: 一次性预训练、离线 reward model（RLHF 语境指冻结，本项目预训练后仍在线更新）、量产 rollout 当 fake 源（旧语义：ADR-0012 曾整体取代，ADR-0020 起以 ρ 混入的第二源回归、默认 ρ=0 仍缺席）
 
 **预训练棘轮（Pretrain ratchet）**:
-判别器预训练的终止判据（ADR-0007/0008 决策 3/6，ADR-0017 门控链退役后保留面的升格口径）：per-condition recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012）逐条件「首测过线 → 换批复测确认」棘轮式入列（报告值取两次较小者，确认步不更新），全部条件过线即提前终止；`pretrain_max_steps` 耗尽则过线条件 = 已确认者、未确认条件对落盘权重补测。过线判定含支撑度规则（小样本条件走 bootstrap CI 下界）。**不设 train 侧上岗门槛**（ADR-0017：白名单空拒绝开跑的启动期硬检查已退役）——报告的过线条件清单与达标与否只承载预训练自身的终止形态与人工判读面；warm-start 装载守卫只对账数据口径指纹与形态指纹（组别绑定 #113：报告 group 与消费 config 严格等值，跨组显式拒绝）。口径交接：预训练判据（recon-AUC）与在线运行口径（fake 侧 = rollout 终点 latent）不同构、不可跨阶段比较绝对值（准入体检 vs 在岗考核，ADR-0012）。
+判别器预训练的终止判据（ADR-0007/0008 决策 3/6，ADR-0017 门控链退役后保留面的升格口径）：per-condition recon-AUC（held-out real 原始 vs 同源重构体——测判别器在训练任务上的 out-of-sample 泛化力，ADR-0012）逐条件「首测过线 → 换批复测确认」棘轮式入列（报告值取两次较小者，确认步不更新），全部条件过线即提前终止；`pretrain_max_steps` 耗尽则过线条件 = 已确认者、未确认条件对落盘权重补测。过线判定含支撑度规则（小样本条件走 bootstrap CI 下界）。**不设 train 侧上岗门槛**（ADR-0017：白名单空拒绝开跑的启动期硬检查已退役）——报告的过线条件清单与达标与否只承载预训练自身的终止形态与人工判读面；warm-start 装载守卫只对账数据口径指纹与形态指纹（组别绑定 #113：报告 group 与消费 config 严格等值，跨组显式拒绝）。口径交接：预训练判据（recon-AUC）与在线运行口径（rollout-AUC，对打分对象的分辨力）**不可跨阶段比较绝对值**（准入体检 vs 在岗考核，ADR-0012）；ρ>0 时预训练 AUC 的 fake 侧构成与在线期一致（双源按同一交错规则混入、构成比例经报告 `disc_rollout_fake_ratio` 留痕——#280 消除 warm-start 上岗的分布跳变，但绝对值跨阶段仍不横向比较）。
 _Avoid_: 上岗门槛/RM readiness gate（启动期拒绝语义已随 ADR-0017 退役）、池化达标（全池单一标量口径，已被按条件取代）、把过线清单当更新开关（policy 每 iteration 无条件更新，ADR-0017）
 
 **支撑度规则（Support rule）**:

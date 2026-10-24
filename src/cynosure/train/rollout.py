@@ -401,24 +401,7 @@ class RolloutPhase:
         静态分配表（async 执行序，#217/#231）——经 ``sample_target`` 构造
         条件，组2 的「源序列自由度」按本相的 rollout 流抽取（#218：
         pair_index 全域一笔消失、端内候选与 source_index 保留在槽内流）。"""
-        condition = self._condition_sampler.sample_target(
-            condition_name, generator=self._generator,
-        )
-        shape = self._vocabulary.latent_shape(condition_name)
-        with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
-            noise = torch.randn(
-                (1, *shape), generator=self._generator,
-            ).to(self._device)
-            anchor = self._sampler.anchor_trajectory(noise, condition)
-            sampled = [
-                (
-                    step_index,
-                    anchor[step_index],
-                    *self._perturb(anchor, step_index, condition),
-                )
-                for step_index in sorted(self._config.policy.train_step_indices_m)
-            ]
-            anchor_terminal = anchor[-1]
+        condition, anchor_terminal, sampled = self._run_core(condition_name)
 
         steps: list[StepRollout] = []
         fakes: list[torch.Tensor] = []
@@ -457,6 +440,62 @@ class RolloutPhase:
             new_fakes=torch.cat(fakes),
             intra_group_reward_std=std_sum / std_count,
         )
+
+    def endpoint_fakes(self, condition_name: str) -> torch.Tensor:
+        """单条件组的 rollout **终点集**（不打分、不记 GRPO 结构——
+        #280 预训练 fake 双源的 rollout 机器出口）：与 ``run_iteration``
+        共享同一编排核心（``_run_core``——条件构造、初始噪声、逐 k 扰动
+        的消耗序单点，不得复制出第二套采样编排），只收各 (k, λ) 终点与
+        Anchor 终点（同 ``new_fakes`` 的收集序：逐 k 逐 λ 升序、Anchor
+        末位），已归位 pool 存储域。"""
+        _, anchor_terminal, sampled = self._run_core(condition_name)
+        fakes = [
+            self._to_pool_domain(latents)
+            for *_, terminals in sampled
+            for latents in terminals.values()
+        ]
+        fakes.append(self._to_pool_domain(anchor_terminal))
+        return torch.cat(fakes)
+
+    @classmethod
+    def endpoint_count(cls, config: CynosureConfig) -> int:
+        """单次 ``endpoint_fakes`` 的终点行数：len(M)×len(λ)×G + 1
+        （各 (k, λ) 的 G 方向终点 + Anchor 终点）——预训练成本读数
+        （``rollout_runs`` 的 ⌈位/终点数⌉ 分母）与锚测试的几何单点。"""
+        return (
+            len(sorted(config.policy.train_step_indices_m))
+            * len(sorted(config.policy.granularity_intervals_lambda))
+            * config.policy.group_size_g
+            + 1
+        )
+
+    def _run_core(
+        self, condition_name: str,
+    ) -> tuple[RolloutCondition, torch.Tensor, list[tuple]]:
+        """rollout 编排核心（两出口的模板方法）：条件构造（rollout 流，
+        组2 源抽取在此消耗）→ 初始噪声 → Anchor 轨迹 → 各被优化步单步
+        SDE 扰动 + 各 λ ODE 续跑。返回 (条件, Anchor 终点, 逐步五元组
+        (k, x_k, 方向, π_old, λ→终点))——打分与 GRPO 记录是出口加工，
+        不在本核。"""
+        condition = self._condition_sampler.sample_target(
+            condition_name, generator=self._generator,
+        )
+        shape = self._vocabulary.latent_shape(condition_name)
+        with torch.no_grad(), torch.autocast(self._device_type, dtype=self._amp_dtype):
+            noise = torch.randn(
+                (1, *shape), generator=self._generator,
+            ).to(self._device)
+            anchor = self._sampler.anchor_trajectory(noise, condition)
+            sampled = [
+                (
+                    step_index,
+                    anchor[step_index],
+                    *self._perturb(anchor, step_index, condition),
+                )
+                for step_index in sorted(self._config.policy.train_step_indices_m)
+            ]
+            anchor_terminal = anchor[-1]
+        return condition, anchor_terminal, sampled
 
     def _to_pool_domain(self, latent: torch.Tensor) -> torch.Tensor:
         """rollout 终点（policy scaled 采样域）→ real pool 存储域：

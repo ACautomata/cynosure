@@ -123,6 +123,72 @@ class TestRolloutShapesFollowConditions:
             assert tuple(record.new_fakes.shape[1:]) == shape
 
 
+class TestEndpointFakes:
+    """rollout 终点集出口（#280 预训练 fake 双源的 rollout 机器面）：
+    ``endpoint_fakes`` 与 ``run_iteration`` 共享同一 rollout 编排核心
+    ——同 seed 同消耗序下产出逐位一致（新出口不得是第二套采样编排），
+    终点集 = 各 (k, λ) 终点 + Anchor 终点、pool 存储域。"""
+
+    def _phase(self, fixture_env, seed: int) -> tuple:
+        fixture, artifacts, vocab, sampler, config = fixture_env
+        generator = torch.Generator().manual_seed(seed)
+        condition_sampler = MrConditionSampler(
+            vocab, generator, torch.device("cpu"),
+        )
+        phase = RolloutPhase(
+            config,
+            sampler,
+            ZeroScorer(),  # type: ignore[arg-type]  # 替身：终点集不含打分
+            generator,
+            condition_sampler,
+            vocabulary=vocab,
+        )
+        return phase, generator
+
+    def test_endpoints_match_run_iteration_new_fakes(
+        self, fixture_env,
+    ) -> None:
+        """同 seed 两实例：endpoint_fakes ≡ run_iteration.new_fakes
+        （逐位）——消耗序（条件构造 → 初始噪声 → 逐 k 扰动噪声）与
+        域归一（除 scale_factor）同构的机器锚；流状态推进量亦一致。"""
+        phase_a, generator_a = self._phase(fixture_env, 42)
+        phase_b, generator_b = self._phase(fixture_env, 42)
+        record = phase_a.run_iteration(condition_name="t1w/axial")
+        endpoints = phase_b.endpoint_fakes("t1w/axial")
+        assert torch.equal(endpoints, record.new_fakes)
+        assert torch.equal(
+            generator_a.get_state(), generator_b.get_state(),
+        )
+
+    def test_shape_is_pairs_times_lambda_plus_anchor(self, fixture_env) -> None:
+        """终点集规模 = len(M)×len(λ)×G + 1（每 (k, λ) 的 G 方向终点 +
+        Anchor 终点在末位）、形状与词汇表该条件统一网格一致。"""
+        fixture, artifacts, vocab, sampler, config = fixture_env
+        phase, _ = self._phase(fixture_env, 0)
+        endpoints = phase.endpoint_fakes("t1w/axial")
+        expected = (
+            len(sorted(config.policy.train_step_indices_m))
+            * len(sorted(config.policy.granularity_intervals_lambda))
+            * config.policy.group_size_g
+            + 1,
+            *vocab.latent_shape("t1w/axial"),
+        )
+        assert tuple(endpoints.shape) == expected
+
+    def test_stream_replays_identically_across_calls(self, fixture_env) -> None:
+        """流式消耗语义：同实例第二次 endpoint_fakes（流顺序推进、
+        不复位）逐位等于「同 seed 实例先消耗一次再调」的第二次产出；
+        首次产出与同 seed 实例的首次逐位一致（pretrain 测量/更新相
+        共用同一机器的消耗前提——池耗尽再跑的流式语义）。"""
+        phase_serial, _ = self._phase(fixture_env, 7)
+        first = phase_serial.endpoint_fakes("t1w/axial")
+        second = phase_serial.endpoint_fakes("t1w/axial")
+        phase_split, _ = self._phase(fixture_env, 7)
+        assert torch.equal(first, phase_split.endpoint_fakes("t1w/axial"))
+        assert torch.equal(second, phase_split.endpoint_fakes("t1w/axial"))
+        assert not torch.equal(first, second)
+
+
 class TestBaselineSamplingShapes:
     """eval/baseline 采样：逐条目噪声形状从条目条件解析（验收 1 后半）。"""
 
