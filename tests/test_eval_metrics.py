@@ -270,6 +270,21 @@ class TestOrthoPlane:
     def test_plane_names_are_the_spec_three(self) -> None:
         assert [plane.value for plane in OrthoPlane] == ["XY", "YZ", "ZX"]
 
+    def test_single_slice_matches_batch_axis_convention(self) -> None:
+        """单层切片（样本图版消费面，#294）与批量口径逐面同轴序——
+        ZX 面内 [Z, X] 带转置（朝向单点约定）。"""
+        volumes = torch.arange(24, dtype=torch.float32).reshape(1, 2, 3, 4)
+        assert torch.equal(
+            OrthoPlane.XY.single_slice(volumes[0], 1), volumes[0, :, :, 1],
+        )
+        assert torch.equal(
+            OrthoPlane.YZ.single_slice(volumes[0], 0), volumes[0, 0, :, :],
+        )
+        assert torch.equal(
+            OrthoPlane.ZX.single_slice(volumes[0], 0),
+            volumes[0, :, 0, :].T.contiguous(),
+        )
+
 
 class TestRealVolumeStore:
     @staticmethod

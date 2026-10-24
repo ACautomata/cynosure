@@ -269,6 +269,10 @@ _Avoid_: 评测路径的全 rank FSDP 集合前向（旧执行序语义，随切
 监控/评测路径专属的 decode 样本面：Baseline/重采 = N_baseline 全量 manifest 条目；里程碑 = 条目前缀 K（`milestone_eval_samples`，小样本相对信号，只服务于跨里程碑 plateau 比较）。decode 从不为训练主循环发生——主循环全程 latent 域（维护者裁决，#111 两本账口径），监控成本（decode+FID 卡时）只在里程碑事件上读数。
 _Avoid_: 评测集（评估集是数据侧互斥分区的概念，样本面是 run 内 manifest 条目）
 
+**样本图版（sample plate）**:
+一个样本一张的 2×2 医学三视图 PNG（`samples` 子命令的产物，渲染入口与 `.pt`/NIfTI 散文件面 #294）：三格 = 三正交面（XY/YZ/ZX，与 ADR-0004 同口径——切面约定单点在 `OrthoPlane`，朝向一致）+ 第四格信息面板（来源标识、体形状、spacing、窗范围）；三格定位线互标切层位置、轴标注按 RAS 轴码（L/R/A/P/I/S）。物理 mm 口径渲染：panel 纵横比 = 显示两维 spacing 比——各向异性网格下层厚轴不被视觉拉伸/压扁（取代临时脚本拼图的比例坍缩）；逐体 percentile 窗（0.5–99.5）缺省、显式覆盖；切片缺省中心层、偏移可调。渲染入口是公共缝（体来源 + 渲染参数 → PNG 产物 + 布局元数据，元数据即测试断言面）；与 Monitoring subsample 的关系：图版消费的是已落盘的解码像素体，不新增解码路径。
+_Avoid_: 打印、拼图（临时脚本时代的口语——正式化后自然消亡）、三视图（泛指，无 2×2 布局与信息面板语义）
+
 **Adjudication FID（裁决性 FID 读数）**:
 fork 口径 2.5D FID 仪器（切片原尺寸直进 ResNet50、MR 百分位强度臂 crop→强度→pad、padding=0）产出的基线与 RL 终评读数。与里程碑评测**双轨**：里程碑维持 224×224 设施口径只看趋势，两侧数字不可互比；裁决性读数走冻结变量 config 校验（`mr_fid` schema）+ `FidResult` provenance 落盘，特征缓存带口径 fingerprint 防护。解读锚点 = real-vs-real 地板（病例级 seed 半分互比）。
 _Avoid_: 验收 FID、最终 FID（验收是阶梯概念，本仪器只产读数）
