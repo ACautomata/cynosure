@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from cynosure.config import ConfigLoader, CynosureConfig
 from cynosure.train import IterEvent, MilestoneEvent, RunArtifacts
 from tests.conftest import CliSession, MINIMAL_CONFIG_DICT
+from tests.test_run_plates import brats_run_dir, mr_run_dir
 
 
 @pytest.fixture
@@ -375,9 +376,29 @@ class TestSamplesCommand:
     ) -> None:
         pt = tmp_path / "case.pt"
         self._write_pt(pt)
-        with pytest.raises(SystemExit) as excinfo:
-            cli.run("samples", str(pt))
-        assert excinfo.value.code == 2
+        result = cli.run("samples", str(pt))
+        assert result.code == 2
+        assert "output-dir" in result.stderr
+
+    def test_samples_flag_rejected_for_loose_file(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        pt = tmp_path / "case0.pt"
+        self._write_pt(pt)
+        output = tmp_path / "plates"
+        result = cli.run(
+            "samples", str(pt), "--samples", "2",
+            "--output-dir", str(output),
+        )
+        assert result.code == 2
+        assert "--samples" in result.stderr
+
+    def test_missing_input_and_run_dir_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        result = cli.run("samples")
+        assert result.code == 2
+        assert "run-dir" in result.stderr
 
     def test_missing_input_rejected_without_creating_output_dir(
         self, tmp_path: Path, cli: CliSession,
@@ -446,3 +467,132 @@ class TestSamplesCommand:
         assert result.code == 0
         assert (output / "ref.png").is_file()
         assert "NIfTI header" in result.stdout
+
+
+class TestSamplesRunDirCommand:
+    """samples 子命令 run 目录面（#295）：一键产出、产物落位契约与
+    usage 错误面——只断言经 CLI 边界可观测的外部行为。"""
+
+    def test_renders_both_versions_at_contract_paths(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+
+        result = cli.run("samples", "--run-dir", str(run_root))
+
+        assert result.code == 0, result.stderr
+        for phase in ("baseline", "resample"):
+            group_dir = run_root / "plots" / "samples" / f"1-{phase}"
+            for index in range(4):
+                assert (group_dir / f"{index:04d}.png").is_file()
+        assert "样本图版已落盘" in result.stdout
+        assert "1-baseline 4 张" in result.stdout
+        assert "1-resample 4 张" in result.stdout
+        assert "条件词汇表" in result.stdout
+
+    def test_samples_count_and_all_flags(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path, baseline_samples=8)
+
+        counted = cli.run("samples", "--run-dir", str(run_root), "--samples", "2")
+        assert counted.code == 0, counted.stderr
+        assert "1-baseline 8 张" in counted.stdout
+
+        everything = cli.run("samples", "--run-dir", str(run_root), "--samples", "all")
+        assert everything.code == 0, everything.stderr
+        assert "1-baseline 8 张" in everything.stdout
+
+    def test_invalid_samples_value_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+
+        for value in ("0", "abc"):
+            result = cli.run(
+                "samples", "--run-dir", str(run_root), "--samples", value,
+            )
+            assert result.code == 2
+            assert "--samples" in result.stderr
+
+    def test_missing_run_dir_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        result = cli.run("samples", "--run-dir", str(tmp_path / "nope"))
+        assert result.code == 2
+        assert "不存在" in result.stderr
+
+    def test_run_dir_without_manifest_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        empty = tmp_path / "empty-run"
+        empty.mkdir()
+
+        result = cli.run("samples", "--run-dir", str(empty))
+
+        assert result.code == 2
+        assert "manifest" in result.stderr
+
+    def test_run_dir_without_config_snapshot_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+        (run_root / "config.json").unlink()
+
+        result = cli.run("samples", "--run-dir", str(run_root))
+
+        assert result.code == 2
+        assert "config 快照" in result.stderr
+
+    def test_output_dir_rejected_for_run_dir_input(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+
+        result = cli.run(
+            "samples", "--run-dir", str(run_root),
+            "--output-dir", str(tmp_path / "plates"),
+        )
+
+        assert result.code == 2
+        assert "不适用" in result.stderr
+
+    def test_loose_input_conflicts_with_run_dir(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+
+        result = cli.run("samples", str(run_root / "x.pt"), "--run-dir", str(run_root))
+
+        assert result.code == 2
+        assert "互斥" in result.stderr
+
+    def test_spacing_rejected_for_run_dir_input(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        run_root, _ = brats_run_dir(tmp_path)
+
+        result = cli.run(
+            "samples", "--run-dir", str(run_root),
+            "--spacing", "1.0", "1.0", "1.0",
+        )
+
+        assert result.code == 2
+        assert "--spacing" in result.stderr
+
+    def test_missing_vocabulary_artifact_is_readable_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        """词汇表工件缺失（config 快照声明的路径失效）：可读错误，
+        不裸 traceback。"""
+        run_root, artifacts = mr_run_dir(tmp_path)
+        snapshot = json.loads(
+            Path(artifacts.paths.config_snapshot).read_text(encoding="utf-8"),
+        )
+        Path(snapshot["artifacts"]["condition_vocabulary_json"]).unlink()
+
+        result = cli.run("samples", "--run-dir", str(run_root))
+
+        assert result.code == 2
+        assert "条件词汇表" in result.stderr
+        assert "Traceback" not in result.stderr

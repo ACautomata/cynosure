@@ -47,6 +47,7 @@ from cynosure.eval.real_real_floor import (
 )
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.plots import MetricsPlotter
+from cynosure.run_plates import RunSamplePlates
 from cynosure.samples import (
     NiftiVolumeSource,
     PtVolumeSource,
@@ -116,17 +117,28 @@ class CynosureCli:
             ("fid", "裁决性 MR FID 读数（fork 口径 2.5D 仪器，#73 双轨）"),
             ("fid-floor", "real-vs-real 地板半分（病例级 seed 冻结 + 逐格清单）"),
             ("base-smoke", "基座 checkpoint 装载与前向自检（wayfinder #120）"),
-            ("samples", "样本图版渲染（2×2 三正交面 PNG，.pt/NIfTI 散文件面）"),
+            ("samples", "样本图版渲染（2×2 三正交面 PNG；run 目录一键出图"
+                        " + .pt/NIfTI 散文件面）"),
         ):
             sub = subparsers.add_parser(name, help=help_text)
             if name == "samples":
                 sub.add_argument(
-                    "input", type=Path,
-                    help="体文件路径（裸 .pt 或 NIfTI）",
+                    "input", nargs="?", default=None, type=Path,
+                    help="体文件路径（裸 .pt 或 NIfTI；与 --run-dir 二选一）",
                 )
                 sub.add_argument(
-                    "--output-dir", required=True, type=Path,
-                    help="图版输出目录（散文件输入必填）",
+                    "--run-dir", default=None, type=Path,
+                    help="run 目录（manifest + config 快照一键产出全部样本"
+                         "图版，#295；与散文件输入互斥）",
+                )
+                sub.add_argument(
+                    "--output-dir", default=None, type=Path,
+                    help="图版输出目录（散文件输入必填；run 目录输入不适用"
+                         "——产物落位由布局契约决定）",
+                )
+                sub.add_argument(
+                    "--samples", default=None,
+                    help="每条件选取张数（run 目录输入；缺省 1，'all' 全量）",
                 )
                 sub.add_argument(
                     "--spacing", nargs=3, type=float, default=None,
@@ -572,10 +584,138 @@ class CynosureCli:
         return 0
 
     def _samples(self, args: argparse.Namespace) -> int:
-        """样本图版渲染（散文件面，#294）：裸 ``.pt`` 或 NIfTI → 输出
-        目录一张 2×2 三视图 PNG。usage 错误面（输入不存在、NIfTI 携带
-        显式 spacing、装载契约违反）exit 2 可读消息且不产出空目录；
-        ``.pt`` spacing 缺省降级体素等比并在 stdout 明示口径降级。"""
+        """样本图版渲染入口：run 目录面（#295，--run-dir）与散文件面
+        （#294，体文件 + --output-dir）二选一。"""
+        if args.run_dir is not None:
+            return self._samples_run_dir(args)
+        return self._samples_loose(args)
+
+    @staticmethod
+    def _parse_samples(raw: str | None) -> tuple[int | None, str | None]:
+        """--samples 值解析：``all`` → None（全量）、正整数 → 每条件
+        张数；非法值给可读错误消息。"""
+        if raw is None:
+            return 1, None
+        if raw == "all":
+            return None, None
+        try:
+            count = int(raw)
+        except ValueError:
+            return None, f"--samples 须为正整数或 all，得到 {raw!r}"
+        if count < 1:
+            return None, f"--samples 须 ≥ 1（每条件选取张数），得到 {count}"
+        return count, None
+
+    def _samples_run_dir(self, args: argparse.Namespace) -> int:
+        """样本图版 run 目录面（#295）：manifest + config 快照一键产出
+        全部样本图版，落位契约 plots/samples/{stage}-{phase}/
+        {index:04d}.png（#293）。spacing 经条件词汇表解析（CLI 面不收
+        --spacing/--output-dir）；未填充条目跳过并 stdout 汇总；布局/
+        词汇表解析失败 exit 2 可读消息。"""
+        if args.input is not None:
+            print(
+                "--run-dir 与散文件输入互斥（run 目录与体文件路径二选一）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        if args.output_dir is not None:
+            print(
+                "run 目录输入时 --output-dir 不适用（产物落位由布局契约"
+                "决定：plots/samples/{stage}-{phase}/）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        if args.spacing is not None:
+            print(
+                "--spacing 只对散文件 .pt 输入有意义（run 目录条目的 "
+                "spacing 经条件词汇表解析）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        per_condition, error = self._parse_samples(args.samples)
+        if error is not None:
+            print(error, file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        run_root = args.run_dir
+        if not run_root.is_dir():
+            print(f"run 目录不存在: {run_root}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        paths = RunArtifacts.layout(run_root)
+        if not paths.manifest.is_file():
+            print(
+                f"run 目录缺 manifest（不是有效 run 目录）: {paths.manifest}",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        if not paths.config_snapshot.is_file():
+            print(
+                "run 目录缺 config 快照（不是有效 run 目录）: "
+                f"{paths.config_snapshot}",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        try:
+            report = RunSamplePlates(run_root).render(
+                per_condition=per_condition,
+                slice_offset=args.slice_offset,
+                window=tuple(args.window) if args.window else None,
+            )
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"samples 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        if report.produced == 0:
+            print(
+                f"无已填充样本（跳过 {len(report.skipped)} 条未填充条目），"
+                f"不产出图版: {report.output_root}",
+                file=self._stdout,
+            )
+            return 0
+        counts = "、".join(
+            f"{group.label} {len(group.plates)} 张" for group in report.groups
+        )
+        origin = SPACING_ORIGIN_LABELS[report.spacing_origin]
+        print(
+            f"样本图版已落盘: {report.output_root}（{counts}；spacing 口径: {origin}）",
+            file=self._stdout,
+        )
+        if report.skipped:
+            skipped = report.skipped_by_group()
+            detail = "、".join(
+                f"{label} {count} 条" for label, count in skipped.items()
+            )
+            print(
+                f"跳过未填充条目 {len(report.skipped)} 条（{detail}）",
+                file=self._stdout,
+            )
+        return 0
+
+    def _samples_loose(self, args: argparse.Namespace) -> int:
+        """样本图版散文件面（#294）：裸 ``.pt`` 或 NIfTI → 输出目录一张
+        2×2 三视图 PNG。usage 错误面（输入不存在、NIfTI 携带显式 spacing、
+        装载契约违反）exit 2 可读消息且不产出空目录；``.pt`` spacing 缺省
+        降级体素等比并在 stdout 明示口径降级。"""
+        if args.input is None:
+            print(
+                "须提供输入体文件（或 --run-dir 走 run 目录面）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        if args.samples is not None:
+            print(
+                "--samples 只对 run 目录输入有意义（散文件输入一文件一图版）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        if args.output_dir is None:
+            print(
+                "散文件输入须显式 --output-dir（run 目录输入落位由布局契约"
+                "决定，散文件无此契约）",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
         if not args.input.is_file():
             print(f"输入体文件不存在: {args.input}", file=self._stderr)
             return _EXIT_USAGE_ERROR
