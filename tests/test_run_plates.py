@@ -289,6 +289,24 @@ class TestUnfilledEntriesSkipped:
             ("resample", 0), ("resample", 1), ("resample", 2),
         ]
 
+    def test_missing_groups_reports_whole_unfilled_phase(
+        self, tmp_path: Path,
+    ) -> None:
+        """缺失版取数面（#296 train 收尾挂接的告警取数面）：某版样本全
+        未落盘 → missing_groups 只含该版 label、stages 仍列全部预期
+        stage；两版齐备时为空集。"""
+        run_root, artifacts = brats_run_dir(tmp_path)
+        assert RunSamplePlates(run_root).render().missing_groups() == []
+
+        manifest = BaselineManifest.load(artifacts.paths.manifest)
+        for entry in manifest.entries:
+            entry.resample_sample = None
+        manifest.write(artifacts.paths.manifest)
+
+        report = RunSamplePlates(run_root).render()
+        assert report.stages == [1]
+        assert report.missing_groups() == ["1-resample"]
+
 
 class TestMrRateVocabularySpacing:
     """MR-RATE 线条目的 spacing 经词汇表解析（AC 3）：逐条件等效 spacing

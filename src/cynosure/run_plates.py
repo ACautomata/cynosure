@@ -7,7 +7,9 @@ resample 两 stage/phase 版本枚举，产物落 run 目录 plots/ 附属产物
 契约）。同 run 同参数重打同产物集合。
 
 未填充样本路径的条目跳过并进报告（stdout 汇总是 CLI 面职责），不产出
-空图版；条件不在词汇表、MR 线出现 pair 条件等解析失败给可读错误。
+空图版；条件不在词汇表、MR 线出现 pair 条件等解析失败给可读错误。train
+正常收尾的自动出图挂接（#296）复用本面（``RunSamplePlates.render``
+单一编排缝），缺失版告警取数面 = ``RunPlateReport.missing_groups``。
 信息面板承载条件与索引、noise seed（组2 另有锁定源病例），内容随
 ``PlateLayout.info_lines`` 进布局元数据断言面。
 """
@@ -23,6 +25,7 @@ from cynosure.samples import (
     PlateLayout,
     RunEntryVolumeSource,
     SamplePlateRenderer,
+    SPACING_ORIGIN_LABELS,
 )
 from cynosure.train.artifacts import (
     BaselineManifest,
@@ -56,12 +59,39 @@ class RunPlateReport(BaseModel):
     """run 目录一键产出的报告（产物集合 + 跳过汇总，断言面）。"""
 
     output_root: Path
+    stages: list[int]
+    """manifest 涉及的采样 stage（升序）——版本完整性的预期面：每个
+    stage 的 baseline/resample 两版都是预期产出（train 收尾挂接的缺失
+    告警取数面；个别条目未填充在 skipped，整版无样本才缺组）。"""
     groups: list[RunPlateGroup]
     skipped: list[SkippedSample]
 
     @property
     def produced(self) -> int:
         return sum(len(group.plates) for group in self.groups)
+
+    def missing_groups(self) -> list[str]:
+        """预期 stage × phase 版本中未产出组的 label（``{stage}-{phase}``，
+        升序）——某版样本全未落盘时该版缺组（train 收尾挂接据此告警）。"""
+        produced_labels = {group.label for group in self.groups}
+        return [
+            f"{stage}-{phase}"
+            for stage in self.stages
+            for phase in PHASES
+            if f"{stage}-{phase}" not in produced_labels
+        ]
+
+    def summary_line(self) -> str:
+        """stdout 汇总行（CLI 面与 train 收尾挂接共用的单一消息源）：
+        产出路径 + 逐组计数 + spacing 口径。"""
+        counts = "、".join(
+            f"{group.label} {len(group.plates)} 张" for group in self.groups
+        )
+        origin = SPACING_ORIGIN_LABELS[self.spacing_origin]
+        return (
+            f"样本图版已落盘: {self.output_root}"
+            f"（{counts}；spacing 口径: {origin}）"
+        )
 
     @property
     def spacing_origin(self) -> str | None:
@@ -191,6 +221,7 @@ class RunSamplePlates:
                 ))
         return RunPlateReport(
             output_root=self._paths.plots / "samples",
+            stages=stages,
             groups=groups,
             skipped=skipped,
         )

@@ -38,6 +38,7 @@ from cynosure.config import (
 from cynosure.fixtures import FIXTURE_MODALITY_MAPPING, Fixture
 from cynosure.netbuild import NetworkArtifact, NetworkAssembler
 from cynosure.plots import MetricsPlotter
+from cynosure.samples import SamplePlateRenderer
 from cynosure.policy.condition import (
     CONDITION_SPACING_X1E2,
     ModalityMapping,
@@ -51,6 +52,7 @@ from cynosure.reward.scorer import ChannelNormalizer
 from cynosure.train import (
     RunArtifacts,
 )
+from cynosure.train.artifacts import BaselineManifest
 from cynosure.train.executor import AsyncTrainingExecutor
 from cynosure.train.rng import SlotRngRegistry, TrainingRngStreams
 from cynosure.train.runtime import TrainingRuntime
@@ -316,6 +318,92 @@ class TestMetricPlotsOnCompletion:
         assert "指标绘图失败" in result.stderr
         assert "RuntimeError: renderer exploded" in result.stderr
         assert "训练完成" in result.stdout
+
+
+class TestSamplePlatesOnCompletion:
+    """train 正常收尾的自动样本图版（#296）：对 run 目录已落盘样本出
+    baseline/resample 两版图版进 plots/samples/{stage}-{phase}/（落位与
+    CLI 手动重打一致）。附属产物语义与指标绘图同款（#257 先例）：生成
+    失败只 stderr 告警、不改变 train 退出码；某版本样本未落盘则该版
+    跳过并告警、另一版照常产出；续训收尾同样挂接。"""
+
+    def test_completed_run_produces_stage_phase_plates_matching_cli(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """正常收尾：run 目录出现 plots/samples/{stage}-{phase}/*.png
+        两版图版；CLI 手动重打（samples --run-dir）产物集合与自动产出
+        一致（落位契约同源）。"""
+        scenario.write_inputs()
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        samples_root = scenario.run_dir / "plots" / "samples"
+        auto = sorted(
+            str(path.relative_to(samples_root))
+            for path in samples_root.rglob("*.png")
+        )
+        assert auto, "训练收尾未产出样本图版"
+        phases = {Path(path).parent.name for path in auto}
+        assert any(name.endswith("-baseline") for name in phases)
+        assert any(name.endswith("-resample") for name in phases)
+        assert scenario.cli.run(
+            "samples", "--run-dir", str(scenario.run_dir),
+        ).code == 0
+        rerendered = sorted(
+            str(path.relative_to(samples_root))
+            for path in samples_root.rglob("*.png")
+        )
+        assert rerendered == auto
+
+    def test_plate_failure_warns_and_keeps_exit_code(
+        self, scenario: TrainingLoopScenario,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """图版生成注入故障：stderr 告警、退出码仍 0（附属产物语义——
+        失败不升级为主命令失败）；训练主产物（checkpoint、指标流）不受
+        影响。"""
+        scenario.write_inputs()
+
+        def broken_render(self, volume, **kwargs):
+            raise RuntimeError("plate renderer exploded")
+
+        monkeypatch.setattr(SamplePlateRenderer, "render", broken_render)
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        assert "样本图版生成失败" in result.stderr
+        assert "RuntimeError: plate renderer exploded" in result.stderr
+        assert "训练完成" in result.stdout
+        assert (scenario.run_dir / "checkpoints" / "policy_iter1.pt").is_file()
+        assert scenario.events()
+
+    def test_resume_replates_and_warns_missing_phase(
+        self, scenario: TrainingLoopScenario,
+    ) -> None:
+        """续训收尾同样挂接（与指标曲线同口径），且某版本样本未落盘时
+        该版跳过并 stderr 告警、另一版照常产出：首次 train 后抹去
+        resample 版样本（manifest 路径回空 + 文件删除）模拟提前中止的
+        残缺 run，续训收尾重打——baseline 版照常产出、resample 版告警
+        跳过。"""
+        scenario.write_inputs()
+        result = scenario.train()
+        assert result.code == 0, result.stderr
+        manifest_path = scenario.run_dir / "manifest.json"
+        manifest = BaselineManifest.load(manifest_path)
+        for entry in manifest.entries:
+            entry.resample_sample = None
+        manifest.write(manifest_path)
+        for path in (scenario.run_dir / "samples").rglob("*.pt"):
+            if "resample" in path.parts:
+                path.unlink()
+        shutil.rmtree(scenario.run_dir / "plots" / "samples")
+
+        result = scenario.resume()
+        assert result.code == 0, result.stderr
+        samples_root = scenario.run_dir / "plots" / "samples"
+        groups = {path.parent.name for path in samples_root.glob("*/*.png")}
+        assert any(name.endswith("-baseline") for name in groups)
+        assert not any(name.endswith("-resample") for name in groups)
+        assert "样本图版已落盘" in result.stdout
+        assert "resample 版样本未落盘" in result.stderr
 
 
 class TestSingleIterationLoop:
