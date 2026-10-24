@@ -53,7 +53,13 @@ run 目录须在本地（还在 SothisAI 实例上的先按 sugon 惯例拉回�
   可读面。纪律是**先可视化**：`.nii.gz` 体数据、`.pt` 张量这类原始形态先转
   成 PNG 切片网格（如三正交中间面拼图）再上；原始体数据挑代表性子集随附，
   供定量复算。数量大时按代表性采样：baseline 与 RL 两侧、各里程碑、各条件
-  都要有代表，末期样本必收，打成 `samples-<short-sha>.tar.gz`；
+  都要有代表，末期样本必收，打成 `samples-<short-sha>.tar.gz`。要嵌进
+  notes 的代表性样本 PNG（如对比拼图）另以独立散件上传——markdown 图像
+  引用只认散件 asset，tarball 里的文件引用不到；
+- 训练曲线：取 run 目录 `plots/`（train/pretrain 收尾自动绘图产出，逐指标
+  一张 SVG）。关键指标曲线（fid / kid / heldout_auc / anchor_eval_reward
+  一类）以独立散件上传供 notes 嵌图，全量加打 `plots-<short-sha>.tar.gz`；
+  散件名沿用产出文件名，别夹空格等会破坏 URL 的字符；
 - checkpoint 默认不上 release：权重留集群持久分区，用户点名要的才打。
 
 每个资产过一遍 `du -h`：单资产上限 2 GiB，超限挡下（GitHub 拒收，release
@@ -65,8 +71,14 @@ run 目录须在本地（还在 SothisAI 实例上的先按 sugon 惯例拉回�
 从 `metrics.jsonl` 与 `config.json` 汇总，中文、短：group、seed、末次
 iteration 与 `anchor_eval_reward`、里程碑 FID 轨迹、`heldout_auc` 末值、
 是否 early-stop；标出源码 commit short sha；末尾一行列出脚本与样本 tarball
-各收了什么，样本注明采样口径（覆盖的侧 / 里程碑 / 条件）。写入临时文件供
-`--notes-file`。
+各收了什么，样本注明采样口径（覆盖的侧 / 里程碑 / 条件）。
+
+嵌图是硬性要素，缺了不算起草完成：按「关键精选」以 markdown 图像引用嵌入
+代表性样本 PNG 与关键指标训练曲线 SVG，格式
+`![alt](https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>)`
+（绝对 download URL，`exp/…` tag 连斜杠整体写入路径）；引用的每个文件必须
+是第 3 步上传的散件 asset。其余曲线与样本不逐张嵌，文字列全清单。写入临时
+文件供 `--notes-file`。
 
 ### 5. 发布并验证
 
@@ -80,5 +92,5 @@ gh release create "exp/<run-dir 目录名>" <资产...> \
 
 完成后 `gh release view "exp/<run-dir 目录名>"` 逐项核对：资产清单与第 3 步
 一致（含 `scripts-<short-sha>.tar.gz` 与 `samples-<short-sha>.tar.gz`）、
-notes 要素齐全；解包样本 tarball 抽一张 PNG 确认可看。核对通过才算发布
-完成。
+notes 要素齐全且每条图像引用都对得上实际 asset（有引用而无 asset 即不通过）；
+解包样本 tarball 抽一张 PNG 确认可看。核对通过才算发布完成。
