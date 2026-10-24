@@ -1,6 +1,6 @@
 # Latent 域载体 DomainLatent：域标签构造期核对，取代手写乘除纪律
 
-`latent_scale_factor` 出现 13 个文件；乘除动作 6 处——`train/rollout.py` `_to_pool_domain`（除回存储域）、`reward/assembly.py` 重构核乘入 + 除回（ADR-0012 同源重构）、`eval/decode.py`（除回）、`smoke.py`（乘回）、`policy/field.py` BareConditionField 源 latent（乘入）；来源裁决 3 处（`netbuild.checkpoint_scale_factor`、`smoke._resolve_scale_factor`、`config.policy.latent_scale_factor`）。「这个 latent 此刻在存储域还是 policy 工作域」没有类型表达，全靠调用点纪律 + 注释维持（CONTEXT.md「存储域」词条锚）；ADR-0012 同源重构使乘除点翻倍，stage-2（跨模态 ControlNet）还将增长。这是全仓唯一「出错不抛错、静默错域」的知识——其余架构摩擦 fail-fast，唯域漂移静默。**决定：新建薄包装类 `DomainLatent`（`policy/latent.py`）——latent 张量 + 域标签，域间换算只存在于载体语义级方法；无裸函数约束（维护者强约束，落档防未来 review 重提）；一次性切换 13 文件，不留双口径。**
+`latent_scale_factor` 出现 13 个文件；乘除动作 6 处——`train/rollout.py` `_to_pool_domain`（除回存储域）、`reward/assembly.py` 重构核乘入 + 除回（ADR-0012 同源重构）、`eval/decode.py`（除回）、`smoke.py`（乘回）、`policy/field.py` BareConditionField 源 latent（乘入）；来源裁决 3 处（`netbuild.checkpoint_scale_factor`、`smoke._resolve_scale_factor`、`config.policy.latent_scale_factor`）。「这个 latent 此刻在存储域还是 policy 工作域」没有类型表达，全靠调用点纪律 + 注释维持（GLOSSARY.md「存储域」词条锚）；ADR-0012 同源重构使乘除点翻倍，stage-2（跨模态 ControlNet）还将增长。这是全仓唯一「出错不抛错、静默错域」的知识——其余架构摩擦 fail-fast，唯域漂移静默。**决定：新建薄包装类 `DomainLatent`（`policy/latent.py`）——latent 张量 + 域标签，域间换算只存在于载体语义级方法；无裸函数约束（维护者强约束，落档防未来 review 重提）；一次性切换 13 文件，不留双口径。**
 
 **Status**: accepted（实施票未启动）
 
@@ -22,7 +22,7 @@
 
 ## Consequences
 
-- **新增面**：`policy/latent.py` 的 `DomainLatent` 载体 + 域枚举 + 语义级换算方法；CONTEXT.md「Latent 域载体」词条。
+- **新增面**：`policy/latent.py` 的 `DomainLatent` 载体 + 域枚举 + 语义级换算方法；GLOSSARY.md「Latent 域载体」词条。
 - **收敛面**：6 处手写乘除、13 文件的 scale factor 认知负担、来源裁决 3 处的重复；stage-2 新消费点不再重学整条域链。
 - **风险（记录在案）**：包装类穿过 rollout / 同源重构 / 判别器测量 / decode 全链，类型改动半径 13 文件——由一次性切换（决策 4）+ 既有逐位一致测试把守；批处理路径（批内 latent 装箱）需要载体感知的容器约定，实施票内定。
 - **stage-2 到来时干净域维度再议（第二票）**：跨模态阶段新增（源影像, 目标标签）条件化前向，域链将再一次扩张——那是重估干净域入枚举的自然时点。

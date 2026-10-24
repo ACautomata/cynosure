@@ -23,7 +23,7 @@
 ## 1. 推算公式与出处（可复核性）
 
 > 本节【上游】指 NVIDIA 真上游（NV-Generate-CTMR）；机制级 fork 与其逐字节零差异
-> （`da438fe` 对拍，见 CONTEXT.md「上游锚」词条），本普查涉及的 resize 与
+> （`da438fe` 对拍，见 GLOSSARY.md「上游锚」词条），本普查涉及的 resize 与
 > `dynamic_infer` 均属机制级，两锚无分歧。
 
 **resize 公式**（语义转录，零依赖，永不 import 上游代码）：
@@ -107,7 +107,7 @@ SAGITTAL 94.5%、FLAIR OBLIQUE 82.4%、FLAIR SAGITTAL 82.3%、T2w AXIAL 74.9%；
 #139 Problem Statement 已现场核验：上游生产链 665,371 训练 embeddings 正是经
 `dynamic_infer` 分派——按本次普查的构成比例，其中 ~61% 量级的卷（>16.38M）走的
 就是 `SlidingWindowInferer` 滑窗路径。上游 v1 语料的**主干编码路径是滑窗**，不是
-长尾特例；这与「fork 机制文件与 NVIDIA 逐字节零差异」（CONTEXT.md「上游锚」词条，
+长尾特例；这与「fork 机制文件与 NVIDIA 逐字节零差异」（GLOSSARY.md「上游锚」词条，
 机制级两锚无分歧）的锚定事实一致。
 
 ## 4. 对 #139 落地优先级的两读法

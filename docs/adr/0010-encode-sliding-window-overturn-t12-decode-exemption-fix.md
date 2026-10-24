@@ -25,6 +25,6 @@ T12 编码裁决（记录于 `docs/spec/data-preparation.md`「上游 recipe」�
 - prepare 对超界卷不再 raise：MR-RATE 长尾 61.4% 恢复可编码；BraTS 生产全语料恒整前向不变，历史工件与读数可比性不受影响。
 - encode 滑窗 latent 与上游存在两层记录在案差异：滑窗分解机制固有截断差异（与上游共享，Decision 2）与 b 语义采样偏离（本仓独有，Decision 3）——对齐讨论引用本 ADR，T12 旧裁决不再作现状引用。
 - decode 修正后的翻转区间量级评测读数与修正前历史读数不可直接横向比较（可归因平移 FID +0.517 / KID +0.373，#142 复测记录为准）。
-- 文档同步改判随本 ADR 落地：`docs/spec/data-preparation.md` 编码侧段落、MR-RATE 调研笔记编码网格条目（`research/mrrate-data-spec.md`）、CONTEXT.md 词条（预编码 / Decode / b 语义）锚定本 ADR。
+- 文档同步改判随本 ADR 落地：`docs/spec/data-preparation.md` 编码侧段落、MR-RATE 调研笔记编码网格条目（`research/mrrate-data-spec.md`）、GLOSSARY.md 词条（预编码 / Decode / b 语义）锚定本 ADR。
 - 证据链：探针报告 + 双跑 JSON + 脚本（钉 `3cf1050`）随 release `exp/20260914-t12-probe` 归档；provenance 见 Decision 1。
 - 探针失败分支未触发：证伪时本应维持显式拒绝、改判转向裁剪/自研拼合方向（#139 行为契约）——本次探针通过，该分支关闭。

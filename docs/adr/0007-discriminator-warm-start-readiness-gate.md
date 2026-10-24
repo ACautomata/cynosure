@@ -13,7 +13,7 @@ T12/T13（#56）取证：判别器 held-out AUC 100 iter 全程徘徊 chance 带
 
 ## Consequences
 
-- ADR-0001 的「在线从零」部分由本 ADR 修订（其状态行已加指针）；CONTEXT.md「Online update」词条同步修订，新增「Warm-start pre-training」「RM readiness gate」词条。
+- ADR-0001 的「在线从零」部分由本 ADR 修订（其状态行已加指针）；GLOSSARY.md「Online update」词条同步修订，新增「Warm-start pre-training」「RM readiness gate」词条。
 - 编排新增预训练阶段与上岗门槛硬检查（T14 前置 ticket）。
 - 门槛阈值 0.65 为暂定值，用预训练曲线校准后定版。
 - T12/T13 与后续 run 口径断层：标注「冷启动失败组」，T14 前定版判别器形态。

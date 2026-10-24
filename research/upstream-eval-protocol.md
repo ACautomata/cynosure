@@ -9,7 +9,7 @@
 > - MAISI v1（arXiv:2409.11169，WACV 2025）与 MAISI-v2（arXiv:2508.05772，AAAI 2026）论文全文
 > - `nvidia/NV-Generate-MR-Brain` 模型卡与 commit 历史
 >
-> 相关背景：`CONTEXT.md`、`docs/spec/experiment-design.md`、`src/cynosure/eval/`
+> 相关背景：`GLOSSARY.md`、`docs/spec/experiment-design.md`、`src/cynosure/eval/`
 
 ---
 

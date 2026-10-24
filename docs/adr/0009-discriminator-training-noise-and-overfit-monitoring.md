@@ -31,5 +31,5 @@ ADR-0008 的条件匹配采样把判别器 real 侧骤缩到单模态池：MRA t
 - 事件契约：新增 `overfit_alert` 事件类型（modality、分叉值、train acc、held-out AUC）；现有事件「可扩不可改名」兼容。
 - **预训练侧落地顺序依赖**：分叉监控的预训练侧挂点在 ADR-0008 per-condition 步进落地之后（`PretrainEvent` 增 modality 字段为其先决，ADR-0008 Consequences 已列）；在线侧无此前置。
 - **BraTS 线同样生效**：训练期增强改变判别器训练动态，BraTS 线旧 run 数字不与新 run 横向比较——ADR-0008 已声明的校准断层之上再叠一层来源，不另设开关回退旧口径。
-- CONTEXT.md：新增「判别器训练期噪声注入」「过拟合分叉监控」词条，`overfit_alert` 入事件流词条。
+- GLOSSARY.md：新增「判别器训练期噪声注入」「过拟合分叉监控」词条，`overfit_alert` 入事件流词条。
 - 地图雾区收窄：「稀疏模态的采样配平策略」中 real 侧已决，仅剩 rollout 条件分布加权。

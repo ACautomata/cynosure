@@ -371,7 +371,7 @@ class PrepareProvenance(BaseModel):
     统一网格（#111 网格裁决的多网格案落地，与 rollout 口径一致）。"""
     upstream_anchor: str
     """上游锚标注（recipe 级分线：BraTS 锚 fork、MR-RATE 锚 NVIDIA v1，
-    CONTEXT.md「上游锚」词条）。"""
+    GLOSSARY.md「上游锚」词条）。"""
 
 
 class ChannelStats(BaseModel):
