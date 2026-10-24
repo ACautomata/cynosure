@@ -32,7 +32,7 @@ MR-RATE 换域调研（#70 → `research/discriminator-saturation-risk.md`）暴
 - **BraTS 线校准断层**：条件匹配对 BraTS 线同样生效（real 侧从混采变按条件），T12/T13 及更早 run 的数字不与新 run 横向比较；ADR-0007 的「冷启动失败组」断层标注之上再叠本断层。
 - 新 config knobs：支撑度界（held-out 卷数 < 20）、动态门控 enter/exit/EMA 跨度——全部标注「暂定，MR-RATE 预训练曲线校准后定版」。
 - 监控语义修复：盲条件不再产生假阳性 AUC 与噪声 reward；hacking 签名的「AUC 掉回带内」通道在按条件归因后才具备判型能力（冷/盲/被错误引导的签名分型另开 ticket）。
-- CONTEXT.md：RM readiness gate 词条修订、新增「条件白名单」「条件匹配采样」词条、Replay buffer 词条补条件标记。
+- GLOSSARY.md：RM readiness gate 词条修订、新增「条件白名单」「条件匹配采样」词条、Replay buffer 词条补条件标记。
 - 稀疏模态 real 侧小池（MRA ≈ 110 条）的过拟合防线（样本级增强 / 重复采样上限 / 配额）不在本 ADR 范围——容量守卫只防「抽不出」，不防「反复抽同一样」；另开 ticket。
 
 ## 修订（2026-09-17，维护者裁决）：条件闸总开关

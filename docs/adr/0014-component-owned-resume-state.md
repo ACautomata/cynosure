@@ -21,7 +21,7 @@
 
 ## Consequences
 
-- **新增面**：state/adopt Protocol + 共享 adopt 校验 helper + v11 分片格式；CONTEXT.md「分片自持」词条。
+- **新增面**：state/adopt Protocol + 共享 adopt 校验 helper + v11 分片格式；GLOSSARY.md「分片自持」词条。
 - **退役面**：8 个转发 property、resume.py 全部穿透路径、三处手写 adopt 校验、旧版分片载入。
 - **核心收益**：组件重排不再动 resume（locality 落到组件自身）；trainer interface 由设计产生、不由消费者长出；v11 键组织获得组件自持的稳定锚。
 - **风险（记录在案）**：v11 落地与存量 run 的时点互斥（决策 5 检查项）；分片键自持后「全分片清单」的完整性从 resume 单点转移到「 trainer 聚合注册是否漏组件」——以注册时逐组件登记 + resume generation marker 对账把守。

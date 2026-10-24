@@ -2,7 +2,7 @@
 
 cynosure 为 MAISI 3D latent rectified-flow 医学影像 checkpoint 设计并实施基于 Granular-GRPO 的 RL 后训练。**零依赖原则**：不 import NV-Generate-CTMR 任何代码，唯一接口是 checkpoint 文件；网络类来自 MONAI 库本身。
 
-实施 spec 见 GitHub issue #15（配合 `docs/spec/` 四章节与 `docs/adr/`）；领域术语表见 `CONTEXT.md`。
+实施 spec 见 GitHub issue #15（配合 `docs/spec/` 四章节与 `docs/adr/`）；领域术语表见 `GLOSSARY.md`。
 
 ## 开发
 

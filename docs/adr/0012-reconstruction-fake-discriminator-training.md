@@ -27,7 +27,7 @@ ADR-0008/0009 链路下判别器以 rollout 终点 latent 为 fake、以训练�
 
 ## Consequences
 
-- **退役面**：`reward.disc_noise_sigma_max`、`disc_noise` 随机流、`training_patch_logits` 带噪入口、ReplayBuffer（base/recent 分区与条件过滤回放）、`reward.replay_current_fraction`、`disc_batch_size_k` 的 current/replay 语义、`reward.pretrain_fake_batch` 量产。CONTEXT.md 删「判别器训练期噪声注入」「Replay buffer」词条。
+- **退役面**：`reward.disc_noise_sigma_max`、`disc_noise` 随机流、`training_patch_logits` 带噪入口、ReplayBuffer（base/recent 分区与条件过滤回放）、`reward.replay_current_fraction`、`disc_batch_size_k` 的 current/replay 语义、`reward.pretrain_fake_batch` 量产。GLOSSARY.md 删「判别器训练期噪声注入」「Replay buffer」词条。
 - **新增面**：同源重构构造原语（real 工作域换算、日程步点加噪、确定性 ODE 续跑、pool 域归位）、recon 构造命名随机流、预训练报告 recon-AUC 口径。
 - **核心风险（记录在案）**：判别器训练分布（重构体）≠ 打分分布（rollout 终点），判别力迁移是赌注，靠 s 取自被优化步压差；观测仪器 = 在线 rollout-AUC（失辨触发白名单 exit，保守方向）+ overfit 分叉 + OOD reward 抖动（GRPO 组内标准化放大，盯 reward 分布）。
 - **成本曲线**：预训练 fake 由 30 步全 ODE → 平均 ~21 步重构（更便宜）；在线判别器更新新增 ~K×21 次 UNet 前向/更新步（no_grad、bf16，按 `update_interval` 节奏摊薄）。

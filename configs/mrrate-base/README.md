@@ -16,7 +16,7 @@ checkpoint 文件 + 网络配置 JSON；网络类全部来自 MONAI 库本身
 
 - **上游仓库**：`NVIDIA-Medtech/NV-Generate-CTMR`（真上游，HEAD
   `da438fe`；本仓 MR-RATE 线一律锚真上游，fork 仅 BraTS 线——见
-  CONTEXT.md「上游锚」词条）。
+  GLOSSARY.md「上游锚」词条）。
 - **来源文件**：`configs/config_network_rflow.json`（网络定义单一来源，
   `docs/inference.md` 指定推理经 `-t` 装载它）。
 - **转写规则**：上游 config 是 MONAI ini 化形态——`_target_` 指类、

@@ -21,7 +21,7 @@
 
 ## Consequences
 
-- **新增面**：`src/cynosure/domains.py` 登记表 + 查询入口 + 注册表单点测试；CONTEXT.md「域资格」词条。
+- **新增面**：`src/cynosure/domains.py` 登记表 + 查询入口 + 注册表单点测试；GLOSSARY.md「域资格」词条。
 - **收敛面**：7 个 validator 的重复互斥模式、6 处运行时字面分支、fixtures payload 域分支、config schema 测试镜像。
 - **风险（记录在案）**：查询入口若设计成转发层（只查字段不承载「按域取行为」语义）会通不过 deletion test——入口必须收行为分派而非转发 config 字段；实施票评审以此为验收轴。
 - **BraTS/MR-RATE 两域行为零变化**：本票动分派写法，不动任何域行为；既有全部域互斥测试应原样通过（错误信息文案经决策 1 保持等值）。
