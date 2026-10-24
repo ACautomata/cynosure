@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from cynosure.samples import (
+    RunEntryVolumeSource,
     Crosshair,
     NiftiVolumeSource,
     PtVolumeSource,
@@ -249,3 +250,22 @@ class TestPixelOrientationAnchor:
         top = quadrant[:middle][content[:middle]].mean()
         bottom = quadrant[middle:][content[middle:]].mean()
         assert top > bottom + 0.1  # 上=A 端（0.7）亮于 下=P 端（0.0）
+
+
+class TestRunEntrySource:
+    """run 目录条目体来源（issue #295）：词汇表 spacing 注入的裸 .pt，
+    spacing 口径标记 vocabulary（布局元数据据此断言物理口径、非体素
+    等比降级）。"""
+
+    def test_loads_pt_with_vocabulary_spacing_and_origin(
+        self, tmp_path: Path,
+    ) -> None:
+        pt = tmp_path / "0000.pt"
+        torch.save(anisotropic_volume(), pt)
+
+        volume = RunEntryVolumeSource(pt, spacing=(3.0, 2.0, 2.0)).load()
+
+        assert volume.spacing == (3.0, 2.0, 2.0)
+        assert volume.spacing_origin == "vocabulary"
+        assert volume.axis_codes == "RAS"
+        assert volume.source_label == "0000.pt"

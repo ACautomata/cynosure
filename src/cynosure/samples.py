@@ -8,18 +8,18 @@ spacing 比（物理 mm 口径，各向异性网格下层厚轴不视觉失真�
 percentile 窗（0.5–99.5）缺省、显式窗参数覆盖；切片缺省中心层、切层
 偏移可调。
 
-体来源分派（Strategy，spec「三实现、单一消费面」；run 目录条目来源属
-后续票）：裸 ``.pt``（预处理链/样本落盘契约——无头裸张量、已 RAS；
-spacing 显式或缺省体素等比降级）与 NIfTI（MONAI 装载即显式重定向
-RAS，header spacing 经 affine 列范数读取——方向无关口径，轴置换朝向
-下 raw pixdim 顺序不可靠）。
+体来源分派（Strategy，spec「三实现、单一消费面」）：裸 ``.pt``（预处
+理链/样本落盘契约——无头裸张量、已 RAS；spacing 显式或缺省体素等比
+降级）、NIfTI（MONAI 装载即显式重定向 RAS，header spacing 经 affine
+列范数读取——方向无关口径，轴置换朝向下 raw pixdim 顺序不可靠）与
+run 目录条目（manifest 样本路径 + 条件词汇表 spacing，#295）。
 
 matplotlib Agg 后端直出 PNG（无显示环境可跑）；依赖零新增。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 import matplotlib
 import nibabel as nib
@@ -45,10 +45,16 @@ SPACING_ORIGIN_HEADER = "header"
 SPACING_ORIGIN_ISOTROPIC = "isotropic-default"
 """spacing 来源：不可得时的降级体素等比（CLI 面 stdout 明示）。"""
 
+SPACING_ORIGIN_VOCABULARY = "vocabulary"
+"""spacing 来源：run 目录条目经条件词汇表解析（issue #295；MR-RATE 线
+逐条件等效 spacing、BraTS 线单位间距各向同性常量——物理口径，非体素
+等比降级，布局元数据断言面）。"""
+
 SPACING_ORIGIN_LABELS = {
     SPACING_ORIGIN_EXPLICIT: "显式指定",
     SPACING_ORIGIN_HEADER: "NIfTI header",
     SPACING_ORIGIN_ISOTROPIC: "体素等比降级",
+    SPACING_ORIGIN_VOCABULARY: "条件词汇表",
 }
 """spacing 来源的 stdout 读数标签（口径降级可见）。"""
 
@@ -92,6 +98,8 @@ class PlateLayout(BaseModel):
     png: Path
     png_size_px: tuple[int, int]
     panels: list[PanelLayout]
+    info_lines: list[str]
+    """信息面板绘出的全部文本行（溯源块 + 几何读数；内容断言面）。"""
 
 
 @dataclass
@@ -179,6 +187,23 @@ class NiftiVolumeSource:
         )
 
 
+class RunEntryVolumeSource:
+    """run 目录条目体来源（issue #295，体来源三实现的收官）：manifest
+    样本路径指向的无头裸 ``.pt``（样本落盘契约，已 RAS），spacing 由
+    调用方经条件词汇表解析注入（MR-RATE 线逐条件等效 spacing / BraTS
+    线单位间距各向同性），口径标记 ``vocabulary``——布局元数据据此
+    断言物理口径（非体素等比降级）。"""
+
+    def __init__(
+        self, path: Path, spacing: tuple[float, float, float],
+    ) -> None:
+        self._delegate = PtVolumeSource(path, spacing=spacing)
+
+    def load(self) -> LoadedVolume:
+        loaded = self._delegate.load()
+        return replace(loaded, spacing_origin=SPACING_ORIGIN_VOCABULARY)
+
+
 class SamplePlateRenderer:
     """样本图版渲染器：LoadedVolume → 输出目录一张 2×2 PNG + PlateLayout。
 
@@ -199,8 +224,11 @@ class SamplePlateRenderer:
         volume: LoadedVolume,
         slice_offset: int = 0,
         window: tuple[float, float] | None = None,
+        caption: Sequence[str] | None = None,
     ) -> PlateLayout:
-        """渲染单样本图版：缺省中心层 + 偏移、缺省 percentile 窗 + 覆盖。"""
+        """渲染单样本图版：缺省中心层 + 偏移、缺省 percentile 窗 + 覆盖；
+        ``caption`` 为信息面板溯源行（run 目录条目的条件/索引/seed，#295），
+        绘出来源标识之下并随布局元数据回传。"""
         self._output_dir.mkdir(parents=True, exist_ok=True)
         data = volume.data
         win = self._resolve_window(data, window)
@@ -219,7 +247,7 @@ class SamplePlateRenderer:
             self._render_panel(axes[0, 1], volume, OrthoPlane.YZ, slice_indices, win),
             self._render_panel(axes[1, 0], volume, OrthoPlane.ZX, slice_indices, win),
         ]
-        self._render_info_panel(axes[1, 1], volume, win)
+        info_lines = self._render_info_panel(axes[1, 1], volume, win, caption)
         figure.savefig(png_path)
         return PlateLayout(
             source=volume.source_label,
@@ -233,6 +261,7 @@ class SamplePlateRenderer:
                 round(self.FIG_SIZE_INCHES[1] * self.FIG_DPI),
             ),
             panels=panels,
+            info_lines=info_lines,
         )
 
     def _render_panel(
@@ -324,14 +353,17 @@ class SamplePlateRenderer:
         ax: matplotlib.axes.Axes,
         volume: LoadedVolume,
         win: tuple[float, float],
-    ) -> None:
-        """第四格信息面板：来源标识、体形状、spacing、窗范围（散文件
-        模式无条件概念，来源即文件名）。"""
+        caption: Sequence[str] | None,
+    ) -> list[str]:
+        """第四格信息面板：来源标识 + 溯源行（run 目录条目条件/索引/
+        seed，散文件模式为空）+ 体形状、spacing、窗范围；绘出文本行
+        原样回传（布局元数据断言面）。"""
         ax.axis("off")
         shape = volume.data.shape
         spacing = " × ".join(f"{v:.3g}" for v in volume.spacing)
         lines = [
             volume.source_label,
+            *(caption or []),
             f"shape: X={shape[0]} Y={shape[1]} Z={shape[2]}",
             f"spacing (mm): {spacing}",
             f"window: {win[0]:.4g} – {win[1]:.4g}",
@@ -341,6 +373,7 @@ class SamplePlateRenderer:
             0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
             va="top", ha="left", fontsize=11, family="monospace",
         )
+        return lines
 
     @staticmethod
     def _resolve_window(
