@@ -36,7 +36,10 @@ fake 仍为同源重构体；ρ=0（默认）时 rollout 供给面整体缺席�
 warm-start 上岗不面临分布跳变，棘轮 recon-AUC 的 fake 侧构成同步
 （``disc_rollout_fake_ratio`` 进报告留痕、事件流记
 ``rollout_fake_volumes`` / ``rollout_fake_pairs`` / ``rollout_runs``
-构成与成本读数；``reconstruction_forwards`` 只计重构位）。判据口径的
+构成与成本读数——成本读数覆盖本步**全部测量段**（首测 + 首测过线
+触发的复测：交错位是位置纯函数、复测段与首测段同几何，消耗照计；
+确认成功步与耗尽补测不落事件，其消耗不入流）；
+``reconstruction_forwards`` 只计重构位、只计首测段）。判据口径的
 两阶段差异记录在案（ADR-0012 决策 5）：预训练判据是 recon-AUC
 （判别器训练任务的 out-of-sample 泛化力）、在线运行口径是 rollout-AUC
 （对打分对象的分辨力），**不可跨阶段比较绝对值**——准入体检 vs 在岗
@@ -310,19 +313,13 @@ class PretrainCardWorker:
         rig = self._require_rig()
         reals = self._load(rig.real_pool, entries)
         if rollout_positions:
-            rollout_set = set(rollout_positions)
-            recon_rows = [
-                index for index in range(reals.shape[0])
-                if index not in rollout_set
-            ]
-            fakes = torch.empty_like(reals)
-            if recon_rows:
-                rows = torch.tensor(recon_rows, device=reals.device)
-                pair = rig.assembler.reconstruct_assigned(
+            fakes = self._compose_fakes(
+                rig, reals, modality,
+                lambda rows: rig.assembler.reconstruct_assigned(
                     reals[rows], modality,
-                )
-                fakes[rows] = pair.fakes
-            self._fill_rollout_fakes(rig, fakes, modality, rollout_positions)
+                ).fakes,
+                rollout_positions,
+            )
         else:
             pair = rig.assembler.reconstruct_assigned(reals, modality)
             fakes = pair.fakes
@@ -338,11 +335,15 @@ class PretrainCardWorker:
         modality: str,
         rollout_positions: Sequence[int],
     ) -> None:
-        """rollout 位填充：本卡 rollout 机器终点集**顺序消费**（池耗尽
-        再跑一次完整 rollout——流式语义，消耗序跨测量/更新相连续推进
-        不复位；``rig.rollouts`` 为 None（ρ=0）时拒绝——掩码只在 ρ>0
-        下发，缺席即主控/装配分叉的 fail-fast 面）。选取项 ``.float()``
-        对齐在线 rollout 型 fake 的 fp32 容器口径（与 real 侧同批 cat）。"""
+        """rollout 位填充：本卡 rollout 机器终点集**顺序消费**（池为
+        **调用局部**——每段（测量/复测/更新批的本卡段）恰一次调用：
+        池从头开、耗尽即再跑一次完整 rollout、段末余量弃置，
+        ``_rollout_runs_for`` 的逐段取整公式与之对齐；跨调用连续推进
+        的是 rollout 随机流——每次完整 rollout 推进本卡流，消耗序与
+        在线同构。``rig.rollouts`` 为 None（ρ=0）时拒绝——掩码只在
+        ρ>0 下发，缺席即主控/装配分叉的 fail-fast 面）。选取项
+        ``.float()`` 对齐在线 rollout 型 fake 的 fp32 容器口径（与
+        real 侧同批 cat）。"""
         if rig.rollouts is None:
             raise RuntimeError(
                 "收到 rollout 位掩码但本卡无 rollout 机器（ρ=0 的装配"
@@ -357,6 +358,32 @@ class PretrainCardWorker:
             fakes[position] = pool[consumed].float()
             consumed += 1
 
+    def _compose_fakes(
+        self,
+        rig: PretrainCardRig,
+        reals: torch.Tensor,
+        modality: str,
+        reconstruct: Callable[[torch.Tensor], torch.Tensor],
+        rollout_positions: Sequence[int],
+    ) -> torch.Tensor:
+        """双源 fake 批的构成骨架（#280）：rollout 位之外的重构子集经
+        ``reconstruct``（消费方注入的 recon 路径：更新段 = 卡轴流
+        ``reconstruct_assigned``、测量段 = 定序 σ + 模板流 ε 的显式重构
+        ——两路径的差异收在回调，位构成骨架单点）填入对应行，rollout
+        位由 ``_fill_rollout_fakes`` 终点填充。返回与 ``reals`` 同位次序
+        的完整 fake 批。"""
+        rollout_set = set(rollout_positions)
+        recon_rows = [
+            index for index in range(reals.shape[0])
+            if index not in rollout_set
+        ]
+        fakes = torch.empty_like(reals)
+        if recon_rows:
+            rows = torch.tensor(recon_rows, device=reals.device)
+            fakes[rows] = reconstruct(rows)
+        self._fill_rollout_fakes(rig, fakes, modality, rollout_positions)
+        return fakes
+
     def _mixed_fakes(
         self,
         rig: PretrainCardRig,
@@ -366,28 +393,19 @@ class PretrainCardWorker:
         noise: torch.Tensor,
         rollout_positions: Sequence[int],
     ) -> torch.Tensor:
-        """测量批的按位 fake 构成（#280）：rollout 位 → 终点集顺序
-        消费；其余位 → 定序 σ + 模板流 ε 的冻结基座同源重构（recon
-        位只对子集消耗一次重构——ε 已在主控全量抽取、rollout 位的
-        ε 白抽但模板复位语义不变）。返回与 ``reals`` 同位次序的完整
-        fake 批（fp32，两侧同 dtype 打分）。"""
-        rollout_set = set(rollout_positions)
-        recon_rows = [
-            index for index in range(reals.shape[0])
-            if index not in rollout_set
-        ]
-        fakes = torch.empty_like(reals)
-        if recon_rows:
-            rows = torch.tensor(recon_rows, device=reals.device)
-            fakes[rows] = rig.assembler.reconstruct(
+        """测量批的按位 fake 构成（#280）：走 ``_compose_fakes`` 骨架
+        （recon 位 = 定序 σ + 模板流 ε 的冻结基座同源重构——ε 已在主控
+        全量抽取、rollout 位的 ε 白抽但模板复位语义不变）。返回与
+        ``reals`` 同位次序的完整 fake 批（fp32，两侧同 dtype 打分）。"""
+        return self._compose_fakes(
+            rig, reals, condition.name_or_raise(),
+            lambda rows: rig.assembler.reconstruct(
                 reals[rows], condition.to(self.device),
-                [sigmas[index] for index in recon_rows],
+                [sigmas[index] for index in rows.tolist()],
                 noise.to(reals.device)[rows],
-            )
-        self._fill_rollout_fakes(
-            rig, fakes, condition.name_or_raise(), rollout_positions,
+            ),
+            rollout_positions,
         )
-        return fakes
 
     def disc_step(self) -> None:
         """判别器步收尾（主控跨卡梯度 SUM 之后）：本卡 optimizer.step
@@ -718,6 +736,12 @@ class PretrainDriver:
         for step in range(reward.pretrain_max_steps):
             started = time.monotonic()
             modality = targets[step % len(targets)]
+            # 本步测量段次数（成本读数的乘数）：首测恒 1；首测过线触发的
+            # 复测再 +1——复测段的 fake 供给消耗真实发生（终点集、完整
+            # rollout），读数照计；AUC 侧维持「复测读数只作确认判定不入
+            # 账」（下方事件 AUC 仍为首测值）——统计值与成本读数口径
+            # 分轨，reconstruction_forwards 沿 #171 旧口径只计首测段
+            measurement_count = 1
             clusters, forwards, rollout_volumes = self._measurement(modality)
             volumes[modality] = clusters.volume_count
             # 首测判定（主控 inline 四态：更新/复测/确认/终止，即下方
@@ -736,6 +760,10 @@ class PretrainDriver:
                 # 复测只读 AUC——配对批不留存（与首测批同一释放口径）
                 first_auc = auc
                 confirm_clusters, _, _ = self._measurement(modality)
+                # 复测段消耗计数（交错位是位置纯函数、复测同条件同卷数
+                # → 复测段与首测段的构成/run 数逐段相同，乘法计数 ≡
+                # 逐段求和的诚实读数）
+                measurement_count += 1
                 confirm_auc = confirm_clusters.pooled_auc()
                 if self._support.passes(confirm_auc, confirm_clusters):
                     confirmed[modality] = min(first_auc, confirm_auc)
@@ -781,6 +809,9 @@ class PretrainDriver:
                 report.loss_discriminator for report in per_card_reports
             )
             card_count = len(self._cards)
+            update_positions = self._interleaved_positions(
+                reward.disc_batch_size_k * card_count,
+            )
             self._run.append_event(PretrainEvent(
                 step=step,
                 modality=modality,
@@ -788,21 +819,23 @@ class PretrainDriver:
                 heldout_auc=auc,
                 # 重构成本读数（#171 AC5 的成本口径落点）：测量批重构的
                 # 前向次数（ρ>0 时只计重构位——rollout 位跳过重构；分段
-                # 求和与全量求和的加法结合恒等）与测量批规模——「没有
-                # 量产」的成本面由 rollout_fake_volumes / rollout_fake_pairs
-                # / rollout_runs 双源构成读数并行可核对
+                # 求和与全量求和的加法结合恒等；只计首测段——复测读数
+                # 不入账的 #171 旧口径）与测量批规模——「没有量产」的
+                # 成本面由 rollout_fake_volumes / rollout_fake_pairs /
+                # rollout_runs 双源构成读数并行可核对（读数覆盖本步全部
+                # 测量段 × ``measurement_count`` 与更新段；确认步与耗尽
+                # 补测不落事件，其消耗不入流）
                 reconstruction_forwards=forwards,
                 measurement_volumes=volumes[modality],
-                rollout_fake_volumes=rollout_volumes,
-                rollout_fake_pairs=len(
-                    self._interleaved_positions(
-                        reward.disc_batch_size_k * card_count,
-                    ) or (),
+                rollout_fake_volumes=rollout_volumes * measurement_count,
+                rollout_fake_pairs=(
+                    0 if update_positions is None else len(update_positions)
                 ),
                 rollout_runs=(
-                    self._rollout_runs_for(volumes[modality], card_count)
+                    self._rollout_runs_for(volumes[modality])
+                    * measurement_count
                     + self._rollout_runs_for(
-                        reward.disc_batch_size_k * card_count, card_count,
+                        reward.disc_batch_size_k * card_count,
                     )
                 ),
                 lr=reward.disc_lr,
@@ -917,20 +950,22 @@ class PretrainDriver:
             if start <= position < stop
         ]
 
-    def _rollout_runs_for(
-        self, count: int, card_count: int,
-    ) -> int:
-        """fake 供给的完整 rollout 次数读数（#280 成本口径）：按卡轴
-        分片逐卡取整上界求和（每卡的终点集顺序消耗——本卡 run 数 =
-        ⌈本卡 rollout 位 / 单跑终点数⌉；rollout 位是**全局序**交错位、
-        卡段取其全局切片，与掩码分派同一位序）。"""
-        plan = ShardPlan.split(count, card_count)
+    def _rollout_runs_for(self, count: int) -> int:
+        """fake 供给的完整 rollout 次数读数（#280 成本口径，单段）：段
+        内全局 ``count`` 位按卡轴分片逐卡取整上界求和（每卡的终点集
+        顺序消费——本卡 run 数 = ⌈本卡 rollout 位 / 单跑终点数⌉；rollout
+        位是**全局序**交错位、卡段取其全局切片，与掩码分派同一位序——
+        交错判定单点复用 ``_interleaved_positions``，位遍历不复制）。"""
+        positions = self._interleaved_positions(count)
+        if positions is None:
+            return 0
         endpoint_count = RolloutPhase.endpoint_count(self._config)
         runs = 0
-        for start, stop in plan.bounds:
+        for start, stop in ShardPlan.split(
+            count, len(self._cards),
+        ).bounds:
             card_rollouts = sum(
-                1 for position in range(start, stop)
-                if self._interleave.is_rollout(position)
+                1 for position in positions if start <= position < stop
             )
             if card_rollouts:
                 runs += -(-card_rollouts // endpoint_count)

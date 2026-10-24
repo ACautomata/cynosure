@@ -225,16 +225,12 @@ class DiscriminatorWindow:
             raise ValueError(f"判别器窗口的 N_d 须 ≥ 1，得到 {n_d}")
         if batch_size_k < 1:
             raise ValueError(f"判别器窗口的 K 须 ≥ 1，得到 {batch_size_k}")
-        if not math.isfinite(rollout_fake_ratio) or not 0.0 <= rollout_fake_ratio < 1.0:
-            raise ValueError(
-                f"判别器窗口的 rollout 型混合比 ρ 须 ∈ [0, 1)，得到 "
-                f"{rollout_fake_ratio}（schema 物理域之外的直调防御——"
-                "ρ=1 为纯 rollout 终点的退化面，见 ADR-0020）"
-            )
         if not card_slots:
             raise ValueError("判别器窗口须至少绑定一张卡（卡槽绑定为空）")
         # 任务双型的交错规则（#277 计划层；#280 起与预训练 fake 供给
-        # 共用同一策略件——ρ 解析单点在 FakeSourceInterleave）
+        # 共用同一策略件——ρ 解析（含 [0,1) 域防御）单点在
+        # FakeSourceInterleave，消费方不复制（schema 物理域之外的直调
+        # 防御随构造抛出）
         interleave = FakeSourceInterleave(rollout_fake_ratio)
         bound = [slot for slots in card_slots.values() for slot in slots]
         if sorted(bound) != list(range(allocation.slot_count)):

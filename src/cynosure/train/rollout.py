@@ -2,7 +2,11 @@
 
 单条件组的完整 rollout：同组共享初始噪声 → Anchor 轨迹（η=0 逐步存
 latent）→ 每个被优化训练步 k 单步 SDE 扰动 G 方向 → 各 Granularity λ
-ODE 续跑到终点 → 判别器 raw real-logit 打分 → π_old 记录。
+ODE 续跑到终点 → 判别器 raw real-logit 打分 → π_old 记录。``RolloutPhase``
+是**双出口**机器（#280 / ADR-0020）：在线 rollout 相走 ``run_iteration``
+（打分 + π_old 记录）；预训练 fake 双源的终点供给走 ``endpoint_fakes``
+（同 ``_run_core`` 编排核心、只收终点不打分——采样编排消耗序单点，
+不出第二套）。
 
 条件分布按组与数据域定义、均匀采样（experiment-design）：组1 BraTS =
 ModalLabelConditionSampler（四序列均匀）；组2 = CrossModalCondition
@@ -367,7 +371,10 @@ class CrossModalConditionSampler:
 
 
 class RolloutPhase:
-    """rollout 相编排：条件采样 → Anchor → 扰动 → λ 续跑 → 打分。"""
+    """rollout 相编排（双出口，#280）：条件采样 → Anchor → 扰动 → λ
+    续跑 → ``run_iteration`` 打分记 π_old（在线出口）｜ ``endpoint_fakes``
+    只收终点集（预训练 fake 双源出口）——两出口共享 ``_run_core`` 编排
+    核心。"""
 
     def __init__(
         self,
