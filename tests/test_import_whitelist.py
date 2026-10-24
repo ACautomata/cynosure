@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "cynosure"
-ALLOWED_THIRD_PARTY = frozenset({"monai", "torch", "numpy", "pydantic", "einops", "matplotlib"})
+ALLOWED_THIRD_PARTY = frozenset(
+    {"monai", "torch", "numpy", "pydantic", "einops", "matplotlib", "nibabel"},
+)
 WHITELIST = frozenset(sys.stdlib_module_names) | ALLOWED_THIRD_PARTY | {"cynosure"}
 
 
@@ -68,4 +70,5 @@ class TestZeroDependency:
         """第三方白名单变更必须是显式决定：钉死清单本体。"""
         assert ALLOWED_THIRD_PARTY == {
             "monai", "torch", "numpy", "pydantic", "einops", "matplotlib",
+            "nibabel",
         }

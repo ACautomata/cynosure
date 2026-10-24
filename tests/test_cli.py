@@ -8,7 +8,10 @@ import copy
 import json
 from pathlib import Path
 
+import nibabel as nib
+import numpy as np
 import pytest
+import torch
 from pydantic import ValidationError
 
 from cynosure.config import ConfigLoader, CynosureConfig
@@ -357,3 +360,89 @@ class TestMetricsStream:
         ))
         artifacts.append_event(MilestoneEvent(iteration=50, fid=1.0))
         assert [e["event"] for e in artifacts.read_events()] == ["iter", "milestone"]
+
+
+class TestSamplesCommand:
+    """samples 子命令（散文件面，#294）：usage 错误面与产物落位——只断言
+    经 CLI 边界可观测的外部行为。"""
+
+    @staticmethod
+    def _write_pt(path: Path) -> None:
+        torch.save(torch.rand(4, 5, 6), path)
+
+    def test_missing_output_dir_is_usage_error(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        pt = tmp_path / "case.pt"
+        self._write_pt(pt)
+        with pytest.raises(SystemExit) as excinfo:
+            cli.run("samples", str(pt))
+        assert excinfo.value.code == 2
+
+    def test_missing_input_rejected_without_creating_output_dir(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        output = tmp_path / "plates"
+        result = cli.run(
+            "samples", str(tmp_path / "nope.pt"),
+            "--output-dir", str(output),
+        )
+        assert result.code == 2
+        assert "不存在" in result.stderr
+        assert not output.exists()
+
+    def test_renders_pt_with_explicit_spacing(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        pt = tmp_path / "case01.pt"
+        self._write_pt(pt)
+        output = tmp_path / "plates"
+        result = cli.run(
+            "samples", str(pt),
+            "--spacing", "1.0", "2.0", "3.0",
+            "--output-dir", str(output),
+        )
+        assert result.code == 0
+        assert (output / "case01.png").is_file()
+
+    def test_default_spacing_downgrade_announced_on_stdout(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        pt = tmp_path / "case02.pt"
+        self._write_pt(pt)
+        output = tmp_path / "plates"
+        result = cli.run("samples", str(pt), "--output-dir", str(output))
+        assert result.code == 0
+        assert "降级" in result.stdout
+        assert (output / "case02.png").is_file()
+
+    def test_spacing_rejected_for_nifti_input(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        nifti = tmp_path / "ref.nii.gz"
+        nib.save(nib.Nifti1Image(
+            np.zeros((4, 4, 4), dtype=np.float32), np.eye(4),
+        ), nifti)
+        output = tmp_path / "plates"
+        result = cli.run(
+            "samples", str(nifti),
+            "--spacing", "1.0", "1.0", "1.0",
+            "--output-dir", str(output),
+        )
+        assert result.code == 2
+        assert "NIfTI" in result.stderr
+
+    def test_renders_nifti_with_header_spacing(
+        self, tmp_path: Path, cli: CliSession,
+    ) -> None:
+        """NIfTI 输入（无 --spacing）：header spacing 自动读取、直接产出。"""
+        nifti = tmp_path / "ref.nii.gz"
+        nib.save(nib.Nifti1Image(
+            np.random.default_rng(0).random((4, 5, 6)).astype(np.float32),
+            np.diag([-1.0, -2.0, -3.0, 1.0]),
+        ), nifti)
+        output = tmp_path / "plates"
+        result = cli.run("samples", str(nifti), "--output-dir", str(output))
+        assert result.code == 0
+        assert (output / "ref.png").is_file()
+        assert "NIfTI header" in result.stdout

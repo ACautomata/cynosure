@@ -47,6 +47,13 @@ from cynosure.eval.real_real_floor import (
 )
 from cynosure.policy import TrajectoryDiagnosticRunner
 from cynosure.plots import MetricsPlotter
+from cynosure.samples import (
+    NiftiVolumeSource,
+    PtVolumeSource,
+    SamplePlateRenderer,
+    SPACING_ORIGIN_ISOTROPIC,
+    SPACING_ORIGIN_LABELS,
+)
 from cynosure.pretrain import PretrainRun
 from cynosure.pretrain.driver import PretrainDriver
 from cynosure.reward import PreparePipeline
@@ -80,6 +87,9 @@ class CynosureCli:
         # base-smoke 走独立 schema（基座装载自检，与训练 config 分离）
         if args.command == "base-smoke":
             return self._base_smoke(args)
+        # samples 纯 argparse 参数（#293 决策：同 fid-floor 风格，无 config JSON）
+        if args.command == "samples":
+            return self._samples(args)
         # 四子命令共享同一 config schema：dispatch 前统一校验
         config = self._load_config(args.config)
         if config is None:
@@ -106,8 +116,34 @@ class CynosureCli:
             ("fid", "裁决性 MR FID 读数（fork 口径 2.5D 仪器，#73 双轨）"),
             ("fid-floor", "real-vs-real 地板半分（病例级 seed 冻结 + 逐格清单）"),
             ("base-smoke", "基座 checkpoint 装载与前向自检（wayfinder #120）"),
+            ("samples", "样本图版渲染（2×2 三正交面 PNG，.pt/NIfTI 散文件面）"),
         ):
             sub = subparsers.add_parser(name, help=help_text)
+            if name == "samples":
+                sub.add_argument(
+                    "input", type=Path,
+                    help="体文件路径（裸 .pt 或 NIfTI）",
+                )
+                sub.add_argument(
+                    "--output-dir", required=True, type=Path,
+                    help="图版输出目录（散文件输入必填）",
+                )
+                sub.add_argument(
+                    "--spacing", nargs=3, type=float, default=None,
+                    metavar=("SX", "SY", "SZ"),
+                    help=".pt 显式 spacing（mm；缺省降级体素等比并在 "
+                         "stdout 明示；NIfTI 自带 header spacing，携带即拒）",
+                )
+                sub.add_argument(
+                    "--slice-offset", type=int, default=0,
+                    help="切层偏移（三轴中心层 + 偏移，越界 clamp 到端层）",
+                )
+                sub.add_argument(
+                    "--window", nargs=2, type=float, default=None,
+                    metavar=("LO", "HI"),
+                    help="显式窗范围（缺省逐体 percentile 0.5–99.5）",
+                )
+                continue
             if name == "fid-floor":
                 sub.add_argument(
                     "--manifest", required=True, type=Path,
@@ -531,6 +567,62 @@ class CynosureCli:
         )
         print(
             f"基座装载自检报告已落盘: {config.output_json}",
+            file=self._stdout,
+        )
+        return 0
+
+    def _samples(self, args: argparse.Namespace) -> int:
+        """样本图版渲染（散文件面，#294）：裸 ``.pt`` 或 NIfTI → 输出
+        目录一张 2×2 三视图 PNG。usage 错误面（输入不存在、NIfTI 携带
+        显式 spacing、装载契约违反）exit 2 可读消息且不产出空目录；
+        ``.pt`` spacing 缺省降级体素等比并在 stdout 明示口径降级。"""
+        if not args.input.is_file():
+            print(f"输入体文件不存在: {args.input}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        is_nifti = args.input.name.endswith((".nii", ".nii.gz"))
+        if is_nifti and args.spacing is not None:
+            print(
+                "NIfTI 输入自带 header spacing，--spacing 只对裸 .pt 有意义",
+                file=self._stderr,
+            )
+            return _EXIT_USAGE_ERROR
+        try:
+            if is_nifti:
+                volume = NiftiVolumeSource(args.input).load()
+            else:
+                volume = PtVolumeSource(
+                    args.input,
+                    spacing=tuple(args.spacing) if args.spacing else None,
+                ).load()
+        except (
+            ValueError, FileNotFoundError, RuntimeError,
+            pickle.UnpicklingError,
+        ) as exc:
+            print(f"samples 输入契约违反: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        if volume.spacing_origin == SPACING_ORIGIN_ISOTROPIC:
+            print(
+                "spacing 不可得（裸 .pt 无头且未给 --spacing）：降级体素"
+                "等比 (1, 1, 1)，图版物理纵横比口径随之降级",
+                file=self._stdout,
+            )
+        try:
+            layout = SamplePlateRenderer(args.output_dir).render(
+                volume,
+                slice_offset=args.slice_offset,
+                window=tuple(args.window) if args.window else None,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"samples 渲染失败: {exc}", file=self._stderr)
+            return _EXIT_USAGE_ERROR
+        window = layout.panels[0].window
+        print(
+            f"样本图版已落盘: {layout.png}"
+            f"（形状 X={layout.volume_shape[0]} Y={layout.volume_shape[1]}"
+            f" Z={layout.volume_shape[2]}、spacing "
+            f"{' × '.join(f'{v:.3g}' for v in layout.spacing)} mm"
+            f"（{SPACING_ORIGIN_LABELS[layout.spacing_origin]}）、"
+            f"窗 {window[0]:.4g}–{window[1]:.4g}、轴码 {layout.axis_codes}）",
             file=self._stdout,
         )
         return 0

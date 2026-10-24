@@ -56,6 +56,20 @@ class OrthoPlane(enum.Enum):
         """spec 钉死的三正交面（XY/YZ/ZX，缺一即不是 2.5D）。"""
         return (cls.XY, cls.YZ, cls.ZX)
 
+    def single_slice(self, volume: torch.Tensor, index: int) -> torch.Tensor:
+        """单体 [X, Y, Z] 的单层切片（样本图版渲染面，#294）：沿法轴取
+        第 ``index`` 层，返回该平面的 2D 切片——轴序与 ``slice`` 批量
+        口径逐面一致（XY→[X, Y]、YZ→[Y, Z]、ZX→[Z, X]）。"""
+        if volume.dim() != 3:
+            raise ValueError(
+                f"体须为 [X, Y, Z]，得到 {tuple(volume.shape)}"
+            )
+        if self is OrthoPlane.XY:
+            return volume[:, :, index]
+        if self is OrthoPlane.YZ:
+            return volume[index, :, :]
+        return volume[:, index, :].T
+
 
 class ReferenceVolumes(Protocol):
     """里程碑参照侧的取数契约（``MilestoneEvaluator`` 的注入面，两域实现）。
